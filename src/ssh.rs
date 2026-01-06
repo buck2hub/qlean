@@ -141,6 +141,7 @@ impl Session {
                         error!(
                             "Reached timeout trying to connect to virtual machine via SSH, aborting"
                         );
+                        return Err(anyhow::anyhow!("Timeout"));
                     }
                     continue;
                 }
