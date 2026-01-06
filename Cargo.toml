@@ -1,0 +1,28 @@
+[package]
+name = "qlean"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+console = "0.16.2"
+dir-lock = "0.5.0"
+directories = "6.0.0"
+futures = "0.3"
+nanoid = "0.4.0"
+reqwest = { version = "0.13.1", features = ["stream"] }
+russh = "0.55.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.148"
+serde_yml = "0.0.12"
+shell-escape = "0.1.5"
+termion = "4.0.6"
+tokio = { version = "1", features = ["full"] }
+tokio-fd = "0.3.0"
+tokio-util = "0.7.18"
+tokio-vsock = "0.7.2"
+tracing = { version = "0.1.43", features = ["log"] }
+walkdir = "2.5.0"
+
+[dev-dependencies]
+tracing-subscriber = "0.3.22"
