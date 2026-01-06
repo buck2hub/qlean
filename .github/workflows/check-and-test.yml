@@ -1,0 +1,100 @@
+on:
+  pull_request:
+    paths-ignore:
+      - '.github/**'
+      - 'docs/**'
+      - 'README.md'
+
+name: Check, Build and Test
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  setup:
+    strategy:
+      fail-fast: false
+
+    name: Setup and Cache
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy rustfmt
+          cache-workspaces: .
+          cache-directories: ./target
+
+  format:
+    name: Rustfmt Check
+    runs-on: ubuntu-latest
+    needs: setup
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      
+      - name: Run rustfmt
+        run: cargo fmt --check
+
+  clippy:
+    strategy:
+        fail-fast: true
+        
+    name: Clippy Check
+    runs-on: ubuntu-latest
+    needs: setup
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy rustfmt
+          cache-workspaces: .
+          cache-directories: ./target
+
+      - name: Run cargo clippy
+        run: cargo clippy -- -D warnings
+
+  test:
+    name: Cargo Test
+    runs-on: ubuntu-latest
+    needs: setup
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy rustfmt
+          cache-workspaces: .
+          cache-directories: ./target
+
+      - name: Run tests
+        run: cargo test --no-run
