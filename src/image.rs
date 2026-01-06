@@ -11,7 +11,7 @@ use crate::utils::QleanDirs;
 pub trait ImageAction {
     /// Download the image from remote source
     fn download(&self, name: &str) -> impl std::future::Future<Output = Result<()>> + Send;
-    /// Extract kenrnel and initrd from the image
+    /// Extract kernel and initrd from the image
     fn extract(
         &self,
         name: &str,

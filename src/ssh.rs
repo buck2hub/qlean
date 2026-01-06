@@ -157,7 +157,7 @@ impl Session {
                         continue;
                     }
                     e => {
-                        error!("Unhandled error occured: {e}");
+                        error!("Unhandled error occurred: {e}");
                         return Err(anyhow::anyhow!("Unknown error"));
                     }
                 },
@@ -179,7 +179,7 @@ impl Session {
                             }
                         }
                         e => {
-                            error!("Unhandled error occured: {e}");
+                            error!("Unhandled error occurred: {e}");
                             return Err(anyhow::anyhow!("Unknown error"));
                         }
                     }
@@ -193,7 +193,7 @@ impl Session {
                     }
                 }
                 Err(e) => {
-                    error!("Unhandled error occured: {e}");
+                    error!("Unhandled error occurred: {e}");
                     return Err(anyhow::anyhow!("Unknown error"));
                 }
             }
