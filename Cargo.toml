@@ -12,6 +12,7 @@ futures = "0.3"
 nanoid = "0.4.0"
 reqwest = { version = "0.13.1", features = ["stream"] }
 russh = "0.55.0"
+russh-sftp = "2.1.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.148"
 serde_yml = "0.0.12"
@@ -25,4 +26,5 @@ tracing = { version = "0.1.43", features = ["log"] }
 walkdir = "2.5.0"
 
 [dev-dependencies]
+tempfile = "3.24.0"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "local-time"] }

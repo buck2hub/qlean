@@ -115,6 +115,16 @@ impl CommandExt for tokio::process::Command {
     }
 }
 
+pub trait PathExt {
+    fn to_string_lossy_owned(&self) -> String;
+}
+
+impl PathExt for Path {
+    fn to_string_lossy_owned(&self) -> String {
+        self.to_string_lossy().into_owned()
+    }
+}
+
 pub async fn ensure_prerequisites() -> Result<()> {
     check_command_available("qemu-system-x86_64").await?;
     check_command_available("qemu-img").await?;
