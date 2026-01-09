@@ -1,5 +1,6 @@
 use std::{
-    os::unix::process::ExitStatusExt,
+    fs::Permissions,
+    os::unix::{fs::PermissionsExt, process::ExitStatusExt},
     path::{Path, PathBuf},
     process::Output,
     sync::{
@@ -11,7 +12,9 @@ use std::{
 
 use anyhow::{Result, bail};
 use nanoid::nanoid;
+use russh_sftp::client::fs::{Metadata, ReadDir};
 use serde::{Deserialize, Serialize};
+use shell_escape::unix::escape;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 use walkdir::WalkDir;
@@ -20,7 +23,7 @@ use crate::{
     image::Image,
     qemu::launch_qemu,
     ssh::{PersistedSshKeypair, Session, connect_ssh, get_ssh_key},
-    utils::{CommandExt, HEX_ALPHABET, PathExt, QleanDirs, get_free_cid},
+    utils::{CommandExt, HEX_ALPHABET, QleanDirs, get_free_cid},
 };
 
 pub struct Machine {
@@ -329,21 +332,18 @@ impl Machine {
     }
 
     /// Upload file or directory to the machine
-    pub async fn upload(&mut self, local_path: &Path, remote_path: &Path) -> Result<()> {
+    pub async fn upload<P: AsRef<Path>, Q: AsRef<Path>>(
+        &mut self,
+        local_path: P,
+        remote_path: Q,
+    ) -> Result<()> {
+        let local_path = local_path.as_ref();
+        let remote_path = remote_path.as_ref();
         info!(
             "📤 Uploading {:?} to {:?} on VM-{}",
             local_path, remote_path, self.id
         );
-        // Ensure SSH session
-        let ssh = self
-            .ssh
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("SSH session not established"))?;
-        let cancel_token = self
-            .ssh_cancel_token
-            .as_ref()
-            .expect("Machine not initialized or spawned")
-            .clone();
+        let (ssh, cancel_token) = self.get_ssh()?;
 
         // Normalize local path type
         let meta = tokio::fs::metadata(local_path).await?;
@@ -352,7 +352,7 @@ impl Machine {
             let remote_target = {
                 let is_dir = {
                     let sftp = ssh.get_sftp().await?;
-                    (sftp.read_dir(remote_path.to_string_lossy_owned()).await).is_ok()
+                    (sftp.read_dir(remote_path.to_string_lossy()).await).is_ok()
                 };
                 if is_dir {
                     remote_path.join(local_path.file_name().unwrap())
@@ -410,8 +410,8 @@ impl Machine {
                                 let sftp = ssh.get_sftp().await?;
                                 let _ = sftp
                                     .symlink(
-                                        remote_entry.to_string_lossy_owned(),
-                                        target.to_string_lossy_owned(),
+                                        remote_entry.to_string_lossy(),
+                                        target.to_string_lossy(),
                                     )
                                     .await; // best-effort
                             }
@@ -430,26 +430,23 @@ impl Machine {
     }
 
     /// Download file or directory from the machine
-    pub async fn download(&mut self, remote_path: &Path, local_path: &Path) -> Result<()> {
+    pub async fn download<P: AsRef<Path>, Q: AsRef<Path>>(
+        &mut self,
+        remote_path: P,
+        local_path: Q,
+    ) -> Result<()> {
+        let remote_path = remote_path.as_ref();
+        let local_path = local_path.as_ref();
         info!(
             "📥 Downloading {:?} from VM-{} to {:?}",
             remote_path, self.id, local_path
         );
-        // Ensure SSH session
-        let ssh = self
-            .ssh
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("SSH session not established"))?;
-        let cancel_token = self
-            .ssh_cancel_token
-            .as_ref()
-            .expect("Machine not initialized or spawned")
-            .clone();
+        let (ssh, cancel_token) = self.get_ssh()?;
 
         // Check remote path type
         let remote_meta = {
             let sftp = ssh.get_sftp().await?;
-            sftp.metadata(remote_path.to_string_lossy_owned())
+            sftp.metadata(remote_path.to_string_lossy())
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to stat remote path: {}", e))?
         };
@@ -530,13 +527,27 @@ impl Machine {
         Ok(())
     }
 
+    /// Helper to get SSH session and cancellation token
+    fn get_ssh(&mut self) -> Result<(&mut Session, CancellationToken)> {
+        let ssh = self
+            .ssh
+            .as_mut()
+            .expect("Machine not initialized or spawned");
+        let cancel_token = self
+            .ssh_cancel_token
+            .as_ref()
+            .cloned()
+            .expect("Machine not initialized or spawned");
+        Ok((ssh, cancel_token))
+    }
+
+    /// Launch QEMU and connect SSH concurrently
     async fn launch(&mut self, is_init: bool) -> Result<()> {
         debug!(
             "SSH command for manual debugging:\nssh root@vsock/{} -i {:?}",
             self.cid, self.keypair.privkey_path,
         );
 
-        // Launch QEMU and connect SSH concurrently
         let qemu_handle = tokio::spawn(launch_qemu(
             self.qemu_should_exit.clone(),
             self.cid,
@@ -586,6 +597,221 @@ impl Machine {
                 }
             }
         }
+
+        Ok(())
+    }
+}
+
+// Filesystem methods for Machine
+impl Machine {
+    /// Copies the contents of one file to another.
+    /// This function will also copy the permission bits of the original file to the destination file.
+    pub async fn copy<P: AsRef<Path>, Q: AsRef<Path>>(&mut self, from: P, to: Q) -> Result<()> {
+        let from = from.as_ref();
+        let to = to.as_ref();
+        let (ssh, cancel_token) = self.get_ssh()?;
+
+        // Validate source and destination semantics to mirror std::fs::copy
+        {
+            let sftp = ssh.get_sftp().await?;
+            let src_meta = sftp
+                .metadata(from.to_string_lossy())
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to stat source: {e}"))?;
+            if src_meta.is_dir() {
+                bail!("Source is a directory: {:?}", from);
+            }
+
+            if let Ok(dst_meta) = sftp.metadata(to.to_string_lossy()).await
+                && dst_meta.is_dir()
+            {
+                bail!("Destination is a directory: {:?}", to);
+            }
+        }
+
+        // Use cp inside the guest to avoid round-tripping data over SFTP.
+        let cmd = format!(
+            "cp -p -- {} {}",
+            escape(from.to_string_lossy()),
+            escape(to.to_string_lossy())
+        );
+        let (code, _stdout, stderr) = ssh.call_with_output(&cmd, cancel_token).await?;
+        if code != 0 {
+            bail!(
+                "Failed to copy file (exit code {}): {}",
+                code,
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Creates a new, empty directory at the provided path
+    pub async fn create_dir<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let path = path.as_ref();
+        let (ssh, _) = self.get_ssh()?;
+
+        let sftp = ssh.get_sftp().await?;
+        sftp.create_dir(path.to_string_lossy()).await?;
+
+        Ok(())
+    }
+
+    /// Recursively create a directory and all of its parent components if they are missing.
+    pub async fn create_dir_all<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let path = path.as_ref();
+        let (ssh, _) = self.get_ssh()?;
+
+        ssh.create_dir_all(path).await?;
+
+        Ok(())
+    }
+
+    /// Returns `Ok(true)` if the path points at an existing entity.
+    pub async fn exists<P: AsRef<Path>>(&mut self, path: P) -> Result<bool> {
+        let path = path.as_ref();
+        let (ssh, _) = self.get_ssh()?;
+
+        let sftp = ssh.get_sftp().await?;
+        Ok(sftp.try_exists(path.to_string_lossy()).await?)
+    }
+
+    /// Creates a new hard link on the filesystem.
+    pub async fn hard_link<P: AsRef<Path>, Q: AsRef<Path>>(
+        &mut self,
+        original: P,
+        link: Q,
+    ) -> Result<()> {
+        let original = original.as_ref();
+        let link = link.as_ref();
+        let (ssh, _) = self.get_ssh()?;
+
+        let sftp = ssh.get_sftp().await?;
+        sftp.hardlink(original.to_string_lossy(), link.to_string_lossy())
+            .await?;
+
+        Ok(())
+    }
+
+    /// Given a path, queries the file system to get information about a file, directory, etc.
+    pub async fn metadata<P: AsRef<Path>>(&mut self, path: P) -> Result<Metadata> {
+        let path = path.as_ref();
+        let (ssh, _) = self.get_ssh()?;
+
+        let sftp = ssh.get_sftp().await?;
+        Ok(sftp.metadata(path.to_string_lossy()).await?)
+    }
+
+    /// Reads the entire contents of a file into a bytes vector.
+    pub async fn read<P: AsRef<Path>>(&mut self, path: P) -> Result<Vec<u8>> {
+        let path = path.as_ref();
+        let (ssh, _) = self.get_ssh()?;
+
+        let sftp = ssh.get_sftp().await?;
+        Ok(sftp.read(path.to_string_lossy()).await?)
+    }
+
+    /// Returns an iterator over the entries within a directory.
+    pub async fn read_dir<P: AsRef<Path>>(&mut self, path: P) -> Result<ReadDir> {
+        let path = path.as_ref();
+        let (ssh, _) = self.get_ssh()?;
+
+        let sftp = ssh.get_sftp().await?;
+        Ok(sftp.read_dir(path.to_string_lossy()).await?)
+    }
+
+    /// Reads a symbolic link, returning the file that the link points to.
+    pub async fn read_link<P: AsRef<Path>>(&mut self, path: P) -> Result<PathBuf> {
+        let path = path.as_ref();
+        let (ssh, _) = self.get_ssh()?;
+
+        let sftp = ssh.get_sftp().await?;
+        Ok(PathBuf::from(sftp.read_link(path.to_string_lossy()).await?))
+    }
+
+    /// Reads the entire contents of a file into a string.
+    pub async fn read_to_string<P: AsRef<Path>>(&mut self, path: P) -> Result<String> {
+        let path = path.as_ref();
+        let (ssh, _) = self.get_ssh()?;
+
+        let sftp = ssh.get_sftp().await?;
+        let bytes = sftp.read(path.to_string_lossy()).await?;
+        Ok(String::from_utf8(bytes)?)
+    }
+
+    /// Removes a directory at provided path, after removing all its contents.
+    pub async fn remove_dir<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let path = path.as_ref();
+        let (ssh, _) = self.get_ssh()?;
+
+        let sftp = ssh.get_sftp().await?;
+        sftp.remove_dir(path.to_string_lossy()).await?;
+
+        Ok(())
+    }
+
+    /// Removes a file from the filesystem on VM.
+    pub async fn remove_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let path = path.as_ref();
+        let (ssh, _) = self.get_ssh()?;
+
+        let sftp = ssh.get_sftp().await?;
+        sftp.remove_file(path.to_string_lossy()).await?;
+
+        Ok(())
+    }
+
+    /// Renames a file or directory to a new name
+    pub async fn rename<P: AsRef<Path>, Q: AsRef<Path>>(&mut self, from: P, to: Q) -> Result<()> {
+        let from = from.as_ref();
+        let to = to.as_ref();
+        let (ssh, _) = self.get_ssh()?;
+
+        let sftp = ssh.get_sftp().await?;
+        sftp.rename(from.to_string_lossy(), to.to_string_lossy())
+            .await?;
+
+        Ok(())
+    }
+
+    /// Changes the permissions found on a file or a directory.
+    pub async fn set_permissions<P: AsRef<Path>>(
+        &mut self,
+        path: P,
+        perm: Permissions,
+    ) -> Result<()> {
+        let path = path.as_ref();
+        let (ssh, _) = self.get_ssh()?;
+
+        {
+            let sftp = ssh.get_sftp().await?;
+            let mut meta = sftp
+                .metadata(path.to_string_lossy())
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to stat file: {}", e))?;
+
+            let mode = perm.mode();
+            meta.permissions = Some(mode);
+
+            sftp.set_metadata(path.to_string_lossy(), meta).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Writes a slice as the entire contents of a file.
+    pub async fn write<P: AsRef<Path>, C: AsRef<[u8]>>(
+        &mut self,
+        path: P,
+        contents: C,
+    ) -> Result<()> {
+        let path = path.as_ref();
+        let contents = contents.as_ref();
+        let (ssh, _) = self.get_ssh()?;
+
+        let sftp = ssh.get_sftp().await?;
+        sftp.write(path.to_string_lossy(), contents).await?;
 
         Ok(())
     }

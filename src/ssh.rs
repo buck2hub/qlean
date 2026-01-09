@@ -23,8 +23,6 @@ use tokio_util::sync::CancellationToken;
 use tokio_vsock::{VsockAddr, VsockStream};
 use tracing::{debug, error, info};
 
-use crate::utils::PathExt;
-
 #[derive(Clone, Debug)]
 pub struct PersistedSshKeypair {
     pub pubkey_str: String,
@@ -388,7 +386,8 @@ pub async fn connect_ssh(
 
 impl Session {
     /// Recursively create a directory and all of its parent components if they are missing.
-    pub async fn create_dir_all(&mut self, path: &Path) -> Result<()> {
+    pub async fn create_dir_all<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let path = path.as_ref();
         // Build path incrementally like mkdir -p
         let mut cur = PathBuf::new();
         for comp in path.components() {
@@ -399,14 +398,14 @@ impl Session {
             // Limit SFTP borrow scope to avoid conflicts with self in recursion
             let create_res = {
                 let sftp = self.get_sftp().await?;
-                sftp.create_dir(cur.to_string_lossy_owned()).await
+                sftp.create_dir(cur.to_string_lossy()).await
             };
             match create_res {
                 Ok(_) => {}
                 Err(_) => {
                     let meta_res = {
                         let sftp = self.get_sftp().await?;
-                        sftp.metadata(cur.to_string_lossy_owned()).await
+                        sftp.metadata(cur.to_string_lossy()).await
                     };
                     if let Ok(attr) = meta_res {
                         if !attr.is_dir() {
@@ -425,18 +424,20 @@ impl Session {
     }
 
     /// Upload a single file via SFTP.
-    pub async fn upload_file(
+    pub async fn upload_file<P: AsRef<Path>, Q: AsRef<Path>>(
         &mut self,
-        local: &Path,
-        remote: &Path,
+        local: P,
+        remote: Q,
         cancel_token: CancellationToken,
     ) -> anyhow::Result<()> {
+        let local = local.as_ref();
+        let remote = remote.as_ref();
         let mut src = tokio::fs::File::open(local).await?;
         // Scope SFTP borrow
         let mut dst = {
             let sftp = self.get_sftp().await?;
             sftp.open_with_flags(
-                remote.to_string_lossy_owned(),
+                remote.to_string_lossy(),
                 OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
             )
             .await?
@@ -459,15 +460,17 @@ impl Session {
     }
 
     /// Download a single file via SFTP.
-    pub async fn download_file(
+    pub async fn download_file<P: AsRef<Path>, Q: AsRef<Path>>(
         &mut self,
-        remote: &Path,
-        local: &Path,
+        remote: P,
+        local: Q,
         cancel_token: CancellationToken,
     ) -> anyhow::Result<()> {
+        let remote = remote.as_ref();
+        let local = local.as_ref();
         let mut src = {
             let sftp = self.get_sftp().await?;
-            sftp.open(remote.to_string_lossy_owned()).await?
+            sftp.open(remote.to_string_lossy()).await?
         };
         let mut dst = tokio::fs::File::create(local).await?;
 
@@ -489,18 +492,19 @@ impl Session {
     /// Walk a remote directory tree over SFTP, similar to walkdir.
     /// Returns a depth-first list of entries including the root.
     /// Note: symlink detection may be limited; russh-sftp often reports symlinks as files.
-    pub async fn walk_remote_dir(
+    pub async fn walk_remote_dir<P: AsRef<Path>>(
         &mut self,
-        root: &Path,
+        root: P,
         follow_links: bool,
         cancel_token: CancellationToken,
-    ) -> anyhow::Result<Vec<RemoteDirEntry>> {
+    ) -> Result<Vec<RemoteDirEntry>> {
+        let root = root.as_ref();
         let mut out = Vec::new();
 
         // Stat root
         let root_meta = {
             let sftp = self.get_sftp().await?;
-            sftp.metadata(root.to_string_lossy_owned()).await?
+            sftp.metadata(root.to_string_lossy()).await?
         };
         let root_type = RemoteFileType::from_attrs(&root_meta);
         out.push(RemoteDirEntry::new(root.to_path_buf(), root_type));
@@ -519,7 +523,7 @@ impl Session {
 
             let entries = {
                 let sftp = self.get_sftp().await?;
-                match sftp.read_dir(dir.to_string_lossy_owned()).await {
+                match sftp.read_dir(dir.to_string_lossy()).await {
                     Ok(e) => e,
                     Err(e) => {
                         // If directory can't be read, skip (best-effort)
@@ -538,7 +542,7 @@ impl Session {
                 let child_path = dir.join(&name);
                 let attrs = {
                     let sftp = self.get_sftp().await?;
-                    match sftp.metadata(child_path.to_string_lossy_owned()).await {
+                    match sftp.metadata(child_path.to_string_lossy()).await {
                         Ok(a) => a,
                         Err(e) => {
                             debug!("Failed to stat {:?}: {}", child_path, e);
