@@ -801,6 +801,8 @@ impl Machine {
     }
 
     /// Writes a slice as the entire contents of a file.
+    ///
+    /// This function will create a file if it does not exist, and will entirely replace its contents if it does.
     pub async fn write<P: AsRef<Path>, C: AsRef<[u8]>>(
         &mut self,
         path: P,
@@ -811,6 +813,7 @@ impl Machine {
         let (ssh, _) = self.get_ssh()?;
 
         let sftp = ssh.get_sftp().await?;
+        let _ = sftp.create(path.to_string_lossy()).await?;
         sftp.write(path.to_string_lossy(), contents).await?;
 
         Ok(())
