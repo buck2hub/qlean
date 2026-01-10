@@ -1,7 +1,15 @@
 [package]
 name = "qlean"
 version = "0.1.0"
+authors = ["jl.jiang <jiangjl9807@gmail.com>"]
+categories = ["development-tools::testing", "virtualization"]
+description = "A system-level isolation testing library based on QEMU/KVM."
+documentation = "https://docs.rs/qlean"
 edition = "2024"
+keywords = ["isolation", "testing", "kvm", "qemu"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/buck2hub/qlean"
 
 [dependencies]
 anyhow = "1.0.100"
