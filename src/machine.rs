@@ -355,7 +355,7 @@ impl Machine {
                     (sftp.read_dir(remote_path.to_string_lossy()).await).is_ok()
                 };
                 if is_dir {
-                    remote_path.join(local_path.file_name().unwrap())
+                    remote_path.join(local_path.file_name().expect("local_path has no basename"))
                 } else {
                     remote_path.to_path_buf()
                 }
@@ -387,7 +387,10 @@ impl Machine {
                 }
 
                 // Relative path under local_path
-                let rel = entry.path().strip_prefix(local_path).unwrap();
+                let rel = entry
+                    .path()
+                    .strip_prefix(local_path)
+                    .expect("Failed to get relative path");
                 let remote_entry = remote_root.join(rel);
 
                 if ty.is_dir() {
@@ -741,7 +744,7 @@ impl Machine {
     }
 
     /// Removes a directory at provided path, after removing all its contents.
-    pub async fn remove_dir<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+    pub async fn remove_dir_all<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         let path = path.as_ref();
         let (ssh, _) = self.get_ssh()?;
 

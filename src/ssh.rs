@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use russh::{
     ChannelMsg, Disconnect,
     keys::{
@@ -402,20 +402,17 @@ impl Session {
             };
             match create_res {
                 Ok(_) => {}
-                Err(_) => {
+                Err(e) => {
                     let meta_res = {
                         let sftp = self.get_sftp().await?;
                         sftp.metadata(cur.to_string_lossy()).await
                     };
                     if let Ok(attr) = meta_res {
                         if !attr.is_dir() {
-                            return Err(anyhow::anyhow!(format!(
-                                "Remote path exists and is not a directory: {:?}",
-                                cur
-                            )));
+                            bail!("Remote path exists and is not a directory: {:?}", cur);
                         }
                     } else {
-                        // If metadata fails for other reasons, propagate generic error
+                        bail!("Failed to create remote directory {:?}: {}", cur, e);
                     }
                 }
             }
@@ -491,7 +488,6 @@ impl Session {
 
     /// Walk a remote directory tree over SFTP, similar to walkdir.
     /// Returns a depth-first list of entries including the root.
-    /// Note: symlink detection may be limited; russh-sftp often reports symlinks as files.
     pub async fn walk_remote_dir<P: AsRef<Path>>(
         &mut self,
         root: P,
@@ -556,8 +552,29 @@ impl Session {
                 if ftype.is_dir() {
                     stack.push(child_path);
                 } else if ftype.is_symlink() && follow_links {
-                    // Best-effort: treat as file unless lstat/readlink available
-                    // Without robust symlink resolution, we won't traverse targets.
+                    // If it's a symlink and we're following links, stat the target
+                    let target_path = {
+                        let sftp = self.get_sftp().await?;
+                        match sftp.read_link(child_path.to_string_lossy()).await {
+                            Ok(tp) => PathBuf::from(tp),
+                            Err(e) => {
+                                bail!("Failed to read_link {:?}: {}", child_path, e);
+                            }
+                        }
+                    };
+                    let target_attrs = {
+                        let sftp = self.get_sftp().await?;
+                        match sftp.metadata(target_path.to_string_lossy()).await {
+                            Ok(a) => a,
+                            Err(e) => {
+                                bail!("Failed to stat symlink target {:?}: {}", target_path, e);
+                            }
+                        }
+                    };
+                    let target_type = RemoteFileType::from_attrs(&target_attrs);
+                    if target_type.is_dir() {
+                        stack.push(target_path);
+                    }
                 }
             }
         }
@@ -575,11 +592,10 @@ pub struct RemoteFileType {
 
 impl RemoteFileType {
     fn from_attrs(attrs: &russh_sftp::protocol::FileAttributes) -> Self {
-        // russh-sftp doesn't expose symlink distinctly; assume false by default
         Self {
             is_dir: attrs.is_dir(),
-            is_file: !attrs.is_dir(),
-            is_symlink: false,
+            is_file: attrs.file_type().is_file(),
+            is_symlink: attrs.file_type().is_symlink(),
         }
     }
     pub fn is_dir(&self) -> bool {

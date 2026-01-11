@@ -122,11 +122,10 @@ The following methods provide filesystem operations compatible with `std::fs` se
 - `Machine::read_dir(path)` - Read directory entries
 - `Machine::read_link(path)` - Read symbolic link target
 - `Machine::read_to_string(path)` - Read file contents as string
-- `Machine::remove_dir(path)` - Remove an empty directory
+- `Machine::remove_dir_all(path)` - Remove a directory after removing all its contents
 - `Machine::remove_file(path)` - Remove a file
 - `Machine::rename(from, to)` - Rename or move a file/directory
 - `Machine::set_permissions(path, perm)` - Set file/directory permissions
-- `Machine::symlink(src, dst)` - Create a symbolic link
 - `Machine::write(path, contents)` - Write bytes to a file
 
 ## License

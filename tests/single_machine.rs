@@ -213,15 +213,15 @@ async fn test_file_operation() -> Result<()> {
             assert!(names.contains(&"symlink.txt".to_string()));
             assert!(names.contains(&"single".to_string()));
 
-            // remove_file & remove_dir
+            // remove_file & remove_dir_all
             vm.remove_file(&renamed_path).await?;
             vm.remove_file(&hard_link_path).await?;
             vm.remove_file(&symlink_path).await?;
             vm.remove_file(&file_path).await?;
-            vm.remove_dir(&nested_dir).await?;
-            vm.remove_dir(&base_dir.join("nested")).await?;
-            vm.remove_dir(&single_dir).await?;
-            vm.remove_dir(&base_dir).await?;
+            vm.remove_dir_all(&nested_dir).await?;
+            vm.remove_dir_all(&base_dir.join("nested")).await?;
+            vm.remove_dir_all(&single_dir).await?;
+            vm.remove_dir_all(&base_dir).await?;
             assert!(!vm.exists(&base_dir).await?);
 
             Ok(())
