@@ -62,11 +62,7 @@ pub fn find_sha512_for_file(checksums_text: &str, filename: &str) -> Option<Stri
         let hash = parts.next()?;
         let fname = parts.next()?;
 
-        if fname == filename {
-            Some(hash.to_string())
-        } else {
-            None
-        }
+        (fname == filename).then(|| hash.to_string())
     })
 }
 
@@ -232,7 +228,7 @@ impl ImageAction for Debian {
             })?;
 
         let dirs = QleanDirs::new()?;
-        let image_path = dirs.images.join(name).join(format!("{}.qcow2", name));
+        let image_path = dirs.images.join(name).join(&target_filename);
 
         let download_url = format!(
             "https://cloud.debian.org/images/cloud/trixie/latest/{}.qcow2",
@@ -258,7 +254,7 @@ impl ImageAction for Debian {
 
         // Verify the downloaded file matches the expected checksum
         anyhow::ensure!(
-            computed_sha512.eq_ignore_ascii_case(&expected_sha512),
+            computed_sha512.to_lowercase() == expected_sha512.to_lowercase(),
             "downloaded image checksum mismatch: expected {}, got {}",
             expected_sha512,
             computed_sha512
@@ -513,12 +509,13 @@ f0442f3cd0087a609ecd5241109ddef0cbf4a1e05372e13d82c97fc77b35b2d8ecff85aea6770915
             .expect("missing qcow2 checksum entry in SHA512SUMS");
 
         let computed = get_sha512(&qcow_path).await?;
-        assert_eq!(computed.to_lowercase(), expected.to_lowercase());
 
-        // Clean up downloaded image
+        // Clean up downloaded image before assertion to ensure cleanup happens even on failure
         if qcow_path.exists() {
             tokio::fs::remove_file(&qcow_path).await?;
         }
+
+        assert_eq!(computed.to_lowercase(), expected.to_lowercase());
 
         Ok(())
     }
