@@ -10,7 +10,8 @@ use crate::utils::QleanDirs;
 
 pub trait ImageAction {
     /// Download the image from remote source
-    fn download(&self, name: &str) -> impl std::future::Future<Output = Result<()>> + Send;
+    /// Returns the computed image hash if available (to avoid redundant hash calculation)
+    fn download(&self, name: &str) -> impl std::future::Future<Output = Result<Option<String>>> + Send;
     /// Extract kernel and initrd from the image
     fn extract(
         &self,
@@ -86,7 +87,7 @@ impl<A: ImageAction + std::default::Default> ImageMeta<A> {
 
         let distro_action = A::default();
 
-        distro_action.download(name).await?;
+        let image_hash = distro_action.download(name).await?;
 
         let (kernel, initrd) = distro_action.extract(name).await?;
         let image_path = image_dir.join(format!("{}.qcow2", name));
@@ -104,7 +105,7 @@ impl<A: ImageAction + std::default::Default> ImageMeta<A> {
             vendor: distro_action,
         };
 
-        image.save(name).await?;
+        image.save(name, image_hash).await?;
 
         Ok(image)
     }
@@ -147,7 +148,8 @@ impl<A: ImageAction + std::default::Default> ImageMeta<A> {
     }
 
     /// Save image metadata to disk
-    async fn save(&self, name: &str) -> Result<()> {
+    /// If `precomputed_image_hash` is provided, it will be used instead of recalculating
+    async fn save(&self, name: &str, precomputed_image_hash: Option<String>) -> Result<()> {
         let dirs = QleanDirs::new()?;
         let json_path = dirs.images.join(format!("{}.json", name));
 
@@ -160,12 +162,18 @@ impl<A: ImageAction + std::default::Default> ImageMeta<A> {
 
         let (image_hash, kernel_hash, initrd_hash) = match self.checksum.sha_type {
             ShaType::Sha256 => (
-                get_sha256(&self.path).await?,
+                match precomputed_image_hash {
+                    Some(hash) => hash,
+                    None => get_sha256(&self.path).await?,
+                },
                 get_sha256(&self.kernel).await?,
                 get_sha256(&self.initrd).await?,
             ),
             ShaType::Sha512 => (
-                get_sha512(&self.path).await?,
+                match precomputed_image_hash {
+                    Some(hash) => hash,
+                    None => get_sha512(&self.path).await?,
+                },
                 get_sha512(&self.kernel).await?,
                 get_sha512(&self.initrd).await?,
             ),
@@ -209,7 +217,7 @@ impl<A: ImageAction + std::default::Default> ImageMeta<A> {
 pub struct Debian {}
 
 impl ImageAction for Debian {
-    async fn download(&self, name: &str) -> Result<()> {
+    async fn download(&self, name: &str) -> Result<Option<String>> {
         let checksums_url = "https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS";
         let checksums_text = reqwest::get(checksums_url)
             .await
@@ -260,7 +268,7 @@ impl ImageAction for Debian {
             computed_sha512
         );
 
-        Ok(())
+        Ok(Some(computed_sha512))
     }
 
     async fn extract(&self, name: &str) -> Result<(PathBuf, PathBuf)> {
