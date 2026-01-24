@@ -224,7 +224,12 @@ impl ImageAction for Debian {
 
         let target_filename = format!("{}.qcow2", name);
         let expected_sha512 = find_sha512_for_file(&checksums_text, &target_filename)
-            .with_context(|| format!("failed to find checksum for {} in SHA512SUMS", target_filename))?;
+            .with_context(|| {
+                format!(
+                    "failed to find checksum for {} in SHA512SUMS",
+                    target_filename
+                )
+            })?;
 
         let dirs = QleanDirs::new()?;
         let image_path = dirs.images.join(name).join(format!("{}.qcow2", name));
@@ -464,21 +469,21 @@ mod tests {
 f0442f3cd0087a609ecd5241109ddef0cbf4a1e05372e13d82c97fc77b35b2d8ecff85aea67709154d84220059672758508afbb0691c41ba8aa6d76818d89d65  debian-13-generic-amd64.qcow2
 \
 9fd031ef5dda6479c8536a0ab396487113303f4924a2941dc4f9ef1d36376dfb8ae7d1ca5f4dfa65ad155639e9a5e61093c686a8e85b51d106c180bce9ac49bc  debian-13-generic-amd64.raw";
-        
+
         // Should match exact qcow2 filename, not json with same prefix
         let result = find_sha512_for_file(checksums, "debian-13-generic-amd64.qcow2");
         assert_eq!(
             result,
             Some("f0442f3cd0087a609ecd5241109ddef0cbf4a1e05372e13d82c97fc77b35b2d8ecff85aea67709154d84220059672758508afbb0691c41ba8aa6d76818d89d65".to_string())
         );
-        
+
         // Should match json file exactly
         let result = find_sha512_for_file(checksums, "debian-13-generic-amd64.json");
         assert_eq!(
             result,
             Some("748f52b959f63352e1e121508cedeae2e66d3e90be00e6420a0b8b9f14a0f84dc54ed801fb5be327866876268b808543465b1613c8649efeeb5f987ff9df1549".to_string())
         );
-        
+
         // Should not match partial names
         let result = find_sha512_for_file(checksums, "debian-13-generic-amd64");
         assert_eq!(result, None);
