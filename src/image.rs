@@ -48,6 +48,20 @@ pub struct ShaSum {
     pub sha_type: ShaType,
 }
 
+fn find_sha512_for_file(checksums_text: &str, filename: &str) -> Option<String> {
+    checksums_text.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let hash = parts.next()?;
+        let fname = parts.next()?;
+
+        if fname == filename {
+            Some(hash.to_string())
+        } else {
+            None
+        }
+    })
+}
+
 impl<A: ImageAction + std::default::Default> ImageMeta<A> {
     /// Create a new image by downloading and extracting
     pub async fn create(name: &str) -> Result<Self> {
@@ -200,12 +214,9 @@ impl ImageAction for Debian {
             .await
             .with_context(|| format!("failed to read SHA512SUMS text from {}", checksums_url))?;
 
-        let expected_sha512 = checksums_text
-            .lines()
-            .find(|line| line.contains(name))
-            .and_then(|line| line.split_whitespace().next())
-            .with_context(|| format!("failed to find {}.qcow2 in SHA512SUMS", name))?
-            .to_string();
+        let target_filename = format!("{}.qcow2", name);
+        let expected_sha512 = find_sha512_for_file(&checksums_text, &target_filename)
+            .with_context(|| format!("failed to find {} in SHA512SUMS", target_filename))?;
 
         let dirs = QleanDirs::new()?;
         let image_path = dirs.images.join(name).join(format!("{}.qcow2", name));
@@ -428,4 +439,38 @@ pub async fn get_sha512(path: &PathBuf) -> Result<String> {
         .to_string();
 
     Ok(sha512)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Debian, ImageAction, find_sha512_for_file, get_sha512};
+    use crate::utils::QleanDirs;
+    use anyhow::Result;
+
+    #[tokio::test]
+    async fn download_real_qcow2_and_validate_checksum() -> Result<()> {
+        let name = "debian-13-generic-amd64";
+        let target = format!("{name}.qcow2");
+
+        let dirs = QleanDirs::new()?;
+        let image_dir = dirs.images.join(name);
+        tokio::fs::create_dir_all(&image_dir).await?;
+        let qcow_path = image_dir.join(&target);
+        if qcow_path.exists() {
+            tokio::fs::remove_file(&qcow_path).await?;
+        }
+
+        let debian = Debian::default();
+        debian.download(name).await?;
+
+        let checksums_url = "https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS";
+        let checksums_text = reqwest::get(checksums_url).await?.text().await?;
+        let expected = find_sha512_for_file(&checksums_text, &target)
+            .expect("missing qcow2 checksum entry in SHA512SUMS");
+
+        let computed = get_sha512(&qcow_path).await?;
+        assert_eq!(computed.to_lowercase(), expected.to_lowercase());
+
+        Ok(())
+    }
 }
