@@ -222,7 +222,7 @@ impl ImageAction for Debian {
         let expected_sha512 = find_sha512_for_file(&checksums_text, &target_filename)
             .with_context(|| {
                 format!(
-                    "failed to find checksum for {} in SHA512SUMS",
+                    "failed to find SHA512 checksum entry for {} in remote SHA512SUMS file",
                     target_filename
                 )
             })?;
