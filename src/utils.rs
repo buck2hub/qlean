@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Ok, Result, bail};
+use anyhow::{Context, Result, bail};
 use dir_lock::DirLock;
 use directories::ProjectDirs;
 use rand::Rng;
@@ -147,13 +147,25 @@ async fn ensure_network() -> Result<()> {
     let output = tokio::process::Command::new("virsh")
         .arg("net-list")
         .arg("--name")
+        .arg("--all")
         .output()
         .await
         .context("failed to execute virsh to check qlean network")?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let networks = stdout.lines().collect::<HashSet<_>>();
+    let all_networks = stdout.lines().collect::<HashSet<_>>();
+    let net_exists = all_networks.contains("qlean");
 
-    if !networks.contains("qlean") {
+    let output = tokio::process::Command::new("virsh")
+        .arg("net-list")
+        .arg("--name")
+        .output()
+        .await
+        .context("failed to execute virsh to check qlean network")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let active_networks = stdout.lines().collect::<HashSet<_>>();
+    let net_active = active_networks.contains("qlean");
+
+    if !net_exists {
         debug!("Creating qlean network");
         let xml = r#"
 <network>
@@ -172,6 +184,7 @@ async fn ensure_network() -> Result<()> {
         tokio::fs::write(&xml_path, xml)
             .await
             .context("failed to write qlean network xml file")?;
+
         let status = tokio::process::Command::new("virsh")
             .arg("net-define")
             .arg(&xml_path)
@@ -180,6 +193,19 @@ async fn ensure_network() -> Result<()> {
             .context("failed to execute virsh to define qlean network")?;
         if !status.success() {
             bail!("failed to define qlean network");
+        }
+    }
+
+    if !net_exists || !net_active {
+        debug!("Starting qlean network");
+        let status = tokio::process::Command::new("virsh")
+            .arg("net-autostart")
+            .arg("qlean")
+            .status()
+            .await
+            .context("failed to execute virsh to autostart qlean network")?;
+        if !status.success() {
+            bail!("failed to autostart qlean network");
         }
 
         let status = tokio::process::Command::new("virsh")
