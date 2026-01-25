@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use tokio::sync::Mutex;
 
 use crate::{Image, Machine, MachineConfig};
@@ -25,6 +25,9 @@ impl MachinePool {
 
     /// Add a new machine to the pool.
     pub async fn add(&mut self, name: String, image: &Image, config: &MachineConfig) -> Result<()> {
+        if self.pool.contains_key(&name) {
+            bail!("Machine with name '{}' already exists in the pool", name);
+        }
         let machine = Machine::new(image, config).await?;
         self.pool.insert(name, Mutex::new(machine));
         Ok(())
