@@ -1990,7 +1990,7 @@ dependencies = [
 
 [[package]]
 name = "qlean"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "console",
@@ -1998,6 +1998,7 @@ dependencies = [
  "directories",
  "futures",
  "nanoid",
+ "rand 0.9.2",
  "reqwest",
  "russh",
  "russh-sftp",

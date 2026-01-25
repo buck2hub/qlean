@@ -23,7 +23,7 @@ use crate::{
     image::Image,
     qemu::launch_qemu,
     ssh::{PersistedSshKeypair, Session, connect_ssh, get_ssh_key},
-    utils::{CommandExt, HEX_ALPHABET, QleanDirs, get_free_cid},
+    utils::{CommandExt, HEX_ALPHABET, QleanDirs, gen_random_mac, get_free_cid},
 };
 
 pub struct Machine {
@@ -43,6 +43,8 @@ pub struct Machine {
     /// This is used to cancel ongoing SSH operations when qemu exits.
     /// Set when the machine is initialized or spawned, cleared on shutdown.
     ssh_cancel_token: Option<CancellationToken>,
+    mac_address: String,
+    ip: Option<String>,
 }
 
 #[derive(Clone)]
@@ -188,6 +190,8 @@ impl Machine {
             pid: None,
             qemu_should_exit: Arc::new(AtomicBool::new(false)),
             ssh_cancel_token: None,
+            mac_address: gen_random_mac(),
+            ip: None,
         })
     }
 
@@ -324,6 +328,7 @@ impl Machine {
             self.ssh = None;
             self.pid = None;
             self.ssh_cancel_token = None;
+            self.ip = None;
 
             Ok(())
         } else {
@@ -496,7 +501,7 @@ impl Machine {
 
             for e in entries {
                 if cancel_token.is_cancelled() {
-                    return Err(anyhow::anyhow!("Download cancelled"));
+                    bail!("Download cancelled");
                 }
 
                 // Compute local path relative to remote root
@@ -544,6 +549,39 @@ impl Machine {
         Ok((ssh, cancel_token))
     }
 
+    /// Get the IP address of the machine
+    pub async fn get_ip(&mut self) -> Result<String> {
+        if let Some(ip) = &self.ip {
+            Ok(ip.to_owned())
+        } else {
+            let (ssh, _) = self.get_ssh()?;
+            let ip = ssh.get_remote_ip().await?;
+            self.ip = Some(ip.to_owned());
+            Ok(ip)
+        }
+    }
+
+    /// Check if the machine is currently running
+    pub(crate) async fn is_running(&self) -> Result<bool> {
+        if let Some(pid) = self.pid {
+            let process_exists = std::path::Path::new(&format!("/proc/{}", pid)).exists();
+            let process_running = if process_exists {
+                // Further check if the process is a QEMU process
+                let cmdline_path = format!("/proc/{}/cmdline", pid);
+                if let Ok(cmdline) = std::fs::read_to_string(&cmdline_path) {
+                    cmdline.contains("qemu-system")
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            Ok(process_running)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Launch QEMU and connect SSH concurrently
     async fn launch(&mut self, is_init: bool) -> Result<()> {
         debug!(
@@ -551,21 +589,25 @@ impl Machine {
             self.cid, self.keypair.privkey_path,
         );
 
-        let qemu_handle = tokio::spawn(launch_qemu(
-            self.qemu_should_exit.clone(),
-            self.cid,
-            self.image.to_owned(),
-            self.config.to_owned(),
-            self.id.to_owned(),
+        let qemu_params = crate::qemu::QemuLaunchParams {
+            cid: self.cid,
+            image: self.image.to_owned(),
+            config: self.config.to_owned(),
+            vmid: self.id.to_owned(),
             is_init,
-            self.ssh_cancel_token
+            mac_address: self.mac_address.to_owned(),
+            cancel_token: self
+                .ssh_cancel_token
                 .as_ref()
                 .expect("Machine not initialized or spawned")
                 .clone(),
-        ));
+            expected_to_exit: self.qemu_should_exit.clone(),
+        };
+
+        let qemu_handle = tokio::spawn(launch_qemu(qemu_params));
         let ssh_handle = tokio::spawn(connect_ssh(
             self.cid,
-            Duration::from_secs(20),
+            Duration::from_secs(60),
             self.keypair.to_owned(),
             self.ssh_cancel_token
                 .as_ref()

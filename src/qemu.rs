@@ -22,15 +22,18 @@ use crate::{
 
 const QEMU_TIMEOUT: Duration = Duration::from_secs(360 * 60); // 6 hours
 
-pub async fn launch_qemu(
-    expected_to_exit: Arc<AtomicBool>,
-    cid: u32,
-    image: MachineImage,
-    config: MachineConfig,
-    vmid: String,
-    is_init: bool,
-    cancel_token: CancellationToken,
-) -> anyhow::Result<()> {
+pub struct QemuLaunchParams {
+    pub expected_to_exit: Arc<AtomicBool>,
+    pub cid: u32,
+    pub image: MachineImage,
+    pub config: MachineConfig,
+    pub vmid: String,
+    pub is_init: bool,
+    pub cancel_token: CancellationToken,
+    pub mac_address: String,
+}
+
+pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
     // Prepare QEMU command
     let mut qemu_cmd = tokio::process::Command::new("qemu-system-x86_64");
     qemu_cmd
@@ -39,42 +42,48 @@ pub async fn launch_qemu(
         // SSH port forwarding
         .args([
             "-device",
-            &format!("vhost-vsock-pci,id=vhost-vsock-pci0,guest-cid={cid}"),
+            &format!(
+                "vhost-vsock-pci,id=vhost-vsock-pci0,guest-cid={}",
+                params.cid
+            ),
         ])
         // Kernel
-        .args(["-kernel", image.kernel.to_str().unwrap()])
+        .args(["-kernel", params.image.kernel.to_str().unwrap()])
         .args(["-append", "rw root=/dev/vda1 console=ttyS0"])
         // Initrd
-        .args(["-initrd", image.initrd.to_str().unwrap()])
+        .args(["-initrd", params.image.initrd.to_str().unwrap()])
         // Disk
         .args([
             "-drive",
             &format!(
                 "file={},if=virtio,cache=writeback",
-                image.overlay.to_str().unwrap()
+                params.image.overlay.to_str().unwrap()
             ),
         ])
         // No GUI
         .arg("-nographic")
         // Network
-        .args(["-netdev", "user,id=net0"])
-        .args(["-device", "virtio-net-pci,netdev=net0"])
+        .args(["-netdev", "bridge,id=net0,br=qlbr0"])
+        .args([
+            "-device",
+            &format!("virtio-net-pci,netdev=net0,mac={}", params.mac_address),
+        ])
         // Memory and CPUs
-        .args(["-m", &config.mem.to_string()])
-        .args(["-smp", &config.core.to_string()])
+        .args(["-m", &params.config.mem.to_string()])
+        .args(["-smp", &params.config.core.to_string()])
         // KVM acceleration
         .args(["-accel", "kvm"])
         .args(["-cpu", "host"])
         // Output redirection
         .args(["-serial", "mon:stdio"]);
 
-    if is_init {
+    if params.is_init {
         // Seed ISO
         qemu_cmd.args([
             "-drive",
             &format!(
                 "file={},if=virtio,media=cdrom",
-                image.seed.to_str().unwrap()
+                params.image.seed.to_str().unwrap()
             ),
         ]);
     }
@@ -91,7 +100,7 @@ pub async fn launch_qemu(
     // Store QEMU PID
     let pid = qemu_child.id().expect("failed to get QEMU PID");
     let dirs = QleanDirs::new()?;
-    let pid_file_path = dirs.runs.join(vmid).join("qemu.pid");
+    let pid_file_path = dirs.runs.join(&params.vmid).join("qemu.pid");
     tokio::fs::write(pid_file_path, pid.to_string()).await?;
 
     // Capture and log stdout
@@ -125,7 +134,7 @@ pub async fn launch_qemu(
         }
         Ok(Ok(status)) => {
             if status.success() {
-                if expected_to_exit.load(Ordering::SeqCst) {
+                if params.expected_to_exit.load(Ordering::SeqCst) {
                     info!("⏏️  Process {} exited as expected", pid);
                     Ok(())
                 } else {
@@ -142,7 +151,7 @@ pub async fn launch_qemu(
     };
 
     // Cancel any ongoing operations due to QEMU exit
-    cancel_token.cancel();
+    params.cancel_token.cancel();
 
     // Wait for logging tasks to complete
     let _ = tokio::join!(stdout_task, stderr_task);

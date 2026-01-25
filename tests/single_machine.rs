@@ -2,22 +2,13 @@ use std::{
     fs::Permissions,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    sync::Once,
 };
 
 use anyhow::Result;
 use qlean::{Distro, MachineConfig, create_image, with_machine};
-use tracing_subscriber::{EnvFilter, fmt::time::LocalTime};
 
-fn tracing_subscriber_init() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::from_default_env())
-            .with_timer(LocalTime::rfc_3339())
-            .init();
-    });
-}
+mod common;
+use common::tracing_subscriber_init;
 
 #[tokio::test]
 async fn hello() -> Result<()> {
