@@ -555,7 +555,9 @@ impl Machine {
             Ok(ip.to_owned())
         } else {
             let (ssh, _) = self.get_ssh()?;
-            ssh.get_remote_ip().await
+            let ip = ssh.get_remote_ip().await?;
+            self.ip = Some(ip.to_owned());
+            Ok(ip)
         }
     }
 
@@ -563,7 +565,18 @@ impl Machine {
     pub(crate) async fn is_running(&self) -> Result<bool> {
         if let Some(pid) = self.pid {
             let process_exists = std::path::Path::new(&format!("/proc/{}", pid)).exists();
-            Ok(process_exists)
+            let process_running = if process_exists {
+                // Further check if the process is a QEMU process
+                let cmdline_path = format!("/proc/{}/cmdline", pid);
+                if let Ok(cmdline) = std::fs::read_to_string(&cmdline_path) {
+                    cmdline.contains("qemu-system")
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            Ok(process_running)
         } else {
             Ok(false)
         }
