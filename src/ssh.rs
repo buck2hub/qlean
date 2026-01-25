@@ -132,7 +132,7 @@ impl Session {
             // Check for cancellation
             if cancel_token.is_cancelled() {
                 info!("SSH connection cancelled during connect loop");
-                return Err(anyhow::anyhow!("SSH connection cancelled"));
+                bail!("SSH connection cancelled");
             }
 
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -147,7 +147,7 @@ impl Session {
                         error!(
                             "Reached timeout trying to connect to virtual machine via SSH, aborting"
                         );
-                        return Err(anyhow::anyhow!("Timeout"));
+                        bail!("Timeout");
                     }
                     continue;
                 }
@@ -159,13 +159,13 @@ impl Session {
                             error!(
                                 "Reached timeout trying to connect to virtual machine via SSH, aborting"
                             );
-                            return Err(anyhow::anyhow!("Timeout"));
+                            bail!("Timeout");
                         }
                         continue;
                     }
                     e => {
                         error!("Unhandled error occurred: {e}");
-                        return Err(anyhow::anyhow!("Unknown error"));
+                        bail!("Unknown error");
                     }
                 },
             };
@@ -182,12 +182,12 @@ impl Session {
                                 error!(
                                     "Reached timeout trying to connect to virtual machine via SSH, aborting"
                                 );
-                                return Err(anyhow::anyhow!("Timeout"));
+                                bail!("Timeout");
                             }
                         }
                         e => {
                             error!("Unhandled error occurred: {e}");
-                            return Err(anyhow::anyhow!("Unknown error"));
+                            bail!("Unknown error");
                         }
                     }
                 }
@@ -196,12 +196,12 @@ impl Session {
                         error!(
                             "Reached timeout trying to connect to virtual machine via SSH, aborting"
                         );
-                        return Err(anyhow::anyhow!("Timeout"));
+                        bail!("Timeout");
                     }
                 }
                 Err(e) => {
                     error!("Unhandled error occurred: {e}");
-                    return Err(anyhow::anyhow!("Unknown error"));
+                    bail!("Unknown error");
                 }
             }
         };
@@ -213,7 +213,7 @@ impl Session {
             .await?;
 
         if !auth_res.success() {
-            return Err(anyhow::anyhow!("Authentication (with publickey) failed"));
+            bail!("Authentication (with publickey) failed");
         }
 
         Ok(Self {
@@ -263,7 +263,7 @@ impl Session {
             // Check for cancellation
             if cancel_token.is_cancelled() {
                 info!("SSH call cancelled during execution");
-                return Err(anyhow::anyhow!("SSH call cancelled"));
+                bail!("SSH call cancelled");
             }
 
             // Handle one of the possible events:
@@ -315,7 +315,7 @@ impl Session {
             // Check for cancellation
             if cancel_token.is_cancelled() {
                 info!("SSH call cancelled during execution");
-                return Err(anyhow::anyhow!("SSH call cancelled"));
+                bail!("SSH call cancelled");
             }
 
             // Handle one of the possible events:
@@ -443,7 +443,7 @@ impl Session {
         let mut buf = vec![0u8; 128 * 1024];
         loop {
             if cancel_token.is_cancelled() {
-                return Err(anyhow::anyhow!("Upload cancelled"));
+                bail!("Upload cancelled");
             }
             let n = AsyncReadExt::read(&mut src, &mut buf).await?;
             if n == 0 {
@@ -474,7 +474,7 @@ impl Session {
         let mut buf = vec![0u8; 128 * 1024];
         loop {
             if cancel_token.is_cancelled() {
-                return Err(anyhow::anyhow!("Download cancelled"));
+                bail!("Download cancelled");
             }
             let n = AsyncReadExt::read(&mut src, &mut buf).await?;
             if n == 0 {
@@ -514,7 +514,7 @@ impl Session {
         let mut stack = vec![root.to_path_buf()];
         while let Some(dir) = stack.pop() {
             if cancel_token.is_cancelled() {
-                return Err(anyhow::anyhow!("Walk cancelled"));
+                bail!("Walk cancelled");
             }
 
             let entries = {
@@ -580,6 +580,18 @@ impl Session {
         }
 
         Ok(out)
+    }
+
+    /// Get the primary IP address of the remote machine.
+    pub async fn get_remote_ip(&mut self) -> Result<String> {
+        let (code, stdout, _stderr) = self
+            .call_with_output("hostname -I | awk '{print $1}'", CancellationToken::new())
+            .await?;
+        if code != 0 {
+            bail!("Failed to get remote IP address, exit code {}", code);
+        }
+        let ip = String::from_utf8(stdout)?.trim().to_string();
+        Ok(ip)
     }
 }
 

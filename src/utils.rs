@@ -1,8 +1,12 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Ok, Result, bail};
 use dir_lock::DirLock;
 use directories::ProjectDirs;
+use rand::Rng;
 use tracing::{debug, trace};
 use walkdir::WalkDir;
 
@@ -11,6 +15,7 @@ pub static HEX_ALPHABET: [char; 16] = [
 ];
 
 pub struct QleanDirs {
+    pub base: PathBuf,
     pub images: PathBuf,
     pub secrets: PathBuf,
     pub runs: PathBuf,
@@ -36,6 +41,7 @@ impl QleanDirs {
         let runs = data_dir.join("runs");
         create_dir("runs", &runs)?;
         Ok(Self {
+            base: data_dir,
             images,
             secrets,
             runs,
@@ -123,6 +129,8 @@ pub async fn ensure_prerequisites() -> Result<()> {
     check_command_available("xorriso").await?;
     check_command_available("guestfish").await?;
     check_command_available("virt-copy-out").await?;
+    check_command_available("virsh").await?;
+    ensure_network().await?;
     Ok(())
 }
 
@@ -133,4 +141,65 @@ async fn check_command_available(cmd: &str) -> Result<()> {
         .await
         .with_context(|| format!("could not find {}", cmd))?;
     Ok(())
+}
+
+async fn ensure_network() -> Result<()> {
+    let output = tokio::process::Command::new("virsh")
+        .arg("net-list")
+        .arg("--name")
+        .output()
+        .await
+        .context("failed to execute virsh to check qlean network")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let networks = stdout.lines().collect::<HashSet<_>>();
+
+    if !networks.contains("qlean") {
+        debug!("Creating qlean network");
+        let xml = r#"
+<network>
+  <name>qlean</name>
+  <bridge name='qlbr0'/>
+  <forward mode="nat"/>
+  <ip address='192.168.221.1' netmask='255.255.255.0'>
+    <dhcp>
+      <range start='192.168.221.2' end='192.168.221.254'/>
+    </dhcp>
+  </ip>
+</network>
+"#;
+        let dirs = QleanDirs::new()?;
+        let xml_path = dirs.base.join("network.xml");
+        tokio::fs::write(&xml_path, xml)
+            .await
+            .context("failed to write qlean network xml file")?;
+        let status = tokio::process::Command::new("virsh")
+            .arg("net-define")
+            .arg(&xml_path)
+            .status()
+            .await
+            .context("failed to execute virsh to define qlean network")?;
+        if !status.success() {
+            bail!("failed to define qlean network");
+        }
+
+        let status = tokio::process::Command::new("virsh")
+            .arg("net-start")
+            .arg("qlean")
+            .status()
+            .await
+            .context("failed to execute virsh to start qlean network")?;
+        if !status.success() {
+            bail!("failed to start qlean network");
+        }
+    }
+    Ok(())
+}
+
+pub fn gen_random_mac() -> String {
+    let mut rng = rand::rng();
+    let bytes: [u8; 6] = [0x52, 0x54, 0x00, rng.random(), rng.random(), rng.random()];
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
+    )
 }

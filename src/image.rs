@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::{fs::File, io::AsyncWriteExt};
@@ -137,10 +137,10 @@ impl<A: ImageAction + std::default::Default> ImageMeta<A> {
             .with_context(|| format!("failed to execute {} -c", checksum_command))?;
 
         if !output.status.success() {
-            return Err(anyhow::anyhow!(
+            bail!(
                 "checksum verification failed: {}",
                 String::from_utf8_lossy(&output.stderr)
-            ));
+            );
         }
 
         Ok(image)
@@ -282,10 +282,10 @@ impl ImageAction for Debian {
             .with_context(|| "failed to execute guestfish")?;
 
         if !output.status.success() {
-            return Err(anyhow::anyhow!(
+            bail!(
                 "guestfish failed: {}",
                 String::from_utf8_lossy(&output.stderr)
-            ));
+            );
         }
 
         let boot_files = String::from_utf8_lossy(&output.stdout);
@@ -318,10 +318,10 @@ impl ImageAction for Debian {
             .with_context(|| format!("failed to execute virt-copy-out for {}", kernel_name))?;
 
         if !output.status.success() {
-            return Err(anyhow::anyhow!(
+            bail!(
                 "virt-copy-out failed for kernel: {}",
                 String::from_utf8_lossy(&output.stderr)
-            ));
+            );
         }
 
         let initrd_src = format!("/boot/{}", initrd_name);
@@ -336,10 +336,10 @@ impl ImageAction for Debian {
             .with_context(|| format!("failed to execute virt-copy-out for {}", initrd_name))?;
 
         if !output.status.success() {
-            return Err(anyhow::anyhow!(
+            bail!(
                 "virt-copy-out failed for initrd: {}",
                 String::from_utf8_lossy(&output.stderr)
-            ));
+            );
         }
 
         let kernel_path = image_dir.join(&kernel_name);
@@ -409,10 +409,10 @@ pub async fn get_sha256(path: &PathBuf) -> Result<String> {
         .with_context(|| format!("failed to execute sha256sum on {}", path.display()))?;
 
     if !output.status.success() {
-        return Err(anyhow::anyhow!(
+        bail!(
             "sha256sum failed: {}",
             String::from_utf8_lossy(&output.stderr)
-        ));
+        );
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -434,10 +434,10 @@ pub async fn get_sha512(path: &PathBuf) -> Result<String> {
         .with_context(|| format!("failed to execute sha512sum on {}", path.display()))?;
 
     if !output.status.success() {
-        return Err(anyhow::anyhow!(
+        bail!(
             "sha512sum failed: {}",
             String::from_utf8_lossy(&output.stderr)
-        ));
+        );
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);

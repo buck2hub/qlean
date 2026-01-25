@@ -1,12 +1,13 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use anyhow::{Error, Result};
+use anyhow::Result;
 
 use crate::utils::ensure_prerequisites;
 
 mod image;
 mod machine;
+mod pool;
 mod qemu;
 mod ssh;
 mod utils;
@@ -15,14 +16,15 @@ pub use image::Distro;
 pub use image::Image;
 pub use image::create_image;
 pub use machine::{Machine, MachineConfig};
+pub use pool::MachinePool;
 
 pub async fn with_machine<'a, F, R>(image: &'a Image, config: &'a MachineConfig, f: F) -> Result<R>
 where
-    F: for<'b> FnOnce(&'b mut Machine) -> Pin<Box<dyn Future<Output = Result<R, Error>> + 'b>>,
+    F: for<'b> FnOnce(&'b mut Machine) -> Pin<Box<dyn Future<Output = Result<R>> + 'b>>,
 {
     #[cfg(not(target_os = "linux"))]
     {
-        return Err(anyhow!("qlean currently only supports Linux hosts."));
+        anyhow::bail!("Qlean currently only supports Linux hosts.");
     }
 
     ensure_prerequisites().await?;
@@ -31,6 +33,24 @@ where
     machine.init().await?;
     let result = f(&mut machine).await;
     machine.shutdown().await?;
+
+    result
+}
+
+pub async fn with_pool<F, R>(f: F) -> Result<R>
+where
+    F: for<'a> FnOnce(&'a mut MachinePool) -> Pin<Box<dyn Future<Output = Result<R>> + 'a>>,
+{
+    #[cfg(not(target_os = "linux"))]
+    {
+        anyhow::bail!("Qlean currently only supports Linux hosts.");
+    }
+
+    ensure_prerequisites().await?;
+
+    let mut pool = MachinePool::new();
+    let result = f(&mut pool).await;
+    pool.shutdown_all().await?;
 
     result
 }
