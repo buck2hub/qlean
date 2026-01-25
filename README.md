@@ -45,10 +45,10 @@ sha512sum --version
 
 Qlean uses `qemu-bridge-helper` to manage networking for multiple virtual machines, so it requires proper configuration.
 
-The setuid attribute needs to be turned on for the default network helper:
+The `CAP_NET_ADMIN` capability needs to be set on for the default network helper:
 
 ```bash
-sudo chmod u+s /usr/lib/qemu/qemu-bridge-helper
+sudo setcap cap_net_admin+ep /usr/lib/qemu/qemu-bridge-helper
 ```
 
 The ACL mechanism enforced by `qemu-bridge-helper` defaults to blacklisting all users, so the `qlbr0` bridge created by qlean must be explicitly allowed:
@@ -141,6 +141,28 @@ async fn test_ping() -> Result<()> {
 ```
 
 For more examples, please refer to the [tests](tests) directory.
+
+## Network Configuration
+
+Qlean uses a dedicated libvirt virtual network to provide isolated, reproducible networking for test VMs. The default network definition is stored at `~/.local/share/qlean/network.xml` as follows:
+
+```xml
+<network>
+  <name>qlean</name>
+  <bridge name='qlbr0'/>
+  <forward mode="nat"/>
+  <ip address='192.168.221.1' netmask='255.255.255.0'>
+    <dhcp>
+      <range start='192.168.221.2' end='192.168.221.254'/>
+    </dhcp>
+  </ip>
+</network>
+```
+
+This configuration defines a **NAT-based** virtual network named `qlean` (used internally by libvirt) that creates a Linux bridge interface called `qlbr0`. The bridge is assigned the IP address `192.168.221.1` and serves as the gateway for a `/24` subnet (`192.168.221.0/24`). A built-in DHCP server automatically assigns IP addresses to virtual machines in the range `192.168.221.2` to `192.168.221.254`, enabling seamless network connectivity between the host, test VMs, and—via NAT—the external network.
+
+> [!NOTE]
+> If the `192.168.221.0/24` subnet conflicts with your local network, you may edit the configuration file to use a different IP range，but keep the `<name>qlean</name>` and `<bridge name='qlbr0'/>` unchanged to ensure compatibility with qlean's internal logic.
 
 ## API Reference
 
