@@ -26,16 +26,37 @@ For projects requiring multi-machine collaboration, Qlean provides a simple API 
 
 ### Host Setup
 
-Before using Qlean, ensure that QEMU, guestfish, libguestfs-tools and some other utils are properly installed on your Linux host. You can verify the installation with the following commands:
+#### Install CLI utils
+
+Before using Qlean, ensure that QEMU, guestfish, libvirt, libguestfs-tools and some other utils are properly installed on your Linux host. You can verify the installation with the following commands:
 
 ```bash
 qemu-system-x86_64 --version
 qemu-img --version
+virsh --version
 guestfish --version
 virt-copy-out --version
 xorriso --version
 sha256sum --version
 sha512sum --version
+```
+
+#### Configure qemu-bridge-helper
+
+Qlean uses `qemu-bridge-helper` to manage networking for multiple virtual machines, so it requires proper configuration.
+
+The setuid attribute needs to be turned on for the default network helper:
+
+```bash
+sudo chmod u+s /usr/lib/qemu/qemu-bridge-helper
+```
+
+The ACL mechanism enforced by `qemu-bridge-helper` defaults to blacklisting all users, so the `qlbr0` bridge created by qlean must be explicitly allowed:
+
+```bash
+sudo mkdir -p /etc/qemu
+sudo sh -c 'echo "allow qlbr0" > /etc/qemu/bridge.conf'
+sudo chmod 644 /etc/qemu/bridge.conf
 ```
 
 ### Getting Started
@@ -44,7 +65,7 @@ Add the dependency to your `Cargo.toml`:
 
 ```toml
 [dev-dependencies]
-qlean = "0.1"
+qlean = "0.2"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -79,6 +100,46 @@ async fn test_with_vm() -> Result<()> {
 }
 ```
 
+The following is another example of a multi-machine test:
+
+```rust
+use anyhow::Result;
+use qlean::{Distro, MachineConfig, create_image, with_pool};
+
+#[tokio::test]
+async fn test_ping() -> Result<()> {
+    with_pool(|pool| {
+        Box::pin(async {
+            // Create VM image and config
+            let image = create_image(Distro::Debian, "debian-13-generic-amd64").await?;
+            let config = MachineConfig::default();
+
+            // Add machines to the pool and initialize them concurrently
+            pool.add("alice".to_string(), &image, &config).await?;
+            pool.add("bob".to_string(), &image, &config).await?;
+            pool.init_all().await?;
+
+            // Get mutable references to both machines by name
+            let mut alice = pool.get("alice").await.expect("Alice machine not found");
+            let mut bob = pool.get("bob").await.expect("Bob machine not found");
+
+            // Test ping from Alice to Bob and vice versa
+            let alice_ip = alice.get_ip().await?;
+            let result = bob.exec(format!("ping -c 4 {}", alice_ip)).await?;
+            assert!(result.status.success());
+            let bob_ip = bob.get_ip().await?;
+            let result = alice.exec(format!("ping -c 4 {}", bob_ip)).await?;
+            assert!(result.status.success());
+
+            Ok(())
+        })
+    })
+    .await?;
+
+    Ok(())
+}
+```
+
 For more examples, please refer to the [tests](tests) directory.
 
 ## API Reference
@@ -87,6 +148,7 @@ For more examples, please refer to the [tests](tests) directory.
 
 - `create_image(distro, name)` - Create or retrieve a VM image from the specified distribution
 - `with_machine(image, config, f)` - Execute an async closure in a virtual machine with automatic resource cleanup
+- `with_pool(f)` - Execute an async closure in a machine pool with automatic resource cleanup
 - `MachineConfig` - Configuration for virtual machine resources (CPU, memory, disk)
 
   ```rust
@@ -107,6 +169,16 @@ For more examples, please refer to the [tests](tests) directory.
 - `Machine::shutdown()` - Gracefully shutdown the virtual machine
 - `Machine::upload(src, dst)` - Upload a file or directory to the VM
 - `Machine::download(src, dst)` - Download a file or directory from the VM
+- `Machine::get_ip()` - Get the IP address of the VM
+
+### Machine Pool Interface
+
+- `MachinePool::new()` - Create a new, empty machine pool
+- `MachinePool::add(name, image, config)` - Add a new machine instance to the pool
+- `MachinePool::get(name)` - Get a machine instance by the name
+- `MachinePool::init_all()` - Initialize all machines in the pool concurrently
+- `MachinePool::spawn_all()` - Spawn all machines in the pool concurrently
+- `MachinePool::shutdown_all()` - Shutdown all machines in the pool concurrently
 
 ### std::fs Compatible Interface
 

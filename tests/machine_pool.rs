@@ -1,4 +1,4 @@
-use anyhow::{Ok, Result};
+use anyhow::Result;
 use qlean::{Distro, MachineConfig, create_image, with_pool};
 
 mod common;
