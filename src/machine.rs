@@ -20,6 +20,7 @@ use tracing::{debug, info};
 use walkdir::WalkDir;
 
 use crate::{
+    KVM_AVAILABLE,
     image::Image,
     qemu::launch_qemu,
     ssh::{PersistedSshKeypair, Session, connect_ssh, get_ssh_key},
@@ -604,10 +605,18 @@ impl Machine {
             expected_to_exit: self.qemu_should_exit.clone(),
         };
 
+        let kvm_available = KVM_AVAILABLE.get().copied().unwrap_or(false);
+        let ssh_timeout = if kvm_available {
+            Duration::from_secs(60)
+        } else {
+            // Give more time if KVM is not available
+            Duration::from_secs(180)
+        };
+
         let qemu_handle = tokio::spawn(launch_qemu(qemu_params));
         let ssh_handle = tokio::spawn(connect_ssh(
             self.cid,
-            Duration::from_secs(60),
+            ssh_timeout,
             self.keypair.to_owned(),
             self.ssh_cancel_token
                 .as_ref()
