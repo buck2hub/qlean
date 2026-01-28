@@ -18,6 +18,7 @@ console = "0.16.2"
 dir-lock = "0.5.0"
 directories = "6.0.0"
 futures = "0.3"
+kvm-ioctls = "0.24.0"
 nanoid = "0.4.0"
 rand = "0.9.2"
 reqwest = { version = "0.13.1", features = ["stream"] }

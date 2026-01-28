@@ -12,10 +12,10 @@ use tokio::{
     time::{Duration, timeout},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{
-    MachineConfig,
+    KVM_AVAILABLE, MachineConfig,
     machine::MachineImage,
     utils::{CommandExt, QleanDirs},
 };
@@ -71,9 +71,6 @@ pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
         // Memory and CPUs
         .args(["-m", &params.config.mem.to_string()])
         .args(["-smp", &params.config.core.to_string()])
-        // KVM acceleration
-        .args(["-accel", "kvm"])
-        .args(["-cpu", "host"])
         // Output redirection
         .args(["-serial", "mon:stdio"]);
 
@@ -86,6 +83,16 @@ pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
                 params.image.seed.to_str().unwrap()
             ),
         ]);
+    }
+
+    let kvm_available = KVM_AVAILABLE.get().copied().unwrap_or(false);
+    if kvm_available {
+        // KVM acceleration
+        qemu_cmd.args(["-accel", "kvm"]).args(["-cpu", "host"]);
+    } else {
+        warn!(
+            "KVM is not available on this host. QEMU will run without hardware acceleration, which may result in significantly reduced performance."
+        );
     }
 
     // Spawn QEMU process
