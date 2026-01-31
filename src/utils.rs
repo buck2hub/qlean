@@ -14,6 +14,8 @@ pub static HEX_ALPHABET: [char; 16] = [
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
 ];
 
+pub const VIRSH_CONNECTION_URI: &str = "qemu:///system";
+
 pub struct QleanDirs {
     pub base: PathBuf,
     pub images: PathBuf,
@@ -145,6 +147,8 @@ async fn check_command_available(cmd: &str) -> Result<()> {
 
 async fn ensure_network() -> Result<()> {
     let output = tokio::process::Command::new("virsh")
+        .arg("-c")
+        .arg(VIRSH_CONNECTION_URI)
         .arg("net-list")
         .arg("--name")
         .arg("--all")
@@ -156,6 +160,8 @@ async fn ensure_network() -> Result<()> {
     let net_exists = all_networks.contains("qlean");
 
     let output = tokio::process::Command::new("virsh")
+        .arg("-c")
+        .arg(VIRSH_CONNECTION_URI)
         .arg("net-list")
         .arg("--name")
         .output()
@@ -186,6 +192,8 @@ async fn ensure_network() -> Result<()> {
             .context("failed to write qlean network xml file")?;
 
         let status = tokio::process::Command::new("virsh")
+            .arg("-c")
+            .arg(VIRSH_CONNECTION_URI)
             .arg("net-define")
             .arg(&xml_path)
             .status()
@@ -199,6 +207,8 @@ async fn ensure_network() -> Result<()> {
     if !net_exists || !net_active {
         debug!("Starting qlean network");
         let status = tokio::process::Command::new("virsh")
+            .arg("-c")
+            .arg(VIRSH_CONNECTION_URI)
             .arg("net-autostart")
             .arg("qlean")
             .status()
@@ -209,6 +219,8 @@ async fn ensure_network() -> Result<()> {
         }
 
         let status = tokio::process::Command::new("virsh")
+            .arg("-c")
+            .arg(VIRSH_CONNECTION_URI)
             .arg("net-start")
             .arg("qlean")
             .status()
