@@ -1,6 +1,6 @@
 [package]
 name = "qlean"
-version = "0.2.1"
+version = "0.2.2"
 authors = ["jl.jiang <jiangjl9807@gmail.com>"]
 categories = ["development-tools::testing", "virtualization"]
 description = "A system-level isolation testing library based on QEMU/KVM."
