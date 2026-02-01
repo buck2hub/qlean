@@ -48,6 +48,7 @@ Qlean uses `qemu-bridge-helper` to manage networking for multiple virtual machin
 The `CAP_NET_ADMIN` capability needs to be set on for the default network helper:
 
 ```bash
+sudo chmod u-s /usr/lib/qemu/qemu-bridge-helper
 sudo setcap cap_net_admin+ep /usr/lib/qemu/qemu-bridge-helper
 ```
 
