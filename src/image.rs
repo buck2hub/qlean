@@ -34,6 +34,7 @@ pub struct ImageMeta<A: ImageAction> {
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 pub enum Distro {
     Debian,
+    Ubuntu,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
@@ -205,6 +206,10 @@ impl<A: ImageAction + std::default::Default> ImageMeta<A> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Debian
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Default)]
 pub struct Debian {}
 
@@ -251,7 +256,6 @@ impl ImageAction for Debian {
         }
 
         let computed_sha512 = get_sha512(&image_path).await?;
-
         // Verify the downloaded file matches the expected checksum
         anyhow::ensure!(
             computed_sha512.to_lowercase() == expected_sha512.to_lowercase(),
@@ -265,7 +269,6 @@ impl ImageAction for Debian {
 
     async fn extract(&self, name: &str) -> Result<(PathBuf, PathBuf)> {
         let file_name = format!("{}.qcow2", name);
-
         let dirs = QleanDirs::new()?;
         let image_dir = dirs.images.join(name);
 
@@ -352,12 +355,96 @@ impl ImageAction for Debian {
         Distro::Debian
     }
 }
-
 /// Wrapper enum for different Image types
+// ---------------------------------------------------------------------------
+// Ubuntu - uses pre-extracted kernel/initrd from official cloud images
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+pub struct Ubuntu {}
+
+impl ImageAction for Ubuntu {
+    async fn download(&self, name: &str) -> Result<()> {
+        let dirs = QleanDirs::new()?;
+        let image_dir = dirs.images.join(name);
+
+        // Ubuntu noble (24.04 LTS) cloud image base URL
+        let base_url = "https://cloud-images.ubuntu.com/noble/current";
+
+        // Download qcow2 image
+        let qcow2_url = format!("{}/noble-server-cloudimg-amd64.img", base_url);
+        let qcow2_path = image_dir.join(format!("{}.qcow2", name));
+        download_file(&qcow2_url, &qcow2_path).await?;
+
+        // Download pre-extracted kernel
+        let kernel_url = format!(
+            "{}/unpacked/noble-server-cloudimg-amd64-vmlinuz-generic",
+            base_url
+        );
+        let kernel_path = image_dir.join("vmlinuz");
+        download_file(&kernel_url, &kernel_path).await?;
+
+        // Download pre-extracted initrd
+        let initrd_url = format!(
+            "{}/unpacked/noble-server-cloudimg-amd64-initrd-generic",
+            base_url
+        );
+        let initrd_path = image_dir.join("initrd.img");
+        download_file(&initrd_url, &initrd_path).await?;
+
+        Ok(())
+    }
+
+    async fn extract(&self, name: &str) -> Result<(PathBuf, PathBuf)> {
+        // Files already downloaded in download() phase
+        let dirs = QleanDirs::new()?;
+        let image_dir = dirs.images.join(name);
+
+        let kernel = image_dir.join("vmlinuz");
+        let initrd = image_dir.join("initrd.img");
+
+        anyhow::ensure!(kernel.exists(), "kernel file not found after download");
+        anyhow::ensure!(initrd.exists(), "initrd file not found after download");
+
+        Ok((kernel, initrd))
+    }
+
+    fn distro(&self) -> Distro {
+        Distro::Ubuntu
+    }
+}
+
+// Helper function to download a file
+async fn download_file(url: &str, dest: &PathBuf) -> Result<()> {
+    debug!("Downloading {} to {}", url, dest.display());
+    let response = reqwest::get(url)
+        .await
+        .with_context(|| format!("failed to download from {}", url))?;
+
+    let mut file = File::create(dest)
+        .await
+        .with_context(|| format!("failed to create file at {}", dest.display()))?;
+
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.with_context(|| "failed to read chunk from stream")?;
+        file.write_all(&chunk)
+            .await
+            .with_context(|| "failed to write to file")?;
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Image wrapper enum
+// ---------------------------------------------------------------------------
+
 #[derive(Debug)]
 pub enum Image {
     Debian(ImageMeta<Debian>),
     // Add more distros as needed
+    Ubuntu(ImageMeta<Ubuntu>),
 }
 
 impl Image {
@@ -365,27 +452,28 @@ impl Image {
     pub fn name(&self) -> &str {
         match self {
             Image::Debian(img) => &img.name,
+            Image::Ubuntu(img) => &img.name,
         }
     }
-
     /// Get the underlying image path regardless of distro
     pub fn path(&self) -> &PathBuf {
         match self {
             Image::Debian(img) => &img.path,
+            Image::Ubuntu(img) => &img.path,
         }
     }
-
     /// Get the kernel path regardless of distro
     pub fn kernel(&self) -> &PathBuf {
         match self {
             Image::Debian(img) => &img.kernel,
+            Image::Ubuntu(img) => &img.kernel,
         }
     }
-
     /// Get the initrd path regardless of distro
     pub fn initrd(&self) -> &PathBuf {
         match self {
             Image::Debian(img) => &img.initrd,
+            Image::Ubuntu(img) => &img.initrd,
         }
     }
 }
@@ -397,6 +485,10 @@ pub async fn create_image(distro: Distro, name: &str) -> Result<Image> {
             let image = ImageMeta::<Debian>::create(name).await?;
             Ok(Image::Debian(image))
         } // Add more distros as needed
+        Distro::Ubuntu => {
+            let image = ImageMeta::<Ubuntu>::create(name).await?;
+            Ok(Image::Ubuntu(image))
+        }
     }
 }
 
@@ -452,7 +544,7 @@ pub async fn get_sha512(path: &PathBuf) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Debian, ImageAction, find_sha512_for_file, get_sha512};
+    use super::{Debian, Distro, ImageAction, find_sha512_for_file, get_sha512};
     use crate::utils::QleanDirs;
     use anyhow::Result;
     use serial_test::serial;
@@ -465,24 +557,27 @@ mod tests {
 f0442f3cd0087a609ecd5241109ddef0cbf4a1e05372e13d82c97fc77b35b2d8ecff85aea67709154d84220059672758508afbb0691c41ba8aa6d76818d89d65  debian-13-generic-amd64.qcow2
 \
 9fd031ef5dda6479c8536a0ab396487113303f4924a2941dc4f9ef1d36376dfb8ae7d1ca5f4dfa65ad155639e9a5e61093c686a8e85b51d106c180bce9ac49bc  debian-13-generic-amd64.raw";
-
         // Should match exact qcow2 filename, not json with same prefix
         let result = find_sha512_for_file(checksums, "debian-13-generic-amd64.qcow2");
         assert_eq!(
             result,
             Some("f0442f3cd0087a609ecd5241109ddef0cbf4a1e05372e13d82c97fc77b35b2d8ecff85aea67709154d84220059672758508afbb0691c41ba8aa6d76818d89d65".to_string())
         );
-
         // Should match json file exactly
         let result = find_sha512_for_file(checksums, "debian-13-generic-amd64.json");
         assert_eq!(
             result,
             Some("748f52b959f63352e1e121508cedeae2e66d3e90be00e6420a0b8b9f14a0f84dc54ed801fb5be327866876268b808543465b1613c8649efeeb5f987ff9df1549".to_string())
         );
-
         // Should not match partial names
         let result = find_sha512_for_file(checksums, "debian-13-generic-amd64");
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_distro_enum_variants() {
+        let variants = vec![Distro::Debian, Distro::Ubuntu];
+        assert_eq!(variants.len(), 2);
     }
 
     #[tokio::test]
@@ -509,7 +604,6 @@ f0442f3cd0087a609ecd5241109ddef0cbf4a1e05372e13d82c97fc77b35b2d8ecff85aea6770915
             .expect("missing qcow2 checksum entry in SHA512SUMS");
 
         let computed = get_sha512(&qcow_path).await?;
-
         // Clean up downloaded image before assertion to ensure cleanup happens even on failure
         if qcow_path.exists() {
             tokio::fs::remove_file(&qcow_path).await?;
