@@ -78,6 +78,13 @@ pub struct CustomImageConfig {
 }
 
 /// Parses SHA512SUMS format and returns the hash for an exact filename match.
+///
+/// # Arguments
+/// * `checksums_text` - The content of a SHA512SUMS file
+/// * `filename` - The exact filename to search for (e.g., "debian-13-generic-amd64.qcow2")
+///
+/// # Returns
+/// The SHA512 hash if found, or None if no exact match exists
 pub fn find_sha512_for_file(checksums_text: &str, filename: &str) -> Option<String> {
     checksums_text.lines().find_map(|line| {
         let mut parts = line.split_whitespace();
