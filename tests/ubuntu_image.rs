@@ -5,10 +5,13 @@ use std::{str, time::Duration};
 
 #[path = "support/e2e.rs"]
 mod e2e;
+#[path = "support/guestfish.rs"]
+mod guestfish;
 #[path = "support/logging.rs"]
 mod logging;
 
 use e2e::ensure_vm_test_env;
+use guestfish::ensure_guestfish_tools;
 use logging::tracing_subscriber_init;
 
 #[tokio::test]
@@ -16,10 +19,14 @@ use logging::tracing_subscriber_init;
 async fn test_ubuntu_image_creation() -> Result<()> {
     tracing_subscriber_init();
 
-    ensure_vm_test_env()?;
+    if !ensure_vm_test_env()? {
+        return Ok(());
+    }
+
     eprintln!("INFO: host checks passed");
 
-    // Ubuntu  uses pre-extracted kernel/initrd.
+    ensure_guestfish_tools()?;
+
     eprintln!("INFO: creating image");
     let image = tokio::time::timeout(
         Duration::from_secs(15 * 60),
@@ -45,6 +52,17 @@ async fn test_ubuntu_image_creation() -> Result<()> {
                     distro_id.contains("ubuntu"),
                     "unexpected distro id: {distro_id}"
                 );
+
+                // Ensure we can execute privileged operations (root or passwordless sudo).
+                let uid = vm.exec("id -u").await?;
+                assert!(uid.status.success());
+                let uid_str = str::from_utf8(&uid.stdout)?.trim();
+                if uid_str != "0" {
+                    let sudo_uid = vm.exec("sudo -n id -u").await?;
+                    assert!(sudo_uid.status.success(), "sudo must be available for E2E");
+                    let sudo_uid_str = str::from_utf8(&sudo_uid.stdout)?.trim();
+                    assert_eq!(sudo_uid_str, "0", "sudo must yield uid 0");
+                }
                 Ok(())
             })
         })

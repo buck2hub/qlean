@@ -9,7 +9,10 @@ fn has_cmd(cmd: &str) -> bool {
     }
 }
 
-/// Require libguestfs extraction tools for images that need kernel/initrd extraction.
+/// Require the libguestfs command-line tools that the real extraction path uses.
+///
+/// Qlean relies on the host's libguestfs installation and appliance setup.
+/// The tests intentionally do not attempt to provision appliances at runtime.
 pub fn ensure_guestfish_tools() -> Result<()> {
     if !has_cmd("guestfish") {
         bail!("Missing required command: guestfish (package: libguestfs-tools).");

@@ -1,5 +1,7 @@
 use std::{
     ffi::OsStr,
+    fs,
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
@@ -75,7 +77,7 @@ pub enum ImageSource {
 
 /// Configuration for custom images - supports two modes:
 /// 1. Image only (requires guestfish for extraction)
-/// 2. Image + pre-extracted kernel/initrd (WSL-friendly)
+/// 2. Image + pre-extracted kernel/initrd
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CustomImageConfig {
     // Image file (required)
@@ -83,7 +85,7 @@ pub struct CustomImageConfig {
     pub image_hash: String,
     pub image_hash_type: ShaType,
 
-    // Optional: pre-extracted kernel and initrd (for WSL compatibility)
+    // Optional: pre-extracted kernel and initrd (avoids guestfish extraction)
     pub kernel_source: Option<ImageSource>,
     pub kernel_hash: Option<String>,
     pub initrd_source: Option<ImageSource>,
@@ -171,11 +173,7 @@ async fn fetch_ubuntu_sha256sums(base_url: &str) -> Result<String> {
 struct ResolvedUbuntuCloudImage {
     base_url: String,
     disk_name: String,
-    kernel_name: String,
-    initrd_name: String,
     disk_sha256: String,
-    kernel_sha256: Option<String>,
-    initrd_sha256: Option<String>,
 }
 
 fn pick_existing_ubuntu_name(checksums: &str, candidates: &[&str]) -> Option<String> {
@@ -223,10 +221,6 @@ async fn resolve_ubuntu_noble_cloudimg() -> Result<ResolvedUbuntuCloudImage> {
             }
         };
 
-        let stem = disk_name.strip_suffix(".img").unwrap_or(&disk_name);
-        let kernel_name = format!("{}-vmlinuz-generic", stem);
-        let initrd_name = format!("{}-initrd-generic", stem);
-
         let disk_sha256 = match ubuntu_sha256_for(&checksums, &disk_name) {
             Ok(v) => v,
             Err(e) => {
@@ -234,34 +228,11 @@ async fn resolve_ubuntu_noble_cloudimg() -> Result<ResolvedUbuntuCloudImage> {
                 continue;
             }
         };
-        let kernel_sha256 = ubuntu_sha256_for(&checksums, &format!("unpacked/{}", kernel_name))
-            .or_else(|_| ubuntu_sha256_for(&checksums, &kernel_name))
-            .ok();
-        if kernel_sha256.is_none() {
-            warn!(
-                "Ubuntu SHA256SUMS did not include kernel checksum for {}; proceeding without kernel hash verification",
-                kernel_name
-            );
-        }
-
-        let initrd_sha256 = ubuntu_sha256_for(&checksums, &format!("unpacked/{}", initrd_name))
-            .or_else(|_| ubuntu_sha256_for(&checksums, &initrd_name))
-            .ok();
-        if initrd_sha256.is_none() {
-            warn!(
-                "Ubuntu SHA256SUMS did not include initrd checksum for {}; proceeding without initrd hash verification",
-                initrd_name
-            );
-        }
 
         return Ok(ResolvedUbuntuCloudImage {
             base_url: (*base).to_string(),
             disk_name,
-            kernel_name,
-            initrd_name,
             disk_sha256,
-            kernel_sha256,
-            initrd_sha256,
         });
     }
 
@@ -632,10 +603,11 @@ pub async fn compute_sha512_streaming(path: &Path) -> Result<String> {
 }
 
 /// Download file and compute hash in single pass to avoid reading file twice
-pub async fn download_with_hash(
+async fn download_with_hash_impl(
     url: &str,
     dest_path: &PathBuf,
     hash_type: ShaType,
+    slow_link_cutoff: Option<(std::time::Duration, u64)>,
 ) -> Result<String> {
     // Keep a temp file to avoid leaving a partially-downloaded blob behind.
     let tmp_path = dest_path.with_extension("part");
@@ -681,7 +653,7 @@ pub async fn download_with_hash(
     let idle = std::time::Duration::from_secs(60);
     let mut downloaded: u64 = 0;
     let mut last_report: u64 = 0;
-    // Report download progress in reasonably small increments. On slower links (or in CI/WSL),
+    // Report download progress in reasonably small increments. On slower links or in CI,
     // 64MiB can take long enough that the test runner prints a scary "running over 60 seconds"
     // warning with no other output.
     let report_step: u64 = 8 * 1024 * 1024; // 8 MiB
@@ -722,8 +694,9 @@ pub async fn download_with_hash(
                         );
                     }
                 }
-                if started_at.elapsed() >= std::time::Duration::from_secs(90)
-                    && downloaded < 32 * 1024 * 1024
+                if let Some((slow_link_timeout, min_bytes)) = slow_link_cutoff
+                    && started_at.elapsed() >= slow_link_timeout
+                    && downloaded < min_bytes
                 {
                     anyhow::bail!(
                         "download too slow for {} ({} MiB in {:?}); trying next mirror",
@@ -772,8 +745,9 @@ pub async fn download_with_hash(
                         );
                     }
                 }
-                if started_at.elapsed() >= std::time::Duration::from_secs(90)
-                    && downloaded < 32 * 1024 * 1024
+                if let Some((slow_link_timeout, min_bytes)) = slow_link_cutoff
+                    && started_at.elapsed() >= slow_link_timeout
+                    && downloaded < min_bytes
                 {
                     anyhow::bail!(
                         "download too slow for {} ({} MiB in {:?}); trying next mirror",
@@ -812,6 +786,14 @@ pub async fn download_with_hash(
     Ok(hash)
 }
 
+pub async fn download_with_hash(
+    url: &str,
+    dest_path: &PathBuf,
+    hash_type: ShaType,
+) -> Result<String> {
+    download_with_hash_impl(url, dest_path, hash_type, None).await
+}
+
 /// Try downloading a remote file from multiple candidate URLs.
 ///
 /// Mirrors can hang mid-transfer; we apply an idle timeout and move on.
@@ -844,7 +826,14 @@ pub async fn download_with_hash_multi(
 
         info!("Trying mirror {}/{}", idx + 1, urls.len());
         debug!("Download attempt {}/{}: {}", idx + 1, urls.len(), url);
-        match download_with_hash(url, dest_path, hash_type.clone()).await {
+        match download_with_hash_impl(
+            url,
+            dest_path,
+            hash_type.clone(),
+            Some((std::time::Duration::from_secs(90), 32 * 1024 * 1024)),
+        )
+        .await
+        {
             Ok(h) => {
                 if let Some(expected) = expected_hex
                     && !h.eq_ignore_ascii_case(expected)
@@ -925,23 +914,6 @@ async fn download_or_copy_with_hash(
     Ok(())
 }
 
-/// Download or copy file from ImageSource without hash verification.
-async fn download_or_copy_without_hash(source: &ImageSource, dest: &PathBuf) -> Result<()> {
-    match source {
-        ImageSource::Url(url) => {
-            if dest.exists() {
-                return Ok(());
-            }
-            let _ = download_with_hash(url, dest, ShaType::Sha256).await?;
-        }
-        ImageSource::LocalPath(src) => {
-            anyhow::ensure!(src.exists(), "file does not exist: {}", src.display());
-            tokio::fs::copy(src, dest).await?;
-        }
-    }
-    Ok(())
-}
-
 impl<A: ImageAction + std::default::Default> ImageMeta<A> {
     /// Create a new image by downloading and extracting
     pub async fn create(name: &str) -> Result<Self> {
@@ -961,15 +933,20 @@ impl<A: ImageAction + std::default::Default> ImageMeta<A> {
         tokio::fs::create_dir_all(&image_dir).await?;
 
         let distro_action = A::default();
+        let distro = distro_action.distro();
 
         distro_action.download(name).await?;
 
         let image_path = image_dir.join(format!("{}.qcow2", name));
         let (kernel, initrd) = distro_action.extract(name).await?;
         let checksum_path = image_dir.join("checksums");
-        let root_arg = detect_root_arg(&image_path)
-            .await
-            .unwrap_or_else(|_| default_root_arg());
+        let root_arg = match distro {
+            Distro::Ubuntu => detect_root_arg(&image_path)
+                .await
+                .unwrap_or_else(|_| default_root_arg()),
+            Distro::Debian | Distro::Fedora | Distro::Arch => detect_root_arg(&image_path).await?,
+            Distro::Custom => unreachable!("custom images use create_with_action()"),
+        };
         let checksum = ShaSum {
             path: checksum_path,
             sha_type: ShaType::Sha512,
@@ -998,19 +975,48 @@ impl<A: ImageAction + std::default::Default> ImageMeta<A> {
             .await
             .with_context(|| format!("failed to read config file at {}", json_path.display()))?;
 
-        let image: ImageMeta<A> = serde_json::from_str(&json_content)
+        let mut image: ImageMeta<A> = serde_json::from_str(&json_content)
             .with_context(|| format!("failed to parse JSON from {}", json_path.display()))?;
 
+        // Older caches may contain a `root=` token with a trailing ':' (e.g. `root=/dev/vda3:`),
+        // which causes direct-kernel boot to hang forever waiting for a non-existent device.
+        // Sanitize on load so users don't have to manually delete their image cache.
+        image.root_arg = image
+            .root_arg
+            .split_whitespace()
+            .map(|t| {
+                if let Some(rest) = t.strip_prefix("root=") {
+                    let clean = rest.trim_end_matches(':');
+                    format!("root={clean}")
+                } else {
+                    t.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+
         let kernel_ok = image.kernel.exists()
+            && !image
+                .kernel
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.ends_with(".unavailable"))
+                .unwrap_or(false)
             && std::fs::metadata(&image.kernel)
                 .map(|m| m.len() > 0)
                 .unwrap_or(false);
         let initrd_ok = image.initrd.exists()
+            && !image
+                .initrd
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.ends_with(".unavailable"))
+                .unwrap_or(false)
             && std::fs::metadata(&image.initrd)
                 .map(|m| m.len() > 0)
                 .unwrap_or(false);
         if !kernel_ok || !initrd_ok {
-            bail!("cached image is missing kernel/initrd markers; recreate is required");
+            bail!("cached image is missing valid kernel/initrd artifacts; recreate is required");
         }
 
         let checksum_dir = dirs.images.join(name);
@@ -1037,8 +1043,11 @@ impl<A: ImageAction + std::default::Default> ImageMeta<A> {
 
         Ok(image)
     }
+}
 
-    /// Save image metadata to disk using streaming hash
+// Special create method for Custom images (non-Default trait)
+impl<A: ImageAction> ImageMeta<A> {
+    /// Save image metadata to disk using streaming hash.
     async fn save(&self, name: &str) -> Result<()> {
         let dirs = QleanDirs::new()?;
         let json_path = dirs.images.join(format!("{}.json", name));
@@ -1050,7 +1059,7 @@ impl<A: ImageAction + std::default::Default> ImageMeta<A> {
             .await
             .with_context(|| format!("failed to write image config to {}", json_path.display()))?;
 
-        // Use streaming hash for best performance (7-27% faster in release mode)
+        // Use streaming hash for best performance (7-27% faster in release mode).
         let (image_hash, kernel_hash, initrd_hash) = match self.checksum.sha_type {
             ShaType::Sha256 => (
                 compute_sha256_streaming(&self.path).await?,
@@ -1096,10 +1105,7 @@ impl<A: ImageAction + std::default::Default> ImageMeta<A> {
 
         Ok(())
     }
-}
 
-// Special create method for Custom images (non-Default trait)
-impl<A: ImageAction> ImageMeta<A> {
     /// Create image with custom action for non-Default implementations
     pub async fn create_with_action(name: &str, action: A) -> Result<Self> {
         debug!("Fetching image {} with custom action ...", name);
@@ -1134,67 +1140,688 @@ impl<A: ImageAction> ImageMeta<A> {
             vendor: action,
         };
 
-        // Inline save with streaming hash
-        let json_path = dirs.images.join(format!("{}.json", name));
-        let json_content = serde_json::to_string_pretty(&image)?;
-        tokio::fs::write(&json_path, json_content).await?;
-
-        let (image_hash, kernel_hash, initrd_hash) = match image.checksum.sha_type {
-            ShaType::Sha256 => (
-                compute_sha256_streaming(&image.path).await?,
-                compute_sha256_streaming(&image.kernel).await?,
-                compute_sha256_streaming(&image.initrd).await?,
-            ),
-            ShaType::Sha512 => (
-                compute_sha512_streaming(&image.path).await?,
-                compute_sha512_streaming(&image.kernel).await?,
-                compute_sha512_streaming(&image.initrd).await?,
-            ),
-        };
-
-        let image_filename = image.path.file_name().unwrap().to_string_lossy();
-        let kernel_filename = image.kernel.file_name().unwrap().to_string_lossy();
-        let initrd_filename = image.initrd.file_name().unwrap().to_string_lossy();
-
-        let checksum_content = format!(
-            "{}  {}\n{}  {}\n{}  {}\n",
-            image_hash, image_filename, kernel_hash, kernel_filename, initrd_hash, initrd_filename
-        );
-
-        tokio::fs::write(&image.checksum.path, checksum_content).await?;
+        image.save(name).await?;
 
         Ok(image)
     }
 }
 
-async fn ensure_fixed_guestfs_appliance() -> Result<PathBuf> {
-    for dir in [
+fn candidate_guestfs_appliance_dirs() -> [&'static str; 6] {
+    [
         "/usr/lib/guestfs/appliance",
+        "/usr/lib64/guestfs/appliance",
+        "/usr/local/lib/guestfs/appliance",
+        "/usr/local/lib64/guestfs/appliance",
         "/usr/lib/x86_64-linux-gnu/guestfs/appliance",
+        "/usr/lib/aarch64-linux-gnu/guestfs/appliance",
+    ]
+}
+
+fn is_complete_guestfs_appliance(dir: &Path) -> bool {
+    dir.join("kernel").exists()
+        && dir.join("initrd").exists()
+        && dir.join("root").exists()
+        && dir.join("README.fixed").exists()
+}
+
+#[derive(Debug, Clone)]
+struct SuperminKernelBundle {
+    kernel: PathBuf,
+    modules_dir: PathBuf,
+    kernel_version: String,
+}
+
+async fn stage_readable_supermin_kernel(
+    cache_root: &Path,
+    bundle: &SuperminKernelBundle,
+) -> Result<SuperminKernelBundle> {
+    let stage_dir = cache_root.join("supermin-host-kernel");
+    tokio::fs::create_dir_all(&stage_dir)
+        .await
+        .with_context(|| format!("failed to create {}", stage_dir.display()))?;
+
+    let file_name = bundle
+        .kernel
+        .file_name()
+        .with_context(|| format!("invalid kernel path: {}", bundle.kernel.display()))?;
+    let staged_kernel = stage_dir.join(file_name);
+
+    let _ = tokio::fs::remove_file(&staged_kernel).await;
+    tokio::fs::copy(&bundle.kernel, &staged_kernel)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to copy host kernel {} into {}",
+                bundle.kernel.display(),
+                stage_dir.display()
+            )
+        })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let perms = std::fs::Permissions::from_mode(0o644);
+        tokio::fs::set_permissions(&staged_kernel, perms)
+            .await
+            .with_context(|| format!("failed to chmod {} to 0644", staged_kernel.display()))?;
+    }
+
+    Ok(SuperminKernelBundle {
+        kernel: staged_kernel,
+        modules_dir: bundle.modules_dir.clone(),
+        kernel_version: bundle.kernel_version.clone(),
+    })
+}
+
+async fn clear_known_paths(root: &Path, names: &[&str]) -> Result<()> {
+    for name in names {
+        let path = root.join(name);
+        if !tokio::fs::try_exists(&path).await? {
+            continue;
+        }
+        let meta = tokio::fs::metadata(&path)
+            .await
+            .with_context(|| format!("failed to stat {}", path.display()))?;
+        if meta.is_dir() {
+            tokio::fs::remove_dir_all(&path)
+                .await
+                .with_context(|| format!("failed to clear {}", path.display()))?;
+        } else {
+            tokio::fs::remove_file(&path)
+                .await
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn find_supermin_kernel_bundle(root: &Path) -> Option<SuperminKernelBundle> {
+    let boot_dir = root.join("boot");
+    let modules_root = root.join("lib/modules");
+
+    let mut kernels = std::fs::read_dir(&boot_dir)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with("vmlinuz"))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    kernels.sort();
+
+    let mut modules = std::fs::read_dir(&modules_root)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    modules.sort();
+
+    for module_dir in modules.iter().rev() {
+        let version = module_dir.file_name()?.to_string_lossy().to_string();
+        if let Some(kernel) = kernels.iter().rev().find(|kernel| {
+            kernel
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.contains(&version))
+                .unwrap_or(false)
+        }) {
+            return Some(SuperminKernelBundle {
+                kernel: kernel.clone(),
+                modules_dir: module_dir.clone(),
+                kernel_version: version,
+            });
+        }
+    }
+
+    let kernel = kernels.into_iter().last()?;
+    let modules_dir = modules.into_iter().last()?;
+    let kernel_version = modules_dir.file_name()?.to_string_lossy().to_string();
+
+    Some(SuperminKernelBundle {
+        kernel,
+        modules_dir,
+        kernel_version,
+    })
+}
+
+fn is_concrete_linux_image_package(name: &str) -> bool {
+    name.strip_prefix("linux-image-unsigned-")
+        .or_else(|| name.strip_prefix("linux-image-"))
+        .and_then(|rest| rest.chars().next())
+        .map(|ch| ch.is_ascii_digit())
+        .unwrap_or(false)
+}
+
+fn parse_apt_depends_for_kernel_package(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(dep) = line.strip_prefix("Depends:") {
+            let dep = dep.trim();
+            if is_concrete_linux_image_package(dep) {
+                return Some(dep.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn parse_apt_search_for_kernel_package(text: &str) -> Option<String> {
+    let mut packages = text
+        .lines()
+        .filter_map(|line| {
+            line.split_once(" - ")
+                .map(|(name, _)| name.trim().to_string())
+        })
+        .filter(|name| is_concrete_linux_image_package(name))
+        .collect::<Vec<_>>();
+    packages.sort();
+    packages.into_iter().last()
+}
+
+fn derive_modules_package_name(image_package: &str) -> Option<String> {
+    let version = image_package
+        .strip_prefix("linux-image-unsigned-")
+        .or_else(|| image_package.strip_prefix("linux-image-"))?;
+    Some(format!("linux-modules-{}", version))
+}
+
+async fn resolve_apt_kernel_package_name() -> Result<String> {
+    for meta_pkg in ["linux-image-virtual", "linux-image-generic"] {
+        let output = tokio::process::Command::new("apt-cache")
+            .arg("depends")
+            .arg("--important")
+            .arg(meta_pkg)
+            .output()
+            .await
+            .with_context(|| format!("failed to execute `apt-cache depends {meta_pkg}`"))?;
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(pkg) = parse_apt_depends_for_kernel_package(&stdout) {
+                return Ok(pkg);
+            }
+        }
+    }
+
+    for pattern in [
+        "^linux-image-[0-9].*-generic$",
+        "^linux-image-unsigned-[0-9].*-generic$",
+        "^linux-image-[0-9].*-virtual$",
     ] {
-        let p = PathBuf::from(dir);
-        if p.join("kernel").exists() && p.join("initrd").exists() {
-            return Ok(p);
+        let output = tokio::process::Command::new("apt-cache")
+            .arg("search")
+            .arg(pattern)
+            .output()
+            .await
+            .with_context(|| format!("failed to execute `apt-cache search {pattern}`"))?;
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(pkg) = parse_apt_search_for_kernel_package(&stdout) {
+                return Ok(pkg);
+            }
+        }
+    }
+
+    bail!("failed to locate an apt-downloadable Linux kernel package for supermin on this host")
+}
+
+async fn download_apt_package(package_name: &str, download_dir: &Path) -> Result<PathBuf> {
+    clear_known_paths(download_dir, &["kernel-download"])
+        .await
+        .with_context(|| {
+            format!(
+                "failed to clear stale package cache in {}",
+                download_dir.display()
+            )
+        })?;
+
+    let package_dir = download_dir.join("kernel-download");
+    tokio::fs::create_dir_all(&package_dir)
+        .await
+        .with_context(|| format!("failed to create {}", package_dir.display()))?;
+
+    let output = tokio::process::Command::new("apt")
+        .arg("download")
+        .arg(package_name)
+        .current_dir(&package_dir)
+        .output()
+        .await
+        .with_context(|| format!("failed to execute `apt download {package_name}`"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let sep = if stdout.trim().is_empty() || stderr.trim().is_empty() {
+            ""
+        } else {
+            "\n"
+        };
+        bail!("{}{}{}", stdout.trim(), sep, stderr.trim());
+    }
+
+    let mut entries = tokio::fs::read_dir(&package_dir)
+        .await
+        .with_context(|| format!("failed to read {}", package_dir.display()))?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("deb") {
+            return Ok(path);
+        }
+    }
+
+    bail!(
+        "`apt download {}` did not produce a .deb in {}",
+        package_name,
+        package_dir.display()
+    )
+}
+
+/// Supermin needs a kernel+modules pair. Some hosts (notably WSL) ship the
+/// libguestfs userspace tools but do not provide a local /boot kernel image.
+/// In that case, bootstrap a matching bundle from an apt-downloadable kernel package.
+async fn prepare_supermin_kernel_bundle(cache_root: &Path) -> Result<SuperminKernelBundle> {
+    let cache_dir = cache_root.join("supermin-kernel-cache");
+    let extract_root = cache_dir.join("root");
+
+    if let Some(bundle) = find_supermin_kernel_bundle(&extract_root) {
+        return Ok(bundle);
+    }
+
+    tokio::fs::create_dir_all(&cache_dir)
+        .await
+        .with_context(|| format!("failed to create {}", cache_dir.display()))?;
+
+    let package_attempt = async {
+        clear_known_paths(&cache_dir, &["root", "kernel-download"])
+            .await
+            .with_context(|| format!("failed to clear {}", cache_dir.display()))?;
+
+        let package_name = resolve_apt_kernel_package_name().await?;
+        info!(
+            "Preparing a cached Linux kernel package for libguestfs supermin: {}",
+            package_name
+        );
+        let deb_file = download_apt_package(&package_name, &cache_dir).await?;
+
+        tokio::fs::create_dir_all(&extract_root)
+            .await
+            .with_context(|| format!("failed to create {}", extract_root.display()))?;
+
+        let output = tokio::process::Command::new("dpkg-deb")
+            .arg("-x")
+            .arg(&deb_file)
+            .arg(&extract_root)
+            .output()
+            .await
+            .with_context(|| format!("failed to extract {} with dpkg-deb", deb_file.display()))?;
+        if !output.status.success() {
+            bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+        }
+
+        if find_supermin_kernel_bundle(&extract_root).is_none()
+            && let Some(modules_pkg) = derive_modules_package_name(&package_name)
+        {
+            info!(
+                "The downloaded image package did not include a full modules tree; fetching {} as well",
+                modules_pkg
+            );
+            let modules_deb = download_apt_package(&modules_pkg, &cache_dir).await?;
+            let output = tokio::process::Command::new("dpkg-deb")
+                .arg("-x")
+                .arg(&modules_deb)
+                .arg(&extract_root)
+                .output()
+                .await
+                .with_context(|| format!("failed to extract {} with dpkg-deb", modules_deb.display()))?;
+            if !output.status.success() {
+                bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+            }
+        }
+
+        find_supermin_kernel_bundle(&extract_root).with_context(|| {
+            format!(
+                "downloaded kernel package {} did not contain a usable kernel/modules pair under {}",
+                package_name,
+                extract_root.display()
+            )
+        })
+    }
+    .await;
+
+    match package_attempt {
+        Ok(bundle) => Ok(bundle),
+        Err(pkg_err) => {
+            if let Some(bundle) = find_supermin_kernel_bundle(Path::new("/")) {
+                warn!(
+                    "Failed to prepare an apt-downloaded kernel bundle for supermin; falling back to a staged host kernel copy: {pkg_err:#}"
+                );
+                return stage_readable_supermin_kernel(cache_root, &bundle).await;
+            }
+            Err(pkg_err)
+        }
+    }
+}
+
+async fn run_make_fixed_appliance(
+    appliance_dir: &Path,
+    kernel_bundle: Option<&SuperminKernelBundle>,
+) -> Result<std::process::Output> {
+    clear_known_paths(appliance_dir, &["kernel", "initrd", "root"]).await?;
+
+    let mut cmd = tokio::process::Command::new("libguestfs-make-fixed-appliance");
+    cmd.arg(appliance_dir);
+    if let Some(bundle) = kernel_bundle {
+        cmd.env("SUPERMIN_KERNEL", &bundle.kernel)
+            .env("SUPERMIN_MODULES", &bundle.modules_dir)
+            .env("SUPERMIN_KERNEL_VERSION", &bundle.kernel_version);
+    }
+
+    cmd.output().await.with_context(
+        || "failed to execute libguestfs-make-fixed-appliance; install libguestfs-tools",
+    )
+}
+
+async fn try_build_fixed_guestfs_appliance(appliance_dir: &Path) -> Result<()> {
+    let first = run_make_fixed_appliance(appliance_dir, None).await?;
+    if first.status.success() {
+        anyhow::ensure!(
+            is_complete_guestfs_appliance(appliance_dir),
+            "libguestfs-make-fixed-appliance completed without producing a usable appliance"
+        );
+        return Ok(());
+    }
+
+    let first_stderr = String::from_utf8_lossy(&first.stderr).trim().to_string();
+    let needs_explicit_kernel = first_stderr.contains("supermin exited with error status")
+        || first_stderr.contains("--copy-kernel")
+        || first_stderr.contains("failed to find a suitable kernel");
+
+    if !needs_explicit_kernel {
+        bail!("{}", first_stderr);
+    }
+
+    let cache_root = appliance_dir.parent().unwrap_or_else(|| Path::new("."));
+    let bundle = prepare_supermin_kernel_bundle(cache_root)
+        .await
+        .with_context(|| "failed to provision a kernel/modules bundle for supermin")?;
+
+    info!(
+        "Retrying libguestfs fixed appliance build with explicit SUPERMIN_KERNEL={} and SUPERMIN_MODULES={}",
+        bundle.kernel.display(),
+        bundle.modules_dir.display()
+    );
+    let retry = run_make_fixed_appliance(appliance_dir, Some(&bundle)).await?;
+    if !retry.status.success() {
+        bail!("{}", String::from_utf8_lossy(&retry.stderr).trim());
+    }
+
+    anyhow::ensure!(
+        is_complete_guestfs_appliance(appliance_dir),
+        "libguestfs-make-fixed-appliance completed without producing a usable appliance"
+    );
+    Ok(())
+}
+
+fn parse_appliance_version_code(version: &str) -> Option<i64> {
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse::<i64>().ok()?;
+    let minor = parts.next().unwrap_or("0").parse::<i64>().ok()?;
+    let patch = parts.next().unwrap_or("0").parse::<i64>().ok()?;
+    Some(major * 1_000_000 + minor * 1_000 + patch)
+}
+
+async fn detect_local_libguestfs_version() -> Option<String> {
+    let guestfish = tokio::process::Command::new("guestfish")
+        .arg("--version")
+        .output()
+        .await
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&guestfish.stdout);
+    if let Some(version) = stdout.split_whitespace().find(|part| {
+        part.chars()
+            .next()
+            .map(|ch| ch.is_ascii_digit())
+            .unwrap_or(false)
+    }) {
+        return Some(version.trim().to_string());
+    }
+
+    let probe = tokio::process::Command::new("libguestfs-test-tool")
+        .env("LIBGUESTFS_BACKEND", "direct")
+        .output()
+        .await
+        .ok()?;
+    let combined = format!(
+        "{}
+{}",
+        String::from_utf8_lossy(&probe.stdout),
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    combined.lines().find_map(|line| {
+        line.split_once("version=")
+            .map(|(_, v)| v.trim().to_string())
+    })
+}
+
+fn parse_official_appliance_versions(index_html: &str) -> Vec<String> {
+    let mut versions = Vec::new();
+    let mut cursor = 0;
+    let needle = "appliance-";
+    let suffix = ".tar.xz";
+
+    while let Some(start_rel) = index_html[cursor..].find(needle) {
+        let start = cursor + start_rel + needle.len();
+        if let Some(end_rel) = index_html[start..].find(suffix) {
+            let version = &index_html[start..start + end_rel];
+            if !version.is_empty()
+                && version.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
+                && !versions.iter().any(|seen| seen == version)
+            {
+                versions.push(version.to_string());
+            }
+            cursor = start + end_rel + suffix.len();
+        } else {
+            break;
+        }
+    }
+
+    versions
+}
+
+fn ordered_appliance_versions(
+    local_version: Option<&str>,
+    mut versions: Vec<String>,
+) -> Vec<String> {
+    let local_code = local_version.and_then(parse_appliance_version_code);
+
+    versions.sort_by(|a, b| {
+        let a_code = parse_appliance_version_code(a).unwrap_or_default();
+        let b_code = parse_appliance_version_code(b).unwrap_or_default();
+
+        match local_code {
+            Some(local) => {
+                let a_dist = (a_code - local).abs();
+                let b_dist = (b_code - local).abs();
+                a_dist.cmp(&b_dist).then_with(|| b_code.cmp(&a_code))
+            }
+            None => b_code.cmp(&a_code),
+        }
+    });
+
+    versions
+}
+
+async fn extract_downloaded_appliance_archive(
+    archive_path: &Path,
+    appliance_dir: &Path,
+) -> Result<()> {
+    let list_output = tokio::process::Command::new("tar")
+        .arg("-tJf")
+        .arg(archive_path)
+        .output()
+        .await
+        .with_context(|| format!("failed to inspect {}", archive_path.display()))?;
+    if !list_output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&list_output.stderr).trim());
+    }
+
+    let listing = String::from_utf8_lossy(&list_output.stdout);
+    let top_level = listing
+        .lines()
+        .find_map(|line| {
+            let trimmed = line.trim_matches('/').trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                trimmed.split('/').next().map(|part| part.to_string())
+            }
+        })
+        .with_context(|| format!("{} was empty", archive_path.display()))?;
+
+    let output = tokio::process::Command::new("tar")
+        .arg("-xJf")
+        .arg(archive_path)
+        .arg("-C")
+        .arg(appliance_dir)
+        .arg("--strip-components=1")
+        .arg(&top_level)
+        .output()
+        .await
+        .with_context(|| format!("failed to extract {}", archive_path.display()))?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+
+    Ok(())
+}
+
+async fn validate_fixed_guestfs_appliance(appliance_dir: &Path) -> Result<()> {
+    let output = timeout(
+        Duration::from_secs(180),
+        tokio::process::Command::new("libguestfs-test-tool")
+            .env("LIBGUESTFS_BACKEND", "direct")
+            .env("LIBGUESTFS_PATH", appliance_dir)
+            .output(),
+    )
+    .await
+    .with_context(|| "libguestfs-test-tool timed out while validating the fixed appliance")?
+    .with_context(|| "failed to execute libguestfs-test-tool")?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let details = if stderr.trim().is_empty() {
+        stdout.trim().to_string()
+    } else if stdout.trim().is_empty() {
+        stderr.trim().to_string()
+    } else {
+        format!("{}\n{}", stdout.trim(), stderr.trim())
+    };
+    bail!("{details}");
+}
+
+async fn try_download_official_guestfs_appliance_version(
+    appliance_dir: &Path,
+    version: &str,
+) -> Result<()> {
+    let archive_name = format!("appliance-{version}.tar.xz");
+    let archive_url = format!("https://download.libguestfs.org/binaries/appliance/{archive_name}");
+
+    let cache_root = appliance_dir.parent().unwrap_or_else(|| Path::new("."));
+    let download_dir = cache_root.join("guestfs-appliance-downloads");
+    tokio::fs::create_dir_all(&download_dir)
+        .await
+        .with_context(|| format!("failed to create {}", download_dir.display()))?;
+    let archive_path = download_dir.join(&archive_name);
+
+    let _actual_sha = download_with_hash(&archive_url, &archive_path, ShaType::Sha512).await?;
+
+    clear_known_paths(appliance_dir, &["kernel", "initrd", "root", "README.fixed"]).await?;
+    tokio::fs::create_dir_all(appliance_dir)
+        .await
+        .with_context(|| format!("failed to create {}", appliance_dir.display()))?;
+
+    extract_downloaded_appliance_archive(&archive_path, appliance_dir).await?;
+
+    anyhow::ensure!(
+        is_complete_guestfs_appliance(appliance_dir),
+        "downloaded {} did not contain a complete fixed appliance",
+        archive_name
+    );
+
+    validate_fixed_guestfs_appliance(appliance_dir).await
+}
+
+async fn provision_official_guestfs_appliance(appliance_dir: &Path) -> Result<()> {
+    let local_version = detect_local_libguestfs_version().await;
+    let index_html = fetch_text("https://download.libguestfs.org/binaries/appliance/").await?;
+    let available = parse_official_appliance_versions(&index_html);
+    anyhow::ensure!(
+        !available.is_empty(),
+        "the upstream appliance index did not advertise any downloadable fixed appliance"
+    );
+
+    let candidates = ordered_appliance_versions(local_version.as_deref(), available);
+    let mut last_err = None;
+
+    for version in candidates {
+        info!(
+            "Trying official libguestfs fixed appliance download: version {}",
+            version
+        );
+        match try_download_official_guestfs_appliance_version(appliance_dir, &version).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                warn!(
+                    "Official libguestfs appliance {} did not validate on this host: {err:#}",
+                    version
+                );
+                last_err = Some(err);
+            }
+        }
+    }
+
+    Err(last_err
+        .unwrap_or_else(|| anyhow::anyhow!("failed to provision an official fixed appliance")))
+}
+
+async fn ensure_fixed_guestfs_appliance() -> Result<PathBuf> {
+    for dir in candidate_guestfs_appliance_dirs() {
+        let path = PathBuf::from(dir);
+        if is_complete_guestfs_appliance(&path) {
+            return Ok(path);
         }
     }
 
     let dirs = QleanDirs::new()?;
     let appliance_dir = dirs.base.join("guestfs-appliance");
-    if appliance_dir.join("kernel").exists() && appliance_dir.join("initrd").exists() {
+    if is_complete_guestfs_appliance(&appliance_dir) {
         return Ok(appliance_dir);
     }
 
-    let output = tokio::process::Command::new("libguestfs-make-fixed-appliance")
-        .arg(&appliance_dir)
-        .output()
+    tokio::fs::create_dir_all(&appliance_dir)
         .await
-        .with_context(|| "failed to execute libguestfs-make-fixed-appliance")?;
-    if !output.status.success() {
-        bail!(
-            "libguestfs fixed appliance build failed: {}\nInstall package: libguestfs-appliance (or libguestfs-tools) and retry.",
-            String::from_utf8_lossy(&output.stderr)
+        .with_context(|| format!("failed to create {}", appliance_dir.display()))?;
+
+    if let Err(download_err) = provision_official_guestfs_appliance(&appliance_dir).await {
+        warn!(
+            "Official libguestfs appliance download failed; falling back to local fixed-appliance build: {download_err:#}"
         );
+        match try_build_fixed_guestfs_appliance(&appliance_dir).await {
+            Ok(()) => {}
+            Err(build_err) => bail!(
+                "failed to provision a usable libguestfs appliance: {build_err:#}
+Tried the official fixed appliance download first, then a local libguestfs-make-fixed-appliance build."
+            ),
+        }
     }
+
     Ok(appliance_dir)
 }
 
@@ -1286,26 +1913,984 @@ async fn virt_copy_out(image_dir: &Path, file_name: &str, src: &str, kind: &str)
     Ok(())
 }
 
-async fn write_unavailable_boot_artifacts(
+async fn extract_boot_artifacts_guestfs(
     image_dir: &Path,
-    reason: &str,
+    file_name: &str,
+    distro: Distro,
 ) -> Result<(PathBuf, PathBuf)> {
-    let kernel = image_dir.join("vmlinuz.unavailable");
-    let initrd = image_dir.join("initrd.img.unavailable");
-    let note = format!("qlean boot artifact unavailable: {}\n", reason);
+    ensure_extraction_prerequisites().await?;
 
-    tokio::fs::write(&kernel, note.as_bytes())
-        .await
-        .with_context(|| format!("failed to write {}", kernel.display()))?;
-    tokio::fs::write(&initrd, note.as_bytes())
-        .await
-        .with_context(|| format!("failed to write {}", initrd.display()))?;
+    let boot_dir = image_dir.join("boot");
+    let _ = tokio::fs::remove_dir_all(&boot_dir).await;
 
-    Ok((kernel, initrd))
+    virt_copy_out(image_dir, file_name, "/boot", "boot directory").await?;
+
+    anyhow::ensure!(
+        boot_dir.exists(),
+        "virt-copy-out did not extract /boot into {}",
+        image_dir.display()
+    );
+
+    let files = collect_files_recursive(&boot_dir).with_context(|| {
+        format!(
+            "failed to scan extracted boot tree in {}",
+            boot_dir.display()
+        )
+    })?;
+
+    let kernel_src = choose_kernel_file(&files, distro.clone())
+        .with_context(|| "failed to find kernel file in extracted /boot")?;
+    let initrd_src = choose_initrd_file(&files, distro)
+        .with_context(|| "failed to find initrd file in extracted /boot")?;
+
+    let kernel_name = kernel_src
+        .file_name()
+        .and_then(|n| n.to_str())
+        .with_context(|| "invalid kernel filename")?
+        .to_string();
+    let initrd_name = initrd_src
+        .file_name()
+        .and_then(|n| n.to_str())
+        .with_context(|| "invalid initrd filename")?
+        .to_string();
+
+    let kernel_path = image_dir.join(&kernel_name);
+    let initrd_path = image_dir.join(&initrd_name);
+
+    fs::copy(&kernel_src, &kernel_path).with_context(|| {
+        format!(
+            "failed to copy extracted kernel {} -> {}",
+            kernel_src.display(),
+            kernel_path.display()
+        )
+    })?;
+    fs::copy(&initrd_src, &initrd_path).with_context(|| {
+        format!(
+            "failed to copy extracted initrd {} -> {}",
+            initrd_src.display(),
+            initrd_path.display()
+        )
+    })?;
+
+    let kernel_args_path = kernel_args_hint_path(image_dir);
+    if let Some(args) = choose_kernel_options(&files, &kernel_name) {
+        fs::write(&kernel_args_path, args).with_context(|| {
+            format!(
+                "failed to write kernel args hint in {}",
+                image_dir.display()
+            )
+        })?;
+    } else {
+        let _ = fs::remove_file(&kernel_args_path);
+    }
+    let _ = fs::remove_file(root_hint_path(image_dir));
+
+    let _ = tokio::fs::remove_dir_all(&boot_dir).await;
+    Ok((kernel_path, initrd_path))
+}
+
+fn root_hint_path(image_dir: &Path) -> PathBuf {
+    image_dir.join(".root-partition")
+}
+
+fn kernel_args_hint_path(image_dir: &Path) -> PathBuf {
+    image_dir.join(".kernel-args")
+}
+
+fn read_u32_le(bytes: &[u8]) -> u32 {
+    let mut arr = [0u8; 4];
+    arr.copy_from_slice(bytes);
+    u32::from_le_bytes(arr)
+}
+
+fn read_u64_le(bytes: &[u8]) -> u64 {
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(bytes);
+    u64::from_le_bytes(arr)
+}
+
+#[derive(Debug, Clone)]
+struct PartitionSlice {
+    number: usize,
+    start_lba: u64,
+    sectors: u64,
+}
+
+fn parse_mbr_partitions(mbr: &[u8]) -> Vec<PartitionSlice> {
+    let mut parts = Vec::new();
+    for idx in 0..4usize {
+        let off = 446 + idx * 16;
+        let entry = &mbr[off..off + 16];
+        let part_type = entry[4];
+        if part_type == 0 {
+            continue;
+        }
+        let start_lba = read_u32_le(&entry[8..12]) as u64;
+        let sectors = read_u32_le(&entry[12..16]) as u64;
+        if start_lba > 0 && sectors > 0 {
+            parts.push(PartitionSlice {
+                number: idx + 1,
+                start_lba,
+                sectors,
+            });
+        }
+    }
+    parts
+}
+
+fn parse_gpt_partitions(raw_path: &Path) -> Result<Vec<PartitionSlice>> {
+    let mut f = fs::File::open(raw_path)
+        .with_context(|| format!("failed to open {}", raw_path.display()))?;
+
+    let mut header = [0u8; 512];
+    f.seek(SeekFrom::Start(512))
+        .with_context(|| format!("failed to seek GPT header in {}", raw_path.display()))?;
+    f.read_exact(&mut header)
+        .with_context(|| format!("failed to read GPT header from {}", raw_path.display()))?;
+
+    anyhow::ensure!(
+        &header[0..8] == b"EFI PART",
+        "{} does not contain a GPT header",
+        raw_path.display()
+    );
+
+    let entries_lba = read_u64_le(&header[72..80]);
+    let num_entries = read_u32_le(&header[80..84]) as usize;
+    let entry_size = read_u32_le(&header[84..88]) as usize;
+    anyhow::ensure!(entry_size >= 56, "invalid GPT entry size: {}", entry_size);
+
+    let max_entries = num_entries.min(256);
+    let table_len = max_entries
+        .checked_mul(entry_size)
+        .with_context(|| "GPT partition table size overflow")?;
+    let mut table = vec![0u8; table_len];
+    f.seek(SeekFrom::Start(entries_lba.saturating_mul(512)))
+        .with_context(|| format!("failed to seek GPT entries in {}", raw_path.display()))?;
+    f.read_exact(&mut table)
+        .with_context(|| format!("failed to read GPT entries from {}", raw_path.display()))?;
+
+    let mut parts = Vec::new();
+    for idx in 0..max_entries {
+        let off = idx * entry_size;
+        let entry = &table[off..off + entry_size];
+        if entry[0..16].iter().all(|b| *b == 0) {
+            continue;
+        }
+
+        let start_lba = read_u64_le(&entry[32..40]);
+        let end_lba = read_u64_le(&entry[40..48]);
+        if start_lba == 0 || end_lba < start_lba {
+            continue;
+        }
+
+        parts.push(PartitionSlice {
+            number: idx + 1,
+            start_lba,
+            sectors: end_lba - start_lba + 1,
+        });
+    }
+
+    Ok(parts)
+}
+
+fn list_partitions(raw_path: &Path) -> Result<Vec<PartitionSlice>> {
+    let mut mbr = [0u8; 512];
+    let mut f = fs::File::open(raw_path)
+        .with_context(|| format!("failed to open {}", raw_path.display()))?;
+    f.read_exact(&mut mbr)
+        .with_context(|| format!("failed to read MBR from {}", raw_path.display()))?;
+
+    anyhow::ensure!(
+        mbr[510] == 0x55 && mbr[511] == 0xAA,
+        "{} does not look like a bootable disk image",
+        raw_path.display()
+    );
+
+    let protective_gpt = (0..4usize).any(|idx| mbr[446 + idx * 16 + 4] == 0xEE);
+    let mut parts = if protective_gpt {
+        parse_gpt_partitions(raw_path)?
+    } else {
+        parse_mbr_partitions(&mbr)
+    };
+
+    parts.sort_by(|a, b| {
+        b.sectors
+            .cmp(&a.sectors)
+            .then_with(|| a.number.cmp(&b.number))
+    });
+    anyhow::ensure!(
+        !parts.is_empty(),
+        "failed to find any partitions in {}",
+        raw_path.display()
+    );
+    Ok(parts)
+}
+
+fn collect_files_recursive(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in walkdir::WalkDir::new(root) {
+        let entry = entry.with_context(|| format!("failed while scanning {}", root.display()))?;
+        if entry.file_type().is_file() {
+            files.push(entry.path().to_path_buf());
+        }
+    }
+    Ok(files)
+}
+
+fn choose_kernel_file(files: &[PathBuf], distro: Distro) -> Option<PathBuf> {
+    let mut candidates = files
+        .iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| match distro {
+                    Distro::Fedora => n.starts_with("vmlinuz") && !n.contains("rescue"),
+                    Distro::Arch => n.starts_with("vmlinuz"),
+                    _ => n.starts_with("vmlinuz"),
+                })
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.into_iter().last()
+}
+
+fn choose_initrd_file(files: &[PathBuf], distro: Distro) -> Option<PathBuf> {
+    let mut candidates = files
+        .iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| match distro {
+                    Distro::Ubuntu | Distro::Debian => n.starts_with("initrd.img"),
+                    Distro::Fedora => {
+                        n.starts_with("initramfs") && n.ends_with(".img") && !n.contains("rescue")
+                    }
+                    Distro::Arch => {
+                        n.starts_with("initramfs")
+                            && n.ends_with(".img")
+                            && n.contains("linux")
+                            && !n.contains("fallback")
+                    }
+                    Distro::Custom => false,
+                })
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if candidates.is_empty() && matches!(distro, Distro::Arch) {
+        candidates = files
+            .iter()
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| {
+                        n.starts_with("initramfs") && n.ends_with(".img") && n.contains("linux")
+                    })
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+    }
+
+    candidates.sort();
+    candidates.into_iter().last()
+}
+
+fn normalize_kernel_options(raw: &str) -> Option<String> {
+    let tokens = raw
+        .split_whitespace()
+        .filter(|token| !token.is_empty() && *token != "ro" && *token != "rw")
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens.join(" "))
+    }
+}
+
+fn resolve_kernelopts_from_grub_cfg(content: &str) -> Option<String> {
+    // Fedora/GRUB often stores a full kernel command line in a variable called "kernelopts",
+    // referenced from BLS entries as: `options $kernelopts`.
+    //
+    // We intentionally keep this parser lightweight and dependency-free.
+    for line in content.lines() {
+        let trimmed = line.trim();
+        // Common forms:
+        //   set kernelopts="root=UUID=... ro ..."
+        //   set kernelopts='root=UUID=... ro ...'
+        if let Some(rest) = trimmed.strip_prefix("set kernelopts=") {
+            let rest = rest.trim();
+            if let Some(stripped) = rest.strip_prefix('"')
+                && let Some(end) = stripped.find('"')
+            {
+                return Some(stripped[..end].to_string());
+            }
+            if let Some(stripped) = rest.strip_prefix('\'')
+                && let Some(end) = stripped.find('\'')
+            {
+                return Some(stripped[..end].to_string());
+            }
+            // Fallback: no quotes, take the remainder of the token.
+            let first = rest.split_whitespace().next().unwrap_or("");
+            if !first.is_empty() {
+                return Some(first.to_string());
+            }
+        }
+
+        // Some grub.cfg variants assign without the "set" keyword.
+        if let Some(idx) = trimmed.find("kernelopts=") {
+            let rest = trimmed[idx + "kernelopts=".len()..].trim();
+            if let Some(stripped) = rest.strip_prefix('"')
+                && let Some(end) = stripped.find('"')
+            {
+                return Some(stripped[..end].to_string());
+            }
+            if let Some(stripped) = rest.strip_prefix('\'')
+                && let Some(end) = stripped.find('\'')
+            {
+                return Some(stripped[..end].to_string());
+            }
+        }
+    }
+    None
+}
+
+fn resolve_kernelopts_from_grubenv(bytes: &[u8]) -> Option<String> {
+    // grubenv is a binary environment block, but it commonly contains plain ASCII entries
+    // like: `kernelopts=root=UUID=... ro ...`.
+    let needle = b"kernelopts=";
+    let pos = bytes.windows(needle.len()).position(|w| w == needle)?;
+    let start = pos + needle.len();
+    let mut end = start;
+    while end < bytes.len() {
+        let b = bytes[end];
+        if b == b'\n' || b == 0 {
+            break;
+        }
+        end += 1;
+    }
+    let s = String::from_utf8_lossy(&bytes[start..end])
+        .trim()
+        .to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+fn resolve_kernelopts(files: &[PathBuf]) -> Option<String> {
+    // Prefer grub.cfg (human-readable).
+    for path in files.iter() {
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n == "grub.cfg")
+            .unwrap_or(false)
+            && let Ok(content) = fs::read_to_string(path)
+            && let Some(v) = resolve_kernelopts_from_grub_cfg(&content)
+        {
+            return Some(v);
+        }
+    }
+
+    // Fallback: scan grubenv blocks.
+    for path in files.iter() {
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n == "grubenv")
+            .unwrap_or(false)
+            && let Ok(bytes) = fs::read(path)
+            && let Some(v) = resolve_kernelopts_from_grubenv(&bytes)
+        {
+            return Some(v);
+        }
+    }
+
+    None
+}
+
+fn expand_kernelopts(options: &str, kernelopts: Option<&str>) -> Option<String> {
+    let ko = kernelopts?;
+    if options.contains("$kernelopts") || options.contains("${kernelopts}") {
+        let expanded = options
+            .replace("${kernelopts}", ko)
+            .replace("$kernelopts", ko);
+        return normalize_kernel_options(&expanded);
+    }
+    None
+}
+
+fn extract_loader_entry_options(entry: &str, kernel_name: &str) -> Option<String> {
+    let mut linux_matches = false;
+    let mut options = None;
+
+    for line in entry.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("linux ") {
+            let linux_path = rest.split_whitespace().next().unwrap_or_default();
+            let linux_base = std::path::Path::new(linux_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(linux_path);
+            // Some images use a symlink like "vmlinuz" in loader entries while the extracted
+            // kernel file is versioned (or vice-versa). Prefer an exact match, but allow a
+            // conservative compatibility match when either side is the common "vmlinuz" alias.
+            linux_matches = linux_base == kernel_name
+                || (linux_base == "vmlinuz" && kernel_name.starts_with("vmlinuz"))
+                || (kernel_name == "vmlinuz" && linux_base.starts_with("vmlinuz"));
+        } else if let Some(rest) = trimmed.strip_prefix("options ") {
+            options = normalize_kernel_options(rest);
+        }
+    }
+
+    if linux_matches { options } else { None }
+}
+
+fn extract_grub_linux_options(line: &str, kernel_name: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let prefixes = ["linux ", "linuxefi ", "linux16 "];
+    let rest = prefixes
+        .iter()
+        .find_map(|prefix| trimmed.strip_prefix(prefix))?;
+
+    let mut parts = rest.split_whitespace();
+    let kernel_path = parts.next()?;
+    let kernel_base = std::path::Path::new(kernel_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(kernel_path);
+    if kernel_base != kernel_name {
+        return None;
+    }
+
+    normalize_kernel_options(&parts.collect::<Vec<_>>().join(" "))
+}
+
+fn choose_kernel_options(files: &[PathBuf], kernel_name: &str) -> Option<String> {
+    let kernelopts = resolve_kernelopts(files);
+
+    let mut loader_entries = files
+        .iter()
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("conf"))
+        .cloned()
+        .collect::<Vec<_>>();
+    loader_entries.sort();
+    loader_entries.reverse();
+
+    // First pass: find an entry whose "linux" line matches the extracted kernel.
+    for path in loader_entries.iter() {
+        let content = match fs::read_to_string(path) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(options) = extract_loader_entry_options(&content, kernel_name) {
+            if let Some(expanded) = expand_kernelopts(&options, kernelopts.as_deref()) {
+                return Some(expanded);
+            }
+            return Some(options);
+        }
+    }
+
+    // Second pass: if the loader entry does not reference the exact same kernel filename
+    // (eg. symlink vs versioned kernel), fall back to the newest *non-rescue* entry that
+    // contains a root= argument.
+    for path in loader_entries.iter() {
+        let content = match fs::read_to_string(path) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let lower = content.to_lowercase();
+        if lower.contains("rescue") || lower.contains("recovery") || lower.contains("fallback") {
+            continue;
+        }
+        let mut options_line = None;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("options ") {
+                options_line = normalize_kernel_options(rest);
+                break;
+            }
+        }
+        if let Some(opts) = options_line {
+            if let Some(expanded) = expand_kernelopts(&opts, kernelopts.as_deref())
+                && expanded.split_whitespace().any(|t| t.starts_with("root="))
+            {
+                return Some(expanded);
+            }
+            if opts.split_whitespace().any(|t| t.starts_with("root=")) {
+                return Some(opts);
+            }
+        }
+    }
+
+    let mut grub_cfgs = files
+        .iter()
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("cfg"))
+        .cloned()
+        .collect::<Vec<_>>();
+    grub_cfgs.sort();
+    grub_cfgs.reverse();
+
+    // First pass: grub.cfg linux line matches the extracted kernel.
+    for path in grub_cfgs.iter() {
+        let content = match fs::read_to_string(path) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        for line in content.lines() {
+            if let Some(options) = extract_grub_linux_options(line, kernel_name) {
+                if let Some(expanded) = expand_kernelopts(&options, kernelopts.as_deref()) {
+                    return Some(expanded);
+                }
+                return Some(options);
+            }
+        }
+    }
+
+    // Second pass: fall back to the first non-rescue linux line that contains a root= argument.
+    for path in grub_cfgs.iter() {
+        let content = match fs::read_to_string(path) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        for line in content.lines() {
+            let trimmed = line.trim();
+            let prefixes = ["linux ", "linuxefi ", "linux16 "];
+            let rest = match prefixes.iter().find_map(|p| trimmed.strip_prefix(p)) {
+                Some(v) => v,
+                None => continue,
+            };
+            if trimmed.contains("rescue") || trimmed.contains("recovery") {
+                continue;
+            }
+            let parts = rest.split_whitespace().collect::<Vec<_>>();
+            if parts.len() < 2 {
+                continue;
+            }
+            if let Some(opts) = normalize_kernel_options(&parts[1..].join(" ")) {
+                if let Some(expanded) = expand_kernelopts(&opts, kernelopts.as_deref())
+                    && expanded.split_whitespace().any(|t| t.starts_with("root="))
+                {
+                    return Some(expanded);
+                }
+                if opts.split_whitespace().any(|t| t.starts_with("root=")) {
+                    return Some(opts);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn partition_size_bytes(part: &PartitionSlice) -> u64 {
+    part.sectors.saturating_mul(512)
+}
+
+async fn has_command(cmd: &str, arg: &str) -> bool {
+    tokio::process::Command::new(cmd)
+        .arg(arg)
+        .output()
+        .await
+        .is_ok()
+}
+
+#[allow(dead_code)]
+async fn check_userspace_extract_tools() -> Result<()> {
+    for (cmd, arg) in [("qemu-img", "--version"), ("dd", "--version")] {
+        tokio::process::Command::new(cmd)
+            .arg(arg)
+            .output()
+            .await
+            .with_context(|| format!("could not find {}", cmd))?;
+    }
+
+    let have_debugfs = has_command("debugfs", "-V").await;
+    let have_mcopy = has_command("mcopy", "-V").await;
+    let have_7z = has_command("7z", "i").await;
+    anyhow::ensure!(
+        have_debugfs || have_mcopy || have_7z,
+        "userspace extraction requires debugfs, mcopy, or 7z"
+    );
+    Ok(())
+}
+
+async fn write_partition_image(
+    raw_path: &Path,
+    image_dir: &Path,
+    part: &PartitionSlice,
+) -> Result<PathBuf> {
+    let part_path = image_dir.join(format!(".extract-part-{}.img", part.number));
+    let _ = tokio::fs::remove_file(&part_path).await;
+
+    let output = tokio::process::Command::new("dd")
+        .arg(format!("if={}", raw_path.display()))
+        .arg(format!("of={}", part_path.display()))
+        .arg("bs=512")
+        .arg(format!("skip={}", part.start_lba))
+        .arg(format!("count={}", part.sectors))
+        .arg("status=none")
+        .output()
+        .await
+        .with_context(|| format!("failed to execute dd for partition {}", part.number))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("dd failed for partition {}: {}", part.number, stderr.trim());
+    }
+
+    Ok(part_path)
+}
+
+async fn dump_partition_subdir_with_mcopy(
+    part_path: &Path,
+    dump_dir: &Path,
+    subdir: &str,
+) -> Result<Option<PathBuf>> {
+    if !has_command("mcopy", "-V").await {
+        return Ok(None);
+    }
+
+    let source = match subdir {
+        "/" => "::/",
+        "/boot" => "::/boot",
+        _ => return Ok(None),
+    };
+
+    let output = tokio::process::Command::new("mcopy")
+        .arg("-s")
+        .arg("-n")
+        .arg("-i")
+        .arg(part_path)
+        .arg(source)
+        .arg(dump_dir)
+        .output()
+        .await
+        .with_context(|| format!("failed to execute mcopy against {}", part_path.display()))?;
+
+    if !output.status.success() {
+        let _ = tokio::fs::remove_dir_all(dump_dir).await;
+        return Ok(None);
+    }
+
+    Ok(Some(dump_dir.to_path_buf()))
+}
+
+async fn dump_partition_subdir_with_7z(
+    part_path: &Path,
+    dump_dir: &Path,
+) -> Result<Option<PathBuf>> {
+    if !has_command("7z", "i").await {
+        return Ok(None);
+    }
+
+    let output = tokio::process::Command::new("7z")
+        .arg("x")
+        .arg("-y")
+        .arg(format!("-o{}", dump_dir.display()))
+        .arg(part_path)
+        .output()
+        .await
+        .with_context(|| format!("failed to execute 7z against {}", part_path.display()))?;
+
+    if !output.status.success() {
+        let _ = tokio::fs::remove_dir_all(dump_dir).await;
+        return Ok(None);
+    }
+
+    Ok(Some(dump_dir.to_path_buf()))
+}
+
+async fn dump_partition_subdir(
+    part_path: &Path,
+    image_dir: &Path,
+    part: &PartitionSlice,
+    subdir: &str,
+) -> Result<Option<PathBuf>> {
+    let sanitized = if subdir == "/" { "root" } else { "boot" };
+    let dump_dir = image_dir.join(format!(".extract-{}-{}", sanitized, part.number));
+    let _ = tokio::fs::remove_dir_all(&dump_dir).await;
+
+    tokio::fs::create_dir_all(&dump_dir)
+        .await
+        .with_context(|| format!("failed to create {}", dump_dir.display()))?;
+
+    if has_command("debugfs", "-V").await {
+        let output = tokio::process::Command::new("debugfs")
+            .arg("-R")
+            .arg(format!("rdump {} {}", subdir, dump_dir.display()))
+            .arg(part_path)
+            .output()
+            .await
+            .with_context(|| format!("failed to execute debugfs for partition {}", part.number))?;
+
+        if output.status.success() {
+            return Ok(Some(dump_dir));
+        }
+    }
+
+    if let Some(dir) = dump_partition_subdir_with_mcopy(part_path, &dump_dir, subdir).await? {
+        return Ok(Some(dir));
+    }
+
+    if let Some(dir) = dump_partition_subdir_with_7z(part_path, &dump_dir).await? {
+        return Ok(Some(dir));
+    }
+
+    let _ = tokio::fs::remove_dir_all(&dump_dir).await;
+    Ok(None)
+}
+
+async fn partition_contains_os_release(
+    part_path: &Path,
+    image_dir: &Path,
+    part: &PartitionSlice,
+) -> Result<bool> {
+    let probe_path = image_dir.join(format!(".extract-os-release-{}", part.number));
+    let _ = tokio::fs::remove_file(&probe_path).await;
+
+    let output = tokio::process::Command::new("debugfs")
+        .arg("-R")
+        .arg(format!("dump -p /etc/os-release {}", probe_path.display()))
+        .arg(part_path)
+        .output()
+        .await
+        .with_context(|| {
+            format!(
+                "failed to probe /etc/os-release in partition {}",
+                part.number
+            )
+        })?;
+
+    let exists = output.status.success() && probe_path.exists();
+    let _ = tokio::fs::remove_file(&probe_path).await;
+    Ok(exists)
+}
+
+#[allow(dead_code)]
+async fn extract_boot_artifacts_userspace(
+    image_dir: &Path,
+    file_name: &str,
+    distro: Distro,
+) -> Result<(PathBuf, PathBuf)> {
+    check_userspace_extract_tools().await?;
+
+    let raw_path = image_dir.join(format!("{}.raw", file_name));
+    let _ = tokio::fs::remove_file(&raw_path).await;
+
+    let convert = tokio::process::Command::new("qemu-img")
+        .arg("convert")
+        .arg("-O")
+        .arg("raw")
+        .arg(file_name)
+        .arg(&raw_path)
+        .current_dir(image_dir)
+        .output()
+        .await
+        .with_context(|| format!("failed to convert {} to raw", file_name))?;
+    if !convert.status.success() {
+        let stderr = String::from_utf8_lossy(&convert.stderr);
+        bail!("qemu-img convert failed: {}", stderr.trim());
+    }
+
+    let parts = list_partitions(&raw_path)?;
+    let mut root_hint = None;
+    let mut last_err = None;
+
+    for part in &parts {
+        let part_path = match write_partition_image(&raw_path, image_dir, part).await {
+            Ok(path) => path,
+            Err(err) => {
+                last_err = Some(err);
+                continue;
+            }
+        };
+
+        match partition_contains_os_release(&part_path, image_dir, part).await {
+            Ok(true) => {
+                root_hint = Some(part.number);
+            }
+            Ok(false) => {}
+            Err(err) => {
+                last_err = Some(err);
+            }
+        }
+
+        let _ = tokio::fs::remove_file(&part_path).await;
+        if root_hint.is_some() {
+            break;
+        }
+    }
+
+    for part in &parts {
+        let part_path = match write_partition_image(&raw_path, image_dir, part).await {
+            Ok(path) => path,
+            Err(err) => {
+                last_err = Some(err);
+                continue;
+            }
+        };
+
+        let mut dump_candidates = vec![("/boot", false)];
+        if partition_size_bytes(part) <= 2 * 1024 * 1024 * 1024 {
+            dump_candidates.push(("/", true));
+        }
+
+        let mut found = None;
+        for (subdir, is_partition_root) in dump_candidates {
+            let dump_dir = match dump_partition_subdir(&part_path, image_dir, part, subdir).await {
+                Ok(Some(dir)) => dir,
+                Ok(None) => continue,
+                Err(err) => {
+                    last_err = Some(err);
+                    continue;
+                }
+            };
+
+            let files = match collect_files_recursive(&dump_dir) {
+                Ok(v) => v,
+                Err(err) => {
+                    let _ = tokio::fs::remove_dir_all(&dump_dir).await;
+                    last_err = Some(err);
+                    continue;
+                }
+            };
+
+            let kernel_src = choose_kernel_file(&files, distro.clone());
+            let initrd_src = choose_initrd_file(&files, distro.clone());
+            if let (Some(kernel_src), Some(initrd_src)) = (kernel_src, initrd_src) {
+                let kernel_name = kernel_src
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let kernel_args = choose_kernel_options(&files, &kernel_name);
+                found = Some((
+                    dump_dir,
+                    kernel_src,
+                    initrd_src,
+                    is_partition_root,
+                    kernel_args,
+                ));
+                break;
+            }
+
+            let _ = tokio::fs::remove_dir_all(&dump_dir).await;
+        }
+
+        let Some((dump_dir, kernel_src, initrd_src, is_partition_root, kernel_args)) = found else {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            continue;
+        };
+
+        let kernel_name = kernel_src
+            .file_name()
+            .and_then(|n| n.to_str())
+            .with_context(|| "invalid kernel filename")?
+            .to_string();
+        let initrd_name = initrd_src
+            .file_name()
+            .and_then(|n| n.to_str())
+            .with_context(|| "invalid initrd filename")?
+            .to_string();
+
+        let kernel_path = image_dir.join(&kernel_name);
+        let initrd_path = image_dir.join(&initrd_name);
+
+        fs::copy(&kernel_src, &kernel_path).with_context(|| {
+            format!(
+                "failed to copy extracted kernel {} -> {}",
+                kernel_src.display(),
+                kernel_path.display()
+            )
+        })?;
+        fs::copy(&initrd_src, &initrd_path).with_context(|| {
+            format!(
+                "failed to copy extracted initrd {} -> {}",
+                initrd_src.display(),
+                initrd_path.display()
+            )
+        })?;
+
+        let chosen_root = if is_partition_root {
+            root_hint
+                .or_else(|| {
+                    parts
+                        .iter()
+                        .find(|candidate| candidate.number != part.number)
+                        .map(|candidate| candidate.number)
+                })
+                .unwrap_or(part.number)
+        } else {
+            root_hint.unwrap_or(part.number)
+        };
+        fs::write(root_hint_path(image_dir), chosen_root.to_string()).with_context(|| {
+            format!(
+                "failed to write root partition hint in {}",
+                image_dir.display()
+            )
+        })?;
+        if let Some(args) = kernel_args {
+            fs::write(kernel_args_hint_path(image_dir), args).with_context(|| {
+                format!(
+                    "failed to write kernel args hint in {}",
+                    image_dir.display()
+                )
+            })?;
+        }
+
+        let _ = tokio::fs::remove_dir_all(&dump_dir).await;
+        let _ = tokio::fs::remove_file(&part_path).await;
+        let _ = tokio::fs::remove_file(&raw_path).await;
+        return Ok((kernel_path, initrd_path));
+    }
+
+    let _ = tokio::fs::remove_file(&raw_path).await;
+
+    if let Some(err) = last_err {
+        return Err(err)
+            .with_context(|| "userspace qcow2 extraction did not find a usable /boot tree");
+    }
+
+    bail!("userspace qcow2 extraction did not find kernel/initrd in any partition");
 }
 
 async fn detect_root_arg(image_path: &Path) -> Result<String> {
     let image_dir = image_path.parent().with_context(|| "missing image dir")?;
+    let kernel_args_path = kernel_args_hint_path(image_dir);
+    if let Ok(args) = fs::read_to_string(&kernel_args_path) {
+        let trimmed = args.trim();
+        if !trimmed.is_empty() {
+            // Some guestfs outputs include a trailing ':' after device names (e.g. /dev/sda3:).
+            // Also, some bootloader entries may embed `root=/dev/vda3:`.
+            // Sanitize these so direct-kernel boot does not hang waiting for a non-existent device.
+            let sanitized = trimmed
+                .split_whitespace()
+                .map(|t| {
+                    if let Some(rest) = t.strip_prefix("root=") {
+                        let clean = rest.trim_end_matches(':');
+                        format!("root={clean}")
+                    } else {
+                        t.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            return Ok(sanitized);
+        }
+    }
+
+    let hint_path = root_hint_path(image_dir);
+    if let Ok(hint) = fs::read_to_string(&hint_path)
+        && let Ok(part) = hint.trim().parse::<usize>()
+    {
+        return Ok(format!("root=/dev/vda{}", part));
+    }
+
     let file_name = image_path
         .file_name()
         .and_then(|v| v.to_str())
@@ -1335,6 +2920,8 @@ async fn detect_root_arg(image_path: &Path) -> Result<String> {
             dev = Some(parts[1]);
         }
         if let Some(d) = dev {
+            // guestfish `mountpoints` typically prints `/dev/sda3: /`.
+            let d = d.trim_end_matches(':');
             let virt = if let Some(rest) = d.strip_prefix("/dev/sd") {
                 format!("/dev/vd{}", rest)
             } else {
@@ -1490,7 +3077,7 @@ impl ImageAction for Debian {
 }
 
 // ---------------------------------------------------------------------------
-// Ubuntu - uses pre-extracted kernel/initrd from official cloud images
+// Ubuntu - downloads the official cloud image and extracts kernel/initrd via libguestfs
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default)]
@@ -1503,8 +3090,8 @@ impl ImageAction for Ubuntu {
 
         let resolved = resolve_ubuntu_noble_cloudimg().await?;
         debug!(
-            "Resolved Ubuntu cloud image from {}: disk={}, kernel={}, initrd={}",
-            resolved.base_url, resolved.disk_name, resolved.kernel_name, resolved.initrd_name
+            "Resolved Ubuntu cloud image from {}: disk={}",
+            resolved.base_url, resolved.disk_name
         );
 
         let qcow2_path = image_dir.join(format!("{}.qcow2", name));
@@ -1517,55 +3104,17 @@ impl ImageAction for Ubuntu {
         )
         .await?;
 
-        let kernel_path = image_dir.join("vmlinuz");
-        let kernel_url = join_url(
-            &resolved.base_url,
-            &format!("unpacked/{}", resolved.kernel_name),
-        );
-        if let Some(kernel_sha256) = resolved.kernel_sha256.as_deref() {
-            download_or_copy_with_hash(
-                &ImageSource::Url(kernel_url),
-                &kernel_path,
-                kernel_sha256,
-                ShaType::Sha256,
-            )
-            .await?;
-        } else {
-            download_or_copy_without_hash(&ImageSource::Url(kernel_url), &kernel_path).await?;
-        }
-
-        let initrd_path = image_dir.join("initrd.img");
-        let initrd_url = join_url(
-            &resolved.base_url,
-            &format!("unpacked/{}", resolved.initrd_name),
-        );
-        if let Some(initrd_sha256) = resolved.initrd_sha256.as_deref() {
-            download_or_copy_with_hash(
-                &ImageSource::Url(initrd_url),
-                &initrd_path,
-                initrd_sha256,
-                ShaType::Sha256,
-            )
-            .await?;
-        } else {
-            download_or_copy_without_hash(&ImageSource::Url(initrd_url), &initrd_path).await?;
-        }
-
         Ok(())
     }
 
     async fn extract(&self, name: &str) -> Result<(PathBuf, PathBuf)> {
-        // Files already downloaded in download() phase
+        let file_name = format!("{}.qcow2", name);
         let dirs = QleanDirs::new()?;
         let image_dir = dirs.images.join(name);
 
-        let kernel = image_dir.join("vmlinuz");
-        let initrd = image_dir.join("initrd.img");
-
-        anyhow::ensure!(kernel.exists(), "kernel file not found after download");
-        anyhow::ensure!(initrd.exists(), "initrd file not found after download");
-
-        Ok((kernel, initrd))
+        extract_boot_artifacts_guestfs(&image_dir, &file_name, Distro::Ubuntu)
+            .await
+            .with_context(|| "failed to extract Ubuntu kernel/initrd from qcow2")
     }
 
     fn distro(&self) -> Distro {
@@ -1574,7 +3123,7 @@ impl ImageAction for Ubuntu {
 }
 
 // ---------------------------------------------------------------------------
-// Fedora - uses pre-extracted kernel/initrd from official cloud images
+// Fedora - uses the official cloud image and extracts kernel/initrd via libguestfs
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default)]
@@ -1610,55 +3159,13 @@ impl ImageAction for Fedora {
     }
 
     async fn extract(&self, name: &str) -> Result<(PathBuf, PathBuf)> {
-        ensure_extraction_prerequisites().await?;
-
         let file_name = format!("{}.qcow2", name);
         let dirs = QleanDirs::new()?;
         let image_dir = dirs.images.join(name);
 
-        let extract_result = async {
-            let boot_files = guestfish_ls_boot(&image_dir, &file_name)
-                .await
-                .with_context(|| "failed to read /boot from Fedora image with guestfish")?;
-            let mut kernel_name = None;
-            let mut initrd_name = None;
-
-            for line in boot_files.lines() {
-                let file = line.trim();
-                if file.starts_with("vmlinuz") {
-                    kernel_name = Some(file.to_string());
-                } else if file.starts_with("initramfs") {
-                    initrd_name = Some(file.to_string());
-                }
-            }
-
-            let kernel_name =
-                kernel_name.with_context(|| "failed to find kernel file (vmlinuz*) in /boot")?;
-            let initrd_name =
-                initrd_name.with_context(|| "failed to find initrd file (initramfs*) in /boot")?;
-
-            let kernel_src = format!("/boot/{}", kernel_name);
-            virt_copy_out(&image_dir, &file_name, &kernel_src, "kernel").await?;
-
-            let initrd_src = format!("/boot/{}", initrd_name);
-            virt_copy_out(&image_dir, &file_name, &initrd_src, "initrd").await?;
-
-            let kernel_path = image_dir.join(&kernel_name);
-            let initrd_path = image_dir.join(&initrd_name);
-            Ok::<(PathBuf, PathBuf), anyhow::Error>((kernel_path, initrd_path))
-        }
-        .await;
-
-        match extract_result {
-            Ok(paths) => Ok(paths),
-            Err(e) => {
-                warn!(
-                    "Fedora kernel/initrd extraction failed: {:#}. Using disk boot fallback.",
-                    e
-                );
-                write_unavailable_boot_artifacts(&image_dir, "fedora extraction failed").await
-            }
-        }
+        extract_boot_artifacts_guestfs(&image_dir, &file_name, Distro::Fedora)
+            .await
+            .with_context(|| "failed to extract Fedora kernel/initrd from qcow2")
     }
 
     fn distro(&self) -> Distro {
@@ -1667,7 +3174,7 @@ impl ImageAction for Fedora {
 }
 
 // ---------------------------------------------------------------------------
-// Arch - uses official cloud images
+// Arch - uses the official cloud image and extracts kernel/initrd via libguestfs
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default)]
@@ -1700,55 +3207,13 @@ impl ImageAction for Arch {
     }
 
     async fn extract(&self, name: &str) -> Result<(PathBuf, PathBuf)> {
-        ensure_extraction_prerequisites().await?;
-
         let file_name = format!("{}.qcow2", name);
         let dirs = QleanDirs::new()?;
         let image_dir = dirs.images.join(name);
 
-        let extract_result = async {
-            let boot_files = guestfish_ls_boot(&image_dir, &file_name)
-                .await
-                .with_context(|| "failed to read /boot from Arch image with guestfish")?;
-            let mut kernel_name = None;
-            let mut initrd_name = None;
-
-            for line in boot_files.lines() {
-                let file = line.trim();
-                if file.starts_with("vmlinuz") {
-                    kernel_name = Some(file.to_string());
-                } else if file.starts_with("initramfs") && file.contains("linux.img") {
-                    initrd_name = Some(file.to_string());
-                }
-            }
-
-            let kernel_name =
-                kernel_name.with_context(|| "failed to find kernel file (vmlinuz*) in /boot")?;
-            let initrd_name = initrd_name
-                .with_context(|| "failed to find initrd file (initramfs*linux.img) in /boot")?;
-
-            let kernel_src = format!("/boot/{}", kernel_name);
-            virt_copy_out(&image_dir, &file_name, &kernel_src, "kernel").await?;
-
-            let initrd_src = format!("/boot/{}", initrd_name);
-            virt_copy_out(&image_dir, &file_name, &initrd_src, "initrd").await?;
-
-            let kernel_path = image_dir.join(&kernel_name);
-            let initrd_path = image_dir.join(&initrd_name);
-            Ok::<(PathBuf, PathBuf), anyhow::Error>((kernel_path, initrd_path))
-        }
-        .await;
-
-        match extract_result {
-            Ok(paths) => Ok(paths),
-            Err(e) => {
-                warn!(
-                    "Arch kernel/initrd extraction failed: {:#}. Using disk boot fallback.",
-                    e
-                );
-                write_unavailable_boot_artifacts(&image_dir, "arch extraction failed").await
-            }
-        }
+        extract_boot_artifacts_guestfs(&image_dir, &file_name, Distro::Arch)
+            .await
+            .with_context(|| "failed to extract Arch kernel/initrd from qcow2")
     }
 
     fn distro(&self) -> Distro {
@@ -1757,7 +3222,7 @@ impl ImageAction for Arch {
 }
 
 // ---------------------------------------------------------------------------
-// Custom - user-provided image with flexible configuration (WSL-friendly)
+// Custom - user-provided image with flexible configuration
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -1934,10 +3399,7 @@ impl Image {
     }
 
     pub fn prefer_direct_kernel_boot(&self) -> bool {
-        match self {
-            Image::Debian(_) | Image::Ubuntu(_) => true,
-            Image::Fedora(_) | Image::Arch(_) | Image::Custom(_) => false,
-        }
+        true
     }
 }
 
@@ -2096,6 +3558,44 @@ f0442f3cd0087a609ecd5241109ddef0cbf4a1e05372e13d82c97fc77b35b2d8ecff85aea6770915
         assert_eq!(
             find_hash_for_file(f3, "initrd.img"),
             Some("bbb".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_apt_depends_for_kernel_package_prefers_concrete_image() {
+        let text = r#"
+Depends: linux-image-virtual
+Depends: linux-image-6.8.0-71-generic
+Depends: initramfs-tools
+"#;
+        assert_eq!(
+            parse_apt_depends_for_kernel_package(text).as_deref(),
+            Some("linux-image-6.8.0-71-generic")
+        );
+    }
+
+    #[test]
+    fn test_derive_modules_package_name_for_signed_and_unsigned_images() {
+        assert_eq!(
+            derive_modules_package_name("linux-image-6.8.0-71-generic").as_deref(),
+            Some("linux-modules-6.8.0-71-generic")
+        );
+        assert_eq!(
+            derive_modules_package_name("linux-image-unsigned-6.8.0-71-generic").as_deref(),
+            Some("linux-modules-6.8.0-71-generic")
+        );
+    }
+
+    #[test]
+    fn test_parse_apt_search_for_kernel_package_picks_latest_match() {
+        let text = r#"
+linux-image-6.8.0-65-generic - Signed kernel image generic
+linux-image-6.8.0-71-generic - Signed kernel image generic
+linux-image-generic - Complete Generic Linux kernel and headers
+"#;
+        assert_eq!(
+            parse_apt_search_for_kernel_package(text).as_deref(),
+            Some("linux-image-6.8.0-71-generic")
         );
     }
 

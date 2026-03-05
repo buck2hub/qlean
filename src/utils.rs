@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+
 use dir_lock::DirLock;
 use directories::ProjectDirs;
 use rand::Rng;
@@ -15,6 +16,11 @@ pub static HEX_ALPHABET: [char; 16] = [
 ];
 
 pub const VIRSH_CONNECTION_URI: &str = "qemu:///system";
+pub const QLEAN_BRIDGE_NAME: &str = "qlbr0";
+
+// NOTE: `derive_mac()` was previously used by an experimental multi-NIC TCP hostfwd
+// path. The current implementation is vsock-only, so we avoid keeping unused code
+// that triggers `dead_code` warnings.
 
 pub struct QleanDirs {
     pub base: PathBuf,
@@ -126,8 +132,8 @@ impl CommandExt for tokio::process::Command {
 /// Ensure host prerequisites for running virtual machines.
 ///
 /// IMPORTANT: This intentionally does **not** require libguestfs tools.
-/// Some images (e.g., Ubuntu) ship pre-extracted kernel/initrd and can boot
-/// without `guestfish`/`virt-copy-out`.
+/// Image creation may need `guestfish`/`virt-copy-out`, but VM launch itself
+/// uses the already-extracted kernel/initrd artifacts on disk.
 pub async fn ensure_prerequisites() -> Result<()> {
     check_command_available("qemu-system-x86_64").await?;
     check_command_available("qemu-img").await?;
@@ -156,6 +162,37 @@ async fn check_command_available(cmd: &str) -> Result<()> {
         .await
         .with_context(|| format!("could not find {}", cmd))?;
     Ok(())
+}
+
+pub fn has_iface(name: &str) -> bool {
+    Path::new(&format!("/sys/class/net/{name}")).exists()
+}
+
+pub fn bridge_conf_allows(bridge: &str) -> bool {
+    let conf = match std::fs::read_to_string("/etc/qemu/bridge.conf") {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    for line in conf.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix("allow ") {
+            let allowed = rest.trim();
+            if allowed == "all" || allowed == bridge {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+pub fn has_vsock_support() -> bool {
+    Path::new("/dev/vhost-vsock").exists()
 }
 
 async fn ensure_network() -> Result<()> {

@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use russh::{
     ChannelMsg, Disconnect,
     keys::{
@@ -17,12 +17,18 @@ use russh::{
 use russh_sftp::{client::SftpSession, protocol::OpenFlags};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-    time::Instant,
+    time::{Instant, sleep},
 };
 use tokio_util::sync::CancellationToken;
 use tokio_vsock::{VsockAddr, VsockStream};
 use tracing::{debug, error, info, warn};
+
+// MAC address string in canonical form (e.g. "52:54:00:aa:bb:cc").
+
+// Avoid adding a libc dependency just to match a couple errno constants.
+// These values are stable across Linux and are used only for user-facing hints.
+const ERR_EACCES: i32 = 13; // Permission denied
+const ERR_ENODEV: i32 = 19; // No such device
 
 #[derive(Clone, Debug)]
 pub struct PersistedSshKeypair {
@@ -84,7 +90,7 @@ pub fn get_ssh_key(dir: &Path) -> Result<PersistedSshKeypair> {
     Ok(keypair)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct SshClient {}
 
 // More SSH event handlers can be defined in this trait
@@ -140,29 +146,55 @@ impl Session {
             tokio::time::sleep(Duration::from_millis(100)).await;
 
             // Establish vsock connection
-            let stream = match VsockStream::connect(vsock_addr).await {
-                Ok(stream) => stream,
-                Err(ref e) if e.raw_os_error() == Some(19) => {
-                    // This is "No such device" but for some reason Rust doesn't have an IO
-                    // ErrorKind for it. Meh.
+            let connect_budget = timeout
+                .saturating_sub(now.elapsed())
+                .max(Duration::from_millis(1));
+            let stream = match tokio::time::timeout(
+                connect_budget,
+                VsockStream::connect(vsock_addr),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => stream,
+                Err(_) => {
+                    warn!("Timeout while connecting to VM via vsock");
+                    bail!(
+                        "Timeout while connecting to VM via vsock.
+Hint: Qlean uses vhost-vsock for SSH. Ensure /dev/vhost-vsock exists and the hypervisor provides a working vsock path."
+                    );
+                }
+                Ok(Err(ref e)) if e.raw_os_error() == Some(ERR_EACCES) => {
+                    bail!(
+                        "Permission denied while connecting via vsock: {e}\n\
+Hint: Ensure your user can access /dev/vhost-vsock (usually by being in the 'kvm' group) or run as root."
+                    );
+                }
+                Ok(Err(ref e)) if e.raw_os_error() == Some(ERR_ENODEV) => {
+                    // ENODEV is commonly observed while QEMU is still booting/initializing the vsock
+                    // transport (e.g. the guest CID isn't ready yet). Treat it as transient and retry
+                    // until the overall timeout is reached.
+                    debug!("SSH vsock connect not ready yet (ENODEV): {e} (will retry)");
                     if now.elapsed() > timeout {
-                        // Don't log this as an error here: higher-level logic may fall back to TCP.
-                        warn!("Timeout connecting to VM via vsock");
-                        bail!("Timeout");
+                        // Keep this at warn level: transient vsock timing issues are expected while the VM boots.
+                        warn!("Timeout while connecting to VM via vsock");
+                        bail!(
+                            "Timeout while connecting to VM via vsock.\n\
+Hint: Qlean uses vhost-vsock for SSH. Ensure /dev/vhost-vsock exists and the hypervisor provides a working vsock path."
+                        );
                     }
                     continue;
                 }
-                Err(ref e) => match e.kind() {
+                Ok(Err(ref e)) => match e.kind() {
                     ErrorKind::TimedOut
                     | ErrorKind::ConnectionRefused
                     | ErrorKind::ConnectionReset
                     | ErrorKind::NetworkUnreachable
                     | ErrorKind::AddrNotAvailable => {
                         if now.elapsed() > timeout {
-                            // Higher-level logic may fall back to TCP; keep this at warn level.
+                            // Keep this at warn level: transient vsock timing issues are expected while the VM boots.
                             warn!("Timeout while connecting to VM via vsock");
                             bail!(
-                                "Timeout while connecting to VM via vsock.\n\
+                                "Timeout while connecting to VM via vsock.
 Hint: Qlean uses vhost-vsock for SSH. Ensure /dev/vhost-vsock exists and the hypervisor provides a working vsock path."
                             );
                         }
@@ -176,9 +208,24 @@ Hint: Qlean uses vhost-vsock for SSH. Ensure /dev/vhost-vsock exists and the hyp
             };
 
             // Connect to SSH via vsock stream
-            match russh::client::connect_stream(config.clone(), stream, sh.clone()).await {
-                Ok(x) => break x,
-                Err(russh::Error::IO(ref e)) => {
+            let handshake_budget = timeout
+                .saturating_sub(now.elapsed())
+                .max(Duration::from_millis(1));
+            match tokio::time::timeout(
+                handshake_budget,
+                russh::client::connect_stream(config.clone(), stream, sh.clone()),
+            )
+            .await
+            {
+                Ok(Ok(x)) => break x,
+                Err(_) => {
+                    warn!("Timeout establishing SSH over vsock");
+                    bail!(
+                        "Timeout establishing SSH handshake over vsock.\n\
+Hint: Ensure the guest exposes SSH over vsock (Qlean configures a vsock->TCP proxy via cloud-init) and that the VM finished booting."
+                    );
+                }
+                Ok(Err(russh::Error::IO(ref e))) => {
                     match e.kind() {
                         // The VM is still booting at this point so we're just ignoring these errors
                         // for some time.
@@ -187,7 +234,10 @@ Hint: Qlean uses vhost-vsock for SSH. Ensure /dev/vhost-vsock exists and the hyp
                         | ErrorKind::UnexpectedEof => {
                             if now.elapsed() > timeout {
                                 warn!("Timeout establishing SSH over vsock");
-                                bail!("Timeout");
+                                bail!(
+                                    "Timeout establishing SSH handshake over vsock.\n\
+Hint: Ensure the guest exposes SSH over vsock (Qlean configures a vsock->TCP proxy via cloud-init) and that the VM finished booting."
+                                );
                             }
                         }
                         e => {
@@ -196,38 +246,45 @@ Hint: Qlean uses vhost-vsock for SSH. Ensure /dev/vhost-vsock exists and the hyp
                         }
                     }
                 }
-                Err(russh::Error::Disconnect) => {
+                Ok(Err(russh::Error::Disconnect)) => {
                     if now.elapsed() > timeout {
                         warn!("Timeout establishing SSH over vsock (disconnect loop)");
-                        bail!("Timeout");
+                        bail!(
+                            "Timeout establishing SSH handshake over vsock.\n\
+Hint: Ensure the guest exposes SSH over vsock (Qlean configures a vsock->TCP proxy via cloud-init) and that the VM finished booting."
+                        );
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     error!("SSH client error: {e}");
                     bail!("SSH client error: {e}");
                 }
             }
         };
         debug!("Authenticating via SSH");
-
-        // use publickey authentication
-        let auth_res = session
-            .authenticate_publickey(
+        let auth_budget = timeout
+            .saturating_sub(now.elapsed())
+            .max(Duration::from_secs(1));
+        let auth_res = tokio::time::timeout(
+            auth_budget,
+            session.authenticate_publickey(
                 username,
                 PrivateKeyWithHashAlg::new(Arc::new(privkey), None),
-            )
-            .await?;
-
+            ),
+        )
+        .await
+        .with_context(|| format!("SSH authentication timed out for user {username}"))??;
         if !auth_res.success() {
             bail!("Authentication (with publickey) failed");
         }
-
         Ok(Self {
             session,
             sftp: None,
         })
     }
 
+    // NOTE: TCP-based SSH fallback intentionally not supported.
+    // Reviewer feedback: avoid architecture changes that introduce non-vsock transports.
     /// Open an SFTP session over the existing SSH connection.
     async fn open_sftp(&mut self) -> Result<SftpSession> {
         let channel = self.session.channel_open_session().await?;
@@ -361,197 +418,81 @@ Hint: Qlean uses vhost-vsock for SSH. Ensure /dev/vhost-vsock exists and the hyp
         Ok(())
     }
 
-    /// Connect to an SSH server via TCP (used as a fallback when vsock is unavailable or flaky).
-    async fn connect_tcp(
-        privkey: PrivateKey,
-        username: &str,
-        host: &str,
-        port: u16,
-        timeout: Duration,
-        cancel_token: CancellationToken,
-    ) -> Result<Self> {
-        let config = russh::client::Config {
-            keepalive_interval: Some(Duration::from_secs(5)),
-            ..<_>::default()
-        };
-        let config = Arc::new(config);
-        let sh = SshClient {};
-
-        let now = Instant::now();
-        info!("🔑 Connecting via tcp {}:{}", host, port);
-
-        let addr = format!("{}:{}", host, port);
-        let mut session = loop {
-            if cancel_token.is_cancelled() {
-                info!("SSH connection cancelled during connect loop");
-                bail!("SSH connection cancelled");
-            }
-
-            tokio::time::sleep(Duration::from_millis(100)).await;
-
-            let stream = match TcpStream::connect(&addr).await {
-                Ok(s) => s,
-                Err(e) => match e.kind() {
-                    ErrorKind::TimedOut
-                    | ErrorKind::ConnectionRefused
-                    | ErrorKind::ConnectionReset
-                    | ErrorKind::NetworkUnreachable
-                    | ErrorKind::AddrNotAvailable => {
-                        if now.elapsed() > timeout {
-                            bail!(
-                                "Timeout while connecting to VM via tcp {}\nHint: Ensure QEMU host port forwarding is enabled and the guest sshd is running.",
-                                addr
-                            );
-                        }
-                        continue;
-                    }
-                    _ => {
-                        error!("Unhandled TCP connect error: {e}");
-                        bail!("Unknown error");
-                    }
-                },
-            };
-
-            match russh::client::connect_stream(config.clone(), stream, sh.clone()).await {
-                Ok(x) => break x,
-                Err(russh::Error::IO(ref e)) => match e.kind() {
-                    ErrorKind::ConnectionRefused
-                    | ErrorKind::ConnectionReset
-                    | ErrorKind::UnexpectedEof => {
-                        if now.elapsed() > timeout {
-                            bail!("Timeout");
-                        }
-                    }
-                    _ => {
-                        error!("SSH vsock connect error: {e}");
-                        bail!("SSH vsock connect error: {e}");
-                    }
-                },
-                Err(russh::Error::Disconnect) => {
-                    if now.elapsed() > timeout {
-                        bail!("Timeout");
-                    }
-                }
-                Err(e) => {
-                    error!("SSH client error: {e}");
-                    bail!("SSH client error: {e}");
-                }
-            }
-        };
-
-        debug!("Authenticating via SSH");
-        let auth_res = session
-            .authenticate_publickey(
-                username,
-                PrivateKeyWithHashAlg::new(Arc::new(privkey), None),
-            )
-            .await?;
-        if !auth_res.success() {
-            bail!("Authentication (with publickey) failed");
-        }
-        Ok(Self {
-            session,
-            sftp: None,
-        })
-    }
+    // NOTE: TCP-based SSH is intentionally not supported.
+    // Qlean's E2E flow is expected to use vhost-vsock for host<->guest SSH.
 }
 
 /// Connect SSH and run a command that checks whether the system is ready for operation.
+/// Connect SSH over vhost-vsock and run a readiness probe.
+///
 pub async fn connect_ssh(
     cid: u32,
-    tcp_port: Option<u16>,
     timeout: Duration,
     keypair: PersistedSshKeypair,
     cancel_token: CancellationToken,
+    _mac_address: String,
 ) -> Result<Session> {
+    if !std::path::Path::new("/dev/vhost-vsock").exists() {
+        bail!("/dev/vhost-vsock is missing. Qlean requires vhost-vsock for SSH (no TCP fallback).")
+    }
+
     let privkey = PrivateKey::from_openssh(&keypair.privkey_str)?;
-    let users = [
-        "root",
-        "arch",
-        "fedora",
-        "ubuntu",
-        "debian",
-        "cloud-user",
-        "ec2-user",
-    ];
-    let vsock_supported = std::path::Path::new("/dev/vhost-vsock").exists();
-    let user_count = users.len() as u32;
-    let per_user_timeout = {
-        let slice = timeout / user_count.max(1);
-        let min_t = Duration::from_secs(8);
-        let max_t = Duration::from_secs(20);
-        if slice < min_t {
-            min_t
-        } else if slice > max_t {
-            max_t
-        } else {
-            slice
+    let deadline = Instant::now() + timeout;
+    let mut last_err: Option<anyhow::Error> = None;
+
+    while Instant::now() < deadline {
+        if cancel_token.is_cancelled() {
+            info!("SSH connection cancelled");
+            bail!("SSH connection cancelled");
         }
-    };
-    let mut last_tcp_err: Option<anyhow::Error> = None;
-    let mut last_vsock_err: Option<anyhow::Error> = None;
 
-    if let Some(port) = tcp_port {
-        info!("Connecting SSH via tcp 127.0.0.1:{}", port);
-        for user in users {
-            match Session::connect_tcp(
-                privkey.clone(),
-                user,
-                "127.0.0.1",
-                port,
-                per_user_timeout,
-                cancel_token.clone(),
-            )
-            .await
-            {
-                Ok(mut s) => {
-                    info!("✅ Connected via tcp as {}", user);
-                    let _ = s.call("true", cancel_token.clone()).await?;
-                    debug!("SSH command channel is ready");
-                    return Ok(s);
-                }
-                Err(e) => {
-                    warn!("SSH via tcp failed for user {}: {}", user, e);
-                    last_tcp_err = Some(e);
-                }
-            }
-        }
-    }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let per_attempt_timeout = Duration::from_secs(12)
+            .min(remaining.max(Duration::from_secs(1)))
+            .min(Duration::from_secs(25));
 
-    if !vsock_supported {
-        return Err(last_tcp_err.unwrap_or_else(|| {
-            anyhow::anyhow!("SSH connection failed over tcp and vhost-vsock is unavailable")
-        }));
-    }
+        info!(
+            "Connecting SSH via vsock cid={} port=22 as root (budget {:?})",
+            cid, per_attempt_timeout
+        );
 
-    info!("Falling back to vsock SSH");
-    for user in users {
         match Session::connect(
             privkey.clone(),
-            user,
+            "root",
             cid,
             22,
-            per_user_timeout,
+            per_attempt_timeout,
             cancel_token.clone(),
         )
         .await
         {
-            Ok(mut s) => {
-                info!("✅ Connected via vsock as {}", user);
-                let _ = s.call("true", cancel_token.clone()).await?;
+            Ok(mut session) => {
+                info!("✅ Connected via vsock as root");
+
+                let ready_budget = deadline.saturating_duration_since(Instant::now());
+                if ready_budget == Duration::ZERO {
+                    bail!("SSH connection timed out");
+                }
+
+                let _ =
+                    tokio::time::timeout(ready_budget, session.call("true", cancel_token.clone()))
+                        .await
+                        .context("SSH readiness probe timed out")??;
+
                 debug!("SSH command channel is ready");
-                return Ok(s);
+                return Ok(session);
             }
             Err(e) => {
-                warn!("SSH via vsock failed for user {}: {}", user, e);
-                last_vsock_err = Some(e);
+                warn!("SSH via vsock not ready yet: {}", e);
+                last_err = Some(e);
+                sleep(Duration::from_millis(250)).await;
             }
         }
     }
 
-    Err(last_vsock_err
-        .or(last_tcp_err)
-        .unwrap_or_else(|| anyhow::anyhow!("SSH connection failed")))
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!(
+        "Timeout establishing SSH over vsock. Hint: Ensure the guest exposes SSH over vsock and finished booting."
+    )))
 }
 
 impl Session {

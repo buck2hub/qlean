@@ -17,7 +17,9 @@ use tracing::{debug, error, info, trace, warn};
 use crate::{
     KVM_AVAILABLE, MachineConfig,
     machine::MachineImage,
-    utils::{CommandExt, QleanDirs},
+    utils::{
+        CommandExt, QLEAN_BRIDGE_NAME, QleanDirs, bridge_conf_allows, has_iface, has_vsock_support,
+    },
 };
 
 const QEMU_TIMEOUT: Duration = Duration::from_secs(360 * 60); // 6 hours
@@ -31,8 +33,6 @@ pub struct QemuLaunchParams {
     pub is_init: bool,
     pub cancel_token: CancellationToken,
     pub mac_address: String,
-    /// Optional host-forwarded TCP port for SSH (used as a fallback when vsock is unavailable).
-    pub ssh_tcp_port: Option<u16>,
 }
 
 pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
@@ -41,15 +41,20 @@ pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
 
     qemu_cmd
         // Decrease idle CPU usage
-        .args(["-machine", "hpet=off"])
-        // Vsock device (preferred transport)
-        .args([
-            "-device",
-            &format!(
-                "vhost-vsock-pci,id=vhost-vsock-pci0,guest-cid={}",
-                params.cid
-            ),
-        ]);
+        .args(["-machine", "hpet=off"]);
+
+    // Qlean's SSH transport is vhost-vsock. Without it we cannot reach the guest.
+    anyhow::ensure!(
+        has_vsock_support(),
+        "Missing /dev/vhost-vsock; vhost-vsock is required (no TCP fallback)."
+    );
+    qemu_cmd.args([
+        "-device",
+        &format!(
+            "vhost-vsock-pci,id=vhost-vsock-pci0,guest-cid={}",
+            params.cid
+        ),
+    ]);
 
     let use_direct_kernel_boot = params.image.prefer_direct_kernel_boot
         && params.image.kernel.exists()
@@ -61,17 +66,35 @@ pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
             .map(|m| m.len() > 0)
             .unwrap_or(false);
 
-    if use_direct_kernel_boot {
-        qemu_cmd
-            .args(["-kernel", params.image.kernel.to_str().unwrap()])
-            .args([
-                "-append",
-                &format!("rw {} console=ttyS0", params.image.root_arg),
-            ])
-            .args(["-initrd", params.image.initrd.to_str().unwrap()]);
-    } else {
-        warn!("Kernel/initrd extraction is unavailable. Booting from qcow2 disk image directly.");
+    anyhow::ensure!(
+        use_direct_kernel_boot,
+        "Kernel/initrd extraction is required before QEMU launch."
+    );
+
+    // Qlean configures an SSH endpoint over vsock through cloud-init. The guest listens on
+    // vsock port 22 and proxies to its regular TCP sshd listener.
+    //
+    // For Fedora/Arch images, a minimal "root=/dev/vdaX" command line is often insufficient.
+    // Cloud images may rely on BLS/GRUB kernelopts (UUID/rootflags/btrfs subvols, etc.).
+    // We therefore pass through the full kernel args extracted from /boot when available.
+    let mut tokens = params.image.root_arg.split_whitespace().collect::<Vec<_>>();
+    if !tokens.iter().any(|t| *t == "rw" || *t == "ro") {
+        tokens.push("rw");
     }
+    // Force NoCloud datasource for cloud-init so guests don't spend time probing
+    // metadata services that are unavailable in this test environment.
+    if !tokens.iter().any(|t| t.starts_with("ds=")) {
+        tokens.push("ds=nocloud");
+    }
+    if !tokens.iter().any(|t| t.starts_with("console=")) {
+        tokens.push("console=ttyS0,115200n8");
+    }
+    let kernel_cmdline = tokens.join(" ");
+
+    qemu_cmd
+        .args(["-kernel", params.image.kernel.to_str().unwrap()])
+        .args(["-append", &kernel_cmdline])
+        .args(["-initrd", params.image.initrd.to_str().unwrap()]);
 
     qemu_cmd
         // Disk
@@ -87,64 +110,55 @@ pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
 
     // ---------------------------------------------------------------------
     // Network
-    // Prefer bridged networking for parity with "real" hosts, but fall back to
-    // user-mode networking (slirp) when bridging is unavailable (common on WSL2
-    // or hosts without qemu bridge ACL configured).
-    //
-    // When using user-mode networking, we rely on hostfwd for SSH TCP fallback.
+    // Qlean requires the libvirt-managed bridge.
     // ---------------------------------------------------------------------
-    let bridge_name = "qlbr0";
-    let ssh_port = params.ssh_tcp_port;
-    let want_bridge = has_iface(bridge_name) && bridge_conf_allows(bridge_name);
+    let want_bridge = has_iface(QLEAN_BRIDGE_NAME) && bridge_conf_allows(QLEAN_BRIDGE_NAME);
 
-    if want_bridge {
-        qemu_cmd
-            .args(["-netdev", &format!("bridge,id=net0,br={bridge_name}")])
-            .args([
-                "-device",
-                &format!("virtio-net-pci,netdev=net0,mac={}", params.mac_address),
-            ]);
+    anyhow::ensure!(
+        want_bridge,
+        "QEMU bridge helper is not configured to allow '{}'. Hint: add `allow {}` (or `allow all`) to /etc/qemu/bridge.conf.",
+        QLEAN_BRIDGE_NAME,
+        QLEAN_BRIDGE_NAME
+    );
 
-        // Optional user-mode networking with host port forwarding for SSH fallback.
-        // This provides a TCP escape hatch even when vsock is unreliable.
-        if let Some(port) = ssh_port {
-            qemu_cmd
-                .args([
-                    "-netdev",
-                    &format!("user,id=net1,hostfwd=tcp:127.0.0.1:{}-:22", port),
-                ])
-                .args(["-device", "virtio-net-pci,netdev=net1"]);
-        }
-    } else {
-        warn!("Bridged networking is unavailable. Falling back to user-mode networking + hostfwd.");
-
-        let port = ssh_port.ok_or_else(|| {
-            anyhow::anyhow!("user-mode networking fallback requires ssh_tcp_port to be set")
-        })?;
-
-        qemu_cmd
-            .args([
-                "-netdev",
-                &format!("user,id=net0,hostfwd=tcp:127.0.0.1:{}-:22", port),
-            ])
-            .args([
-                "-device",
-                &format!("virtio-net-pci,netdev=net0,mac={}", params.mac_address),
-            ]);
-    }
+    qemu_cmd
+        .args([
+            "-netdev",
+            &format!("bridge,id=net0,br={}", QLEAN_BRIDGE_NAME),
+        ])
+        .args([
+            "-device",
+            &format!("virtio-net-pci,netdev=net0,mac={}", params.mac_address),
+        ]);
 
     // Memory and CPUs
     qemu_cmd
         .args(["-m", &params.config.mem.to_string()])
-        .args(["-smp", &params.config.core.to_string()])
-        // Output redirection
-        .args(["-serial", "mon:stdio"]);
+        .args(["-smp", &params.config.core.to_string()]);
+
+    // Output redirection
+    // We multiplex QEMU monitor + guest serial onto stdio AND tee it into a file under the run dir.
+    let dirs = QleanDirs::new()?;
+    let run_dir = dirs.runs.join(&params.vmid);
+    let serial_log = run_dir.join("serial.log");
+    qemu_cmd
+        .args([
+            "-chardev",
+            &format!(
+                "stdio,id=char0,mux=on,signal=off,logfile={},logappend=on",
+                serial_log.to_string_lossy()
+            ),
+        ])
+        .args(["-serial", "chardev:char0"])
+        .args(["-mon", "chardev=char0,mode=readline"]);
     if params.is_init {
         // Seed ISO
         qemu_cmd.args([
             "-drive",
             &format!(
-                "file={},if=virtio,media=cdrom",
+                // Use an emulated CD-ROM device for maximum compatibility with NoCloud on Fedora/Arch.
+                // Some images do not reliably scan virtio-cdrom paths during early boot.
+                "file={},if=ide,media=cdrom,readonly=on",
                 params.image.seed.to_str().unwrap()
             ),
         ]);
@@ -172,8 +186,7 @@ pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
 
     // Store QEMU PID
     let pid = qemu_child.id().expect("failed to get QEMU PID");
-    let dirs = QleanDirs::new()?;
-    let pid_file_path = dirs.runs.join(&params.vmid).join("qemu.pid");
+    let pid_file_path = run_dir.join("qemu.pid");
     tokio::fs::write(pid_file_path, pid.to_string()).await?;
 
     // Capture and log stdout
@@ -230,32 +243,4 @@ pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
     let _ = tokio::join!(stdout_task, stderr_task);
 
     result
-}
-
-fn bridge_conf_allows(bridge: &str) -> bool {
-    // qemu-bridge-helper enforces an ACL file (commonly /etc/qemu/bridge.conf).
-    // If the file is missing or doesn't allow the bridge, QEMU will fail with:
-    // "failed to parse default acl file `/etc/qemu/bridge.conf`" or "bridge helper failed".
-    let conf = match std::fs::read_to_string("/etc/qemu/bridge.conf") {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    for line in conf.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        // Supported entries: "allow <bridge>".
-        if let Some(rest) = line.strip_prefix("allow ") {
-            let b = rest.trim();
-            if b == "all" || b == bridge {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn has_iface(name: &str) -> bool {
-    std::path::Path::new(&format!("/sys/class/net/{name}")).exists()
 }

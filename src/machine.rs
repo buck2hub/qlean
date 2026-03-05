@@ -35,8 +35,6 @@ pub struct Machine {
     /// SSH session
     ssh: Option<Session>,
     cid: u32,
-    /// Host-forwarded TCP port reserved at startup and used as an SSH fallback when vsock is unavailable.
-    ssh_tcp_port: u16,
     /// QEMU process ID
     pid: Option<u32>,
     /// Indicates whether QEMU is expected to exit.
@@ -84,6 +82,39 @@ pub struct MetaData {
 pub struct UserData {
     pub disable_root: bool,
     pub ssh_authorized_keys: Vec<String>,
+
+    /// Optional cloud-init directives used to configure the guest at first boot.
+    ///
+    /// We use these to enable an SSH listener on vhost-vsock so that Qlean can
+    /// reach the guest without relying on TCP port forwarding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_files: Option<Vec<CloudInitWriteFile>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runcmd: Option<Vec<Vec<String>>>,
+
+    /// Additional cloud-init configuration.
+    ///
+    /// This is intentionally a loose YAML value so we can support a mix of distro
+    /// defaults (Ubuntu/Fedora/Arch) without encoding every schema detail in Rust.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub users: Option<serde_yml::Value>,
+
+    /// Explicitly disable password authentication.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_pwauth: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct CloudInitWriteFile {
+    pub path: String,
+    pub content: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 impl Default for MachineConfig {
@@ -139,13 +170,6 @@ impl Machine {
         // Get a free CID
         let cid = get_free_cid(&dirs.runs, &run_dir)?;
 
-        // Reserve an ephemeral local TCP port for SSH host forwarding.
-        // We don't keep the listener open; the goal is just to select a port that is very
-        // likely to be free. The QEMU command will fail loudly if there is a race.
-        let ssh_tcp_port = std::net::TcpListener::bind(("127.0.0.1", 0))
-            .map(|l| l.local_addr().map(|a| a.port()))
-            .map_err(|e| anyhow::anyhow!("Failed to reserve TCP port for SSH hostfwd: {e}"))??;
-
         // Prepare cloud-init config
         let meta_data = MetaData {
             instance_id: format!("VM-{}", &machine_id),
@@ -155,24 +179,165 @@ impl Machine {
         meta_data_str.insert_str(0, "#cloud-config\n");
         debug!("Writing cloud-init meta-data:\n{}", meta_data_str);
         tokio::fs::write(seed_dir.join("meta-data"), meta_data_str).await?;
+
+        // Enable an SSH path over vhost-vsock without requiring OpenSSH to accept an AF_VSOCK
+        // socket directly.
+        //
+        // VSOCK-only (no TCP fallback): provide SSH access exclusively via vhost-vsock.
+        //
+        // We intentionally do NOT depend on the guest distro enabling/running sshd.service.
+        // Instead, we use systemd socket activation and run `sshd -i` (inetd mode) for each
+        // incoming vsock connection.
+        //
+        // IMPORTANT: StandardOutput must be wired to the socket; otherwise clients may connect
+        // but never receive an SSH banner (hangs until handshake timeout).
+        let sshd_wrapper = r#"#!/bin/sh
+set -eu
+
+for p in /usr/sbin/sshd /usr/bin/sshd /sbin/sshd; do
+  if [ -x "$p" ]; then
+    exec "$p" "$@"
+  fi
+done
+
+echo "qlean: sshd not found" >&2
+exit 127
+"#
+        .to_string();
+
+        let vsock_socket_unit = r#"[Unit]
+Description=Qlean SSH over vhost-vsock (socket-activated sshd)
+
+[Socket]
+ListenStream=vsock::22
+Accept=yes
+
+[Install]
+WantedBy=sockets.target
+"#
+        .to_string();
+
+        let vsock_service_unit = r#"[Unit]
+Description=Qlean SSH over vhost-vsock (per-connection sshd)
+
+[Service]
+ExecStart=/usr/bin/qlean-sshd-run -i -e \
+  -o PermitRootLogin=yes \
+  -o PasswordAuthentication=no \
+  -o PubkeyAuthentication=yes \
+  -o AuthorizedKeysFile=/root/.ssh/authorized_keys \
+  -o StrictModes=yes
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+"#
+        .to_string();
+
         let user_data = UserData {
             disable_root: false,
             ssh_authorized_keys: vec![ssh_keypair.pubkey_str.clone()],
+            write_files: Some(vec![
+                CloudInitWriteFile {
+                    path: "/etc/systemd/system/qlean-sshd-vsock.socket".to_string(),
+                    content: vsock_socket_unit,
+                    permissions: Some("0644".to_string()),
+                    owner: Some("root:root".to_string()),
+                },
+                CloudInitWriteFile {
+                    path: "/etc/systemd/system/qlean-sshd-vsock@.service".to_string(),
+                    content: vsock_service_unit,
+                    permissions: Some("0644".to_string()),
+                    owner: Some("root:root".to_string()),
+                },
+                CloudInitWriteFile {
+                    // /usr/bin is a safe location across distros, including SELinux-enforcing Fedora.
+                    path: "/usr/bin/qlean-sshd-run".to_string(),
+                    content: sshd_wrapper,
+                    permissions: Some("0755".to_string()),
+                    owner: Some("root:root".to_string()),
+                },
+                CloudInitWriteFile {
+                    path: "/root/.ssh/authorized_keys".to_string(),
+                    content: format!("{}\n", ssh_keypair.pubkey_str),
+                    permissions: Some("0600".to_string()),
+                    owner: Some("root:root".to_string()),
+                },
+            ]),
+            runcmd: Some(vec![
+                // Ensure the vsock transport exists in the guest.
+                vec![
+                    "bash".to_string(),
+                    "-lc".to_string(),
+                    "modprobe vsock 2>/dev/null || true; modprobe vmw_vsock_virtio_transport 2>/dev/null || true; modprobe vhost_vsock 2>/dev/null || true".to_string(),
+                ],
+                // Ensure SSH host keys exist.
+                vec![
+                    "bash".to_string(),
+                    "-lc".to_string(),
+                    "command -v ssh-keygen >/dev/null && ssh-keygen -A || true".to_string(),
+                ],
+                vec![
+                    "bash".to_string(),
+                    "-lc".to_string(),
+                    "systemctl daemon-reload".to_string(),
+                ],
+                // Fedora images commonly run with SELinux enforcing; permissive avoids rare policy
+                // issues when starting our helper service.
+                vec![
+                    "bash".to_string(),
+                    "-lc".to_string(),
+                    "if command -v getenforce >/dev/null && command -v setenforce >/dev/null; then if [ \"$(getenforce 2>/dev/null)\" = \"Enforcing\" ]; then setenforce 0 || true; fi; fi".to_string(),
+                ],
+                // Ensure sshd runtime dirs exist.
+                vec![
+                    "bash".to_string(),
+                    "-lc".to_string(),
+                    "mkdir -p /run/sshd /root/.ssh && chmod 700 /root/.ssh || true".to_string(),
+                ],
+                // Enable the vsock sshd socket.
+                vec![
+                    "bash".to_string(),
+                    "-lc".to_string(),
+                    "systemctl enable --now qlean-sshd-vsock.socket".to_string(),
+                ],
+                // Marker to simplify debugging via virt-cat.
+                vec![
+                    "bash".to_string(),
+                    "-lc".to_string(),
+                    "echo qlean-cloud-init-ok > /var/log/qlean-cloud-init.marker || true".to_string(),
+                ],
+            ]),
+            users: None,
+            ssh_pwauth: Some(false),
         };
         let mut user_data_str = serde_yml::to_string(&user_data)?;
         user_data_str.insert_str(0, "#cloud-config\n");
         debug!("Writing cloud-init user-data:\n{}", user_data_str);
         tokio::fs::write(seed_dir.join("user-data"), user_data_str).await?;
 
+        // cloud-init's NoCloud datasource expects both user-data and meta-data.
+        // If meta-data is missing, many images will ignore the seed ISO entirely,
+        // which means our SSH key and the vsock SSH proxy won't be configured.
+        let meta_data = format!("instance-id: qlean-{}\nlocal-hostname: qlean\n", machine_id);
+        tokio::fs::write(seed_dir.join("meta-data"), meta_data).await?;
+
         // Prepare seed ISO
         let seed_iso_path = run_dir.join("seed.iso");
+        // NoCloud expects user-data/meta-data at the *root* of the ISO.
+        // Passing the directory path directly would place it under /seed/ in the ISO, which
+        // some distros do not detect (leading to missing SSH key/proxy setup).
+        let user_data_path = seed_dir.join("user-data");
+        let meta_data_path = seed_dir.join("meta-data");
+
         let mut xorriso_command = tokio::process::Command::new("xorriso");
         xorriso_command
             .args(["-as", "mkisofs"])
             .args(["-V", "cidata"])
             .args(["-J", "-R"])
             .args(["-o", seed_iso_path.to_str().unwrap()])
-            .arg(seed_dir);
+            .args(["-graft-points"])
+            .arg(format!("user-data={}", user_data_path.to_string_lossy()))
+            .arg(format!("meta-data={}", meta_data_path.to_string_lossy()));
         debug!(
             "Creating seed ISO with command:\n{:?}",
             xorriso_command.to_string()
@@ -201,7 +366,6 @@ impl Machine {
             keypair: ssh_keypair,
             ssh: None,
             cid,
-            ssh_tcp_port,
             pid: None,
             qemu_should_exit: Arc::new(AtomicBool::new(false)),
             ssh_cancel_token: None,
@@ -621,6 +785,59 @@ impl Machine {
             self.cid, self.keypair.privkey_path,
         );
 
+        let kvm_available = KVM_AVAILABLE.get().copied().unwrap_or(false);
+        // SSH reachability can be slow on first boot (cloud-init + sshd startup), especially on
+        // slower disks or under nested virtualization.
+        let ssh_timeout = if kvm_available {
+            Duration::from_secs(180)
+        } else {
+            Duration::from_secs(300)
+        };
+
+        // Helper: read pid written by launch_qemu.
+        async fn read_pid(vmid: &str) -> Result<u32> {
+            let dirs = QleanDirs::new()?;
+            let pid_file_path = dirs.runs.join(vmid).join("qemu.pid");
+
+            // QEMU writes pid almost immediately after spawn; wait a short time to make cleanup reliable
+            // even on slower filesystems.
+            for _ in 0..50 {
+                if let Ok(pid_str) = tokio::fs::read_to_string(&pid_file_path).await
+                    && let Ok(pid) = pid_str.trim().parse::<u32>()
+                {
+                    return Ok(pid);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            bail!("Failed to read QEMU pid file at {:?}", pid_file_path);
+        }
+
+        // Helper: terminate QEMU process best-effort.
+        async fn terminate_qemu(pid: u32) {
+            let _ = std::process::Command::new("kill")
+                .arg("-TERM")
+                .arg(pid.to_string())
+                .output();
+
+            // Give it a moment to exit; then SIGKILL.
+            let start = std::time::Instant::now();
+            while start.elapsed() < Duration::from_secs(5) {
+                if !std::path::Path::new(&format!("/proc/{}", pid)).exists() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let _ = std::process::Command::new("kill")
+                .arg("-9")
+                .arg(pid.to_string())
+                .output();
+        }
+
+        // Create a fresh cancellation token per launch.
+        let launch_cancel = CancellationToken::new();
+        self.ssh_cancel_token = Some(launch_cancel.clone());
+
+        self.qemu_should_exit.store(false, Ordering::SeqCst);
         let qemu_params = crate::qemu::QemuLaunchParams {
             cid: self.cid,
             image: self.image.to_owned(),
@@ -628,72 +845,54 @@ impl Machine {
             vmid: self.id.to_owned(),
             is_init,
             mac_address: self.mac_address.to_owned(),
-            ssh_tcp_port: Some(self.ssh_tcp_port),
-            cancel_token: self
-                .ssh_cancel_token
-                .as_ref()
-                .expect("Machine not initialized or spawned")
-                .clone(),
+            cancel_token: launch_cancel.clone(),
             expected_to_exit: self.qemu_should_exit.clone(),
         };
 
-        let kvm_available = KVM_AVAILABLE.get().copied().unwrap_or(false);
-        // SSH reachability can be slow on first boot (cloud-init + sshd startup), especially on
-        // slower disks or under nested virtualization (e.g. WSL2).
-        // Use a generous timeout so E2E tests reflect real readiness rather than flakiness.
-        let ssh_timeout = if kvm_available {
-            Duration::from_secs(180)
-        } else {
-            // Give more time if KVM is not available
-            Duration::from_secs(300)
-        };
+        let mut qemu_handle = tokio::spawn(launch_qemu(qemu_params));
+        let pid = read_pid(&self.id).await?;
+        self.pid = Some(pid);
 
-        info!(
-            "🔌 SSH transports: prefer vsock cid={} port=22, tcp fallback 127.0.0.1:{}",
-            self.cid, self.ssh_tcp_port
-        );
-
-        let qemu_handle = tokio::spawn(launch_qemu(qemu_params));
-        let ssh_handle = tokio::spawn(connect_ssh(
+        let mut ssh_handle = tokio::spawn(connect_ssh(
             self.cid,
-            Some(self.ssh_tcp_port),
             ssh_timeout,
             self.keypair.to_owned(),
-            self.ssh_cancel_token
-                .as_ref()
-                .expect("Machine not initialized or spawned")
-                .clone(),
+            launch_cancel.clone(),
+            self.mac_address.to_owned(),
         ));
 
-        // Wait for SSH to complete, or abort SSH if QEMU errors
-        tokio::select! {
-            result = ssh_handle => {
-                // SSH completed, QEMU continues running
+        // Wait for SSH to complete, or abort SSH if QEMU errors.
+        let ssh_result = tokio::select! {
+            result = &mut ssh_handle => {
+                result.map_err(|e| anyhow::anyhow!("SSH task panicked: {e}"))?
+            }
+            result = &mut qemu_handle => {
+                // QEMU completed or errored, cancel SSH task.
+                launch_cancel.cancel();
                 match result {
-                    Ok(Ok(session)) => {
-                        self.ssh = Some(session);
-                        let dirs = QleanDirs::new()?;
-                        let runs_dir = dirs.runs;
-                        let pid_file_path = runs_dir.join(&self.id).join("qemu.pid");
-                        let pid_str = tokio::fs::read_to_string(pid_file_path).await?;
-                        self.pid = Some(pid_str.trim().parse()?);
-                    }
+                    Ok(Ok(())) => bail!("QEMU exited unexpectedly"),
                     Ok(Err(e)) => bail!(e),
-                    Err(e) => bail!("SSH task panicked: {}", e),
+                    Err(e) => bail!("QEMU task error: {e}"),
                 }
             }
-            result = qemu_handle => {
-                // QEMU completed or errored, cancel SSH task
-                self.ssh_cancel_token.as_ref().expect("Machine not initialized or spawned").cancel();
-                match result {
-                    Ok(Err(e)) => bail!(e),
-                    Ok(Ok(())) => bail!("QEMU exited unexpectedly"),
-                    Err(e) => bail!("QEMU task error: {}", e),
+        };
+
+        match ssh_result {
+            Ok(session) => {
+                self.ssh = Some(session);
+                Ok(())
+            }
+            Err(e) => {
+                // Ensure QEMU is torn down to avoid orphan processes.
+                self.qemu_should_exit.store(true, Ordering::SeqCst);
+                launch_cancel.cancel();
+                if let Some(pid) = self.pid {
+                    terminate_qemu(pid).await;
                 }
+                let _ = qemu_handle.await;
+                bail!(e)
             }
         }
-
-        Ok(())
     }
 }
 

@@ -19,7 +19,10 @@ use logging::tracing_subscriber_init;
 async fn test_fedora_image_startup_flow() -> Result<()> {
     tracing_subscriber_init();
 
-    ensure_vm_test_env()?;
+    if !ensure_vm_test_env()? {
+        return Ok(());
+    }
+
     eprintln!("INFO: host checks passed");
 
     ensure_guestfish_tools()?;
@@ -49,6 +52,17 @@ async fn test_fedora_image_startup_flow() -> Result<()> {
                     distro_id.contains("fedora"),
                     "unexpected distro id: {distro_id}"
                 );
+
+                // Ensure we can execute privileged operations (root or passwordless sudo).
+                let uid = vm.exec("id -u").await?;
+                assert!(uid.status.success());
+                let uid_str = str::from_utf8(&uid.stdout)?.trim();
+                if uid_str != "0" {
+                    let sudo_uid = vm.exec("sudo -n id -u").await?;
+                    assert!(sudo_uid.status.success(), "sudo must be available for E2E");
+                    let sudo_uid_str = str::from_utf8(&sudo_uid.stdout)?.trim();
+                    assert_eq!(sudo_uid_str, "0", "sudo must yield uid 0");
+                }
                 Ok(())
             })
         })
