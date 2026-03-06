@@ -1,8 +1,9 @@
 use anyhow::Result;
 use qlean::{Distro, MachineConfig, create_image, with_pool};
 
-mod common;
-use common::tracing_subscriber_init;
+#[path = "support/logging.rs"]
+mod logging;
+use logging::tracing_subscriber_init;
 
 #[tokio::test]
 async fn test_ping() -> Result<()> {
