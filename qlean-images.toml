@@ -1,0 +1,27 @@
+# Default official image sources used by Qlean integration tests.
+# Users may edit these URLs/checksum files directly to point to their preferred
+# official mirror or pinned image release.
+
+[debian]
+image_url = "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.qcow2"
+checksum_url = "https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS"
+checksum_entry = "debian-13-generic-amd64.qcow2"
+checksum_type = "Sha512"
+
+[ubuntu]
+image_url = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+checksum_url = "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS"
+checksum_entry = "noble-server-cloudimg-amd64.img"
+checksum_type = "Sha256"
+
+[fedora]
+image_url = "https://download.fedoraproject.org/pub/fedora/linux/releases/43/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2"
+checksum_url = "https://download.fedoraproject.org/pub/fedora/linux/releases/43/Cloud/x86_64/images/Fedora-Cloud-43-1.6-x86_64-CHECKSUM"
+checksum_entry = "Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2"
+checksum_type = "Sha256"
+
+[arch]
+image_url = "https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2"
+checksum_url = "https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2.SHA256"
+checksum_entry = "Arch-Linux-x86_64-cloudimg.qcow2"
+checksum_type = "Sha256"
