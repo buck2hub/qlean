@@ -15,12 +15,31 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::{
-    KVM_AVAILABLE, MachineConfig,
+    MachineConfig,
+    image::GuestArch,
+    is_kvm_available,
     machine::MachineImage,
-    utils::{CommandExt, QleanDirs},
+    utils::{CommandExt, QLEAN_BRIDGE_NAME, QleanDirs},
 };
 
 const QEMU_TIMEOUT: Duration = Duration::from_secs(360 * 60); // 6 hours
+
+fn qemu_system_program(arch: GuestArch) -> &'static str {
+    match arch {
+        GuestArch::Amd64 => "qemu-system-x86_64",
+        GuestArch::Aarch64 => "qemu-system-aarch64",
+        GuestArch::Riscv64 => "qemu-system-riscv64",
+    }
+}
+
+fn host_arch() -> Option<GuestArch> {
+    match std::env::consts::ARCH {
+        "x86_64" => Some(GuestArch::Amd64),
+        "aarch64" => Some(GuestArch::Aarch64),
+        "riscv64" => Some(GuestArch::Riscv64),
+        _ => None,
+    }
+}
 
 pub struct QemuLaunchParams {
     pub expected_to_exit: Arc<AtomicBool>,
@@ -35,23 +54,21 @@ pub struct QemuLaunchParams {
 
 pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
     // Prepare QEMU command
-    let mut qemu_cmd = tokio::process::Command::new("qemu-system-x86_64");
+    let mut qemu_cmd = tokio::process::Command::new(qemu_system_program(params.image.arch));
+    if params.image.arch == GuestArch::Amd64 {
+        // Decrease idle CPU usage on x86_64.
+        qemu_cmd.args(["-machine", "hpet=off"]);
+    }
+
+    qemu_cmd.args([
+        "-device",
+        &format!(
+            "vhost-vsock-pci,id=vhost-vsock-pci0,guest-cid={}",
+            params.cid
+        ),
+    ]);
+
     qemu_cmd
-        // Decrease idle CPU usage
-        .args(["-machine", "hpet=off"])
-        // SSH port forwarding
-        .args([
-            "-device",
-            &format!(
-                "vhost-vsock-pci,id=vhost-vsock-pci0,guest-cid={}",
-                params.cid
-            ),
-        ])
-        // Kernel
-        .args(["-kernel", params.image.kernel.to_str().unwrap()])
-        .args(["-append", "rw root=/dev/vda1 console=ttyS0"])
-        // Initrd
-        .args(["-initrd", params.image.initrd.to_str().unwrap()])
         // Disk
         .args([
             "-drive",
@@ -61,42 +78,63 @@ pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
             ),
         ])
         // No GUI
-        .arg("-nographic")
-        // Network
-        .args(["-netdev", "bridge,id=net0,br=qlbr0"])
+        .arg("-nographic");
+
+    qemu_cmd
+        .args([
+            "-netdev",
+            &format!("bridge,id=net0,br={}", QLEAN_BRIDGE_NAME),
+        ])
         .args([
             "-device",
             &format!("virtio-net-pci,netdev=net0,mac={}", params.mac_address),
-        ])
-        // Memory and CPUs
-        .args(["-m", &params.config.mem.to_string()])
-        .args(["-smp", &params.config.core.to_string()])
-        // Output redirection
-        .args(["-serial", "mon:stdio"]);
+        ]);
 
+    // Memory and CPUs
+    qemu_cmd
+        .args(["-m", &params.config.mem.to_string()])
+        .args(["-smp", &params.config.core.to_string()]);
+
+    // Output redirection
+    // We multiplex QEMU monitor + guest serial onto stdio AND tee it into a file under the run dir.
+    let dirs = QleanDirs::new()?;
+    let run_dir = dirs.runs.join(&params.vmid);
+    let serial_log = run_dir.join("serial.log");
+    qemu_cmd
+        .args([
+            "-chardev",
+            &format!(
+                "stdio,id=char0,mux=on,signal=off,logfile={},logappend=on",
+                serial_log.to_string_lossy()
+            ),
+        ])
+        .args(["-serial", "chardev:char0"])
+        .args(["-mon", "chardev=char0,mode=readline"]);
     if params.is_init {
         // Seed ISO
         qemu_cmd.args([
             "-drive",
             &format!(
-                "file={},if=virtio,media=cdrom",
+                // Use an emulated CD-ROM device for maximum compatibility with NoCloud on Fedora/Arch.
+                // Some images do not reliably scan virtio-cdrom paths during early boot.
+                "file={},if=ide,media=cdrom,readonly=on",
                 params.image.seed.to_str().unwrap()
             ),
         ]);
     }
 
-    let kvm_available = KVM_AVAILABLE.get().copied().unwrap_or(false);
-    if kvm_available {
+    if is_kvm_available() && host_arch() == Some(params.image.arch) {
         // KVM acceleration
         qemu_cmd.args(["-accel", "kvm"]).args(["-cpu", "host"]);
     } else {
+        qemu_cmd.args(["-accel", "tcg"]);
         warn!(
-            "KVM is not available on this host. QEMU will run without hardware acceleration, which may result in significantly reduced performance."
+            "KVM acceleration is unavailable for this host/guest architecture pair. Falling back to TCG emulation, which may be slower."
         );
     }
 
     // Spawn QEMU process
-    debug!("Spawning QEMU with command:\n{:?}", qemu_cmd.to_string());
+    debug!("QEMU command: {:?}", qemu_cmd.to_string());
     let mut qemu_child = qemu_cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -106,8 +144,7 @@ pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
 
     // Store QEMU PID
     let pid = qemu_child.id().expect("failed to get QEMU PID");
-    let dirs = QleanDirs::new()?;
-    let pid_file_path = dirs.runs.join(&params.vmid).join("qemu.pid");
+    let pid_file_path = run_dir.join("qemu.pid");
     tokio::fs::write(pid_file_path, pid.to_string()).await?;
 
     // Capture and log stdout
@@ -116,7 +153,7 @@ pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
         let reader = BufReader::new(stdout);
         let mut lines = reader.lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            trace!("{}", strip_ansi_codes(&line));
+            trace!("[qemu] {}", strip_ansi_codes(&line));
         }
     });
 
@@ -126,7 +163,7 @@ pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
         let reader = BufReader::new(stderr);
         let mut lines = reader.lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            error!("{}", strip_ansi_codes(&line));
+            error!("[qemu] {}", strip_ansi_codes(&line));
         }
     });
 

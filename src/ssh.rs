@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use russh::{
     ChannelMsg, Disconnect,
     keys::{
@@ -17,11 +17,14 @@ use russh::{
 use russh_sftp::{client::SftpSession, protocol::OpenFlags};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    time::Instant,
+    time::{Instant, sleep},
 };
 use tokio_util::sync::CancellationToken;
 use tokio_vsock::{VsockAddr, VsockStream};
-use tracing::{debug, error, info};
+use tracing::{debug, info};
+
+const ERR_EACCES: i32 = 13; // Permission denied
+const ERR_ENODEV: i32 = 19; // No such device
 
 #[derive(Clone, Debug)]
 pub struct PersistedSshKeypair {
@@ -83,7 +86,7 @@ pub fn get_ssh_key(dir: &Path) -> Result<PersistedSshKeypair> {
     Ok(keypair)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct SshClient {}
 
 // More SSH event handlers can be defined in this trait
@@ -112,6 +115,7 @@ impl Session {
     /// Connect to an SSH server via vsock
     async fn connect(
         privkey: PrivateKey,
+        username: &str,
         cid: u32,
         port: u32,
         timeout: Duration,
@@ -127,101 +131,121 @@ impl Session {
 
         let vsock_addr = VsockAddr::new(cid, port);
         let now = Instant::now();
-        info!("🔑 Connecting via vsock");
-        let mut session = loop {
-            // Check for cancellation
-            if cancel_token.is_cancelled() {
-                info!("SSH connection cancelled during connect loop");
-                bail!("SSH connection cancelled");
-            }
-
-            tokio::time::sleep(Duration::from_millis(100)).await;
-
-            // Establish vsock connection
-            let stream = match VsockStream::connect(vsock_addr).await {
-                Ok(stream) => stream,
-                Err(ref e) if e.raw_os_error() == Some(19) => {
-                    // This is "No such device" but for some reason Rust doesn't have an IO
-                    // ErrorKind for it. Meh.
-                    if now.elapsed() > timeout {
-                        error!(
-                            "Reached timeout trying to connect to virtual machine via SSH, aborting"
-                        );
-                        bail!("Timeout");
-                    }
-                    continue;
+        let mut session =
+            loop {
+                // Check for cancellation
+                if cancel_token.is_cancelled() {
+                    bail!("SSH connection cancelled");
                 }
-                Err(ref e) => match e.kind() {
-                    ErrorKind::TimedOut
-                    | ErrorKind::ConnectionRefused
-                    | ErrorKind::ConnectionReset => {
-                        if now.elapsed() > timeout {
-                            error!(
-                                "Reached timeout trying to connect to virtual machine via SSH, aborting"
-                            );
-                            bail!("Timeout");
-                        }
-                        continue;
-                    }
-                    e => {
-                        error!("Unhandled error occurred: {e}");
-                        bail!("Unknown error");
-                    }
-                },
-            };
 
-            // Connect to SSH via vsock stream
-            match russh::client::connect_stream(config.clone(), stream, sh.clone()).await {
-                Ok(x) => break x,
-                Err(russh::Error::IO(ref e)) => {
-                    match e.kind() {
-                        // The VM is still booting at this point so we're just ignoring these errors
-                        // for some time.
-                        ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+
+                // Establish vsock connection
+                let connect_budget = timeout
+                    .saturating_sub(now.elapsed())
+                    .max(Duration::from_millis(1));
+                let stream =
+                    match tokio::time::timeout(connect_budget, VsockStream::connect(vsock_addr))
+                        .await
+                    {
+                        Ok(Ok(stream)) => stream,
+                        Err(_) => {
+                            bail!("Timeout while connecting to VM via vsock.");
+                        }
+                        Ok(Err(ref e)) if e.raw_os_error() == Some(ERR_EACCES) => {
+                            bail!("Permission denied while connecting via vsock: {e}\n");
+                        }
+                        Ok(Err(ref e)) if e.raw_os_error() == Some(ERR_ENODEV) => {
+                            // ENODEV is commonly observed while QEMU is still booting/initializing the vsock
+                            // transport (e.g. the guest CID isn't ready yet). Treat it as transient and retry
+                            // until the overall timeout is reached.
+                            debug!("SSH vsock connect not ready yet (ENODEV): {e} (will retry)");
                             if now.elapsed() > timeout {
-                                error!(
-                                    "Reached timeout trying to connect to virtual machine via SSH, aborting"
-                                );
-                                bail!("Timeout");
+                                bail!("Timeout while connecting to VM via vsock.\n");
+                            }
+                            continue;
+                        }
+                        Ok(Err(ref e)) => match e.kind() {
+                            ErrorKind::TimedOut
+                            | ErrorKind::ConnectionRefused
+                            | ErrorKind::ConnectionReset
+                            | ErrorKind::NetworkUnreachable
+                            | ErrorKind::AddrNotAvailable => {
+                                if now.elapsed() > timeout {
+                                    bail!("Timeout while connecting to VM via vsock.");
+                                }
+                                continue;
+                            }
+                            e => {
+                                bail!("SSH vsock connect error: {e}");
+                            }
+                        },
+                    };
+
+                // Connect to SSH via vsock stream
+                let handshake_budget = timeout
+                    .saturating_sub(now.elapsed())
+                    .max(Duration::from_millis(1));
+                match tokio::time::timeout(
+                    handshake_budget,
+                    russh::client::connect_stream(config.clone(), stream, sh.clone()),
+                )
+                .await
+                {
+                    Ok(Ok(x)) => break x,
+                    Err(_) => {
+                        bail!("Timeout establishing SSH handshake over vsock.");
+                    }
+                    Ok(Err(russh::Error::IO(ref e))) => {
+                        match e.kind() {
+                            // The VM is still booting at this point so we're just ignoring these errors
+                            // for some time.
+                            ErrorKind::ConnectionRefused
+                            | ErrorKind::ConnectionReset
+                            | ErrorKind::UnexpectedEof => {
+                                if now.elapsed() > timeout {
+                                    bail!("Timeout establishing SSH handshake over vsock.");
+                                }
+                            }
+                            e => {
+                                bail!("SSH handshake error: {e}");
                             }
                         }
-                        e => {
-                            error!("Unhandled error occurred: {e}");
-                            bail!("Unknown error");
+                    }
+                    Ok(Err(russh::Error::Disconnect)) => {
+                        if now.elapsed() > timeout {
+                            bail!("Timeout establishing SSH handshake over vsock.");
                         }
                     }
-                }
-                Err(russh::Error::Disconnect) => {
-                    if now.elapsed() > timeout {
-                        error!(
-                            "Reached timeout trying to connect to virtual machine via SSH, aborting"
-                        );
-                        bail!("Timeout");
+                    Ok(Err(e)) => {
+                        bail!("SSH client error: {e}");
                     }
                 }
-                Err(e) => {
-                    error!("Unhandled error occurred: {e}");
-                    bail!("Unknown error");
-                }
-            }
-        };
+            };
         debug!("Authenticating via SSH");
-
-        // use publickey authentication
-        let auth_res = session
-            .authenticate_publickey("root", PrivateKeyWithHashAlg::new(Arc::new(privkey), None))
-            .await?;
-
+        let auth_budget = timeout
+            .saturating_sub(now.elapsed())
+            .max(Duration::from_secs(1));
+        let auth_res = tokio::time::timeout(
+            auth_budget,
+            session.authenticate_publickey(
+                username,
+                PrivateKeyWithHashAlg::new(Arc::new(privkey), None),
+            ),
+        )
+        .await
+        .with_context(|| format!("SSH authentication timed out for user {username}"))??;
         if !auth_res.success() {
             bail!("Authentication (with publickey) failed");
         }
-
         Ok(Self {
             session,
             sftp: None,
         })
     }
 
+    // NOTE: TCP-based SSH fallback intentionally not supported.
+    // Reviewer feedback: avoid architecture changes that introduce non-vsock transports.
     /// Open an SFTP session over the existing SSH connection.
     async fn open_sftp(&mut self) -> Result<SftpSession> {
         let channel = self.session.channel_open_session().await?;
@@ -266,33 +290,32 @@ impl Session {
                 bail!("SSH call cancelled");
             }
 
-            // Handle one of the possible events:
-            tokio::select! {
-                // There's an event available on the session channel
-                Some(msg) = channel.wait() => {
-                    match msg {
-                        // Write data to the terminal
-                        ChannelMsg::Data { ref data } => {
-                            stdout.write_all(data).await?;
-                            stdout.flush().await?;
-                        }
-                        ChannelMsg::ExtendedData { ref data, ext } => {
-                            // ext == 1 means it's stderr content
-                            // https://github.com/Eugeny/russh/discussions/258
-                            if ext == 1 {
-                                stderr.write_all(data).await?;
-                                stderr.flush().await?;
-                            }
-                        }
-                        // The command has returned an exit code
-                        ChannelMsg::ExitStatus { exit_status } => {
-                            code = exit_status;
-                            channel.eof().await?;
-                            break;
-                        }
-                        _ => {}
-                    }
-                },
+            let Some(msg) = channel.wait().await else {
+                bail!(
+                    "SSH channel closed before exit status for command: {}",
+                    command
+                );
+            };
+            match msg {
+                // Write data to the terminal
+                ChannelMsg::Data { ref data } => {
+                    stdout.write_all(data).await?;
+                    stdout.flush().await?;
+                }
+                ChannelMsg::ExtendedData { ref data, ext: 1 } => {
+                    // ext == 1 means it's stderr content
+                    // https://github.com/Eugeny/russh/discussions/258
+                    stderr.write_all(data).await?;
+                    stderr.flush().await?;
+                }
+
+                // The command has returned an exit code
+                ChannelMsg::ExitStatus { exit_status } => {
+                    code = exit_status;
+                    channel.eof().await?;
+                    break;
+                }
+                _ => {}
             }
         }
         Ok(code)
@@ -318,31 +341,29 @@ impl Session {
                 bail!("SSH call cancelled");
             }
 
-            // Handle one of the possible events:
-            tokio::select! {
-                // There's an event available on the session channel
-                Some(msg) = channel.wait() => {
-                    match msg {
-                        // Write data to the buffer
-                        ChannelMsg::Data { ref data } => {
-                            stdout.extend_from_slice(data);
-                        }
-                        ChannelMsg::ExtendedData { ref data, ext } => {
-                            // ext == 1 means it's stderr content
-                            // https://github.com/Eugeny/russh/discussions/258
-                            if ext == 1 {
-                                stderr.extend_from_slice(data);
-                            }
-                        }
-                        // The command has returned an exit code
-                        ChannelMsg::ExitStatus { exit_status } => {
-                            code = exit_status;
-                            channel.eof().await?;
-                            break;
-                        }
-                        _ => {}
-                    }
-                },
+            let Some(msg) = channel.wait().await else {
+                bail!(
+                    "SSH channel closed before exit status for command: {}",
+                    command
+                );
+            };
+            match msg {
+                // Write data to the buffer
+                ChannelMsg::Data { ref data } => {
+                    stdout.extend_from_slice(data);
+                }
+                ChannelMsg::ExtendedData { ref data, ext: 1 } => {
+                    // ext == 1 means it's stderr content
+                    // https://github.com/Eugeny/russh/discussions/258
+                    stderr.extend_from_slice(data);
+                }
+                // The command has returned an exit code
+                ChannelMsg::ExitStatus { exit_status } => {
+                    code = exit_status;
+                    channel.eof().await?;
+                    break;
+                }
+                _ => {}
             }
         }
         Ok((code, stdout, stderr))
@@ -362,26 +383,60 @@ pub async fn connect_ssh(
     timeout: Duration,
     keypair: PersistedSshKeypair,
     cancel_token: CancellationToken,
+    _mac_address: String,
 ) -> Result<Session> {
+    if !std::path::Path::new("/dev/vhost-vsock").exists() {
+        bail!("/dev/vhost-vsock is missing. Qlean requires vhost-vsock for SSH (no TCP fallback).")
+    }
+
     let privkey = PrivateKey::from_openssh(&keypair.privkey_str)?;
+    let deadline = Instant::now() + timeout;
+    let mut last_err: Option<anyhow::Error> = None;
 
-    // Session is a wrapper around a russh client, defined down below.
-    let mut ssh = Session::connect(privkey, cid, 22, timeout, cancel_token.clone()).await?;
-    info!("✅ Connected");
+    while Instant::now() < deadline {
+        if cancel_token.is_cancelled() {
+            bail!("SSH connection cancelled");
+        }
 
-    // First we'll wait until the system has fully booted up.
-    let is_running_exitcode = ssh
-        .call(
-            "systemctl is-system-running --wait --quiet",
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let per_attempt_timeout = Duration::from_secs(12)
+            .min(remaining.max(Duration::from_secs(1)))
+            .min(Duration::from_secs(25));
+
+        match Session::connect(
+            privkey.clone(),
+            "root",
+            cid,
+            22,
+            per_attempt_timeout,
             cancel_token.clone(),
         )
-        .await?;
-    debug!("systemctl is-system-running --wait exit code {is_running_exitcode}");
+        .await
+        {
+            Ok(mut session) => {
+                info!("✅ Connected via vsock as root");
 
-    // Allow the --env option to work by allowing SSH to accept all sent environment variables.
-    // ssh.call("echo AcceptEnv * >> /etc/ssh/sshd_config").await?;
+                let ready_budget = deadline.saturating_duration_since(Instant::now());
+                if ready_budget == Duration::ZERO {
+                    bail!("SSH connection timed out");
+                }
 
-    Ok(ssh)
+                let _ =
+                    tokio::time::timeout(ready_budget, session.call("true", cancel_token.clone()))
+                        .await
+                        .context("SSH readiness probe timed out")??;
+
+                debug!("SSH command channel is ready");
+                return Ok(session);
+            }
+            Err(e) => {
+                last_err = Some(e);
+                sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Timeout establishing SSH over vsock.")))
 }
 
 impl Session {

@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+
 use dir_lock::DirLock;
 use directories::ProjectDirs;
 use rand::Rng;
@@ -15,6 +16,11 @@ pub static HEX_ALPHABET: [char; 16] = [
 ];
 
 pub const VIRSH_CONNECTION_URI: &str = "qemu:///system";
+pub const QLEAN_BRIDGE_NAME: &str = "qlbr0";
+
+// NOTE: `derive_mac()` was previously used by an experimental multi-NIC TCP hostfwd
+// path. The current implementation is vsock-only, so we avoid keeping unused code
+// that triggers `dead_code` warnings.
 
 pub struct QleanDirs {
     pub base: PathBuf,
@@ -123,16 +129,14 @@ impl CommandExt for tokio::process::Command {
     }
 }
 
+/// Ensure host prerequisites for running virtual machines.
 pub async fn ensure_prerequisites() -> Result<()> {
     check_command_available("qemu-system-x86_64").await?;
     check_command_available("qemu-img").await?;
-    check_command_available("sha256sum").await?;
-    check_command_available("sha512sum").await?;
     check_command_available("xorriso").await?;
-    check_command_available("guestfish").await?;
-    check_command_available("virt-copy-out").await?;
     check_command_available("virsh").await?;
     ensure_network().await?;
+    ensure_vsock()?;
     Ok(())
 }
 
@@ -142,6 +146,15 @@ async fn check_command_available(cmd: &str) -> Result<()> {
         .output()
         .await
         .with_context(|| format!("could not find {}", cmd))?;
+    Ok(())
+}
+
+pub fn ensure_vsock() -> Result<()> {
+    if !Path::new("/dev/vhost-vsock").exists() {
+        bail!(
+            "`/dev/vhost-vsock` is missing. Qlean requires vhost-vsock for SSH. Please ensure it is available and try again."
+        );
+    }
     Ok(())
 }
 
@@ -155,8 +168,8 @@ async fn ensure_network() -> Result<()> {
         .output()
         .await
         .context("failed to execute virsh to check qlean network")?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let all_networks = stdout.lines().collect::<HashSet<_>>();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let all_networks = stdout.lines().map(str::to_owned).collect::<HashSet<_>>();
     let net_exists = all_networks.contains("qlean");
 
     let output = tokio::process::Command::new("virsh")
@@ -167,8 +180,8 @@ async fn ensure_network() -> Result<()> {
         .output()
         .await
         .context("failed to execute virsh to check qlean network")?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let active_networks = stdout.lines().collect::<HashSet<_>>();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let active_networks = stdout.lines().map(str::to_owned).collect::<HashSet<_>>();
     let net_active = active_networks.contains("qlean");
 
     if !net_exists {
@@ -240,4 +253,8 @@ pub fn gen_random_mac() -> String {
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
     )
+}
+
+pub fn qlean_user_agent() -> &'static str {
+    "qlean/0.3.0"
 }

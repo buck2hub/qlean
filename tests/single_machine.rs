@@ -5,16 +5,18 @@ use std::{
 };
 
 use anyhow::Result;
-use qlean::{Distro, MachineConfig, create_image, with_machine};
+use qlean::{Distro, Image, ImageConfig, MachineConfig, with_machine};
+use serial_test::serial;
 
-mod common;
-use common::tracing_subscriber_init;
+mod utils;
+use utils::tracing_subscriber_init;
 
 #[tokio::test]
+#[serial]
 async fn hello() -> Result<()> {
     tracing_subscriber_init();
 
-    let image = create_image(Distro::Debian, "debian-13-generic-amd64").await?;
+    let image = Image::new(ImageConfig::default().with_distro(Distro::Debian)).await?;
     let config = MachineConfig::default();
 
     with_machine(&image, &config, |vm| {
@@ -33,10 +35,11 @@ async fn hello() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_file_transfer() -> Result<()> {
     tracing_subscriber_init();
 
-    let image = create_image(Distro::Debian, "debian-13-generic-amd64").await?;
+    let image = Image::new(ImageConfig::default().with_distro(Distro::Debian)).await?;
     let config = MachineConfig::default();
 
     with_machine(&image, &config, |vm| {
@@ -127,10 +130,11 @@ async fn test_file_transfer() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_file_operation() -> Result<()> {
     tracing_subscriber_init();
 
-    let image = create_image(Distro::Debian, "debian-13-generic-amd64").await?;
+    let image = Image::new(ImageConfig::default().with_distro(Distro::Debian)).await?;
     let config = MachineConfig::default();
 
     with_machine(&image, &config, |vm| {

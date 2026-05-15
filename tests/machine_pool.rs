@@ -1,16 +1,18 @@
 use anyhow::Result;
-use qlean::{Distro, MachineConfig, create_image, with_pool};
+use qlean::{Distro, Image, ImageConfig, MachineConfig, with_pool};
+use serial_test::serial;
 
-mod common;
-use common::tracing_subscriber_init;
+mod utils;
+use utils::tracing_subscriber_init;
 
 #[tokio::test]
+#[serial]
 async fn test_ping() -> Result<()> {
     tracing_subscriber_init();
 
     with_pool(|pool| {
         Box::pin(async {
-            let image = create_image(Distro::Debian, "debian-13-generic-amd64").await?;
+            let image = Image::new(ImageConfig::default().with_distro(Distro::Debian)).await?;
             let config = MachineConfig::default();
 
             pool.add("alice".to_string(), &image, &config).await?;
@@ -36,12 +38,13 @@ async fn test_ping() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_concurrency() -> Result<()> {
     tracing_subscriber_init();
 
     with_pool(|pool| {
         Box::pin(async {
-            let image = create_image(Distro::Debian, "debian-13-generic-amd64").await?;
+            let image = Image::new(ImageConfig::default().with_distro(Distro::Debian)).await?;
             let config = MachineConfig::default();
 
             pool.add("vm1".to_string(), &image, &config).await?;
