@@ -1,9 +1,9 @@
 use std::sync::Once;
 
 use tracing_indicatif::IndicatifLayer;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, fmt::time::LocalTime};
+use tracing_subscriber::{
+    EnvFilter, fmt::time::LocalTime, layer::SubscriberExt, util::SubscriberInitExt,
+};
 
 /// Initialize a global tracing subscriber for integration tests.
 ///

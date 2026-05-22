@@ -1,54 +1,47 @@
 # Qlean
 
-**Qlean** is a system-level isolation testing library based on QEMU/KVM, providing complete virtual machine isolation environments for Rust projects.
+**Qlean** is a system-level isolation testing library built on QEMU/KVM. It spins up lightweight VMs in your Rust tests so privileged or risky operations stay off the host.
 
 ## Overview
 
-Qlean provides a comprehensive testing solution for projects requiring system-level isolation by launching lightweight virtual machines during tests. It addresses two major challenges:
+Qlean targets two common needs in system-level testing:
 
 **1. Complete Resource Isolation**
 
-Many projects require root privileges or direct manipulation of system-level resources. Traditional single-machine tests can easily crash the host system if tests fail. Qlean uses virtual machine isolation to completely isolate these operations within the VM, ensuring host system stability.
+Some tests need root privileges or direct access to kernel interfaces. Running them on the host can leave the machine in a bad state when a test fails. Qlean runs each test in its own VM so failures stay contained and the host stays stable.
 
-**2. Convenient Multi-Machine Testing**
+**2. Convenient Distributed Testing**
 
-For projects requiring multi-machine collaboration, Qlean provides a simple API that allows you to easily create and manage multiple VM instances in test code without complex infrastructure configuration.
+For distributed or multi-node scenarios, Qlean lets you create and coordinate several VMs from test code—no separate cluster setup or orchestration layer required.
 
 ## Key Features
 
 - 🔒 **Complete Isolation**: Based on QEMU/KVM, providing full virtual machine isolation
-- 🔄 **Multi-Machine Support**: Easily create and manage multiple virtual machines
+- 🔄 **Distributed Testing**: Easily create and manage multiple virtual machines
 - 🛡️ **RAII-style Interface**: Automatic resource management ensures VMs are properly cleaned up
-- 📦 **Out-of-the-Box**: Automated image downloading and extraction, no manual configuration needed
-- 🐧 **Linux Native**: Native support for Linux hosts with multiple Linux distributions
+- 📦 **Out-of-the-Box**: Automated image downloading with verification, no manual configuration needed
+- 🐧 **Linux Native**: Native support for Linux hosts with multiple guest distributions and architectures
 
 ## Usage
 
 ### Host Setup
 
-#### Install CLI utils
+#### Install CLI tools
 
-Before using Qlean, ensure that QEMU, guestfish, libvirt, libguestfs-tools and some other utils are properly installed on your Linux host. You can verify the installation with the following commands:
-
-```bash
-qemu-system-x86_64 --version
-qemu-img --version
-virsh --version
-xorriso --version
-```
+Install and configure QEMU, libvirt, and xorriso on your Linux host before using Qlean. On Debian or Ubuntu, see [the setup guide](https://buck2hub.com/docs/qlean/setup) for step-by-step instructions.
 
 #### Configure qemu-bridge-helper
 
 Qlean uses `qemu-bridge-helper` to manage networking for multiple virtual machines, so it requires proper configuration.
 
-The `CAP_NET_ADMIN` capability needs to be set on for the default network helper:
+Grant `CAP_NET_ADMIN` to the default network helper:
 
 ```bash
 sudo chmod u-s /usr/lib/qemu/qemu-bridge-helper
 sudo setcap cap_net_admin+ep /usr/lib/qemu/qemu-bridge-helper
 ```
 
-The ACL mechanism enforced by `qemu-bridge-helper` defaults to blacklisting all users, so the `qlbr0` bridge created by qlean must be explicitly allowed:
+`qemu-bridge-helper` denies all bridges by default, so you must allow the `qlbr0` bridge that Qlean creates:
 
 ```bash
 sudo mkdir -p /etc/qemu
@@ -64,25 +57,55 @@ Add the dependency to your `Cargo.toml`:
 [dev-dependencies]
 qlean = "0.3"
 tokio = { version = "1", features = ["full"] }
+tracing-indicatif = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time"] }
 ```
+
+Qlean uses [`tracing`](https://docs.rs/tracing) and [`indicatif`](https://docs.rs/indicatif) for structured logs and progress bars (for example while downloading images). To see that output in your own tests, add `tracing-indicatif` and `tracing-subscriber` as above and install a global subscriber once per process. A helper guarded with `std::sync::Once` works well when many tests share the same setup:
+
+```rust
+use std::sync::Once;
+
+use tracing_indicatif::IndicatifLayer;
+use tracing_subscriber::{
+    EnvFilter, fmt::time::LocalTime, layer::SubscriberExt, util::SubscriberInitExt,
+};
+
+static INIT: Once = Once::new();
+
+pub fn init_tracing() {
+    INIT.call_once(|| {
+        let env_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,qlean=info"));
+        let indicatif_layer = IndicatifLayer::new();
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_timer(LocalTime::rfc_3339())
+                    .with_writer(indicatif_layer.get_stderr_writer()),
+            )
+            .with(indicatif_layer)
+            .try_init()
+            .ok();
+    });
+}
+```
+
+Call `init_tracing()` at the start of each test (or from a shared test harness). Adjust verbosity with `RUST_LOG`, for example `RUST_LOG=debug,qlean=trace`.
 
 ### Basic Example
 
-Here's a simple test example with single machine:
+A minimal single-VM test:
 
 ```rust
 use anyhow::Result;
-use qlean::{Distro, Image, ImageConfig, GuestArch, MachineConfig, with_machine};
+use qlean::{Image, ImageConfig, MachineConfig, with_machine};
 
 #[tokio::test]
 async fn test_with_vm() -> Result<()> {
     // Create VM image and config
-    let image = Image::new(
-      ImageConfig::default()
-          .with_arch(GuestArch::Amd64),
-          .with_distro(Distro::Debian)
-    )
-    .await?;
+    let image = Image::new(ImageConfig::default()).await?;
     let config = MachineConfig::default();
 
     // Execute tests in the virtual machine
@@ -102,28 +125,23 @@ async fn test_with_vm() -> Result<()> {
 }
 ```
 
-The following is another example of a multi-machine test:
+A distributed test with two VMs on the same virtual network:
 
 ```rust
 use anyhow::Result;
-use qlean::{Distro, Image, ImageConfig, GuestArch, MachineConfig, create_image, with_pool};
+use qlean::{Image, ImageConfig, MachineConfig, with_pool};
 
 #[tokio::test]
 async fn test_ping() -> Result<()> {
     with_pool(|pool| {
         Box::pin(async {
             // Create VM image and config
-            let image = Image::new(
-              ImageConfig::default()
-                  .with_distro(Distro::Debian)
-                  .with_arch(GuestArch::Amd64),
-            )
-            .await?;
+            let image = Image::new(ImageConfig::default()).await?;
             let config = MachineConfig::default();
 
             // Add machines to the pool and initialize them concurrently
-            pool.add("alice".to_string(), &image, &config).await?;
-            pool.add("bob".to_string(), &image, &config).await?;
+            pool.add("alice", &image, &config).await?;
+            pool.add("bob", &image, &config).await?;
             pool.init_all().await?;
 
             // Get mutable references to both machines by name
@@ -147,11 +165,11 @@ async fn test_ping() -> Result<()> {
 }
 ```
 
-For more examples, please refer to the [tests](tests) directory.
+More examples live in the [tests](tests) directory.
 
 ## Network Configuration
 
-Qlean uses a dedicated libvirt virtual network to provide isolated, reproducible networking for test VMs. The default network definition is stored at `~/.local/share/qlean/network.xml` as follows:
+Qlean uses a dedicated libvirt virtual network for isolated, reproducible connectivity between test VMs. The default definition is written to `~/.local/share/qlean/network.xml`:
 
 ```xml
 <network>
@@ -166,68 +184,102 @@ Qlean uses a dedicated libvirt virtual network to provide isolated, reproducible
 </network>
 ```
 
-This configuration defines a **NAT-based** virtual network named `qlean` (used internally by libvirt) that creates a Linux bridge interface called `qlbr0`. The bridge is assigned the IP address `192.168.221.1` and serves as the gateway for a `/24` subnet (`192.168.221.0/24`). A built-in DHCP server automatically assigns IP addresses to virtual machines in the range `192.168.221.2` to `192.168.221.254`, enabling seamless network connectivity between the host, test VMs, and—via NAT—the external network.
+This defines a **NAT** network named `qlean` in libvirt, backed by the Linux bridge `qlbr0` at `192.168.221.1`. DHCP hands out addresses in `192.168.221.2`–`192.168.221.254` on the `192.168.221.0/24` subnet so VMs can reach each other, the host, and the outside world through NAT.
 
 > [!NOTE]
-> If the `192.168.221.0/24` subnet conflicts with your local network, you may edit the configuration file to use a different IP range，but keep the `<name>qlean</name>` and `<bridge name='qlbr0'/>` unchanged to ensure compatibility with qlean's internal logic.
+> If `192.168.221.0/24` conflicts with your LAN, change the IP range in that file, but leave `<name>qlean</name>` and `<bridge name='qlbr0'/>` as they are—Qlean expects those identifiers.
 
 ## API Reference
 
 ### Top-Level Interface
 
-- `is_kvm_available()` - Check if KVM is available on host.
-- `with_machine(image, config, f)` - Execute an async closure in a virtual machine with automatic resource cleanup
-- `with_pool(f)` - Execute an async closure in a machine pool with automatic resource cleanup
-- `MachineConfig` - Configuration for virtual machine resources (CPU, memory, disk)
+- `is_kvm_available()` - Check if KVM is available on the host.
+- `with_machine(image, config, f)` — Run an async closure with one VM; initializes on entry and shuts down on exit.
+- `with_pool(f)` — Run an async closure with a `MachinePool`; shuts down all pool members on exit.
+
+- `ImageConfig` - Configuration for a virtual machine image.
 
   ```rust
-  pub struct MachineConfig {
-    pub core: u32,              // Number of CPU cores
-    pub mem: u32,               // Memory size in MB
-    pub disk: Option<u32>,      // Disk size in GB (optional)
-    pub clear: bool,            // Clear resources after use
+  pub struct ImageConfig {
+    /// Architecture of the image, defaults to `GuestArch::Amd64`.
+    pub arch: GuestArch,
+    /// Distribution of the image, defaults to `Distro::Debian`.
+    pub distro: Distro,
+    /// Source of the image, it can be a URL or a local file path. 
+    /// If provided, the image will be fetched from the source and verified against the digest.
+    pub source: Option<String>,
+    /// Digest of the image, in the form of `sha256:<hex>` or `sha512:<hex>`. 
+    /// It should be provided along with the source.
+    pub digest: Option<String>,
+    /// Whether to clear the image after use, defaults to `false`. 
+    /// It is useful for custom images that are not expected to be used again.
+    pub clear: bool,
   }
   ```
 
+- `MachineConfig` - Configuration for a virtual machine.
+
+  ```rust
+  pub struct MachineConfig {
+    /// Number of CPU cores, defaults to `2`.
+    pub core: u32,
+    /// Memory in MB, defaults to `4096`.
+    pub mem: u32,
+    /// Disk size in GB, defaults to `None`.
+    /// If provided, the image will be resized to the specified size.
+    pub disk: Option<u32>,
+    /// Whether to clear the runtime directory after use, defaults to `true`.
+    pub clear: bool,
+    /// Timeout in seconds for SSH over vsock to wait during launch, 
+    /// defaults to `180` with KVM and `300` under TCG.
+    pub ssh_timeout: Option<u64>,
+  }
+  ```
+
+### Image Interface
+
+- `Image::new(config)` - Create a new image with specified configuration.
+
 ### Machine Core Interface
 
-- `Machine::new(image, config)` - Create a new machine instance
-- `Machine::init()` - Initialize the machine (first boot with cloud-init)
-- `Machine::spawn()` - Start the machine (normal boot)
-- `Machine::exec(command)` - Execute a command in the VM and return the output
-- `Machine::shutdown()` - Gracefully shutdown the virtual machine
-- `Machine::upload(src, dst)` - Upload a file or directory to the VM
-- `Machine::download(src, dst)` - Download a file or directory from the VM
-- `Machine::get_ip()` - Get the IP address of the VM
+- `Machine::new(image, config)` - Create a new machine instance.
+- `Machine::init()` - Initialize the machine (first boot with cloud-init).
+- `Machine::spawn()` - Start the machine (normal boot).
+- `Machine::exec(command)` - Execute a command in the VM and return the output.
+- `Machine::shutdown()` - Gracefully shutdown the virtual machine.
+- `Machine::upload(src, dst)` - Upload a file or directory to the VM.
+- `Machine::download(src, dst)` - Download a file or directory from the VM.
+- `Machine::get_ip()` - Get the IP address of the VM.
+- `Machine::is_running()` - Check if the VM is currently running.
 
 ### Machine Pool Interface
 
-- `MachinePool::new()` - Create a new, empty machine pool
-- `MachinePool::add(name, image, config)` - Add a new machine instance to the pool
-- `MachinePool::get(name)` - Get a machine instance by the name
-- `MachinePool::init_all()` - Initialize all machines in the pool concurrently
-- `MachinePool::spawn_all()` - Spawn all machines in the pool concurrently
-- `MachinePool::shutdown_all()` - Shutdown all machines in the pool concurrently
+- `MachinePool::new()` - Create a new, empty machine pool.
+- `MachinePool::add(name, image, config)` - Add a new machine instance to the pool.
+- `MachinePool::get(name)` - Get a machine instance by the name.
+- `MachinePool::init_all()` - Initialize all machines in the pool concurrently.
+- `MachinePool::spawn_all()` - Spawn all machines in the pool concurrently.
+- `MachinePool::shutdown_all()` - Shutdown all machines in the pool concurrently.
 
 ### std::fs Compatible Interface
 
 The following methods provide filesystem operations compatible with `std::fs` semantics:
 
-- `Machine::copy(from, to)` - Copy a file within the VM
-- `Machine::create_dir(path)` - Create a directory
-- `Machine::create_dir_all(path)` - Create a directory and all missing parent directories
-- `Machine::exists(path)` - Check if a path exists
-- `Machine::hard_link(src, dst)` - Create a hard link
-- `Machine::metadata(path)` - Get file/directory metadata
-- `Machine::read(path)` - Read file contents as bytes
-- `Machine::read_dir(path)` - Read directory entries
-- `Machine::read_link(path)` - Read symbolic link target
-- `Machine::read_to_string(path)` - Read file contents as string
-- `Machine::remove_dir_all(path)` - Remove a directory after removing all its contents
-- `Machine::remove_file(path)` - Remove a file
-- `Machine::rename(from, to)` - Rename or move a file/directory
-- `Machine::set_permissions(path, perm)` - Set file/directory permissions
-- `Machine::write(path, contents)` - Write bytes to a file
+- `Machine::copy(from, to)` - Copy a file within the VM.
+- `Machine::create_dir(path)` - Create a directory.
+- `Machine::create_dir_all(path)` - Create a directory and all missing parent directories.
+- `Machine::exists(path)` - Check if a path exists.
+- `Machine::hard_link(src, dst)` - Create a hard link.
+- `Machine::metadata(path)` - Get file/directory metadata.
+- `Machine::read(path)` - Read file contents as bytes.
+- `Machine::read_dir(path)` - Read directory entries.
+- `Machine::read_link(path)` - Read symbolic link target.
+- `Machine::read_to_string(path)` - Read file contents as string.
+- `Machine::remove_dir_all(path)` - Remove a directory after removing all its contents.
+- `Machine::remove_file(path)` - Remove a file.
+- `Machine::rename(from, to)` - Rename or move a file/directory.
+- `Machine::set_permissions(path, perm)` - Set file/directory permissions.
+- `Machine::write(path, contents)` - Write bytes to a file.
 
 ## License
 

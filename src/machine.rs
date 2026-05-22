@@ -23,10 +23,12 @@ use crate::{
     image::{GuestArch, Image},
     is_kvm_available,
     qemu::launch_qemu,
+    qmp,
     ssh::{PersistedSshKeypair, Session, connect_ssh, get_ssh_key},
     utils::{CommandExt, HEX_ALPHABET, QleanDirs, gen_random_mac, get_free_cid},
 };
 
+/// Virtual machine.
 pub struct Machine {
     id: String,
     image: MachineImage,
@@ -49,26 +51,62 @@ pub struct Machine {
 }
 
 #[derive(Clone)]
-pub struct MachineImage {
+pub(crate) struct MachineImage {
     pub overlay: PathBuf,
     pub arch: GuestArch,
     pub seed: PathBuf,
 }
 
+/// Configuration for a virtual machine.
 #[derive(Clone, Debug)]
 pub struct MachineConfig {
-    /// Number of CPU cores
+    /// Number of CPU cores, defaults to `2`.
     pub core: u32,
-    /// Memory in MB
+    /// Memory in MB, defaults to `4096`.
     pub mem: u32,
-    /// Disk size in GB (optional)
+    /// Disk size in GB, defaults to `None`. If provided, the image will be resized to the specified size.
     pub disk: Option<u32>,
-    /// Clear after use
+    /// Whether to clear the runtime directory after use, defaults to `true`.
     pub clear: bool,
+    /// Timeout in seconds for SSH over vsock to wait during launch, defaults to `180` with KVM and `300` under TCG.
+    pub ssh_timeout: Option<u64>,
+}
+
+impl MachineConfig {
+    /// Set the number of CPU cores.
+    pub fn with_core(self, core: u32) -> Self {
+        Self { core, ..self }
+    }
+
+    /// Set the memory in MB.
+    pub fn with_mem(self, mem: u32) -> Self {
+        Self { mem, ..self }
+    }
+
+    /// Set the disk size in GB.
+    pub fn with_disk(self, disk: u32) -> Self {
+        Self {
+            disk: Some(disk),
+            ..self
+        }
+    }
+
+    /// Set the timeout in seconds for SSH over vsock to wait during launch.
+    pub fn with_timeout(self, ssh_timeout: u64) -> Self {
+        Self {
+            ssh_timeout: Some(ssh_timeout),
+            ..self
+        }
+    }
+
+    /// Set whether to clear the runtime directory after use.
+    pub fn with_clear(self, clear: bool) -> Self {
+        Self { clear, ..self }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct MetaData {
+struct MetaData {
     #[serde(rename = "instance-id")]
     pub instance_id: String,
     #[serde(rename = "local-hostname")]
@@ -76,14 +114,13 @@ pub struct MetaData {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct UserData {
+struct UserData {
     pub disable_root: bool,
     pub ssh_authorized_keys: Vec<String>,
 
     /// Optional cloud-init directives used to configure the guest at first boot.
     ///
-    /// We use these to enable an SSH listener on vhost-vsock so that Qlean can
-    /// reach the guest without relying on TCP port forwarding.
+    /// We use these to enable an SSH listener on vhost-vsock so that Qlean can reach the guest without relying on TCP port forwarding.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub write_files: Option<Vec<CloudInitWriteFile>>,
 
@@ -92,8 +129,7 @@ pub struct UserData {
 
     /// Additional cloud-init configuration.
     ///
-    /// This is intentionally a loose YAML value so we can support a mix of distro
-    /// defaults (Ubuntu/Fedora/Arch) without encoding every schema detail in Rust.
+    /// This is intentionally a loose YAML value so we can support a mix of distro defaults (Ubuntu/Fedora/Arch) without encoding every schema detail in Rust.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub users: Option<serde_yml::Value>,
 
@@ -103,7 +139,7 @@ pub struct UserData {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct CloudInitWriteFile {
+struct CloudInitWriteFile {
     pub path: String,
     pub content: String,
 
@@ -121,13 +157,27 @@ impl Default for MachineConfig {
             mem: 4096,
             disk: None,
             clear: true,
+            ssh_timeout: None,
         }
     }
 }
 
+fn resolve_ssh_timeout(config: &MachineConfig) -> Duration {
+    config
+        .ssh_timeout
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| {
+            if is_kvm_available() {
+                Duration::from_secs(180)
+            } else {
+                Duration::from_secs(300)
+            }
+        })
+}
+
 // Core methods for Machine
 impl Machine {
-    /// Create a new Machine instance
+    /// Create a new Machine instance with specified image and configuration.
     pub async fn new(image: &Image, config: &MachineConfig) -> Result<Self> {
         // Prepare run directory
         let dirs = QleanDirs::new()?;
@@ -177,17 +227,12 @@ impl Machine {
         debug!("Writing cloud-init meta-data:\n{}", meta_data_str);
         tokio::fs::write(seed_dir.join("meta-data"), meta_data_str).await?;
 
-        // Enable an SSH path over vhost-vsock without requiring OpenSSH to accept an AF_VSOCK
-        // socket directly.
-        //
-        // VSOCK-only: provide SSH access exclusively via vhost-vsock.
+        // Enable an SSH path over vhost-vsock without requiring OpenSSH to accept an AF_VSOCK socket directly.
         //
         // We intentionally do NOT depend on the guest distro enabling/running sshd.service.
-        // Instead, we use systemd socket activation and run `sshd -i` (inetd mode) for each
-        // incoming vsock connection.
+        // Instead, we use systemd socket activation and run `sshd -i` (inetd mode) for each incoming vsock connection.
         //
-        // IMPORTANT: StandardOutput must be wired to the socket; otherwise clients may connect
-        // but never receive an SSH banner (hangs until handshake timeout).
+        // IMPORTANT: StandardOutput must be wired to the socket; otherwise clients may connect but never receive an SSH banner (hangs until handshake timeout).
         let sshd_wrapper = r#"#!/bin/sh
 set -eu
 
@@ -368,7 +413,7 @@ StandardError=journal
         })
     }
 
-    /// Initialize the machine (first boot)
+    /// Initialize the machine (first boot with cloud-init).
     pub async fn init(&mut self) -> Result<()> {
         info!("🚀 Initializing VM-{}", self.id);
 
@@ -403,7 +448,7 @@ StandardError=journal
         Ok(())
     }
 
-    /// Spawn the machine (normal boot)
+    /// Spawn the machine (normal boot).
     pub async fn spawn(&mut self) -> Result<()> {
         info!("🔥 Spawning VM-{}", self.id);
 
@@ -418,7 +463,7 @@ StandardError=journal
         Ok(())
     }
 
-    /// Execute a command on the machine and return the output
+    /// Execute a command on the machine and return the output.
     pub async fn exec<S: AsRef<str>>(&mut self, cmd: S) -> Result<Output> {
         let cmd_ref = cmd.as_ref();
         info!("🧬 Executing command `{}` on VM-{}", cmd_ref, self.id);
@@ -441,92 +486,67 @@ StandardError=journal
         }
     }
 
-    /// Shutdown the machine
+    /// Shutdown the machine.
     pub async fn shutdown(&mut self) -> Result<()> {
-        if let Some(ssh) = self.ssh.as_mut() {
-            // Then shut the system down. Try several commands because some cloud images
-            // (notably Arch) log in as an unprivileged default user and plain
-            // `systemctl poweroff` can fail with "Access denied".
-            let shutdown_cmd = r#"sh -lc 'systemctl poweroff \
-                || sudo -n systemctl poweroff \
-                || sudo -n poweroff \
-                || poweroff \
-                || shutdown -h now \
-                || sudo -n shutdown -h now'"#;
-            if let Err(e) = ssh
-                .call(
-                    shutdown_cmd,
-                    self.ssh_cancel_token
-                        .as_ref()
-                        .expect("Machine not initialized or spawned")
-                        .clone(),
-                )
-                .await
-            {
-                // During shutdown the SSH session can drop before the command fully returns.
-                // Keep going and rely on the QEMU process wait/cleanup below.
-                debug!(
-                    "Guest shutdown command returned error during teardown: {}",
-                    e
-                );
-            }
-            info!("🔌 Shutting down VM-{}", self.id);
-
-            // Tell the QEMU handler it's now fine to wait for exit.
-            self.qemu_should_exit.store(true, Ordering::SeqCst);
-
-            // Ignore whatever error we might get from this as we want to close the connection at this
-            // point anyway.
-            let _ = ssh.close().await;
-
-            // Wait for QEMU process to actually exit
-            if let Some(pid) = self.pid {
-                debug!("Waiting for QEMU process {} to exit", pid);
-                let max_wait_time = Duration::from_secs(30);
-                let poll_interval = Duration::from_millis(100);
-                let start = std::time::Instant::now();
-
-                loop {
-                    // Check if process is still running
-                    let process_exists = std::path::Path::new(&format!("/proc/{}", pid)).exists();
-
-                    if !process_exists {
-                        debug!("QEMU process {} has exited", pid);
-                        break;
-                    }
-
-                    if start.elapsed() > max_wait_time {
-                        info!(
-                            "QEMU process {} did not exit within timeout, force killing",
-                            pid
-                        );
-                        let _ = std::process::Command::new("kill")
-                            .arg("-9")
-                            .arg(pid.to_string())
-                            .output();
-                        break;
-                    }
-
-                    tokio::time::sleep(poll_interval).await;
-                }
-            }
-
-            // Clean up runtime files
-            let dirs = QleanDirs::new()?;
-            let pid_file_path = dirs.runs.join(&self.id).join("qemu.pid");
-            let _ = tokio::fs::remove_file(pid_file_path).await;
-            self.ssh = None;
-            self.pid = None;
-            self.ssh_cancel_token = None;
-            self.ip = None;
-
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("SSH session not established"))
+        if self.pid.is_none() && self.ssh.is_none() {
+            bail!("Machine is not running");
         }
+
+        info!("🔌 Shutting down VM-{}", self.id);
+
+        if self.pid.is_some() {
+            let socket_path = qmp::qmp_socket_path(&self.id)?;
+            if let Err(e) = qmp::powerdown(&socket_path).await {
+                debug!("QMP system-powerdown failed during teardown: {e}");
+            }
+        }
+
+        self.qemu_should_exit.store(true, Ordering::SeqCst);
+
+        if let Some(ssh) = self.ssh.as_mut() {
+            let _ = ssh.close().await;
+        }
+
+        if let Some(pid) = self.pid {
+            debug!("Waiting for QEMU process {} to exit", pid);
+            let max_wait_time = Duration::from_secs(30);
+            let poll_interval = Duration::from_millis(100);
+            let start = std::time::Instant::now();
+
+            loop {
+                if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                    debug!("QEMU process {} has exited", pid);
+                    break;
+                }
+
+                if start.elapsed() > max_wait_time {
+                    info!(
+                        "QEMU process {} did not exit within timeout, force killing",
+                        pid
+                    );
+                    let _ = std::process::Command::new("kill")
+                        .arg("-9")
+                        .arg(pid.to_string())
+                        .output();
+                    break;
+                }
+
+                tokio::time::sleep(poll_interval).await;
+            }
+        }
+
+        let dirs = QleanDirs::new()?;
+        let pid_file_path = dirs.runs.join(&self.id).join("qemu.pid");
+        let _ = tokio::fs::remove_file(pid_file_path).await;
+        self.ssh = None;
+        self.pid = None;
+        self.ssh_cancel_token = None;
+        self.ip = None;
+
+        Ok(())
     }
 
-    /// Upload file or directory to the machine
+    /// Upload file or directory to the machine.
     pub async fn upload<P: AsRef<Path>, Q: AsRef<Path>>(
         &mut self,
         local_path: P,
@@ -627,7 +647,7 @@ StandardError=journal
         Ok(())
     }
 
-    /// Download file or directory from the machine
+    /// Download file or directory from the machine.
     pub async fn download<P: AsRef<Path>, Q: AsRef<Path>>(
         &mut self,
         remote_path: P,
@@ -739,7 +759,7 @@ StandardError=journal
         Ok((ssh, cancel_token))
     }
 
-    /// Get the IP address of the machine
+    /// Get the IP address of the machine.
     pub async fn get_ip(&mut self) -> Result<String> {
         if let Some(ip) = &self.ip {
             Ok(ip.to_owned())
@@ -751,49 +771,30 @@ StandardError=journal
         }
     }
 
-    /// Check if the machine is currently running
-    pub(crate) async fn is_running(&self) -> Result<bool> {
-        if let Some(pid) = self.pid {
-            let process_exists = std::path::Path::new(&format!("/proc/{}", pid)).exists();
-            let process_running = if process_exists {
-                // Further check if the process is a QEMU process
-                let cmdline_path = format!("/proc/{}/cmdline", pid);
-                if let Ok(cmdline) = std::fs::read_to_string(&cmdline_path) {
-                    cmdline.contains("qemu-system")
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-            Ok(process_running)
-        } else {
-            Ok(false)
+    /// Check if the machine is currently running.
+    pub async fn is_running(&self) -> Result<bool> {
+        if self.pid.is_none() {
+            return Ok(false);
         }
+        let socket_path = qmp::qmp_socket_path(&self.id)?;
+        Ok(qmp::query_running(&socket_path).await.unwrap_or(false))
     }
 
-    /// Launch QEMU and connect SSH concurrently
+    /// Launch QEMU and connect SSH concurrently.
     async fn launch(&mut self, is_init: bool) -> Result<()> {
         debug!(
             "SSH command for manual debugging:\nssh root@vsock/{} -i {:?}",
             self.cid, self.keypair.privkey_path,
         );
 
-        // SSH reachability can be slow on first boot (cloud-init + sshd startup), especially on
-        // slower disks or under nested virtualization.
-        let ssh_timeout = if is_kvm_available() {
-            Duration::from_secs(180)
-        } else {
-            Duration::from_secs(300)
-        };
+        let ssh_timeout = resolve_ssh_timeout(&self.config);
 
         // Helper: read pid written by launch_qemu.
         async fn read_pid(vmid: &str) -> Result<u32> {
             let dirs = QleanDirs::new()?;
             let pid_file_path = dirs.runs.join(vmid).join("qemu.pid");
 
-            // QEMU writes pid almost immediately after spawn; wait a short time to make cleanup reliable
-            // even on slower filesystems.
+            // QEMU writes pid almost immediately after spawn; wait a short time to make cleanup reliable even on slower filesystems.
             for _ in 0..50 {
                 if let Ok(pid_str) = tokio::fs::read_to_string(&pid_file_path).await
                     && let Ok(pid) = pid_str.trim().parse::<u32>()
@@ -826,10 +827,11 @@ StandardError=journal
                 .output();
         }
 
-        // Create a fresh cancellation token per launch.
-        let launch_cancel = CancellationToken::new();
-        self.ssh_cancel_token = Some(launch_cancel.clone());
-
+        let cancel_token = self
+            .ssh_cancel_token
+            .as_ref()
+            .expect("Machine not initialized or spawned")
+            .clone();
         self.qemu_should_exit.store(false, Ordering::SeqCst);
         let qemu_params = crate::qemu::QemuLaunchParams {
             cid: self.cid,
@@ -838,7 +840,7 @@ StandardError=journal
             vmid: self.id.to_owned(),
             is_init,
             mac_address: self.mac_address.to_owned(),
-            cancel_token: launch_cancel.clone(),
+            cancel_token: cancel_token.clone(),
             expected_to_exit: self.qemu_should_exit.clone(),
         };
 
@@ -850,18 +852,17 @@ StandardError=journal
             self.cid,
             ssh_timeout,
             self.keypair.to_owned(),
-            launch_cancel.clone(),
+            cancel_token.clone(),
             self.mac_address.to_owned(),
         ));
 
-        // Wait for SSH to complete, or abort SSH if QEMU errors.
         let ssh_result = tokio::select! {
             result = &mut ssh_handle => {
                 result.map_err(|e| anyhow::anyhow!("SSH task panicked: {e}"))?
             }
             result = &mut qemu_handle => {
-                // QEMU completed or errored, cancel SSH task.
-                launch_cancel.cancel();
+                // QEMU completed or errored, cancel SSH task
+                cancel_token.cancel();
                 match result {
                     Ok(Ok(())) => bail!("QEMU exited unexpectedly"),
                     Ok(Err(e)) => bail!(e),
@@ -872,13 +873,13 @@ StandardError=journal
 
         match ssh_result {
             Ok(session) => {
+                // SSH completed, QEMU continues running
                 self.ssh = Some(session);
                 Ok(())
             }
             Err(e) => {
-                // Ensure QEMU is torn down to avoid orphan processes.
-                self.qemu_should_exit.store(true, Ordering::SeqCst);
-                launch_cancel.cancel();
+                // SSH failed, QEMU should exit
+                // Here we proactively terminate QEMU process to avoid leaving a zombie process, but we don't set the flag `qemu_should_exit` to true because the failure of SSH is unexpected.
                 if let Some(pid) = self.pid {
                     terminate_qemu(pid).await;
                 }
@@ -934,7 +935,7 @@ impl Machine {
         Ok(())
     }
 
-    /// Creates a new, empty directory at the provided path
+    /// Creates a new, empty directory at the provided path.
     pub async fn create_dir<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         let path = path.as_ref();
         let (ssh, _) = self.get_ssh()?;
@@ -1049,7 +1050,7 @@ impl Machine {
         Ok(())
     }
 
-    /// Renames a file or directory to a new name
+    /// Renames a file or directory to a new name.
     pub async fn rename<P: AsRef<Path>, Q: AsRef<Path>>(&mut self, from: P, to: Q) -> Result<()> {
         let from = from.as_ref();
         let to = to.as_ref();

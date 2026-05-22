@@ -5,6 +5,7 @@ use tokio::sync::Mutex;
 
 use crate::{Image, Machine, MachineConfig};
 
+/// Pool to manage multiple virtual machines.
 pub struct MachinePool {
     pool: HashMap<String, Mutex<Machine>>,
 }
@@ -24,12 +25,18 @@ impl MachinePool {
     }
 
     /// Add a new machine to the pool.
-    pub async fn add(&mut self, name: String, image: &Image, config: &MachineConfig) -> Result<()> {
-        if self.pool.contains_key(&name) {
+    pub async fn add(
+        &mut self,
+        name: impl AsRef<str>,
+        image: &Image,
+        config: &MachineConfig,
+    ) -> Result<()> {
+        let name = name.as_ref();
+        if self.pool.contains_key(name) {
             bail!("Machine with name '{}' already exists in the pool", name);
         }
         let machine = Machine::new(image, config).await?;
-        self.pool.insert(name, Mutex::new(machine));
+        self.pool.insert(name.to_owned(), Mutex::new(machine));
         Ok(())
     }
 

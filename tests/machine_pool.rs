@@ -15,8 +15,8 @@ async fn test_ping() -> Result<()> {
             let image = Image::new(ImageConfig::default().with_distro(Distro::Debian)).await?;
             let config = MachineConfig::default();
 
-            pool.add("alice".to_string(), &image, &config).await?;
-            pool.add("bob".to_string(), &image, &config).await?;
+            pool.add("alice", &image, &config).await?;
+            pool.add("bob", &image, &config).await?;
             pool.init_all().await?;
 
             let mut alice = pool.get("alice").await.expect("Alice machine not found");
@@ -47,10 +47,10 @@ async fn test_concurrency() -> Result<()> {
             let image = Image::new(ImageConfig::default().with_distro(Distro::Debian)).await?;
             let config = MachineConfig::default();
 
-            pool.add("vm1".to_string(), &image, &config).await?;
-            pool.add("vm2".to_string(), &image, &config).await?;
-            pool.add("vm3".to_string(), &image, &config).await?;
-            pool.add("vm4".to_string(), &image, &config).await?;
+            pool.add("vm1", &image, &config).await?;
+            pool.add("vm2", &image, &config).await?;
+            pool.add("vm3", &image, &config).await?;
+            pool.add("vm4", &image, &config).await?;
 
             pool.init_all().await?;
             pool.shutdown_all().await?;

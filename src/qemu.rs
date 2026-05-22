@@ -41,7 +41,7 @@ fn host_arch() -> Option<GuestArch> {
     }
 }
 
-pub struct QemuLaunchParams {
+pub(crate) struct QemuLaunchParams {
     pub expected_to_exit: Arc<AtomicBool>,
     pub cid: u32,
     pub image: MachineImage,
@@ -52,7 +52,7 @@ pub struct QemuLaunchParams {
     pub mac_address: String,
 }
 
-pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
+pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
     // Prepare QEMU command
     let mut qemu_cmd = tokio::process::Command::new(qemu_system_program(params.image.arch));
     if params.image.arch == GuestArch::Amd64 {
@@ -66,6 +66,23 @@ pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
             "vhost-vsock-pci,id=vhost-vsock-pci0,guest-cid={}",
             params.cid
         ),
+    ]);
+
+    let dirs = QleanDirs::new()?;
+    let run_dir = dirs.runs.join(&params.vmid);
+    let qmp_socket = run_dir.join("qmp.sock");
+    if qmp_socket.exists() {
+        let _ = std::fs::remove_file(&qmp_socket);
+    }
+
+    qemu_cmd.args([
+        "-chardev",
+        &format!(
+            "socket,path={},server=on,wait=off,id=qmp0",
+            qmp_socket.to_string_lossy()
+        ),
+        "-mon",
+        "chardev=qmp0,mode=control",
     ]);
 
     qemu_cmd
@@ -97,8 +114,6 @@ pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
 
     // Output redirection
     // We multiplex QEMU monitor + guest serial onto stdio AND tee it into a file under the run dir.
-    let dirs = QleanDirs::new()?;
-    let run_dir = dirs.runs.join(&params.vmid);
     let serial_log = run_dir.join("serial.log");
     qemu_cmd
         .args([
@@ -110,8 +125,9 @@ pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
         ])
         .args(["-serial", "chardev:char0"])
         .args(["-mon", "chardev=char0,mode=readline"]);
+
+    // Seed ISO is only used for initial boot with cloud-init.
     if params.is_init {
-        // Seed ISO
         qemu_cmd.args([
             "-drive",
             &format!(
@@ -153,7 +169,7 @@ pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
         let reader = BufReader::new(stdout);
         let mut lines = reader.lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            trace!("[qemu] {}", strip_ansi_codes(&line));
+            trace!("{}", strip_ansi_codes(&line));
         }
     });
 
@@ -163,7 +179,7 @@ pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
         let reader = BufReader::new(stderr);
         let mut lines = reader.lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            error!("[qemu] {}", strip_ansi_codes(&line));
+            error!("{}", strip_ansi_codes(&line));
         }
     });
 

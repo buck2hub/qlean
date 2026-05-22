@@ -14,15 +14,19 @@ use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 use crate::utils::{QleanDirs, qlean_user_agent};
 
+/// Virtual machine image.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Image {
-    pub name: String,
-    pub path: PathBuf,
-    pub arch: GuestArch,
-    pub distro: Distro,
-    pub digest: (ShaType, String),
+    name: String,
+    path: PathBuf,
+    arch: GuestArch,
+    distro: Distro,
+    pub(crate) digest: (ShaType, String),
+    #[serde(default)]
+    pub(crate) clear: bool,
 }
 
+/// Distribution of the image: Debian, Ubuntu, Fedora or Arch.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize, Clone, Copy, Default)]
 pub enum Distro {
     #[default]
@@ -32,6 +36,7 @@ pub enum Distro {
     Arch,
 }
 
+/// Guest architecture: amd64, aarch64 or riscv64.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize, Clone, Copy, Default)]
 pub enum GuestArch {
     #[default]
@@ -40,15 +45,16 @@ pub enum GuestArch {
     Riscv64,
 }
 
+/// Type of hash: SHA256 or SHA512.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize, Clone)]
-pub enum ShaType {
+pub(crate) enum ShaType {
     Sha256,
     Sha512,
 }
 
-/// Source of a file: URL or local file path
+/// Source of a image: URL or local file path.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ImageSource {
+pub(crate) enum ImageSource {
     Url(String),
     LocalPath(PathBuf),
 }
@@ -59,23 +65,33 @@ impl Default for ImageSource {
     }
 }
 
+/// Configuration for a virtual machine image.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ImageConfig {
+    /// Architecture of the image, defaults to `GuestArch::Amd64`.
     pub arch: GuestArch,
+    /// Distribution of the image, defaults to `Distro::Debian`.
     pub distro: Distro,
+    /// Source of the image, it can be a URL or a local file path. If provided, the image will be fetched from the source and verified against the digest.
     pub source: Option<String>,
+    /// Digest of the image, in the form of `sha256:<hex>` or `sha512:<hex>`. It should be provided along with the source.
     pub digest: Option<String>,
+    /// Whether to clear the image after use, defaults to `false`. It is useful for custom images that are not expected to be used again.
+    pub clear: bool,
 }
 
 impl ImageConfig {
+    /// Set the distribution of the image.
     pub fn with_distro(self, distro: Distro) -> Self {
         Self { distro, ..self }
     }
 
+    /// Set the architecture of the image.
     pub fn with_arch(self, arch: GuestArch) -> Self {
         Self { arch, ..self }
     }
 
+    /// Set the source of the image.
     pub fn with_source(self, source: String) -> Self {
         Self {
             source: Some(source),
@@ -83,6 +99,7 @@ impl ImageConfig {
         }
     }
 
+    /// Set the digest of the image.
     pub fn with_digest(self, digest: String) -> Self {
         Self {
             digest: Some(digest),
@@ -90,8 +107,13 @@ impl ImageConfig {
         }
     }
 
+    /// Set whether to clear the image after use.
+    pub fn with_clear(self, clear: bool) -> Self {
+        Self { clear, ..self }
+    }
+
     /// `source` and `digest` must both be set or both omitted.
-    pub fn validate(&self) -> Result<()> {
+    fn validate(&self) -> Result<()> {
         anyhow::ensure!(
             (self.source.is_none() && self.digest.is_none())
                 || (self.source.is_some() && self.digest.is_some()),
@@ -160,7 +182,7 @@ fn checksum_text_payload(raw: &str) -> &str {
 /// 2) "SHA256 (<filename>) = <hex>" / "SHA512 (<filename>) = <hex>"
 ///
 /// Comment lines (`#` ...) and PGP-signed-message wrappers are ignored.
-pub fn find_hash_for_file(checksums_text: &str, filename: &str) -> Option<String> {
+fn find_hash_for_file(checksums_text: &str, filename: &str) -> Option<String> {
     let payload = checksum_text_payload(checksums_text);
 
     for line in payload.lines() {
@@ -359,7 +381,7 @@ impl StreamingHasher {
 }
 
 /// Compute a streaming hash over `path` using sync I/O on a blocking thread.
-pub async fn compute_hash(path: &Path, hash_type: ShaType) -> Result<String> {
+async fn compute_hash(path: &Path, hash_type: ShaType) -> Result<String> {
     let path = path.to_path_buf();
 
     tokio::task::spawn_blocking(move || {
@@ -566,23 +588,21 @@ async fn fetch_from_source(
 }
 
 impl Image {
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn path(&self) -> &PathBuf {
+    pub(crate) fn path(&self) -> &PathBuf {
         &self.path
     }
 
-    pub fn guest_arch(&self) -> GuestArch {
+    pub(crate) fn guest_arch(&self) -> GuestArch {
         self.arch
     }
 }
 
 impl Image {
-    /// Create a new image using an explicit vendor value (supports per-image `arch` and optional `source` + `digest` overrides on built-in distros).
+    /// Create a new image with specified configuration.
     pub async fn new<C: AsRef<ImageConfig>>(config: C) -> Result<Self> {
         let config = config.as_ref();
+        config.validate().context("invalid image config")?;
+
         let override_source = config.source.as_deref().map(resolve_image_source);
         let override_digest = config
             .digest
@@ -627,9 +647,12 @@ impl Image {
             arch: config.arch,
             distro: config.distro,
             digest: image_digest,
+            clear: config.clear,
         };
 
-        image.save(&name).await?;
+        if !config.clear {
+            image.save(&name).await?;
+        }
 
         Ok(image)
     }
@@ -671,6 +694,14 @@ impl Image {
             .with_context(|| format!("failed to write image config to {}", json_path.display()))?;
 
         Ok(())
+    }
+}
+
+impl Drop for Image {
+    fn drop(&mut self) {
+        if self.clear {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -749,6 +780,7 @@ f0442f3cd0087a609ecd5241109ddef0cbf4a1e05372e13d82c97fc77b35b2d8ecff85aea6770915
             distro: Distro::Debian,
             source: Some("https://example.com/image.qcow2".to_string()),
             digest: Some("sha256:abcdef123456".to_string()),
+            clear: false,
         };
 
         let json = serde_json::to_string(&config).unwrap();

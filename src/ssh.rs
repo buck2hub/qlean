@@ -27,7 +27,7 @@ const ERR_EACCES: i32 = 13; // Permission denied
 const ERR_ENODEV: i32 = 19; // No such device
 
 #[derive(Clone, Debug)]
-pub struct PersistedSshKeypair {
+pub(crate) struct PersistedSshKeypair {
     pub pubkey_str: String,
     pub _pubkey_path: PathBuf,
     pub privkey_str: String,
@@ -36,7 +36,7 @@ pub struct PersistedSshKeypair {
 
 impl PersistedSshKeypair {
     // Try to load a keypair from `dir`
-    pub fn from_dir(dir: &Path) -> Result<Self> {
+    pub(crate) fn from_dir(dir: &Path) -> Result<Self> {
         let privkey_path = dir.join("id_ed25519");
         let pubkey_path = privkey_path.with_extension("pub");
         let privkey_str = std::fs::read_to_string(&privkey_path)?;
@@ -51,7 +51,7 @@ impl PersistedSshKeypair {
     }
 }
 
-pub fn get_ssh_key(dir: &Path) -> Result<PersistedSshKeypair> {
+pub(crate) fn get_ssh_key(dir: &Path) -> Result<PersistedSshKeypair> {
     // First try reading an existing keypair from disk.
     // If that fails we'll just create a new one.
     if let Ok(existing_keypair) = PersistedSshKeypair::from_dir(dir) {
@@ -105,7 +105,7 @@ impl russh::client::Handler for SshClient {
 
 /// This struct is a convenience wrapper around a russh client that handles the input/output event
 /// loop
-pub struct Session {
+pub(crate) struct Session {
     session: russh::client::Handle<SshClient>,
     // Cached SFTP session for reuse; lazily initialized
     sftp: Option<SftpSession>,
@@ -255,7 +255,7 @@ impl Session {
     }
 
     /// Get a cached SFTP session, opening one if needed.
-    pub async fn get_sftp(&mut self) -> Result<&mut SftpSession> {
+    pub(crate) async fn get_sftp(&mut self) -> Result<&mut SftpSession> {
         if self.sftp.is_none() {
             let sftp = self.open_sftp().await?;
             self.sftp = Some(sftp);
@@ -264,7 +264,7 @@ impl Session {
     }
 
     /// Call a command via SSH, streaming its output to stdout/stderr.
-    pub async fn call(
+    pub(crate) async fn call(
         &mut self,
         // env: HashMap<String, String>,
         command: &str,
@@ -322,7 +322,7 @@ impl Session {
     }
 
     /// Call a command via SSH and capture its output.
-    pub async fn call_with_output(
+    pub(crate) async fn call_with_output(
         &mut self,
         command: &str,
         cancel_token: CancellationToken,
@@ -369,7 +369,7 @@ impl Session {
         Ok((code, stdout, stderr))
     }
 
-    pub async fn close(&mut self) -> Result<()> {
+    pub(crate) async fn close(&mut self) -> Result<()> {
         self.session
             .disconnect(Disconnect::ByApplication, "", "English")
             .await?;
@@ -378,7 +378,7 @@ impl Session {
 }
 
 /// Connect SSH and run a command that checks whether the system is ready for operation.
-pub async fn connect_ssh(
+pub(crate) async fn connect_ssh(
     cid: u32,
     timeout: Duration,
     keypair: PersistedSshKeypair,
@@ -441,7 +441,7 @@ pub async fn connect_ssh(
 
 impl Session {
     /// Recursively create a directory and all of its parent components if they are missing.
-    pub async fn create_dir_all<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+    pub(crate) async fn create_dir_all<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         let path = path.as_ref();
         // Build path incrementally like mkdir -p
         let mut cur = PathBuf::new();
@@ -476,7 +476,7 @@ impl Session {
     }
 
     /// Upload a single file via SFTP.
-    pub async fn upload_file<P: AsRef<Path>, Q: AsRef<Path>>(
+    pub(crate) async fn upload_file<P: AsRef<Path>, Q: AsRef<Path>>(
         &mut self,
         local: P,
         remote: Q,
@@ -512,7 +512,7 @@ impl Session {
     }
 
     /// Download a single file via SFTP.
-    pub async fn download_file<P: AsRef<Path>, Q: AsRef<Path>>(
+    pub(crate) async fn download_file<P: AsRef<Path>, Q: AsRef<Path>>(
         &mut self,
         remote: P,
         local: Q,
@@ -543,7 +543,7 @@ impl Session {
 
     /// Walk a remote directory tree over SFTP, similar to walkdir.
     /// Returns a depth-first list of entries including the root.
-    pub async fn walk_remote_dir<P: AsRef<Path>>(
+    pub(crate) async fn walk_remote_dir<P: AsRef<Path>>(
         &mut self,
         root: P,
         follow_links: bool,
@@ -638,7 +638,7 @@ impl Session {
     }
 
     /// Get the primary IP address of the remote machine.
-    pub async fn get_remote_ip(&mut self) -> Result<String> {
+    pub(crate) async fn get_remote_ip(&mut self) -> Result<String> {
         let (code, stdout, _stderr) = self
             .call_with_output("hostname -I | awk '{print $1}'", CancellationToken::new())
             .await?;
@@ -651,7 +651,7 @@ impl Session {
 }
 
 #[derive(Clone, Debug)]
-pub struct RemoteFileType {
+pub(crate) struct RemoteFileType {
     is_dir: bool,
     is_file: bool,
     is_symlink: bool,
@@ -665,19 +665,19 @@ impl RemoteFileType {
             is_symlink: attrs.file_type().is_symlink(),
         }
     }
-    pub fn is_dir(&self) -> bool {
+    pub(crate) fn is_dir(&self) -> bool {
         self.is_dir
     }
-    pub fn is_file(&self) -> bool {
+    pub(crate) fn is_file(&self) -> bool {
         self.is_file
     }
-    pub fn is_symlink(&self) -> bool {
+    pub(crate) fn is_symlink(&self) -> bool {
         self.is_symlink
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct RemoteDirEntry {
+pub(crate) struct RemoteDirEntry {
     path: PathBuf,
     file_type: RemoteFileType,
 }
@@ -686,11 +686,11 @@ impl RemoteDirEntry {
     fn new(path: PathBuf, file_type: RemoteFileType) -> Self {
         Self { path, file_type }
     }
-    pub fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
-    pub fn file_type(&self) -> &RemoteFileType {
+    pub(crate) fn file_type(&self) -> &RemoteFileType {
         &self.file_type
     }
 }

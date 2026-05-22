@@ -4,7 +4,6 @@ version = "0.3.0"
 authors = ["jl.jiang <jiangjl9807@gmail.com>"]
 categories = ["development-tools::testing", "virtualization"]
 description = "A system-level isolation testing library based on QEMU/KVM."
-documentation = "https://buck2hub.com/docs/qlean"
 edition = "2024"
 exclude = ["/.github"]
 keywords = ["isolation", "testing", "kvm", "qemu"]
@@ -21,6 +20,7 @@ futures = "0.3"
 indicatif = "0.18.4"
 kvm-ioctls = "0.24.0"
 nanoid = "0.4.0"
+qapi = { version = "0.15.0", features = ["qmp", "async-tokio-all"] }
 rand = "0.9.2"
 reqwest = { version = "0.13.1", features = ["stream"] }
 russh = "0.55.0"

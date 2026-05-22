@@ -11,18 +11,18 @@ use rand::Rng;
 use tracing::{debug, trace};
 use walkdir::WalkDir;
 
-pub static HEX_ALPHABET: [char; 16] = [
+pub(crate) static HEX_ALPHABET: [char; 16] = [
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
 ];
 
-pub const VIRSH_CONNECTION_URI: &str = "qemu:///system";
-pub const QLEAN_BRIDGE_NAME: &str = "qlbr0";
+pub(crate) const VIRSH_CONNECTION_URI: &str = "qemu:///system";
+pub(crate) const QLEAN_BRIDGE_NAME: &str = "qlbr0";
 
 // NOTE: `derive_mac()` was previously used by an experimental multi-NIC TCP hostfwd
 // path. The current implementation is vsock-only, so we avoid keeping unused code
 // that triggers `dead_code` warnings.
 
-pub struct QleanDirs {
+pub(crate) struct QleanDirs {
     pub base: PathBuf,
     pub images: PathBuf,
     pub secrets: PathBuf,
@@ -30,7 +30,7 @@ pub struct QleanDirs {
 }
 
 impl QleanDirs {
-    pub fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         let project_dir = ProjectDirs::from("", "", "qlean").expect("Couldn't get project dir");
 
         // Dir containing persistent data (usually ~/.local/share/qlean/)
@@ -57,7 +57,7 @@ impl QleanDirs {
     }
 }
 
-pub fn create_dir(purpose: &str, path: &Path) -> Result<()> {
+pub(crate) fn create_dir(purpose: &str, path: &Path) -> Result<()> {
     if !path.exists() {
         debug!("{purpose} dir {path:?} doesn't exist yet, creating");
         std::fs::create_dir_all(path).expect("Failed to create directory");
@@ -65,7 +65,7 @@ pub fn create_dir(purpose: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn get_free_cid(runs_dir: &Path, run_dir: &Path) -> Result<u32> {
+pub(crate) fn get_free_cid(runs_dir: &Path, run_dir: &Path) -> Result<u32> {
     let mut cids = vec![];
 
     let runs_dir = runs_dir.to_owned();
@@ -130,7 +130,7 @@ impl CommandExt for tokio::process::Command {
 }
 
 /// Ensure host prerequisites for running virtual machines.
-pub async fn ensure_prerequisites() -> Result<()> {
+pub(crate) async fn ensure_prerequisites() -> Result<()> {
     check_command_available("qemu-system-x86_64").await?;
     check_command_available("qemu-img").await?;
     check_command_available("xorriso").await?;
@@ -149,7 +149,7 @@ async fn check_command_available(cmd: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn ensure_vsock() -> Result<()> {
+fn ensure_vsock() -> Result<()> {
     if !Path::new("/dev/vhost-vsock").exists() {
         bail!(
             "`/dev/vhost-vsock` is missing. Qlean requires vhost-vsock for SSH. Please ensure it is available and try again."
@@ -246,7 +246,7 @@ async fn ensure_network() -> Result<()> {
     Ok(())
 }
 
-pub fn gen_random_mac() -> String {
+pub(crate) fn gen_random_mac() -> String {
     let mut rng = rand::rng();
     let bytes: [u8; 6] = [0x52, 0x54, 0x00, rng.random(), rng.random(), rng.random()];
     format!(
@@ -255,6 +255,6 @@ pub fn gen_random_mac() -> String {
     )
 }
 
-pub fn qlean_user_agent() -> &'static str {
+pub(crate) fn qlean_user_agent() -> &'static str {
     "qlean/0.3.0"
 }
