@@ -1,6 +1,8 @@
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use sha2::{Digest, Sha256};
+use std::hint::black_box;
 use std::path::PathBuf;
+
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use sha2::{Digest, Sha256};
 use tokio::runtime::Runtime;
 
 /// Shell-based SHA-256 (legacy method)
@@ -37,7 +39,7 @@ async fn streaming_sha256(path: &PathBuf) -> String {
             hasher.update(&buf[..n]);
         }
 
-        format!("{:x}", hasher.finalize())
+        hex::encode(hasher.finalize())
     })
     .await
     .unwrap()

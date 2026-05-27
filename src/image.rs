@@ -373,9 +373,13 @@ impl StreamingHasher {
     }
 
     fn finalize_hex(self) -> String {
+        // `sha2` 0.11 returns `hybrid_array::Array<u8, _>` from `Digest::finalize`,
+        // which no longer implements `LowerHex` (the 0.10-era `GenericArray` did).
+        // It still implements `AsRef<[u8]>`, so `hex::encode` is the canonical
+        // replacement and matches what RustCrypto's own examples now use.
         match self {
-            Self::Sha256(h) => format!("{:x}", h.finalize()),
-            Self::Sha512(h) => format!("{:x}", h.finalize()),
+            Self::Sha256(h) => hex::encode(h.finalize()),
+            Self::Sha512(h) => hex::encode(h.finalize()),
         }
     }
 }

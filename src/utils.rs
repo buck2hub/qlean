@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 
 use dir_lock::DirLock;
 use directories::ProjectDirs;
-use rand::Rng;
+use rand::RngExt;
 use tracing::{debug, trace};
 use walkdir::WalkDir;
 

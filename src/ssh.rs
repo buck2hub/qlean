@@ -9,10 +9,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use russh::{
     ChannelMsg, Disconnect,
-    keys::{
-        PrivateKey, PrivateKeyWithHashAlg, PublicKey,
-        ssh_key::{LineEnding, private::Ed25519Keypair, rand_core::OsRng},
-    },
+    keys::{Algorithm, PrivateKey, PrivateKeyWithHashAlg, ssh_key::LineEnding},
 };
 use russh_sftp::{client::SftpSession, protocol::OpenFlags};
 use tokio::{
@@ -61,15 +58,18 @@ pub(crate) fn get_ssh_key(dir: &Path) -> Result<PersistedSshKeypair> {
     let privkey_path = dir.join("id_ed25519");
     let pubkey_path = privkey_path.with_extension("pub");
 
-    let ed25519_keypair = Ed25519Keypair::random(&mut OsRng);
+    // Use `rand::rng()` (rand 0.10's thread-local CSPRNG) directly: it implements
+    // `CryptoRng`, which is what `ssh-key` 0.7's `PrivateKey::random` requires.
+    // This matches the pattern used by russh's own tests and avoids the extra
+    // `rand_core::OsRng.unwrap_err()` dance that the new `TryRngCore`-only OsRng
+    // would otherwise force on us.
+    let privkey = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
 
-    let pubkey_openssh = PublicKey::from(ed25519_keypair.public).to_openssh()?;
+    let pubkey_openssh = privkey.public_key().to_openssh()?;
     debug!("Writing SSH public key to {pubkey_path:?}");
     std::fs::write(&pubkey_path, &pubkey_openssh)?;
 
-    let privkey_openssh = PrivateKey::from(ed25519_keypair)
-        .to_openssh(LineEnding::default())?
-        .to_string();
+    let privkey_openssh = privkey.to_openssh(LineEnding::default())?.to_string();
     debug!("Writing SSH private key to {privkey_path:?}");
 
     std::fs::write(&privkey_path, &privkey_openssh)?;
