@@ -251,6 +251,39 @@ This defines a **NAT** network named `qlean` in libvirt, backed by the Linux bri
 - `Machine::download(src, dst)` - Download a file or directory from the VM.
 - `Machine::get_ip()` - Get the IP address of the VM.
 - `Machine::is_running()` - Check if the VM is currently running.
+- `Machine::open_interactive_shell(cols, rows)` - Open a dedicated interactive SSH shell (PTY) over a new vsock session. Does not block the management SSH session used by `exec` and upload. Requires the machine to already be running.
+
+### Interactive Shell
+
+For tooling that needs a terminal session (for example a web-based console), use `InteractiveShell` on a dedicated vsock SSH connection:
+
+```rust
+let shell = machine.open_interactive_shell(80, 24).await?;
+shell.write(b"ls\n").await?;
+while let Some(output) = shell.read_chunk().await? {
+    // handle PTY output (stdout + stderr merged)
+}
+shell.resize(120, 40).await?;
+shell.close().await?;
+```
+
+For concurrent read/write (WebSocket bridges, `tokio::select!`), split the shell:
+
+```rust
+let (mut reader, writer) = shell.split();
+// reader.read_chunk() + writer.write() / resize() in select!
+writer.close(reader).await?;
+```
+
+- `InteractiveShell::write(data)` - Send bytes to shell stdin.
+- `InteractiveShell::read_chunk()` - Read the next output chunk; returns `None` when the shell exits.
+- `InteractiveShell::resize(cols, rows)` - Resize the remote PTY.
+- `InteractiveShell::close()` - Close the shell and its dedicated SSH session.
+- `InteractiveShell::split()` - Split into reader/writer halves for concurrent I/O.
+
+### Keep-alive / long-running VMs
+
+By default, Qlean waits for the QEMU process until it exits (no wall-clock limit), so keep-alive workloads are not cut off after a fixed duration. Optional `QLEAN_QEMU_TIMEOUT_SECS` (positive integer) enables a bounded wait for tests; on timeout QEMU is killed before SSH operations are cancelled.
 
 ### Machine Pool Interface
 

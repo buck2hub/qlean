@@ -22,7 +22,26 @@ use crate::{
     utils::{CommandExt, QLEAN_BRIDGE_NAME, QleanDirs},
 };
 
-const QEMU_TIMEOUT: Duration = Duration::from_secs(360 * 60); // 6 hours
+/// Optional wall-clock limit for waiting on the QEMU process.
+///
+/// Unset or `0` = wait until QEMU exits (required for keep-alive VMs).
+/// Set `QLEAN_QEMU_TIMEOUT_SECS` to a positive value only for bounded test runs.
+fn resolve_qemu_wait_timeout() -> Option<Duration> {
+    match std::env::var("QLEAN_QEMU_TIMEOUT_SECS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(secs) => Some(Duration::from_secs(secs)),
+            Err(_) => {
+                warn!(
+                    value = %raw,
+                    "invalid QLEAN_QEMU_TIMEOUT_SECS, waiting indefinitely for QEMU"
+                );
+                None
+            }
+        },
+        Err(_) => None,
+    }
+}
 
 fn qemu_system_program(arch: GuestArch) -> &'static str {
     match arch {
@@ -183,38 +202,64 @@ pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> 
         }
     });
 
-    let result = match timeout(QEMU_TIMEOUT, qemu_child.wait()).await {
-        Err(_) => {
-            error!("QEMU process timed out after 6 hours");
-            Err(anyhow::anyhow!("QEMU process timed out"))
-        }
-        Ok(Err(e)) => {
-            error!("Failed to wait for QEMU: {}", e);
-            Err(e.into())
-        }
-        Ok(Ok(status)) => {
-            if status.success() {
-                if params.expected_to_exit.load(Ordering::SeqCst) {
-                    info!("⏏️  Process {} exited as expected", pid);
-                    Ok(())
-                } else {
-                    error!("Process {} exited unexpectedly", pid);
-                    Err(anyhow::anyhow!("QEMU exited unexpectedly"))
-                }
-            } else {
+    let result = match resolve_qemu_wait_timeout() {
+        Some(limit) => match timeout(limit, qemu_child.wait()).await {
+            Err(_) => {
+                error!(
+                    "QEMU process timed out after {} seconds; killing process before cancelling SSH",
+                    limit.as_secs()
+                );
+                // Ensure the guest is gone before sticky-canceling SSH. Previously a
+                // hard-coded 6h wait timeout cancelled the token while QEMU could still
+                // be alive, leaving keep-alive VMs "running" with dead Machine::exec.
+                let _ = qemu_child.kill().await;
+                let _ = qemu_child.wait().await;
                 Err(anyhow::anyhow!(
-                    "QEMU exited with error code: {:?}",
-                    status.code()
+                    "QEMU process timed out after {} seconds",
+                    limit.as_secs()
                 ))
             }
-        }
+            Ok(Err(e)) => {
+                error!("Failed to wait for QEMU: {}", e);
+                Err(e.into())
+            }
+            Ok(Ok(status)) => map_qemu_exit_status(status, pid, &params.expected_to_exit),
+        },
+        None => match qemu_child.wait().await {
+            Err(e) => {
+                error!("Failed to wait for QEMU: {}", e);
+                Err(e.into())
+            }
+            Ok(status) => map_qemu_exit_status(status, pid, &params.expected_to_exit),
+        },
     };
 
-    // Cancel any ongoing operations due to QEMU exit
+    // Cancel any ongoing operations due to QEMU exit (or intentional kill after timeout)
     params.cancel_token.cancel();
 
     // Wait for logging tasks to complete
     let _ = tokio::join!(stdout_task, stderr_task);
 
     result
+}
+
+fn map_qemu_exit_status(
+    status: std::process::ExitStatus,
+    pid: u32,
+    expected_to_exit: &Arc<AtomicBool>,
+) -> anyhow::Result<()> {
+    if status.success() {
+        if expected_to_exit.load(Ordering::SeqCst) {
+            info!("⏏️  Process {} exited as expected", pid);
+            Ok(())
+        } else {
+            error!("Process {} exited unexpectedly", pid);
+            Err(anyhow::anyhow!("QEMU exited unexpectedly"))
+        }
+    } else {
+        Err(anyhow::anyhow!(
+            "QEMU exited with error code: {:?}",
+            status.code()
+        ))
+    }
 }

@@ -24,7 +24,7 @@ use crate::{
     is_kvm_available,
     qemu::launch_qemu,
     qmp,
-    ssh::{PersistedSshKeypair, Session, connect_ssh, get_ssh_key},
+    ssh::{InteractiveShell, PersistedSshKeypair, Session, connect_ssh, get_ssh_key},
     utils::{CommandExt, HEX_ALPHABET, QleanDirs, gen_random_mac, get_free_cid},
 };
 
@@ -219,7 +219,7 @@ impl Machine {
 
         // Prepare cloud-init config
         let meta_data = MetaData {
-            instance_id: format!("VM-{}", &machine_id),
+            instance_id: format!("VM-{}", machine_id),
             local_hostname: "qlean-vm".to_string(),
         };
         let mut meta_data_str = serde_yml::to_string(&meta_data)?;
@@ -461,6 +461,35 @@ StandardError=journal
         self.launch(false).await?;
 
         Ok(())
+    }
+
+    /// Open a dedicated interactive SSH shell (PTY) over a new vsock session.
+    ///
+    /// Does not use or block the management SSH session used by `exec` / upload.
+    /// Requires the machine to already be running (`ssh` and `pid` set after init/spawn).
+    pub async fn open_interactive_shell(&self, cols: u32, rows: u32) -> Result<InteractiveShell> {
+        if self.ssh.is_none() || self.pid.is_none() {
+            bail!(
+                "Machine is not running; initialize or spawn before opening an interactive shell"
+            );
+        }
+
+        let cancel = self
+            .ssh_cancel_token
+            .as_ref()
+            .expect("Machine not initialized or spawned")
+            .clone();
+
+        let session = connect_ssh(
+            self.cid,
+            resolve_ssh_timeout(&self.config),
+            self.keypair.clone(),
+            cancel.clone(),
+            self.mac_address.clone(),
+        )
+        .await?;
+
+        session.open_shell(cols, rows, cancel).await
     }
 
     /// Execute a command on the machine and return the output.

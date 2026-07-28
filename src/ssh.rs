@@ -375,6 +375,197 @@ impl Session {
             .await?;
         Ok(())
     }
+
+    /// Open an interactive PTY shell on this SSH session.
+    pub(crate) async fn open_shell(
+        self,
+        cols: u32,
+        rows: u32,
+        cancel_token: CancellationToken,
+    ) -> Result<InteractiveShell> {
+        if cancel_token.is_cancelled() {
+            bail!("SSH shell cancelled");
+        }
+
+        let channel = self.session.channel_open_session().await?;
+        channel
+            .request_pty(true, "xterm-256color", cols, rows, 0, 0, &[])
+            .await?;
+        channel.request_shell(true).await?;
+
+        Ok(InteractiveShell {
+            session: self,
+            channel,
+            cancel_token,
+        })
+    }
+}
+
+/// Interactive SSH shell (PTY) over a dedicated vsock session.
+pub struct InteractiveShell {
+    session: Session,
+    channel: russh::Channel<russh::client::Msg>,
+    cancel_token: CancellationToken,
+}
+
+/// Read half of an [`InteractiveShell`] (for concurrent use with [`InteractiveShellWriter`]).
+pub struct InteractiveShellReader {
+    read_half: russh::ChannelReadHalf,
+    cancel_token: CancellationToken,
+}
+
+/// Write half of an [`InteractiveShell`] (stdin / resize / close).
+pub struct InteractiveShellWriter {
+    session: Session,
+    write_half: russh::ChannelWriteHalf<russh::client::Msg>,
+    cancel_token: CancellationToken,
+}
+
+impl InteractiveShell {
+    /// Split into reader and writer halves for concurrent PTY I/O (e.g. `tokio::select!`).
+    pub fn split(self) -> (InteractiveShellReader, InteractiveShellWriter) {
+        let Self {
+            session,
+            channel,
+            cancel_token,
+        } = self;
+        let (read_half, write_half) = channel.split();
+        (
+            InteractiveShellReader {
+                read_half,
+                cancel_token: cancel_token.clone(),
+            },
+            InteractiveShellWriter {
+                session,
+                write_half,
+                cancel_token,
+            },
+        )
+    }
+
+    /// Write bytes to the shell stdin.
+    pub async fn write(&self, data: &[u8]) -> Result<()> {
+        if self.cancel_token.is_cancelled() {
+            bail!("SSH shell cancelled");
+        }
+        self.channel.data_bytes(data.to_vec()).await?;
+        Ok(())
+    }
+
+    /// Read the next chunk of shell output (stdout and stderr merged).
+    ///
+    /// Returns `Ok(None)` when the shell has exited or the channel closed.
+    pub async fn read_chunk(&mut self) -> Result<Option<Vec<u8>>> {
+        let mut buf = Vec::new();
+        loop {
+            if self.cancel_token.is_cancelled() {
+                bail!("SSH shell cancelled");
+            }
+
+            let Some(msg) = self.channel.wait().await else {
+                return Ok(None);
+            };
+
+            match msg {
+                ChannelMsg::Data { data } => buf.extend_from_slice(&data),
+                ChannelMsg::ExtendedData { data, ext: 1 } => buf.extend_from_slice(&data),
+                ChannelMsg::ExitStatus { .. } | ChannelMsg::Eof | ChannelMsg::Close => {
+                    return Ok(None);
+                }
+                _ => {}
+            }
+
+            if !buf.is_empty() {
+                return Ok(Some(buf));
+            }
+        }
+    }
+
+    /// Resize the remote PTY.
+    pub async fn resize(&self, cols: u32, rows: u32) -> Result<()> {
+        if self.cancel_token.is_cancelled() {
+            bail!("SSH shell cancelled");
+        }
+        self.channel.window_change(cols, rows, 0, 0).await?;
+        Ok(())
+    }
+
+    /// Close the interactive shell and its dedicated SSH session.
+    pub async fn close(self) -> Result<()> {
+        let Self {
+            mut session,
+            channel,
+            ..
+        } = self;
+        let _ = channel.eof().await;
+        let _ = channel.close().await;
+        let _ = session.close().await;
+        Ok(())
+    }
+}
+
+impl InteractiveShellReader {
+    /// Read the next chunk of shell output (stdout and stderr merged).
+    ///
+    /// Returns `Ok(None)` when the shell has exited or the channel closed.
+    pub async fn read_chunk(&mut self) -> Result<Option<Vec<u8>>> {
+        let mut buf = Vec::new();
+        loop {
+            if self.cancel_token.is_cancelled() {
+                bail!("SSH shell cancelled");
+            }
+
+            let Some(msg) = self.read_half.wait().await else {
+                return Ok(None);
+            };
+
+            match msg {
+                ChannelMsg::Data { data } => buf.extend_from_slice(&data),
+                ChannelMsg::ExtendedData { data, ext: 1 } => buf.extend_from_slice(&data),
+                ChannelMsg::ExitStatus { .. } | ChannelMsg::Eof | ChannelMsg::Close => {
+                    return Ok(None);
+                }
+                _ => {}
+            }
+
+            if !buf.is_empty() {
+                return Ok(Some(buf));
+            }
+        }
+    }
+}
+
+impl InteractiveShellWriter {
+    /// Write bytes to the shell stdin.
+    pub async fn write(&self, data: &[u8]) -> Result<()> {
+        if self.cancel_token.is_cancelled() {
+            bail!("SSH shell cancelled");
+        }
+        self.write_half.data_bytes(data.to_vec()).await?;
+        Ok(())
+    }
+
+    /// Resize the remote PTY.
+    pub async fn resize(&self, cols: u32, rows: u32) -> Result<()> {
+        if self.cancel_token.is_cancelled() {
+            bail!("SSH shell cancelled");
+        }
+        self.write_half.window_change(cols, rows, 0, 0).await?;
+        Ok(())
+    }
+
+    /// Close the interactive shell and its dedicated SSH session.
+    pub async fn close(self, _reader: InteractiveShellReader) -> Result<()> {
+        let Self {
+            mut session,
+            write_half,
+            ..
+        } = self;
+        let _ = write_half.eof().await;
+        let _ = write_half.close().await;
+        let _ = session.close().await;
+        Ok(())
+    }
 }
 
 /// Connect SSH and run a command that checks whether the system is ready for operation.

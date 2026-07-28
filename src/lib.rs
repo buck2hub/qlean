@@ -40,6 +40,7 @@ pub use image::Image;
 pub use image::ImageConfig;
 pub use machine::{Machine, MachineConfig};
 pub use pool::MachinePool;
+pub use ssh::{InteractiveShell, InteractiveShellReader, InteractiveShellWriter};
 
 /// Check if KVM is available on the host.
 pub fn is_kvm_available() -> bool {
