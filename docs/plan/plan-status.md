@@ -8,7 +8,7 @@
 
 | 计划 | 主题 | 状态 | 目标分支 | 目标版本 | 最近更新时间 |
 |---|---|---|---|---|---|
-| [`plan-20261104-windows-guest.md`](plan-20261104-windows-guest.md) | Windows 客户机支持 | `in-progress`（R5 环境消歧：`SPK-01`/`SPK-02` 因 DEP-01/02 不可用而 `blocked`；实现卡在临时接受的 ADR 上推进，`OSX-01` 完成、`OSX-02`/`OSX-03`/`TRN-01`/`EXE-01`/`IP-01`/`FS-01` 本地验收，`REL-01` 阻塞；R6 实施后逐卡 review PASS） | `main` | 0.4.0（minor；公开结构体字面量构造的源码兼容破坏） | 2026-11-12 13:45:00 UTC |
+| [`plan-20261104-windows-guest.md`](plan-20261104-windows-guest.md) | Windows 客户机支持 | `in-progress`（R5 环境消歧：`SPK-01`/`SPK-02` 因 DEP-01/02 不可用而 `blocked`；实现卡在临时接受的 ADR 上推进，`OSX-01` 完成、`OSX-02`/`OSX-03`/`TRN-01`/`EXE-01`/`IP-01`/`FS-01` 本地验收，`REL-01` 阻塞；R6 实施后逐卡 review PASS；R7 结构/状态一致性复核 PASS） | `main` | 0.4.0（minor；公开结构体字面量构造的源码兼容破坏） | 2026-11-12 14:05:00 UTC |
 
 ## 任务卡状态
 

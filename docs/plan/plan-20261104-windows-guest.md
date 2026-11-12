@@ -117,6 +117,8 @@
 
 | 2026-11-12 13:45:00 UTC | review R6（实施后逐卡 review；修订提交 `496b471`） | 逐卡核对 `OSX-01`~`FS-01` 实现与门禁；F1~F4 修复（`Drop`/`swtpm` 顺序、证据表 Review 列语义、`GuestPath::join` 不可达分支、`TRN-01` 提交号更正）；`REL-01` 维持 `blocked` | N/A（无拆合卡、无 AC 变更） | 实施证据汇总、Review log、`src/machine.rs`、`src/firmware.rs`、`src/guest_path.rs`、plan-status |
 
+| 2026-11-12 14:05:00 UTC | review R7（结构复核） | 修复文档结构：恢复丢失的 `OSX-01` 标题与 `Task type` 行；`SPK-01`/`SPK-02` 卡片状态由 `pending` 更正为 `blocked` 并写入阻塞审计证据，与状态视图、实施证据汇总一致 | N/A（无拆合卡、无 AC 变更） | 任务卡、Review log、plan-status |
+
 ## 已决议设计决策
 
 实现时若需偏离本节，必须先修改计划、状态视图与受影响任务卡并重新 review，不得在代码中静默改语义。
@@ -304,7 +306,7 @@
 
 **Task type:** `spike`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `blocked` / 空（2026-11-12 环境审计：`DEP-01` 无合法 Windows qcow2、`DEP-02` 无 QEMU/OVMF/swtpm/virsh/xorriso 与免密 sudo，spike 无法执行；ADR-WIN-02 在临时接受状态下由 `TRN-01` 落地）
 
 **Description:** 用真实 Windows VM 选定连接、鉴权、地址发现与会话方案，产出 ADR-WIN-02 和可直接执行的 `TRN-01` 输入。
 
@@ -319,6 +321,7 @@
 | vsock-only、root 用户、true probe | `src/ssh.rs:571-630` |
 | 服务端 key 无条件接受 | `src/ssh.rs:89-104` |
 | 0.3.0 移除 TCP fallback | `CHANGELOG.md:19-24` |
+| 2026-11-12 环境审计：无法取得连接/SFTP 证据 | 宿主机缺 `qemu-system-x86_64`/`qemu-img`/`swtpm`/`xorriso`/`virsh`/`qemu-bridge-helper`/OVMF，`sudo -n` 需密码，无 Windows qcow2（`DEP-01`/`DEP-02` 不可用） |
 
 **Acceptance criteria:**
 
@@ -368,7 +371,7 @@
 
 **Task type:** `spike`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `blocked` / 空（2026-11-12 环境审计：`DEP-01`/`DEP-02` 均不可用，无法取得真实首启/重启证据；ADR-WIN-03 在临时接受状态下由 `OSX-02`/`OSX-03` 落地）
 
 **Description:** 验证统一 OVMF + TPM 2.0 基线、Secure Boot、VirtIO 与部署方案，产出 ADR-WIN-03 和具体实现输入。
 
@@ -382,6 +385,7 @@
 |---|---|
 | QEMU 无 pflash/vTPM | `src/qemu.rs:74-169` |
 | seed 为 cloud-init NoCloud | `src/machine.rs:220-399` |
+| 2026-11-12 环境审计：无法取得首启/重启证据 | 同 `SPK-01` 宿主审计（`DEP-01`/`DEP-02` 不可用） |
 
 **Acceptance criteria:**
 
@@ -427,7 +431,11 @@
 
 **Granularity:** `type=spike; axis=Windows 固件/部署可行性; recovery=无生产改动; complete=yes; self-contained=yes; AC=6/8; VER=2/8; landing=0; prod-files=0; scope=M; deps=SPK-01,DEP-01,DEP-02; writeset=序列化于 SPK-01; release=no-release; split-from=N/A; exception=N/A`
 
-**Lifecycle / Acceptance:** `done` / `complete`
+### Task OSX-01: GuestOs 与镜像校验
+
+**Task type:** `implementation`
+
+**Lifecycle / Acceptance:** `done` / `complete`（A 实现与 B 本地门已过；本卡无真实 Windows KVM 门，T-1 全量门登记为 `DEFER-04`）
 
 **Description:** 新增 OS 维度、builder、持久化默认值和镜像/source/cache 校验，防止 Windows 配置落到 Linux 镜像。
 
@@ -1183,6 +1191,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R4 | P2 缺口修订（OSX-02 资源默认值、OSX-03 部署超时） | PASS | 无开放项；GAP-08/09 已修复 | 无 residual risk | 审计表重算：`OSX-02` AC=8/8、VER=5/8；`OSX-03` AC=8/8、VER=7/8（均在上限内）；追溯表补 `windows_deploy_timeout`；风险表新增两行；事实基线/性能摘要同步；plan-status 状态与时间戳同步；新增 AC 不扩大行为轴、不引入新依赖 |
 | R5 | 环境消歧（DEP-01/DEP-02 不可用）与依赖边重排 | PASS | 无开放项；spike 阻塞已登记，ADR 临时接受已写明 revisit 条件 | 残余风险：Windows 实测证据缺失（由 `SPK-01`/`SPK-02` 与 `REL-01` 阻塞承载），具名接受人=计划 Owner | 审计命令输出（`command -v` 全缺、`sudo -n` 需密码、`/dev/kvm` 存在）；依赖图无环复核；`SPK-02 -> OSX-01` 取消理由=OSX-01 无 Phase 0 输入；粒度审计表 deps 列同步 |
 | R6 | 实施后逐卡 review：`OSX-01`~`FS-01` 的实现产物、AC 对照与逐卡门禁 | PASS | 无 P0/P1 开放 | F1~F4 已在本轮修复；残余风险：真实 Windows KVM 证据与独立第二人 review 仍缺（由 `SPK-01`/`SPK-02`/`REL-01` 阻塞承载） | 逐卡门禁重跑：`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、8 个 focused filter 全绿（`image::tests` 18、`qemu` 5、`windows_deploy` 7+2、`ssh::tests` 5、`utils::tests` 4、`windows_exec` 5、`windows_ip` 6、`windows_path` 9）、`cargo test --lib` 69 passed、`cargo test --no-run`；F1~F3 修订见下表 |
+| R7 | 文档结构与状态一致性复核（10 张卡的标题/字段/状态机对齐 `plan-status.md`） | PASS | 无开放项 | 修复 R7 前存在 2 处结构缺陷（`OSX-01` 标题与 `Task type` 行丢失、`SPK-01`/`SPK-02` 卡头仍为 `pending`） | 逐卡字段审计脚本比对 10 张卡：每卡含标题、`Task type`、`Lifecycle / Acceptance` 与全部模板字段；状态与 `plan-status.md`、实施证据汇总三处一致 |
 
 ### R1 findings 与修订对照
 
