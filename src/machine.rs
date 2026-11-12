@@ -864,9 +864,7 @@ StandardError=journal
                         // Leave `self.pid` set: the process is still running, so reporting a
                         // clean shutdown would let the next start rebuild the overlay of a
                         // live guest.
-                        bail!(
-                            "QEMU process {pid} is still running after SIGKILL: the machine was not shut down.                              Kill pid {pid} manually before starting it again"
-                        );
+                        bail!("{}", unkillable_message(pid));
                     }
                 }
             }
@@ -2024,6 +2022,18 @@ fn teardown_step(
     }
 }
 
+/// Message for the one teardown outcome that must never look like success.
+///
+/// Extracted so the wording is testable: the apostrophe-free sentence spans two source
+/// lines, and a lost continuation silently turned it into one string with a run of spaces
+/// in the middle of the user-visible error.
+fn unkillable_message(pid: u32) -> String {
+    format!(
+        "QEMU process {pid} is still running after SIGKILL: the machine was not shut down. \
+         Kill pid {pid} manually before starting it again"
+    )
+}
+
 /// Convert a caller-supplied path into a validated guest path for `os`.
 fn guest_path_from(os: GuestOs, path: &Path) -> Result<GuestPath> {
     let text = path.to_str().ok_or_else(|| {
@@ -2329,6 +2339,14 @@ mod timeout_tests {
     }
 
     #[test]
+    fn unkillable_message_reads_as_one_sentence_and_names_the_pid() {
+        let message = unkillable_message(4242);
+        assert!(message.contains("still running after SIGKILL"), "{message}");
+        assert!(message.contains("Kill pid 4242 manually"), "{message}");
+        assert!(message.ends_with("again"), "{message}");
+    }
+
+    #[test]
     fn teardown_step_keeps_waiting_while_the_guest_shuts_down() {
         use std::time::Duration;
         let grace = Duration::from_secs(30);
@@ -2474,6 +2492,9 @@ mod timeout_tests {
         let messages = [
             spawn_guard(true, "abc123").unwrap_err().to_string(),
             not_running_error("upload files", "abc123").to_string(),
+            // This one shipped with a 30-space hole where a `\` continuation was meant to
+            // be, and the guard did not list it, so nothing caught it.
+            unkillable_message(4242),
         ];
         for message in messages {
             for line in message.lines() {
