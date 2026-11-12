@@ -2177,9 +2177,23 @@ mod plan_doc_tests {
             "the shared launch teardown has no test of its own"
         );
         // The recovery matrix is the contract a reader trusts; it has to name the mechanism.
-        let matrix: Vec<&str> = PLAN
-            .lines()
+        // Slice the matrix out by its heading: the same phrase is quoted in the revision
+        // history and the review log, and a whole-document search would find those instead.
+        let lines: Vec<&str> = PLAN.lines().collect();
+        let matrix_start = lines
+            .iter()
+            .position(|line| line.trim_end() == "### 故障恢复矩阵")
+            .expect("the plan has no recovery matrix");
+        let matrix_end = matrix_start
+            + 1
+            + lines[matrix_start + 1..]
+                .iter()
+                .position(|line| line.starts_with("### ") || line.starts_with("## "))
+                .expect("the recovery matrix runs to the end of the document");
+        let matrix: Vec<&str> = lines[matrix_start..matrix_end]
+            .iter()
             .filter(|line| line.starts_with("| ") && line.contains("统一失败分支"))
+            .copied()
             .collect();
         assert_eq!(
             matrix.len(),
