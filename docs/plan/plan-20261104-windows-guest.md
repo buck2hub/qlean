@@ -178,6 +178,7 @@
 | 2026-11-13 06:10:00 UTC | review R66（同一节里两句话不能互相打脸） | F71：README 的 Windows 传输一节**自相矛盾**——第一条断言「所以 `Machine::get_ip` **绝不会**在 Windows guest 里跑命令」，倒数第二条又说「重新查询会在 guest 内跑 PowerShell 并只保留本机 MAC 的地址」。两句都是我们写的，读者无法判断哪句是真的。代码的真实行为是：`launch` 连接成功后就把发现到的地址缓存进 `self.ip`，`get_ip` 走的正是这份缓存；`query_windows_ip`（guest 内 PowerShell + MAC 匹配）只在地址未知时才是唯一出路。也就是说第一条把「通常路径」说成了「永远」，第二句才是完整语义。这类漂移比代码 bug 更伤：文档是外部使用者唯一的验收面，而本节正是他们核对 `get_ip` 语义的地方。修：把第一条改成「Qlean 拨号的地址从不来自 guest 内命令」，`get_ip` 那条改写成「通常返回缓存地址；**只有地址未知时**才去 guest 里查」。无代码改动、无行为变化，因此不动 CHANGELOG（ER-06 只约束公开行为变化）| `IP-01`（`get_ip` 语义文档）、`TRN-01`（传输与安全文档）| README、Review log、覆盖矩阵、plan-status |
 | 2026-11-13 06:40:00 UTC | review R67（形状不对的输入要在门口就拦下） | F72：两处「形状不对但没有形状检查」——(1) `parse_prefixed_digest` 只校验「是十六进制」，**不校验长度**：`sha256:abc` 能通过解析，之后必然与算出来的 64 位摘要不等，用户看到的却是「digest mismatch」，指向**镜像损坏**而不是自己截断了的摘要；(2) `tests/windows_machine.rs` 的 `QLEAN_WINDOWS_IMAGE` 护栏只判断 `is_file()`，把 Linux 磁盘或随便一个文本文件指进去也能通过，随后 QEMU 用 OVMF 引导它、烧掉整段部署预算，最后报「没拿到 guest 地址」——离真正的错误变量十万八千里。这正是本项目反复记的「失败要出现在看得见错误的地方」。修：(1) 按算法校验长度（sha256=64、sha512=128），错误消息带算法、期望长度、实际长度与摘要前缀；(2) 护栏改读 4 字节 qcow2 魔数 `QFI\xfb`，不符就报出实际首字节与期望魔数。新增 1 个单测（三种长度错误 + 两种正确长度）；另把 `test_parse_prefixed_digest_case_insensitive` 的样例摘要改成真实长度。`cargo test --lib` 175 → 176。**本地实跑验证**（无需 KVM）：文本文件 → `is not a qcow2 image: it starts with [6e, 6f, 74, 20]`；qcow2 魔数 + `sha256:abc` → `sha256 digest must be 64 hexadecimal characters, got 3 (\`abc\`)` | `OSX-01`（镜像与摘要校验）、`OSX-03`/`IP-01`（冒烟护栏的可诊断性）| `src/image.rs`、`tests/windows_machine.rs`、Review log、CHANGELOG、plan-status |
 | 2026-11-13 07:10:00 UTC | review R68（配置字段是 public，就能被填成描述不出机器的值） | F73：`MachineConfig` 的字段全部 `pub`，但**没有任何校验**：`core = 0` 会变成 QEMU 自己的 `-smp 0` 报错、被包成「QEMU exited unexpectedly」；`mem = 0` 同理；`disk = Some(0)` 会把镜像缩到 0 GB；`ssh_timeout = Some(0)` 更糟——预算在第一次尝试之前就已耗尽，于是每一段都报「guest 从未应答」，把用户的配置错误说成客人的性能问题。这是 R67 同一族的第三处：形状不对的值不该等到下游以别的形式失败。修：新增 `MachineConfig::validate()`（按字段名报错、给出含义），并作为 `Machine::new` 的**第一条语句**（在任何 `create_dir_all` / overlay 之前），所以坏配置连 run 目录都不会留下。新增 2 个测试：一个按字段名断言四条错误消息；一个 `#[tokio::test]` 用不存在的镜像路径调用 `Machine::new`，断言报的是 `MachineConfig::mem`（而不是「镜像不存在」）且 `runs` 目录条数不变——直接证明校验发生在任何写盘之前。`cargo test --lib` 176 → 178 | `OSX-01`（`Machine`/`MachineConfig` 契约）、`EXE-01`（`with_machine` 入口）| `src/machine.rs`、`src/image.rs`（仅 `#[cfg(test)]` 构造器）、Review log、CHANGELOG、plan-status |
+| 2026-11-13 07:40:00 UTC | review R69（MAC 到处都在比，规则却有三套） | F74：同一个 MAC 在三个地方用三套规则比较——`windows::normalize_mac` 去掉一切非十六进制字符（`-`/`:`/大小写都不重要，喂给它 Windows 的 `AA-BB-CC-DD-EE-FF` 也能认）；`utils::parse_dhcp_leases` 里的 `looks_like_mac` **只认冒号**六组；`utils::lease_address_for` 又用 `lease.mac == mac` 做**字符串全等**。后果同 R67/R68 一族：`virsh` 将来（或某个版本、某种输出）把 MAC 印成短横线，那一行会被**静默跳过**，最终报「DHCP 租约一直没出现」——把解析问题说成网络问题；而调用方只要传大写或短横形式的 MAC，全等比较就必然失败。修：`normalize_mac` 收敛到 `utils`（`windows` 改为委托，单一实现），`looks_like_mac` 同时接受 `:` 与 `-`（仍要求六组、每组两位十六进制，混合分隔符与裸 12 位十六进制都不算 MAC），`lease_address_for` 改为比较**规范化后的地址**而不是字符串。新增 1 个单测：短横线租约被解析、裸 12 位与混合分隔符被拒、短横租约能用冒号查询命中且大小写无关。`cargo test --lib` 178 → 179 | `TRN-01`（Windows 传输的地址发现）、`IP-01`（`get_ip`）| `src/utils.rs`、`src/windows.rs`、Review log、CHANGELOG、plan-status |
 
 ## 已决议设计决策
 
@@ -780,6 +781,7 @@
 | 集成测试（`#[ignore]`） | `tests/windows_machine.rs`：`windows_transport`（地址、pin、unsupported、shutdown→spawn 重连）、`windows_pool`（双机地址/host key/会话隔离） |
 | README/CHANGELOG | README「Windows transport and security」；CHANGELOG Added ×4 / Changed ×1 |
 | 地址发现与 QEMU 退出 race | `launch` 把 DHCP lease 轮询与 `qemu_handle`、cancel token 一起 `select!`，QEMU 启动即退出时立即返回其真实错误并停 `swtpm`（R12，`src/machine.rs`） |
+| 一个概念一套规则 | 同一个值（MAC、摘要、版本号）只能有一个规范化实现与一套比较规则（R69，`dd128bd`） |
 | 配置形状在门口校验 | 字段为 `pub` 的配置结构必须在构造前按字段名校验，且校验先于任何写盘（R68，`c8235c2`） |
 | 输入形状在门口校验 | 长度/魔数这类形状错误必须在入口报出真实病因，不能等到下游以别的形式失败（R67，`c01ea1a`） |
 | 文档自洽 | 同一节内不得出现互相否定的两句；描述按代码真实路径写（R66） |
@@ -1376,6 +1378,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R66 | 文档自身不自相矛盾 | PASS | 无开放项 | F71：同一节里「`get_ip` 绝不会在 guest 里跑命令」与「重新查询会跑 PowerShell」互相打脸 | 两条都按代码实际行为改写（修正与本节同一提交 `docs(readme): stop claiming get_ip ...`，纯文档、无代码改动、无行为变化） |
 | R67 | 输入形状在门口校验 | PASS | 无开放项 | F72：摘要不校验长度、镜像护栏不校验魔数，两种情况都把用户指向错误的病因 | 长度按算法校验 + qcow2 魔数检查（`c01ea1a`）；新增 1 个单测；本地实跑两条错误消息；`cargo test --lib` 176 passed |
 | R68 | 配置形状在门口校验 | PASS | 无开放项 | F73：`core`/`mem`/`disk`/`ssh_timeout` 可被填成 0，全部在下游以别的形式失败 | `MachineConfig::validate()` + `Machine::new` 首条语句（`c8235c2`）；新增 2 个测试（含「不留 run 目录」的时序证明）；`cargo test --lib` 178 passed |
+| R69 | 同一个概念只有一套比较规则 | PASS | 无开放项 | F74：MAC 比较散落三处、规则互不相同，短横线租约会被静默跳过并报成网络问题 | `normalize_mac` 收敛到 `utils`、解析器接受两种分隔符、比较规范化地址（`dd128bd`）；新增 1 个单测；`cargo test --lib` 179 passed |
 
 ### R1 findings 与修订对照
 
