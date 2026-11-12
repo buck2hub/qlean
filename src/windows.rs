@@ -85,15 +85,17 @@ pub(crate) fn parse_adapter_addresses(output: &str) -> Vec<(String, std::net::Ip
             let mac = parts.next()?;
             let addr = parts.next()?;
             let ip = addr.parse::<std::net::IpAddr>().ok()?;
-            Some((normalize_mac(mac), ip))
+            // Only IPv4 is usable for the transport: a link-local IPv6 address has no
+            // scope id here, exactly as the DHCP lease path already assumes.
+            ip.is_ipv4().then(|| (normalize_mac(mac), ip))
         })
         .collect()
 }
 
 /// Pick the address that belongs to `mac`, refusing to guess.
 ///
-/// Qlean assigns one MAC per VM, so a Windows guest must report exactly one address for
-/// its own MAC. Zero matches means the guest has no usable IPv4 address; more than one is
+/// Qlean assigns one MAC per VM, so a Windows guest must report exactly one IPv4 address
+/// for its own MAC. Zero matches means the guest has no usable IPv4 address; more than one is
 /// ambiguous (multiple NICs, or a stale address). Neither case may silently fall back to
 /// another VM's lease.
 pub(crate) fn select_guest_address(
@@ -101,9 +103,12 @@ pub(crate) fn select_guest_address(
     mac: &str,
 ) -> Result<std::net::IpAddr> {
     let expected = normalize_mac(mac);
+    // Decide on IPv4 only. Keeping the filter here as well as in the parser means a
+    // reported IPv6 address can neither be dialled nor make a single IPv4 address look
+    // ambiguous.
     let mut matches = addresses
         .iter()
-        .filter(|(reported_mac, _)| *reported_mac == expected)
+        .filter(|(reported_mac, ip)| *reported_mac == expected && ip.is_ipv4())
         .map(|(_, ip)| *ip);
 
     let Some(first) = matches.next() else {
@@ -120,7 +125,7 @@ pub(crate) fn select_guest_address(
     if matches.next().is_some() {
         let candidates = addresses
             .iter()
-            .filter(|(reported_mac, _)| *reported_mac == expected)
+            .filter(|(reported_mac, ip)| *reported_mac == expected && ip.is_ipv4())
             .map(|(_, ip)| ip.to_string())
             .collect::<Vec<_>>();
         anyhow::bail!(
@@ -609,6 +614,46 @@ mod tests {
         assert!(GUEST_IP_QUERY.contains("169.254.*"));
         assert!(GUEST_IP_QUERY.contains("Get-NetIPAddress"));
         assert!(!GUEST_IP_QUERY.contains("hostname -I"));
+    }
+
+    #[test]
+    fn windows_guest_address_ignores_ipv6_for_the_same_adapter() {
+        // A dual-stack adapter reports both families; only IPv4 can be dialled, and the
+        // IPv6 row must not make the answer look ambiguous.
+        let output =
+            "52-54-00-AA-BB-CC 192.168.221.42\n52-54-00-AA-BB-CC fe80::4c2f:1ff:fe12:3456\n";
+        let addresses = parse_adapter_addresses(output);
+        assert_eq!(addresses.len(), 1, "{addresses:?}");
+        let selected = select_guest_address(&addresses, "52:54:00:aa:bb:cc").unwrap();
+        assert_eq!(selected.to_string(), "192.168.221.42");
+    }
+
+    #[test]
+    fn windows_guest_address_refuses_an_ipv6_only_report() {
+        let output = "52-54-00-AA-BB-CC fe80::4c2f:1ff:fe12:3456\n";
+        let addresses = parse_adapter_addresses(output);
+        let err = select_guest_address(&addresses, "52:54:00:aa:bb:cc")
+            .expect_err("an IPv6-only report must not be dialled")
+            .to_string();
+        assert!(err.contains("IPv4"), "{err}");
+    }
+
+    #[test]
+    fn windows_guest_address_selection_filters_ipv6_even_if_a_caller_passes_it() {
+        // Defence in depth: the selection site enforces IPv4 too, so a future query change
+        // cannot smuggle an unusable address through.
+        let addresses = vec![
+            (
+                normalize_mac("52-54-00-AA-BB-CC"),
+                "fe80::1".parse::<std::net::IpAddr>().unwrap(),
+            ),
+            (
+                normalize_mac("52-54-00-AA-BB-CC"),
+                "192.168.221.43".parse::<std::net::IpAddr>().unwrap(),
+            ),
+        ];
+        let selected = select_guest_address(&addresses, "52:54:00:aa:bb:cc").unwrap();
+        assert_eq!(selected.to_string(), "192.168.221.43");
     }
 
     #[test]
