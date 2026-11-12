@@ -71,9 +71,15 @@ pub(crate) fn ensure_supported(
 const WINDOWS_INVALID_CHARS: [char; 7] = ['<', '>', ':', '"', '|', '?', '*'];
 
 /// Device names Windows reserves regardless of extension or directory.
-const WINDOWS_RESERVED_NAMES: [&str; 22] = [
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+///
+/// The console names are here for the same reason as `CON`: `CONIN$` and `CONOUT$` address the
+/// console's input and output devices, so a file of either name is not a file at all - SFTP
+/// opens the device instead, or fails with a message about a device it was never asked for.
+/// `CLOCK$` is the legacy clock device, reserved for the same reason.
+const WINDOWS_RESERVED_NAMES: [&str; 25] = [
+    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "CLOCK$", "COM1", "COM2", "COM3", "COM4",
+    "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7",
+    "LPT8", "LPT9",
 ];
 
 impl GuestPath {
@@ -649,6 +655,9 @@ mod tests {
             ("C:/Users/COM1.log", "reserved Windows device name"),
             ("C:/Users/LPT9", "reserved Windows device name"),
             ("C:/Users/prn.tar.gz", "reserved Windows device name"),
+            ("C:/conin$", "reserved Windows device name"),
+            ("C:/Users/CONOUT$.txt", "reserved Windows device name"),
+            ("C:/Windows/clock$", "reserved Windows device name"),
         ];
         for (raw, expected) in rejected {
             let message = GuestPath::new(GuestOs::Windows, raw)

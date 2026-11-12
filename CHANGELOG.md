@@ -40,6 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `with_pool` no longer requires `/dev/vhost-vsock`, and `with_machine` requires it only for `GuestOs::Linux`
 
 ### Fixed
+- The reserved Windows device names were missing the console devices, so `CONIN$`,
+  `CONOUT$` and `CLOCK$` were accepted as ordinary file names: SFTP then opened the console
+  instead of a file, or failed with a message about a device nobody asked for. Windows guest
+  paths now refuse them, like `CON` and `NUL`.
 - Allocating a guest CID panicked in a debug build and wrapped to a reserved value in a
   release build when a run directory already recorded the highest CID a guest may use: the
   next machine either crashed the library or was booted with an address the host cannot
