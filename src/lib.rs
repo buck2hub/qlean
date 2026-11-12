@@ -142,6 +142,32 @@ mod plan_doc_tests {
     ];
 
     /// Each card's id, lifecycle and acceptance token, in the order the plan declares them.
+    /// The UTC date of the machine running the tests, as `YYYY-MM-DD`.
+    ///
+    /// Written out rather than pulled from a crate so the guard below needs no dependency: the
+    /// count of days since the epoch converts to a civil date by the usual shift-and-divide.
+    fn today_utc() -> String {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is before the epoch")
+            .as_secs() as i64;
+        let days = secs.div_euclid(86_400) + 719_468;
+        let era = days.div_euclid(146_097);
+        let day_of_era = days - era * 146_097;
+        let year_of_era =
+            (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+        let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+        let month_index = (5 * day_of_year + 2) / 153;
+        let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+        let month = if month_index < 10 {
+            month_index + 3
+        } else {
+            month_index - 9
+        };
+        let year = year_of_era + era * 400 + i64::from(month <= 2);
+        format!("{year:04}-{month:02}-{day:02}")
+    }
+
     fn card_states(plan: &str) -> Vec<(String, String, String)> {
         let mut cards: Vec<(String, String, String)> = Vec::new();
         let mut current: Option<String> = None;
@@ -1189,6 +1215,54 @@ mod plan_doc_tests {
 
     /// The seven ignored Windows smoke tests all stop at the precondition the plan describes.
     ///
+    /// No date in the plan lies in the future.
+    ///
+    /// R111 found a third of the revision history stamped with times that had not happened yet,
+    /// and the same habit had leaked into two evidence rows and one sampling note - a reader
+    /// cannot tell an invented date from a recorded one, so a plan that dates its evidence in the
+    /// future dates all of it in doubt. The revision history is exempt because its bad rows are
+    /// preserved on purpose and registered as unrecoverable; so is any line that says as much.
+    #[test]
+    fn the_plan_states_no_date_that_has_not_happened_yet() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        let today = today_utc();
+        let mut checked = 0;
+        let mut in_history = false;
+        for line in PLAN.lines() {
+            let trimmed = line.trim_end();
+            if trimmed.starts_with("## ") || trimmed.starts_with("### ") {
+                in_history = trimmed == "### 修订历史";
+            }
+            if in_history || line.contains("不可回溯") {
+                continue;
+            }
+            let bytes = line.as_bytes();
+            for at in 0..bytes.len().saturating_sub(9) {
+                let window = &bytes[at..at + 10];
+                let shaped = window[..4].iter().all(u8::is_ascii_digit)
+                    && window[4] == b'-'
+                    && window[5..7].iter().all(u8::is_ascii_digit)
+                    && window[7] == b'-'
+                    && window[8..10].iter().all(u8::is_ascii_digit);
+                if !shaped {
+                    continue;
+                }
+                let date = std::str::from_utf8(window).expect("a date is not ascii");
+                checked += 1;
+                assert!(
+                    date <= today.as_str(),
+                    "the plan dates evidence {date}, but the clock says {today}: nothing can \
+                     have been observed on that day yet"
+                );
+            }
+        }
+        assert!(
+            checked >= 5,
+            "the plan yielded only {checked} dates outside the revision history: the scan is not \
+             looking at them"
+        );
+    }
+
     /// The plan says every ignored Windows test halts on the DEP-01 message, and that is only true
     /// while each of them goes through the shared `windows_image_config()` gate before touching a
     /// disk or a hypervisor. A new ignored test that reads the environment itself would make the

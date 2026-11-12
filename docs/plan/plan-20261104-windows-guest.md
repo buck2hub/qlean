@@ -45,7 +45,7 @@
 
 > 所有行号和源码锚点必须在开工当天刷新；下表是 2026-11-04 当前 checkout 的成稿基线。
 >
-> **行号锚定在基线提交 `69002eb`**（`50c8cff` 之前最后一次计划提交，即尚未落地任何实现卡时的代码）。实现落地后这些「当前事实」已不成立，所以核对时不要看工作区，用 `libra show 69002eb:src/machine.rs | sed -n '220,399p'` 这类命令按基线提交复核。抽样核对（2026-11-13）：`src/machine.rs:220` 是 cloud-init `MetaData` 起点、`src/qemu.rs:74` 是 `launch_qemu` 起点、`src/ssh.rs:831` 是 `get_remote_ip` 的 `hostname -I` 一行——三处均与表中描述一致。当前的实现状态见「实施证据汇总」与各任务卡的 `Implementation evidence`。
+> **行号锚定在基线提交 `69002eb`**（`50c8cff` 之前最后一次计划提交，即尚未落地任何实现卡时的代码）。实现落地后这些「当前事实」已不成立，所以核对时不要看工作区，用 `libra show 69002eb:src/machine.rs | sed -n '220,399p'` 这类命令按基线提交复核。抽样核对（2026-11-12 复核，命令即上文的 `libra show 69002eb:…`）：`src/machine.rs:220` 是 cloud-init `MetaData` 起点、`src/qemu.rs:74` 是 `launch_qemu` 起点、`src/ssh.rs:831` 是 `get_remote_ip` 的 `hostname -I` 一行——三处均与表中描述一致。当前的实现状态见「实施证据汇总」与各任务卡的 `Implementation evidence`。
 
 | 类别 | 当前事实 | 证据 |
 |---|---|---|
@@ -1381,7 +1381,7 @@
 | 契约 schema 一致性 `(new)` | README 给出的 `deploy.json` 示例必须能被真实 `DeployContract` 解析且与 guest 真收到的契约逐字段相等（改 serde key 或改示例值即失败） | `cargo test --lib windows::tests::test_the_readme_deploy_json_example_is_the_contract_the_guest_receives` |
 | QEMU 自身原因随错误返回 `(new)` | 子进程写在 stderr 上的拒绝理由必须进入错误报文（有界尾部），不能只落日志；无尾部时才回退到「看日志」 | `cargo test --lib qemu::tests::test_a_launch_failure_returns_the_reason_the_process_printed`（真 `/bin/sh` 子进程；`capture_stderr` 不记行或 `qemu_exit_result` 传 `None` 即失败）+ `cargo test --lib qemu::tests::test_the_stderr_tail_is_bounded` |
 | 池关停的未知分支 `(new)` | 探针失败（活 QEMU + 控制 socket 丢失）时 `shutdown_all` 仍必须关掉机器；探针失败不得被读成「没在跑」，也不得让从未启动的机器报假失败 | `cargo test --lib pool::tests::test_a_failed_liveness_probe_still_shuts_the_machine_down`、`cargo test --lib machine::shutdown_tests`、`cargo test --lib machine::timeout_tests::a_machine_counts_as_started`；真机：容器内 `cargo test --lib -- --ignored test_a_live_qemu_without_a_control_socket_is_still_shut_down`（修前该用例拿到的是一句错误且 QEMU 仍在跑） |
-| 真程序证据全量快照 | 容器内 `--ignored --test-threads 1` 跑全部 11 条：9 条真程序用例通过、2 条按契约打印 `SMOKE-UNAVAILABLE` 并给出宿主原因 | `qlean-… --ignored --test-threads 1 --nocapture`（`qlean-smoke` 镜像，2026-11-14 复跑：11 passed / 34.06s） |
+| 真程序证据全量快照 | 容器内 `--ignored --test-threads 1` 跑全部 11 条：9 条真程序用例通过、2 条按契约打印 `SMOKE-UNAVAILABLE` 并给出宿主原因 | `qlean-… --ignored --test-threads 1 --nocapture`（`qlean-smoke` 镜像，2026-11-12 20:26:47→20:27:22 UTC 复跑：`11 passed / 0 failed`，34.09s，11 条全部真程序用例、无一条 `SMOKE-UNAVAILABLE`） |
 | TPM 状态落盘 `(new, 真程序)` | 真 `swtpm` 被 `stop()` 之后 `tpm2-00.permall` 内容必须改变（SIGTERM 落盘 vs SIGKILL 不落盘：1315→4409 字节 vs 1315） | `qlean-… --ignored firmware::tests::test_a_real_swtpm_flushes_its_state_when_it_is_stopped`（容器内真 swtpm 0.10.2） |
 | 秘密目录创建位 `(new)` | 嵌套创建的两级目录都是 0700；helper 必须用 `DirBuilder::mode(0o700)` 且不 `chmod`；`tpm/`、run/seed 目录必须走 helper | `cargo test --lib utils::owner_only_tests::test_owner_only_directories_are_created_that_way_and_never_chmoded` |
 | 预算与进程的真死 `(new)` | 预算到期后直接子进程必须真的不在（`/proc/<pid>` 的 state 不是 `Z`/`X`），而不只是返回 `Killed` 变体 | `cargo test --lib utils::tests::test_run_bounded_kills_the_child_it_gave_up_on`（真 `/bin/sh` + `exec sleep 30`） |
@@ -1435,7 +1435,7 @@ libra diff --staged <card-hash>^ -- <该卡的文件>   # 必须为空：回滚�
 libra commit -m "revert: <card>"
 ```
 
-实测（2026-11-14，`libra revert` 于本仓库）：
+实测（`libra revert` 于本仓库；该轮的写入时刻不可回溯确证——与上方 R111 登记的同类问题一样，日期原是按轮次顺序填的估计值，故此处不写具体日期，只保留下表可复核的文件数）：
 
 | 卡 | 提交 | 回滚结果 |
 |---|---|---|
