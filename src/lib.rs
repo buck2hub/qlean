@@ -519,6 +519,90 @@ mod plan_doc_tests {
             "the trace table's 指定测试 column yielded only {checked} labels"
         );
     }
+    /// The push backlog is one number, whichever document states it.
+    ///
+    /// Two documents describe the same blocked dependency: the plan's dependency registry says how
+    /// far `main` is ahead of the remote, and the status view says how many commits the eventual
+    /// push will carry. Both are hand-typed after each `libra push` failure, and a reader planning
+    /// the release reads whichever they find first. Neither number can be checked from inside a
+    /// test - only that they agree - so that is what this asserts, along with the retest stamp they
+    /// both claim.
+    #[test]
+    fn the_push_backlog_is_stated_once() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        const STATUS: &str = include_str!("../docs/plan/plan-status.md");
+
+        fn registry(plan: &str) -> Vec<&str> {
+            let lines: Vec<&str> = plan.lines().collect();
+            let start = lines
+                .iter()
+                .position(|line| line.trim_end() == "### 依赖登记表")
+                .expect("the plan has no dependency registry");
+            let end = lines[start + 1..]
+                .iter()
+                .position(|line| line.starts_with("### "))
+                .map(|offset| start + 1 + offset)
+                .expect("the dependency registry is the last section of its level");
+            lines[start..end].to_vec()
+        }
+
+        fn backlog<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
+            let at = text.find(marker)?;
+            let after = &text[at + marker.len()..];
+            let digits: &str = after.split(|c: char| !c.is_ascii_digit()).next()?;
+            (!digits.is_empty()).then_some(digits)
+        }
+
+        let plan_registry = registry(PLAN).join("\n");
+        let status_row = STATUS
+            .lines()
+            .find(|line| line.starts_with("| DEP-03 |"))
+            .expect("the status view has no DEP-03 row");
+        let plan_row = plan_registry
+            .lines()
+            .find(|line| line.starts_with("| DEP-03 |"))
+            .expect("the plan registry has no DEP-03 row");
+
+        let stated = [
+            ("the plan", plan_row, "领先远端 "),
+            ("the status view", status_row, "届时推送 "),
+        ];
+        let counts: Vec<(&str, &str)> = stated
+            .iter()
+            .map(|(who, row, marker)| {
+                (
+                    *who,
+                    backlog(row, marker).unwrap_or_else(|| {
+                        panic!("{who} no longer states the push backlog as `{marker}N 个提交`")
+                    }),
+                )
+            })
+            .collect();
+        for (who, count) in &counts[1..] {
+            assert_eq!(
+                *count, counts[0].1,
+                "{who} says the backlog is {count} commits but {} says {}: one push, two numbers",
+                counts[0].0, counts[0].1
+            );
+        }
+
+        fn first_stamp(row: &str) -> &str {
+            let at = row
+                .find(" UTC 复测")
+                .unwrap_or_else(|| panic!("a DEP-03 row carries no retest stamp: {row}"));
+            let start = row[..at]
+                .rfind(|c: char| !c.is_ascii_digit() && c != '-')
+                .map(|index| index + 1)
+                .unwrap_or(0);
+            &row[start..at]
+        }
+        assert_eq!(
+            first_stamp(status_row),
+            first_stamp(plan_row),
+            "the two DEP-03 rows describe retests at different times, so one of them is stale"
+        );
+    }
+
     /// The changelog's newest release is the version the crate is, dated, and in order.
     ///
     /// A version lives in three places: `Cargo.toml`, the README's support matrix and the
