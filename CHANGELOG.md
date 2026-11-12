@@ -48,6 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `is_running` no longer reports a live QEMU as stopped just because its control socket is missing: a live process without a socket is an error, so a second QEMU cannot be started on the same disk
 
 ### Fixed
+- Uploading a directory tree that contains a symbolic link to a Linux guest created the link at the *target's* path: `SSH_FXP_SYMLINK` carries two strings, the client fills the draft's `linkpath` field first, and OpenSSH reads the first string as the link's target. A link whose target was writable was silently created in the wrong place, and one whose target already existed failed with "failed to recreate the symbolic link". The request is now sent in the order OpenSSH reads it, from `ssh::symlink_arguments`
+
 - Windows guests no longer lose the reason Secure Boot was skipped: when the host
   has a `secboot` OVMF code image but no Microsoft-enrolled vars template, Qlean falls
   back to a plain code image and now warns with the skipped pair and the Windows 11
