@@ -372,6 +372,36 @@ mod plan_doc_tests {
         text.lines().find(|line| line.starts_with(&prefix))
     }
 
+    /// The whole `YYYY-MM-DD HH:MM:SS` stamp before the first ` UTC 复测` in a row.
+    ///
+    /// A retest stamp was once read by slicing from the last character that is neither a digit
+    /// nor a `-` - which is the colon before the seconds, so two rows were compared on their
+    /// seconds alone and R178 proved a six-month date gap passed the guard. The tail of a stamp
+    /// is not the stamp, so the shape is validated and the whole stamp is returned.
+    fn retest_stamp(row: &str) -> &str {
+        const SHAPE: &str = "YYYY-MM-DD HH:MM:SS";
+        let at = row
+            .find(" UTC 复测")
+            .unwrap_or_else(|| panic!("a DEP-03 row carries no retest stamp: {row}"));
+        let mut start = at.saturating_sub(SHAPE.len());
+        while start > 0 && !row.is_char_boundary(start) {
+            start -= 1;
+        }
+        let stamp = &row[start..at];
+        let shaped = stamp.len() == SHAPE.len()
+            && stamp.bytes().enumerate().all(|(index, byte)| match index {
+                4 | 7 => byte == b'-',
+                10 => byte == b' ',
+                13 | 16 => byte == b':',
+                _ => byte.is_ascii_digit(),
+            });
+        assert!(
+            shaped,
+            "a DEP-03 row's retest stamp is not `{SHAPE}`: `{stamp}` in {row}"
+        );
+        stamp
+    }
+
     /// The digits after `marker`, if the text states one.
     fn number_after<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
         let at = text.find(marker)?;
@@ -1200,19 +1230,9 @@ mod plan_doc_tests {
             }
         }
 
-        fn first_stamp(row: &str) -> &str {
-            let at = row
-                .find(" UTC 复测")
-                .unwrap_or_else(|| panic!("a DEP-03 row carries no retest stamp: {row}"));
-            let start = row[..at]
-                .rfind(|c: char| !c.is_ascii_digit() && c != '-')
-                .map(|index| index + 1)
-                .unwrap_or(0);
-            &row[start..at]
-        }
         assert_eq!(
-            first_stamp(status_row),
-            first_stamp(policy_row),
+            retest_stamp(status_row),
+            retest_stamp(policy_row),
             "the two DEP-03 rows describe retests at different times, so one of them is stale"
         );
     }
@@ -3926,6 +3946,44 @@ mod plan_doc_tests {
                 flat.contains(claim),
                 "the README no longer states `{claim}`, which is what `GuestPath::join` now \
                  does for each guest"
+            );
+        }
+    }
+
+    /// A retest stamp is read whole, not by the part after its last colon.
+    ///
+    /// R178: `the_push_backlog_is_stated_once` compared the two DEP-03 rows through a slice that
+    /// began after the last `:` - the seconds - so a row saying `2027-05-01 23:56:13` and one
+    /// saying `2026-11-12 23:56:13` read as equal and the stale one sat there green. The stamp a
+    /// reader trusts is the whole date and time, so this is what the comparison must return; the
+    /// malformed shapes below are refused rather than silently truncated into a passing value.
+    #[test]
+    fn a_retest_stamp_is_read_whole_instead_of_by_its_seconds() {
+        let plan =
+            "| DEP-03 | outgoing | 本机出口 | 2026-11-12 23:56:13 UTC 复测仍 `LBR-NET-002` |";
+        let status = "| DEP-03 | outgoing | ... | open（2027-05-01 23:56:13 UTC 复测（报文相同） |";
+        assert_eq!(retest_stamp(plan), "2026-11-12 23:56:13");
+        assert_eq!(retest_stamp(status), "2027-05-01 23:56:13");
+        assert_ne!(
+            retest_stamp(plan),
+            retest_stamp(status),
+            "two stamps that differ by six months must not compare equal just because their \
+             seconds agree"
+        );
+        // The control: identical stamps still compare equal, so the guard is not just refusing.
+        assert_eq!(retest_stamp(plan), retest_stamp(plan));
+
+        for broken in [
+            "| DEP-03 | outgoing | ... | 23:56:13 UTC 复测 |",
+            "| DEP-03 | outgoing | ... | 2026-11-12 23:56 UTC 复测 |",
+            "| DEP-03 | outgoing | ... | 2026/11/12 23:56:13 UTC 复测 |",
+            "| DEP-03 | outgoing | ... | no stamp at all |",
+        ] {
+            let refused = std::panic::catch_unwind(|| retest_stamp(broken)).is_err();
+            assert!(
+                refused,
+                "a retest stamp that is not `YYYY-MM-DD HH:MM:SS` must be refused, not read \
+                 as something shorter: {broken}"
             );
         }
     }
