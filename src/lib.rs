@@ -1060,6 +1060,71 @@ mod plan_doc_tests {
         }
     }
 
+    /// Every line citation in the plan points inside the file it names.
+    ///
+    /// The traceability table pins each card's evidence to a slice of source, like
+    /// `src/machine.rs:578-775`. Those numbers are hand-typed and are never re-derived when the
+    /// file grows or shrinks, so the one thing worth asserting is the cheap invariant: the file
+    /// exists, the range starts at or after line 1, ends at or before the last line, and does not
+    /// run backwards. A citation past the end of the file is not a matter of taste.
+    #[test]
+    fn the_plan_cites_line_ranges_inside_the_files_it_names() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+
+        let lengths: Vec<(&str, usize)> = CRATE_SOURCES
+            .iter()
+            .filter(|(path, _)| path.starts_with("src/"))
+            .map(|(path, text)| (*path, text.lines().count()))
+            .collect();
+        assert_eq!(
+            lengths.len(),
+            12,
+            "the crate has {} source files",
+            lengths.len()
+        );
+
+        let mut seen = 0_usize;
+        let mut rest = PLAN;
+        while let Some(at) = rest.find("`src/") {
+            rest = &rest[at + 1..];
+            let Some(close) = rest.find('`') else { break };
+            let citation = &rest[..close];
+            let Some((path, spec)) = citation.split_once(':') else {
+                continue;
+            };
+            if spec.is_empty()
+                || !spec
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c == ',' || c == '-')
+            {
+                continue;
+            }
+            let last = lengths
+                .iter()
+                .find(|(name, _)| *name == path)
+                .map(|(_, last)| last)
+                .unwrap_or_else(|| panic!("the plan cites {path}, which is not a source file"));
+            for part in spec.split(',') {
+                let (start, end) = match part.split_once('-') {
+                    Some((start, end)) => (start, end),
+                    None => (part, part),
+                };
+                let start: usize = start.parse().expect("a citation starts with a line number");
+                let end: usize = end.parse().expect("a citation ends with a line number");
+                assert!(
+                    start >= 1 && start <= end,
+                    "the plan cites {path}:{spec}, which is not a forward range"
+                );
+                assert!(
+                    end <= *last,
+                    "the plan cites {path}:{spec} but that file has {last} lines"
+                );
+                seen += 1;
+            }
+        }
+        assert!(seen >= 40, "only {seen} line citations were checked");
+    }
+
     /// The evidence summary repeats the lifecycle its card declares, in a third place.
     ///
     /// The same two tokens are written three times: in the card, in the status view's table and in
