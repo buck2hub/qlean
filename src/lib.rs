@@ -519,6 +519,59 @@ mod plan_doc_tests {
             "the trace table's 指定测试 column yielded only {checked} labels"
         );
     }
+    /// Every round in the review log that can name its commit does name one.
+    ///
+    /// The log's whole value is that a reader can walk from a round number to the code. Ten early
+    /// rounds cannot: they were written before the rule existed and the commits behind them were
+    /// never recorded, so filling them in now would be a guess. That set is fixed and small. Any
+    /// other row without a hash is a row nobody can follow - including the docs-only rounds, whose
+    /// own documentation commit is the thing to cite.
+    #[test]
+    fn the_review_log_names_a_commit_for_every_round_it_can() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        const UNRECORDED: &[u32] = &[1, 2, 3, 4, 5, 6, 18, 24, 25, 66];
+
+        let lines: Vec<&str> = PLAN.lines().collect();
+        let heading = lines
+            .iter()
+            .position(|line| line.trim_end() == "## Review log")
+            .expect("the plan has no Review log section");
+
+        let mut rounds = 0;
+        let mut unrecorded = Vec::new();
+        for line in &lines[heading + 1..] {
+            if line.starts_with("## ") || line.starts_with("### ") {
+                break;
+            }
+            let Some(rest) = line.strip_prefix("| R") else {
+                continue;
+            };
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            if digits.is_empty() {
+                // The header row starts the same way.
+                continue;
+            }
+            let round: u32 = digits
+                .parse()
+                .unwrap_or_else(|_| panic!("a review log row has an unreadable round: {line}"));
+            rounds += 1;
+            let has_hash = line
+                .match_indices('`')
+                .filter_map(|(at, _)| line[at + 1..].split('`').next())
+                .any(|inside| inside.len() == 7 && inside.chars().all(|c| c.is_ascii_hexdigit()));
+            if !has_hash {
+                unrecorded.push(round);
+            }
+        }
+        assert!(rounds > 100, "the review log yielded only {rounds} rounds");
+        unrecorded.sort_unstable();
+        assert_eq!(
+            unrecorded, UNRECORDED,
+            "the rounds with no commit hash changed: a row either lost the hash that let a reader \
+             follow it, or a round that can name its commit did not"
+        );
+    }
+
     /// No line of the plan claims a filter passed more tests than the filter now selects.
     ///
     /// The evidence rows record counts ("18 passed") so a later reviewer can tell whether the
