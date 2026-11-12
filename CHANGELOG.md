@@ -58,6 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Windows guests were launched with `vhost-vsock-pci`, so a Windows VM needed `/dev/vhost-vsock` and the `vhost_vsock` module and failed to start without them; the device is now added only for Linux guests
 - OVMF setup required the code image and vars template to be exactly the same size, which no stock firmware pair satisfies (a ~528 KiB vars template ships next to a multi-megabyte code image); only a vars template larger than the code image is now rejected
 - The `swtpm` control socket was created with default permissions; it is now owner-only (`mode=0600`)
+- The `User-Agent` sent when downloading a guest image follows the crate version instead of a hand-written `0.3.0`
 - A failing `virsh net-list` is reported as libvirt being unreachable instead of being read as "the qlean network does not exist"; libvirt's own message is surfaced when defining or starting the network fails
 - Closing the guest SSH session is bounded too (5s): a guest that stopped answering no longer blocks shutdown before the kill fallback
 - QMP exchanges are bounded (10s), so a wedged QEMU makes shutdown fall back to killing it instead of hanging a test forever

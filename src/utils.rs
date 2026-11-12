@@ -704,8 +704,13 @@ pub(crate) fn gen_random_mac() -> String {
     )
 }
 
+/// `User-Agent` for HTTP requests Qlean makes on the user's behalf.
+///
+/// Derived from the crate version on purpose: this string is how a mirror operator
+/// identifies the client, and a hand-written version silently keeps advertising the release
+/// it was typed in (it already said `0.3.0` while the crate was `0.3.1`).
 pub(crate) fn qlean_user_agent() -> &'static str {
-    "qlean/0.3.0"
+    concat!("qlean/", env!("CARGO_PKG_VERSION"))
 }
 
 #[cfg(test)]
@@ -1039,6 +1044,20 @@ mod tests {
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
         }
+    }
+
+    #[test]
+    fn the_user_agent_follows_the_crate_version() {
+        // A literal would drift at the next release and nobody would notice.
+        assert_eq!(
+            qlean_user_agent(),
+            concat!("qlean/", env!("CARGO_PKG_VERSION"))
+        );
+        assert!(
+            qlean_user_agent().starts_with("qlean/"),
+            "{}",
+            qlean_user_agent()
+        );
     }
 
     #[test]
