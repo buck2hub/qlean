@@ -499,8 +499,7 @@ async fn ensure_network() -> Result<()> {
         .output()
         .await
         .context("failed to execute virsh to check qlean network")?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let all_networks = stdout.lines().map(str::to_owned).collect::<HashSet<_>>();
+    let all_networks = listed_networks(&output, "net-list --all")?;
     let net_exists = all_networks.contains("qlean");
 
     let output = tokio::process::Command::new("virsh")
@@ -511,8 +510,7 @@ async fn ensure_network() -> Result<()> {
         .output()
         .await
         .context("failed to execute virsh to check qlean network")?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let active_networks = stdout.lines().map(str::to_owned).collect::<HashSet<_>>();
+    let active_networks = listed_networks(&output, "net-list")?;
     let net_active = active_networks.contains("qlean");
 
     // QEMU is always launched with `br={QLEAN_BRIDGE_NAME}`, so a `qlean` network that
@@ -526,10 +524,7 @@ async fn ensure_network() -> Result<()> {
                 bail!("{}", bridge_mismatch_message(name));
             }
             Some(_) => {}
-            None => warn!(
-                "could not read the bridge name of the existing `qlean` network; assuming it is                  {QLEAN_BRIDGE_NAME}. If guest networking fails, recreate the network with \
-                 `virsh -c {VIRSH_CONNECTION_URI} net-undefine qlean`"
-            ),
+            None => warn!("{}", bridge_assumed_message()),
         }
     }
 
@@ -553,46 +548,95 @@ async fn ensure_network() -> Result<()> {
             .await
             .context("failed to write qlean network xml file")?;
 
-        let status = tokio::process::Command::new("virsh")
+        let output = tokio::process::Command::new("virsh")
             .arg("-c")
             .arg(VIRSH_CONNECTION_URI)
             .arg("net-define")
             .arg(&xml_path)
-            .status()
+            .output()
             .await
             .context("failed to execute virsh to define qlean network")?;
-        if !status.success() {
-            bail!("failed to define qlean network");
+        if !output.status.success() {
+            bail!(
+                "failed to define the qlean network: {}",
+                virsh_reason(&output)
+            );
         }
     }
 
     if !net_exists || !net_active {
         debug!("Starting qlean network");
-        let status = tokio::process::Command::new("virsh")
+        let output = tokio::process::Command::new("virsh")
             .arg("-c")
             .arg(VIRSH_CONNECTION_URI)
             .arg("net-autostart")
             .arg("qlean")
-            .status()
+            .output()
             .await
             .context("failed to execute virsh to autostart qlean network")?;
-        if !status.success() {
-            bail!("failed to autostart qlean network");
+        if !output.status.success() {
+            bail!(
+                "failed to autostart the qlean network: {}",
+                virsh_reason(&output)
+            );
         }
 
-        let status = tokio::process::Command::new("virsh")
+        let output = tokio::process::Command::new("virsh")
             .arg("-c")
             .arg(VIRSH_CONNECTION_URI)
             .arg("net-start")
             .arg("qlean")
-            .status()
+            .output()
             .await
             .context("failed to execute virsh to start qlean network")?;
-        if !status.success() {
-            bail!("failed to start qlean network");
+        if !output.status.success() {
+            bail!(
+                "failed to start the qlean network: {}",
+                virsh_reason(&output)
+            );
         }
     }
     Ok(())
+}
+
+/// The reason a virsh invocation failed: its stderr, so libvirt's own message reaches the user.
+fn virsh_reason(output: &std::process::Output) -> String {
+    let reason = String::from_utf8_lossy(&output.stderr);
+    let reason = reason.trim();
+    if reason.is_empty() {
+        format!("`virsh` exited with {}", output.status)
+    } else {
+        format!("`virsh` exited with {}: {reason}", output.status)
+    }
+}
+
+/// Networks reported by a `virsh net-list --name` invocation.
+///
+/// A failed listing is an error, never an empty list. Reading it as "no such network" sends
+/// the user down the create-the-network path when the actual problem is that libvirt is
+/// unreachable, and the useful message (libvirt's own) is what they need to see.
+fn listed_networks(output: &std::process::Output, what: &str) -> Result<HashSet<String>> {
+    if !output.status.success() {
+        bail!(
+            "`virsh -c {VIRSH_CONNECTION_URI} {what}` failed, so the qlean network state is \
+             unknown (is libvirtd running and reachable?): {}",
+            virsh_reason(output)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_owned)
+        .filter(|line| !line.trim().is_empty())
+        .collect())
+}
+
+/// Message for a `qlean` network whose bridge name could not be read.
+fn bridge_assumed_message() -> String {
+    format!(
+        "could not read the bridge name of the existing `qlean` network; assuming it is \
+         {QLEAN_BRIDGE_NAME}. If guest networking fails, recreate the network with \
+         `virsh -c {VIRSH_CONNECTION_URI} net-undefine qlean` and run the command again"
+    )
 }
 
 /// Bridge name of the existing `qlean` libvirt network.
@@ -986,5 +1030,62 @@ mod tests {
         assert!(message.contains("`virbr0`"), "{message}");
         assert!(message.contains(QLEAN_BRIDGE_NAME), "{message}");
         assert!(message.contains("net-undefine qlean"), "{message}");
+    }
+
+    fn virsh_output(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_failed_listing_is_an_error_not_an_empty_network_list() {
+        // The exact mistake this guards: reading "virsh could not talk to libvirt" as
+        // "the qlean network does not exist", which sends the user off to create it.
+        let output = virsh_output(
+            1,
+            "",
+            "error: failed to connect to the hypervisor\n\
+             error: Failed to connect socket to '/run/libvirt/libvirt-sock': No such file or directory",
+        );
+        let error = listed_networks(&output, "net-list --all")
+            .expect_err("a failed listing must not read as an empty list");
+        let message = error.to_string();
+        assert!(message.contains("libvirtd"), "{message}");
+        assert!(message.contains(VIRSH_CONNECTION_URI), "{message}");
+        assert!(message.contains("libvirt-sock"), "{message}");
+    }
+
+    #[test]
+    fn a_listing_lists_networks_and_ignores_blank_lines() {
+        let output = virsh_output(0, "default\nqlean\n\n", "");
+        let networks = listed_networks(&output, "net-list --all").expect("a successful listing");
+        assert!(networks.contains("qlean"), "{networks:?}");
+        assert!(!networks.contains(""), "blank lines are not networks");
+    }
+
+    #[test]
+    fn network_messages_have_no_runs_of_spaces() {
+        // A lost `\` continuation left a long run of spaces in the bridge message; this is the
+        // same guard the user-facing machine messages have.
+        let failed = listed_networks(&virsh_output(1, "", "boom"), "net-list").unwrap_err();
+        let messages = [
+            bridge_assumed_message(),
+            bridge_mismatch_message("virbr9"),
+            failed.to_string(),
+        ];
+        for message in messages {
+            for line in message.lines() {
+                // Leading indentation is deliberate (it marks the commands to run); a run of
+                // spaces *inside* a sentence is always a lost `\` continuation.
+                assert!(
+                    !line.trim_start().contains("  "),
+                    "message line has a run of spaces: {line:?}"
+                );
+            }
+        }
     }
 }
