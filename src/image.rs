@@ -93,9 +93,17 @@ pub struct ImageConfig {
     pub arch: GuestArch,
     /// Distribution of the image, defaults to `Distro::Debian`.
     pub distro: Distro,
-    /// Source of the image, it can be a URL or a local file path. If provided, the image will be fetched from the source and verified against the digest.
+    /// Source of the image, it can be a URL or a local file path.
+    ///
+    /// `source` and `digest` must both be set or both omitted: an image is never fetched
+    /// without a digest to verify it against, and config validation refuses the half-set
+    /// pair with that sentence. When set, the image is fetched from `source` and verified
+    /// against `digest`.
     pub source: Option<String>,
-    /// Digest of the image, in the form of `sha256:<hex>` or `sha512:<hex>`. It should be provided along with the source.
+    /// Digest of the image, in the form of `sha256:<hex>` or `sha512:<hex>`.
+    ///
+    /// It must be set together with `source`; see [`ImageConfig::source`] for the rule and
+    /// the error a half-set pair produces.
     pub digest: Option<String>,
     /// Whether to clear the image after use, defaults to `false`. It is useful for custom images that are not expected to be used again.
     pub clear: bool,

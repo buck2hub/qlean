@@ -1316,6 +1316,59 @@ mod plan_doc_tests {
         );
     }
 
+    /// The `source`/`digest` docs state the rule the code enforces, not a softer one.
+    ///
+    /// `ImageConfig::validate` refuses a half-set pair outright - an image is never fetched
+    /// without a digest to verify it against - but both fields documented the digest as
+    /// something that "should be provided along with the source", which reads as advice. A
+    /// reader who follows the advice gets a hard error far from the sentence, and one who
+    /// omits both learns nothing from the field docs. The guard reads the doc comments that
+    /// sit directly above the two fields (and their README copy) so prose elsewhere in the
+    /// file cannot satisfy it.
+    #[test]
+    fn the_image_config_fields_document_the_digest_rule_the_code_enforces() {
+        fn doc_above(file: &str, field: &str) -> String {
+            let lines: Vec<&str> = file.lines().collect();
+            let at = lines
+                .iter()
+                .position(|line| line.trim() == field)
+                .unwrap_or_else(|| panic!("`{field}` must still be a field on its own line"));
+            let mut doc = Vec::new();
+            for line in lines[..at].iter().rev() {
+                let trimmed = line.trim();
+                if let Some(rest) = trimmed.strip_prefix("///") {
+                    doc.push(rest.trim().to_string());
+                } else {
+                    break;
+                }
+            }
+            assert!(
+                !doc.is_empty(),
+                "`{field}` must keep a doc comment: it carries the rule the code enforces"
+            );
+            doc.reverse();
+            doc.join(" ")
+        }
+
+        for (name, text) in [
+            ("src/image.rs", include_str!("image.rs")),
+            ("README.md", include_str!("../README.md")),
+        ] {
+            for field in ["pub source: Option<String>,", "pub digest: Option<String>,"] {
+                let doc = doc_above(text, field);
+                assert!(
+                    doc.contains("must both be set or both omitted")
+                        || doc.contains("must be set together with `source`"),
+                    "{name}: the doc above `{field}` must state the rule: {doc}"
+                );
+                assert!(
+                    !doc.contains("should"),
+                    "{name}: the doc above `{field}` hedges a rule the code enforces: {doc}"
+                );
+            }
+        }
+    }
+
     /// The image contract requires PowerShell, because `exec` sends the command verbatim.
     ///
     /// `exec` hands the user's string straight to the guest's default shell with no wrapping,
