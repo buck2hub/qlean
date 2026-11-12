@@ -519,6 +519,112 @@ mod plan_doc_tests {
             "the trace table's 指定测试 column yielded only {checked} labels"
         );
     }
+    /// The plan keeps every section the template makes mandatory.
+    ///
+    /// The template's rule is that mandatory sections may not be dropped - a section that does not
+    /// apply is written `N/A` instead. Nothing enforced that against the plan, and the plan had
+    /// already lost one: the three subsections under `文档职责` were all present, but their heading
+    /// was not, so a reader (or a grep for the section) saw no document-responsibility section at
+    /// all. Deriving the list from the template means a template change reaches this check.
+    #[test]
+    fn the_plan_keeps_every_section_the_template_requires() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        const TEMPLATE: &str = include_str!("../docs/plan/plan-template.md");
+
+        // Sections that describe the template itself, not a plan.
+        const TEMPLATE_ONLY: &[&str] = &["使用规则", "标题"];
+
+        let required: Vec<&str> = TEMPLATE
+            .lines()
+            .filter_map(|line| line.strip_prefix("## "))
+            .map(str::trim)
+            .filter(|title| !TEMPLATE_ONLY.contains(title))
+            .collect();
+        assert!(
+            required.len() > 15,
+            "the template yielded only {} mandatory sections",
+            required.len()
+        );
+
+        let headings: Vec<&str> = PLAN
+            .lines()
+            .filter_map(|line| line.strip_prefix("## "))
+            .map(str::trim)
+            .collect();
+        for title in &required {
+            assert!(
+                headings.contains(title),
+                "the plan has no `## {title}` section, though the template makes it mandatory"
+            );
+        }
+    }
+
+    /// Every card carries the fields the template makes mandatory, with a value in each.
+    ///
+    /// The fields are what makes a card executable on its own: its type, its state, how to undo it,
+    /// what it may write, whether it bumps the version, what it inherits and how it splits. A card
+    /// missing one of them reads as if that question had no answer, and the plan's own granularity
+    /// audit table would not notice.
+    #[test]
+    fn every_card_carries_the_fields_the_template_requires() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        const FIELDS: &[&str] = &[
+            "**Task type:**",
+            "**Lifecycle / Acceptance:**",
+            "**Rollback mode:**",
+            "**Implementation write set:**",
+            "**Version increment:**",
+            "**C/D coverage from:**",
+            "**Granularity:**",
+            "**Deliverables:**",
+            "**Docs and compatibility impact:**",
+        ];
+
+        let mut cards = 0;
+        let mut current: Option<String> = None;
+        let mut seen: Vec<String> = Vec::new();
+
+        let check = |id: &str, seen: &Vec<String>| {
+            for field in FIELDS {
+                let value = seen
+                    .iter()
+                    .find_map(|line| line.strip_prefix(field))
+                    .unwrap_or_else(|| panic!("card {id} has no {field} line"));
+                assert!(
+                    !value.trim().is_empty(),
+                    "card {id} leaves {field} empty instead of writing N/A and why"
+                );
+            }
+        };
+
+        for line in PLAN.lines() {
+            if let Some(rest) = line.strip_prefix("### Task ") {
+                if let Some(id) = current.as_deref() {
+                    check(id, &seen);
+                }
+                current = Some(rest.split(':').next().unwrap_or(rest).trim().to_string());
+                seen.clear();
+                cards += 1;
+                continue;
+            }
+            if line.starts_with("## ") || line.starts_with("### ") {
+                if let Some(id) = current.as_deref() {
+                    check(id, &seen);
+                }
+                current = None;
+                seen.clear();
+                continue;
+            }
+            if current.is_some() && line.starts_with("**") {
+                seen.push(line.to_string());
+            }
+        }
+        if let Some(id) = current.as_deref() {
+            check(id, &seen);
+        }
+        assert_eq!(cards, 10, "the plan declares {cards} cards");
+    }
+
     /// The status view repeats the lifecycle each card declares, not one of its own.
     ///
     /// A card states its state in two places: its own `Lifecycle / Acceptance` line, which the

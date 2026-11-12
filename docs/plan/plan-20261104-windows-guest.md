@@ -10,6 +10,8 @@
 
 **计划状态同步义务（强制）:** 单一执行状况视图是 [`plan-status.md`](plan-status.md)。任何 Agent 推进或完成一张任务卡时，必须在同一变更中同步状态、发布版本/commit 和该卡的 UTC 更新时间；任务卡、`DEFER-*` 或依赖变化时同样同步。状态推进前运行 `git status --short --branch`（Git checkout）或 `libra status --short --branch`（Libra checkout）并记录所用工具。
 
+## 文档职责
+
 ### 适用范围
 
 - **公开 API**：`ImageConfig` 新增 `GuestOs` 维度与 `with_guest_os` builder；`Image`、`Machine`、`MachinePool`、`with_machine`/`with_pool`、`is_kvm_available`。
