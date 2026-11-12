@@ -907,6 +907,22 @@ impl Image {
     }
 }
 
+#[cfg(test)]
+impl Image {
+    /// Minimal `Image` for unit tests that stop before QEMU is involved.
+    pub(crate) fn for_tests(path: std::path::PathBuf) -> Self {
+        Self {
+            name: "test-image".to_string(),
+            path,
+            arch: GuestArch::Amd64,
+            distro: Distro::Debian,
+            guest_os: GuestOs::Linux,
+            digest: (ShaType::Sha256, "0".repeat(64)),
+            clear: true,
+        }
+    }
+}
+
 impl Drop for Image {
     fn drop(&mut self) {
         if self.clear {

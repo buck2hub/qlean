@@ -167,6 +167,41 @@ impl MachineConfig {
     pub fn with_clear(self, clear: bool) -> Self {
         Self { clear, ..self }
     }
+
+    /// Reject field values that cannot describe a machine.
+    ///
+    /// Every field is public, so a caller can set a value QEMU has no interpretation for.
+    /// Left alone, such a value surfaces much later and in the wrong place: `core = 0`
+    /// becomes QEMU's own `-smp 0` error under "QEMU exited unexpectedly", and
+    /// `ssh_timeout = 0` makes every phase of the launch report that the guest used up a
+    /// budget it never had. The check runs before anything is written to disk, so a bad
+    /// config leaves no run directory behind either.
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.core > 0,
+            "MachineConfig::core must be at least 1, got 0: a machine without a CPU cannot boot"
+        );
+        anyhow::ensure!(
+            self.mem > 0,
+            "MachineConfig::mem must be at least 1 (MB), got 0: a machine without memory cannot boot"
+        );
+        if let Some(disk) = self.disk {
+            anyhow::ensure!(
+                disk > 0,
+                "MachineConfig::disk must be at least 1 (GB) when set, got 0: resizing the \
+                 image to 0 GB would truncate it instead of enlarging it"
+            );
+        }
+        if let Some(ssh_timeout) = self.ssh_timeout {
+            anyhow::ensure!(
+                ssh_timeout > 0,
+                "MachineConfig::ssh_timeout must be at least 1 (second), got 0: a zero budget is \
+                 already spent when the first attempt starts, so every launch reports that the \
+                 guest never answered"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -312,6 +347,9 @@ fn resolve_ssh_timeout(config: &MachineConfig) -> Duration {
 impl Machine {
     /// Create a new Machine instance with specified image and configuration.
     pub async fn new(image: &Image, config: &MachineConfig) -> Result<Self> {
+        // Before anything is written: a config QEMU cannot interpret must not leave a run
+        // directory (or a half-created overlay) behind.
+        config.validate()?;
         // Prepare run directory
         let dirs = QleanDirs::new()?;
         let machine_id = nanoid!(12, &HEX_ALPHABET);
@@ -2151,6 +2189,74 @@ mod timeout_tests {
             "the message must say that later phases get no fresh wait: {message}"
         );
         assert!(message.contains("ssh_timeout"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_config_that_cannot_describe_a_machine_fails_before_anything_is_written() {
+        let runs = crate::utils::QleanDirs::new().unwrap().runs;
+        let count =
+            |dir: &std::path::Path| std::fs::read_dir(dir).map(|it| it.count()).unwrap_or(0);
+        let before = count(&runs);
+        // The image path does not exist: validation must run before the overlay is built,
+        // so the error talks about the config instead of a missing image.
+        let image = crate::image::Image::for_tests(std::env::temp_dir().join("qlean-absent.qcow2"));
+        let config = MachineConfig {
+            mem: 0,
+            ..MachineConfig::default()
+        };
+        let error = match Machine::new(&image, &config).await {
+            Ok(_) => panic!("a config without memory must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("MachineConfig::mem"), "{error}");
+        assert_eq!(
+            count(&runs),
+            before,
+            "a rejected config must not leave a run directory behind"
+        );
+    }
+
+    #[test]
+    fn a_config_that_cannot_describe_a_machine_is_rejected_by_name() {
+        let zero_core = MachineConfig {
+            core: 0,
+            ..MachineConfig::default()
+        };
+        let message = zero_core.validate().unwrap_err().to_string();
+        assert!(message.contains("core"), "{message}");
+        assert!(message.contains("at least 1"), "{message}");
+
+        let zero_mem = MachineConfig {
+            mem: 0,
+            ..MachineConfig::default()
+        };
+        let message = zero_mem.validate().unwrap_err().to_string();
+        assert!(message.contains("mem"), "{message}");
+
+        let zero_disk = MachineConfig {
+            disk: Some(0),
+            ..MachineConfig::default()
+        };
+        let message = zero_disk.validate().unwrap_err().to_string();
+        assert!(message.contains("disk"), "{message}");
+        assert!(message.contains("truncate"), "{message}");
+
+        let zero_budget = config(Some(0));
+        let message = zero_budget.validate().unwrap_err().to_string();
+        assert!(message.contains("ssh_timeout"), "{message}");
+        assert!(message.contains("already spent"), "{message}");
+
+        // A default config and a deliberate one-second budget stay valid.
+        assert!(MachineConfig::default().validate().is_ok());
+        assert!(config(Some(1)).validate().is_ok());
+        assert!(
+            MachineConfig {
+                disk: Some(1),
+                ..MachineConfig::default()
+            }
+            .validate()
+            .is_ok()
+        );
     }
 
     fn config(ssh_timeout: Option<u64>) -> MachineConfig {
