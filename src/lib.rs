@@ -1316,6 +1316,44 @@ mod plan_doc_tests {
         );
     }
 
+    /// The image contract requires PowerShell, because `exec` sends the command verbatim.
+    ///
+    /// `exec` hands the user's string straight to the guest's default shell with no wrapping,
+    /// so the documented PowerShell example only works when the image changed OpenSSH's
+    /// `DefaultShell`. Qlean's own probes dodge that requirement by encoding themselves; a
+    /// user's `exec` cannot. A contract sentence that hedges ("should set") reads as optional
+    /// and leaves the documented example failing under a stock `cmd.exe` default shell, so the
+    /// requirement is pinned as a must and the hedge is rejected outright.
+    #[test]
+    fn the_image_contract_requires_powershell_as_the_default_shell() {
+        let readme = include_str!("../README.md");
+        let contract = readme
+            .split("#### Windows image contract")
+            .nth(1)
+            .and_then(|rest| rest.split("#### Windows transport and security").next())
+            .expect("the README must keep the Windows image contract in its own section");
+
+        // Re-wrapping the paragraph must not decide whether the requirement still holds.
+        let flat = contract.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("must set the OpenSSH default shell to PowerShell"),
+            "the contract must state that the image sets OpenSSH's DefaultShell to PowerShell"
+        );
+        // Whole phrases only: `contains("DefaultShell")` would also accept a renamed value
+        // such as `DefaultShellValue`, which no image would ever read.
+        let binary = "`HKLM:\\SOFTWARE\\OpenSSH` -> `DefaultShell` = \
+                      `C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`";
+        assert!(
+            flat.contains(binary),
+            "the contract must name the registry value and the shell an image has to set: {binary}"
+        );
+        assert!(
+            !flat.contains("should set"),
+            "an image requirement written as `should` reads as optional, and `exec` would then \
+             run PowerShell syntax under cmd.exe"
+        );
+    }
+
     /// The library test count the evidence rows claim only ever grows.
     ///
     /// Every round records `cargo test --lib` in its revision-history row. Those numbers are

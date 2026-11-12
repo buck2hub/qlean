@@ -116,11 +116,11 @@ already be generalized and ship a first-boot task that consumes Qlean's seed med
      and a `sftp` subsystem. Qlean's own probes (guest IP query, file copy) are
      wrapped in `powershell -NoProfile -NonInteractive -EncodedCommand`, so they run
      under either default shell; your `exec` commands still use the image's default
-     shell, and the contract below assumes PowerShell, so the image should set the
+     shell, and Qlean's `exec` semantics assume PowerShell, so the image must set the
      OpenSSH default shell to PowerShell
      (`HKLM:\SOFTWARE\OpenSSH` -> `DefaultShell` =
-     `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`, which Qlean's
-     `exec` semantics assume), then restarts `sshd`;
+     `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`), then restarts
+     `sshd`;
    - writes `C:\ProgramData\qlean\deployed` once all of the above succeeded.
 4. Leave the image shut down and unconfigured; Qlean creates a per-VM overlay, a per-VM
    `ovmf_vars.fd`, a per-VM TPM 2.0 state and a per-VM seed medium on every `init`.
