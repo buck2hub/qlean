@@ -191,6 +191,23 @@ fn vsock_args(guest_os: GuestOs, cid: u32) -> Vec<String> {
     ]
 }
 
+/// Serve QMP on `socket` and expose it as monitor `qmp0`.
+///
+/// Kept separate from [`launch_qemu`] so the exact channel string qlean relies on can be
+/// handed to a real QEMU in a test: a typo here makes every shutdown fall back to SIGKILL
+/// and every `is_running` check report a dead VM.
+fn qmp_chardev_args(socket: &Path) -> anyhow::Result<Vec<String>> {
+    Ok(vec![
+        "-chardev".to_string(),
+        format!(
+            "socket,path={},server=on,wait=off,id=qmp0",
+            qemu_option_path("QMP socket", socket)?
+        ),
+        "-mon".to_string(),
+        "chardev=qmp0,mode=control".to_string(),
+    ])
+}
+
 pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
     // Prepare QEMU command
     let is_windows = params.image.guest_os == GuestOs::Windows;
@@ -218,16 +235,7 @@ pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> 
         let _ = std::fs::remove_file(&qmp_socket);
     }
 
-    let qmp_chardev = format!(
-        "socket,path={},server=on,wait=off,id=qmp0",
-        qemu_option_path("QMP socket", &qmp_socket)?
-    );
-    qemu_cmd.args([
-        "-chardev",
-        &qmp_chardev,
-        "-mon",
-        "chardev=qmp0,mode=control",
-    ]);
+    qemu_cmd.args(qmp_chardev_args(&qmp_socket)?);
 
     let disk_drive = format!(
         "file={},if=virtio,cache=writeback",
@@ -470,6 +478,87 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .status()
             .is_ok_and(|status| status.success())
+    }
+
+    /// Check the QMP control channel against a real QEMU.
+    ///
+    /// `Machine::shutdown` asks QMP for an ACPI powerdown and every liveness check goes
+    /// through `query-status`. Both are built from one chardev string, and the unit tests
+    /// only ever talk to a silent fake socket: they can prove a hang is bounded, not that a
+    /// real QEMU ever answers. A wrong socket option (`server=on,wait=off`), a missing
+    /// capability negotiation or a mis-parsed reply would surface as "every VM is dead" and
+    /// "shutdown always falls back to SIGKILL", which is exactly what this checks.
+    ///
+    /// ```text
+    /// cargo test --lib -- --ignored qmp_control_channel
+    /// ```
+    #[tokio::test]
+    #[ignore = "needs qemu-system-x86_64; run with --ignored on a real host"]
+    async fn test_the_qmp_control_channel_answers_a_real_qemu() {
+        let qemu = Path::new(qemu_system_program(GuestArch::Amd64));
+        if !program_runs(qemu) {
+            assert!(smoke_unavailable(&format!(
+                "`{}` is not runnable",
+                qemu.display()
+            )));
+            return;
+        }
+        let run_dir = std::env::temp_dir().join(format!("qlean-qmp-real-{}", std::process::id()));
+        std::fs::create_dir_all(&run_dir).expect("test run dir");
+        let socket = run_dir.join("qmp.sock");
+        let _ = std::fs::remove_file(&socket);
+
+        let mut args: Vec<String> = ["-machine", "q35,hpet=off", "-m", "512", "-display", "none"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        args.extend(qmp_chardev_args(&socket).expect("qmp args"));
+        let mut child = tokio::process::Command::new(qemu)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn qemu");
+
+        // A VM with no bootable medium still has to report `running`: that is the state
+        // `Machine::is_running` treats as alive, and a client that always answered `false`
+        // would pass every fake-socket test while declaring live VMs dead.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut running = false;
+        let mut last = String::new();
+        while std::time::Instant::now() < deadline {
+            match crate::qmp::query_running(&socket).await {
+                Ok(true) => {
+                    running = true;
+                    break;
+                }
+                Ok(false) => last = "query-status reported a stopped VM".to_string(),
+                Err(error) => last = format!("{error:#}"),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            running,
+            "QMP never reported the VM as running: {last} (qemu still up: {})",
+            child.try_wait().expect("qemu state").is_none()
+        );
+
+        crate::qmp::powerdown(&socket)
+            .await
+            .expect("real QEMU must accept system_powerdown");
+
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        // The socket outlives QEMU for a moment; the client must report the path instead of
+        // pretending the VM is alive, which is what makes a stopped VM look running.
+        let stale = crate::qmp::query_running(&socket).await;
+        assert!(
+            stale.is_err(),
+            "a socket with no QEMU behind it must not answer: {stale:?}"
+        );
+        let _ = std::fs::remove_dir_all(&run_dir);
     }
 
     /// Check that real QEMU accepts the Windows firmware/TPM argument list.
