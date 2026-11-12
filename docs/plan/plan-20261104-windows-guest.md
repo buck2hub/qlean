@@ -174,6 +174,7 @@
 | 2026-11-13 04:10:00 UTC | review R62（QMP 也是控制面，也要有预算） | F67：`qmp::with_qmp_client`（连接 + 协商 + 执行）**没有任何超时**，而 `shutdown` 里 `qmp::powerdown(&socket).await` 是直接 `await`。QMP 跑在 QEMU 主循环上，被卡住的 guest（Windows bugcheck 后 vCPU 卡住、QEMU 在 syscall 里不返回）可以让 powerdown **永远不返回**：于是收尾根本走不到 30s 后那段 SIGKILL 兜底，`with_machine` 也永远不会返回，**用户的测试就挂在那里**。R52 把 guest 探测收了预算、R49 把启动收拾收了预算，唯独真正的控制面（QMP）还敞着。修：`QMP_TIMEOUT = 10s`，新增 `with_qmp_client_within(socket, budget, f)` 把**连接+协商+执行**整体包进 `tokio::time::timeout`，超时即返回可读错误（说明 QEMU 可能已卡死、请求被放弃、收尾将改为杀进程）；`with_qmp_client` 转发到它。新增 2 个单测：绑定一个**只 accept 不说话**的 unix socket，断言 200ms 预算内返回错误且消息含 socket 路径与「kill it instead」；缺失 socket 的错误必须带上路径。`cargo test --lib` 167 → 169 | N/A（`OSX-02`/`OSX-03` 既有 AC：收尾必须有界、失败必须可诊断；无卡拆合） | `OSX-03` 实现证据、Review log、`src/qmp.rs`、CHANGELOG、plan-status |
 | 2026-11-13 04:40:00 UTC | review R63（关会话也是写 guest，也要有预算） | F68：R62 给 QMP 加了预算，但 `shutdown` 的下一条语句 `let _ = ssh.close().await;`**同样无界**——`eof`/`close`/`disconnect` 都是往 guest 写、都要等对端，guest 一旦不再应答（bugcheck、内核冻住、网络消失），收尾就卡在**杀掉 QEMU 之前**，调用者的测试还是挂住。同一族缺陷第二次出现：预算必须覆盖**每一步**，不是只覆盖显眼的那一步。修：`SSH_CLOSE_BUDGET = 5s` + 泛型 `bounded_teardown(budget, future) -> Option<T>`；`shutdown` 用 `self.ssh.take()` 取走会话后限时关闭，超时即 `warn!` 说明 guest 已不响应、收尾改为杀 QEMU。新增 2 个单测（永不完成的 future 在预算内被放弃、正常完成的 future 保留返回值）。`cargo test --lib` 169 → 171 | N/A（`OSX-03` 既有 AC：收尾必须整体有界；无卡拆合） | `OSX-03` 实现证据、Review log、`src/machine.rs`、CHANGELOG、plan-status |
 | 2026-11-13 05:10:00 UTC | review R64（枚举失败不等于不存在） | F69：`ensure_network` 完全不看 `virsh net-list` 的退出码——**只要 stdout 里没有 `qlean` 就当网络不存在**。于是 libvirtd 没起/连不上（`virsh` 退出 1、stderr 说 `Failed to connect socket to '/run/libvirt/libvirt-sock'`）时，Qlean 会去**创建**一个可能已经存在的网络，最后只报一句 `failed to define qlean network`，真正的病因（libvirt 不可达）用户看不到。这正是本项目反复出现的「判据放错层」：**列举失败 ≠ 集合为空**。顺带发现同函数里那条「读不到 bridge 就假定是 qlbr0」的 warn **中间有一长串空格**（`\` 续行丢了），而专治这类问题的 `user_facing_messages_have_no_runs_of_spaces` 只覆盖了两条机器消息，没覆盖它。修：新增 `listed_networks(output, what)`——非零退出直接报错并带上 libvirt 原文与连接 URI（「is libvirtd running and reachable?」），空行不计入集合；`virsh_reason(output)` 统一把 stderr 带进 define/autostart/start 的失败消息（`status()` 改 `output()`）；空格串收敛进 `bridge_assumed_message()`。新增 3 个单测（失败列举必须报错且含 `libvirtd`/URI/`libvirt-sock`、成功列举忽略空行、三条网络消息都不许有句中空格串）。`cargo test --lib` 171 → 174 | N/A（`OSX-02` 既有 AC：宿主前置条件失败必须指向真正原因；无卡拆合） | `OSX-02` 实现证据、Review log、`src/utils.rs`、CHANGELOG、plan-status |
+| 2026-11-13 05:40:00 UTC | review R65（声明值必须来自真实来源） | F70：`qlean_user_agent()` 返回**写死的** `"qlean/0.3.0"`，而 `Cargo.toml` 早就是 `0.3.1`——下载 guest 镜像时发给镜像站的 `User-Agent` 已经少报了一个版本，而且每次发布都会继续漂移，没有任何门禁会提醒。这正是本项目记过的「声明值必须来自真实来源」：版本号只有一个真相（`Cargo.toml`），不该在代码里再抄一份。修：改成 `concat!("qlean/", env!("CARGO_PKG_VERSION"))`，编译期取自 crate 版本；新增 1 个单测断言它与 `env!("CARGO_PKG_VERSION")` 相等且以 `qlean/` 开头。`cargo test --lib` 174 → 175 | N/A（`IP-01`/`OSX-02` 既有 AC：对外声明必须与实际一致；无卡拆合） | `OSX-02` 实现证据、Review log、`src/utils.rs`、CHANGELOG、plan-status |
 
 ## 已决议设计决策
 
@@ -776,6 +777,7 @@
 | 集成测试（`#[ignore]`） | `tests/windows_machine.rs`：`windows_transport`（地址、pin、unsupported、shutdown→spawn 重连）、`windows_pool`（双机地址/host key/会话隔离） |
 | README/CHANGELOG | README「Windows transport and security」；CHANGELOG Added ×4 / Changed ×1 |
 | 地址发现与 QEMU 退出 race | `launch` 把 DHCP lease 轮询与 `qemu_handle`、cancel token 一起 `select!`，QEMU 启动即退出时立即返回其真实错误并停 `swtpm`（R12，`src/machine.rs`） |
+| 声明值来自真实来源 | 版本号只认 `Cargo.toml`，代码里不抄第二份（R65，`d6573e1`） |
 | 失败不等于空集 | 命令失败与「结果为空」必须区分，报错要带工具原文（R64，`933563f`） |
 | 每步都有预算 | 收尾的**每一步**都有上界（SSH 关闭 5s、QMP 10s、杀进程 30s+5s），不是只有显眼那一步（R63，`5c54113`） |
 | 控制面有预算 | QMP 连接/协商/执行整体限时，卡死即放弃并转为杀进程（R62，`1a0c61a`） |
@@ -1364,6 +1366,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R62 | QMP 有预算 | PASS | 无开放项 | F67：QMP 连接/协商/执行均无超时，卡死的 QEMU 会让 `shutdown` 与调用者的测试永久挂起 | `QMP_TIMEOUT` + `with_qmp_client_within` 整体限时（`1a0c61a`）；新增 2 个单测（静默 socket 200ms 内放弃）；`cargo test --lib` 169 passed |
 | R63 | 关会话也有预算 | PASS | 无开放项 | F68：`ssh.close().await` 无界，guest 不响应时收尾卡在杀 QEMU 之前 | `SSH_CLOSE_BUDGET` + `bounded_teardown`（`5c54113`）；新增 2 个单测；`cargo test --lib` 171 passed |
 | R64 | 枚举失败不是空集 | PASS | 无开放项 | F69：`virsh net-list` 的退出码被忽略，libvirt 不可达被读成「网络不存在」，病因不可见；bridge 警告含空格串 | `listed_networks`/`virsh_reason`/`bridge_assumed_message`（`933563f`）；新增 3 个单测；`cargo test --lib` 174 passed |
+| R65 | 声明值来自真实来源 | PASS | 无开放项 | F70：`User-Agent` 写死 `0.3.0`，crate 已是 `0.3.1`，发布后继续漂移且无门禁提醒 | `concat!("qlean/", env!("CARGO_PKG_VERSION"))`（`d6573e1`）；新增 1 个单测；`cargo test --lib` 175 passed |
 
 ### R1 findings 与修订对照
 
