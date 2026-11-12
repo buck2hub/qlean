@@ -1313,12 +1313,27 @@ StandardError=journal
     ///
     /// A failed QMP query is reported instead of being folded into `false`: the callers use
     /// `false` to decide that a launch is safe, and starting a second QEMU on a live domain's
-    /// disk would corrupt it. Only a missing socket is proof that the domain is gone.
+    /// disk would corrupt it. A missing socket is proof that the domain is gone only when the
+    /// process is gone too; a live QEMU without its socket is a missing socket, not a dead
+    /// domain, and is reported as such.
     pub async fn is_running(&self) -> Result<bool> {
         let socket_path = qmp::qmp_socket_path(&self.id)?;
-        match running_check(self.pid.is_some(), socket_path.exists()) {
+        let qemu_alive = self
+            .pid
+            .is_some_and(|pid| !process_is_gone(pid) && process_is_qemu(pid));
+        match running_check(self.pid.is_some(), socket_path.exists(), qemu_alive) {
             RunningCheck::NotRunning => Ok(false),
             RunningCheck::NoControlSocket => Ok(false),
+            RunningCheck::LiveWithoutSocket => bail!(
+                "VM-{} still has a live QEMU process ({}) but its control socket at {} is \
+                 missing; the socket is gone, not the domain. Check the process before \
+                 starting it again, or a second QEMU will fight it for the disk",
+                self.id,
+                self.pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "unknown pid".to_owned()),
+                socket_path.display()
+            ),
             RunningCheck::AskQmp => qmp::query_running(&socket_path).await.with_context(|| {
                 format!(
                     "VM-{} has a QEMU pid and a QMP socket at {} but the control socket did not \
@@ -2113,17 +2128,20 @@ impl Drop for Machine {
 enum RunningCheck {
     /// No QEMU pid was recorded, so nothing was launched.
     NotRunning,
-    /// A pid exists but the QMP socket is gone: the domain exited and left a stale pid.
+    /// A pid exists, the QMP socket is gone and the process is gone: a stale pid only.
     NoControlSocket,
+    /// A pid exists, the QMP socket is gone, but the process is still our QEMU.
+    LiveWithoutSocket,
     /// Both exist, so only QMP can answer.
     AskQmp,
 }
 
-fn running_check(pid_present: bool, socket_present: bool) -> RunningCheck {
-    match (pid_present, socket_present) {
-        (false, _) => RunningCheck::NotRunning,
-        (true, false) => RunningCheck::NoControlSocket,
-        (true, true) => RunningCheck::AskQmp,
+fn running_check(pid_present: bool, socket_present: bool, qemu_alive: bool) -> RunningCheck {
+    match (pid_present, socket_present, qemu_alive) {
+        (false, _, _) => RunningCheck::NotRunning,
+        (true, true, _) => RunningCheck::AskQmp,
+        (true, false, true) => RunningCheck::LiveWithoutSocket,
+        (true, false, false) => RunningCheck::NoControlSocket,
     }
 }
 
@@ -2544,12 +2562,27 @@ mod timeout_tests {
 
     #[test]
     fn running_check_only_asks_qmp_when_both_facts_are_present() {
-        assert_eq!(running_check(false, false), RunningCheck::NotRunning);
+        assert_eq!(running_check(false, false, false), RunningCheck::NotRunning);
         // A stale pid without a socket is still "not running".
-        assert_eq!(running_check(false, true), RunningCheck::NotRunning);
-        assert_eq!(running_check(true, false), RunningCheck::NoControlSocket);
+        assert_eq!(running_check(false, true, false), RunningCheck::NotRunning);
+        assert_eq!(
+            running_check(true, false, false),
+            RunningCheck::NoControlSocket
+        );
         // Only here may a QMP failure be reported instead of "not running".
-        assert_eq!(running_check(true, true), RunningCheck::AskQmp);
+        assert_eq!(running_check(true, true, false), RunningCheck::AskQmp);
+    }
+
+    #[test]
+    fn a_live_qemu_without_its_socket_is_not_a_dead_domain() {
+        // The socket is a file; its absence says nothing about the process. Reporting
+        // "not running" here would let `spawn` start a second QEMU on the same overlay.
+        assert_eq!(
+            running_check(true, false, true),
+            RunningCheck::LiveWithoutSocket
+        );
+        // A live QEMU with a socket still goes to QMP, which decides.
+        assert_eq!(running_check(true, true, true), RunningCheck::AskQmp);
     }
 
     #[test]

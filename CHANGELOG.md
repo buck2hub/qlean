@@ -45,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Windows guests reject TCG: a launch without KVM acceleration now fails with an actionable error instead of silently emulating
 - A `secboot` OVMF code image paired with a vars template that carries no Microsoft keys (including via `QLEAN_OVMF_CODE`/`QLEAN_OVMF_VARS`) is now refused with an actionable error instead of booting in Secure Boot setup mode, which Windows 11 rejects
 - `Machine::open_interactive_shell` returns an actionable error for `GuestOs::Windows` instead of attempting a vsock shell
+- `is_running` no longer reports a live QEMU as stopped just because its control socket is missing: a live process without a socket is an error, so a second QEMU cannot be started on the same disk
 
 ### Fixed
 
