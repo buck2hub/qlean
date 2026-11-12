@@ -774,19 +774,73 @@ fn ensure_copy_has_two_files(src: &Path, dest: &Path) -> Result<()> {
 }
 
 /// Fetch image file from remote source or local path and verify it against the expected hash.
+/// Magic bytes every qcow2 image starts with.
+const QCOW2_MAGIC: [u8; 4] = [0x51, 0x46, 0x49, 0xfb];
+
+/// Refuse a Windows image that is not qcow2.
+///
+/// `Machine::new` builds the overlay with `-F qcow2`, so a raw, VHDX or VMDK image fails
+/// deep inside `qemu-img create` with `Image is not in qcow2 format` and no hint about what
+/// to do — and for a local source only after the whole image was copied into the cache.
+/// Four bytes are enough to say so at the door, with the conversion command.
+fn ensure_windows_image_is_qcow2(path: &Path, what: &str) -> Result<()> {
+    use std::io::Read;
+
+    let mut magic = [0u8; QCOW2_MAGIC.len()];
+    let observed = std::fs::File::open(path)
+        .with_context(|| format!("failed to open {what} at {}", path.display()))
+        .and_then(|mut file| {
+            let mut read = 0;
+            while read < magic.len() {
+                match file.read(&mut magic[read..]) {
+                    Ok(0) => break,
+                    Ok(n) => read += n,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("failed to read {what} at {}", path.display())
+                        });
+                    }
+                }
+            }
+            Ok(magic[..read].to_vec())
+        })?;
+
+    anyhow::ensure!(
+        observed == QCOW2_MAGIC,
+        "the {what} at {} is not a qcow2 image: it starts with {:02x?}, but a qcow2 image \
+         starts with {QCOW2_MAGIC:02x?}. Windows guests need qcow2 because Qlean creates a \
+         qcow2 overlay on top of the image; convert it once with \
+         `qemu-img convert -O qcow2 <input> <output>.qcow2`, then point `source` at that file \
+         and `digest` at its sha256",
+        path.display(),
+        observed
+    );
+    Ok(())
+}
+
 async fn fetch_from_source(
     source: &ImageSource,
     dest: &PathBuf,
     expected_hash: &str,
     hash_type: ShaType,
+    guest_os: GuestOs,
 ) -> Result<()> {
     match source {
         ImageSource::Url(url) => {
             let computed = download_with_hash(url, dest, hash_type.clone()).await?;
             verify_fetched(dest, expected_hash, &computed).await?;
+            if guest_os == GuestOs::Windows {
+                ensure_windows_image_is_qcow2(dest, "downloaded Windows image")?;
+            }
         }
         ImageSource::LocalPath(src) => {
             anyhow::ensure!(src.exists(), "file does not exist: {}", src.display());
+            // Before the copy, not after: a wrong format must not cost a multi-gigabyte
+            // copy into the cache (and must not fill the disk the guest needs).
+            if guest_os == GuestOs::Windows {
+                ensure_windows_image_is_qcow2(src, "Windows source image")?;
+            }
             ensure_copy_has_two_files(src, dest)?;
             if let Some(parent) = dest.parent() {
                 tokio::fs::create_dir_all(parent)
@@ -877,6 +931,12 @@ impl Image {
                     image.digest.1
                 );
             }
+            // A cache entry that predates (or bypassed) the format check must not reach
+            // `qemu-img`: the overlay it cannot build is the confusing failure this guard
+            // exists to prevent.
+            if config.guest_os == GuestOs::Windows {
+                ensure_windows_image_is_qcow2(image.path(), "cached Windows image")?;
+            }
             return Ok(image);
         }
 
@@ -886,7 +946,14 @@ impl Image {
 
         if let (Some(src), Some((digest_type, digest_hex))) = (override_source, override_digest) {
             // If source and digest are provided, fetch from source.
-            fetch_from_source(&src, &image_path, &digest_hex, digest_type.clone()).await?;
+            fetch_from_source(
+                &src,
+                &image_path,
+                &digest_hex,
+                digest_type.clone(),
+                config.guest_os,
+            )
+            .await?;
 
             image_digest = (digest_type, digest_hex);
         } else {
@@ -899,6 +966,7 @@ impl Image {
                 &image_path,
                 &expected_hash,
                 spec.checksum_type.clone(),
+                config.guest_os,
             )
             .await?;
 
@@ -1474,6 +1542,7 @@ dummy
             &image,
             &digest,
             ShaType::Sha256,
+            GuestOs::Linux,
         )
         .await
         .expect_err("a copy of a file onto itself must be refused, not performed");
@@ -1484,6 +1553,95 @@ dummy
             bytes,
             "the source image must survive the refusal"
         );
+        Ok(())
+    }
+
+    /// A Windows image that is not qcow2 is refused before it is copied, with a way out.
+    ///
+    /// The overlay is built with `-F qcow2`, so `qemu-img create` is where this used to
+    /// surface: `Image is not in qcow2 format` after the whole image had been copied into
+    /// the cache, and without saying what to do about it.
+    #[tokio::test]
+    async fn test_a_windows_source_that_is_not_qcow2_is_refused_before_it_is_copied() -> Result<()>
+    {
+        let tmp = tempfile::tempdir()?;
+        let src = tmp.path().join("windows-11.vhdx");
+        // A VHDX starts with `vhdxfile`; anything that is not the qcow2 magic is refused.
+        tokio::fs::write(&src, b"vhdxfile and a lot of bytes").await?;
+        let digest = compute_hash(&src, ShaType::Sha256).await?;
+        let dest = tmp.path().join("images").join("windows-11.qcow2");
+
+        let error = fetch_from_source(
+            &ImageSource::LocalPath(src.clone()),
+            &dest,
+            &digest,
+            ShaType::Sha256,
+            GuestOs::Windows,
+        )
+        .await
+        .expect_err("a Windows image that is not qcow2 must be refused");
+        let message = error.to_string();
+        assert!(message.contains("not a qcow2 image"), "{message}");
+        assert!(
+            message.contains("qemu-img convert -O qcow2"),
+            "the refusal has to name the way out: {message}"
+        );
+        assert!(
+            message.contains(&src.display().to_string()),
+            "the refusal has to name the file the user pointed at: {message}"
+        );
+        assert!(
+            !dest.exists() && !dest.with_extension("part").exists(),
+            "nothing may be copied for an image that cannot be used"
+        );
+        assert_eq!(
+            tokio::fs::read(&src).await?,
+            b"vhdxfile and a lot of bytes",
+            "the source must be untouched"
+        );
+        Ok(())
+    }
+
+    /// The check applies to Windows guests only: the Linux path is unchanged.
+    #[tokio::test]
+    async fn test_a_linux_source_is_copied_without_the_qcow2_check() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let src = tmp.path().join("linux.img");
+        let bytes: &[u8] = b"not qcow2, and still the Linux path's business";
+        tokio::fs::write(&src, bytes).await?;
+        let digest = compute_hash(&src, ShaType::Sha256).await?;
+        let dest = tmp.path().join("images").join("linux.img");
+        fetch_from_source(
+            &ImageSource::LocalPath(src),
+            &dest,
+            &digest,
+            ShaType::Sha256,
+            GuestOs::Linux,
+        )
+        .await?;
+        assert_eq!(tokio::fs::read(&dest).await?, bytes);
+        Ok(())
+    }
+
+    /// A real qcow2 header is not refused: the guard must not cost Windows support.
+    #[tokio::test]
+    async fn test_a_windows_qcow2_source_is_copied_and_verified() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let src = tmp.path().join("windows-11.qcow2");
+        let mut bytes = vec![0x51, 0x46, 0x49, 0xfb];
+        bytes.extend_from_slice(&[0u8; 4096]);
+        tokio::fs::write(&src, &bytes).await?;
+        let digest = compute_hash(&src, ShaType::Sha256).await?;
+        let dest = tmp.path().join("images").join("windows-11.qcow2");
+        fetch_from_source(
+            &ImageSource::LocalPath(src),
+            &dest,
+            &digest,
+            ShaType::Sha256,
+            GuestOs::Windows,
+        )
+        .await?;
+        assert_eq!(tokio::fs::read(&dest).await?, bytes);
         Ok(())
     }
 
@@ -1503,6 +1661,7 @@ dummy
             &dest,
             &digest,
             ShaType::Sha256,
+            GuestOs::Linux,
         )
         .await
         .expect_err("a hard link to the destination is the same file");
@@ -1531,6 +1690,7 @@ dummy
             &dest,
             &digest,
             ShaType::Sha256,
+            GuestOs::Linux,
         )
         .await?;
         assert_eq!(tokio::fs::read(&dest).await?, bytes);
@@ -1547,6 +1707,7 @@ dummy
             &rejected,
             "deadbeef",
             ShaType::Sha256,
+            GuestOs::Linux,
         )
         .await
         .expect_err("a wrong digest must be rejected");
