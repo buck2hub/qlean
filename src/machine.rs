@@ -700,10 +700,7 @@ StandardError=journal
                         "QEMU process {} did not exit within timeout, force killing",
                         pid
                     );
-                    let _ = std::process::Command::new("kill")
-                        .arg("-9")
-                        .arg(pid.to_string())
-                        .output();
+                    kill_if_qemu(pid);
                     break;
                 }
 
@@ -1142,6 +1139,10 @@ StandardError=journal
 
         // Helper: terminate QEMU process best-effort.
         async fn terminate_qemu(pid: u32) {
+            if !process_is_qemu(pid) {
+                warn!("QEMU pid {pid} is gone; nothing to terminate");
+                return;
+            }
             let _ = std::process::Command::new("kill")
                 .arg("-TERM")
                 .arg(pid.to_string())
@@ -1155,10 +1156,7 @@ StandardError=journal
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            let _ = std::process::Command::new("kill")
-                .arg("-9")
-                .arg(pid.to_string())
-                .output();
+            kill_if_qemu(pid);
         }
 
         let cancel_token = self
@@ -1668,6 +1666,47 @@ impl Machine {
     }
 }
 
+/// Whether a `/proc/<pid>/cmdline` payload belongs to QEMU.
+///
+/// Only Qlean's own QEMU process may be signalled. `/proc/<pid>` existing is not proof:
+/// after a crash the kernel can hand the same pid to an unrelated process, and SIGKILLing
+/// that would destroy somebody else's work.
+fn cmdline_is_qemu(cmdline: &[u8]) -> bool {
+    // Only argv[0] names the program: a later argument can mention QEMU without the
+    // process being QEMU (`-D /tmp/qemu-system-x86_64.log`), so scanning the whole
+    // command line would be a false positive.
+    let program = cmdline.split(|byte| *byte == 0).next().unwrap_or_default();
+    let program = String::from_utf8_lossy(program);
+    let program = program.rsplit('/').next().unwrap_or_default();
+    program.starts_with("qemu-system") || program.starts_with("qemu-kvm")
+}
+
+/// Whether `pid` still looks like the QEMU process Qlean started.
+fn process_is_qemu(pid: u32) -> bool {
+    match std::fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(cmdline) => cmdline_is_qemu(&cmdline),
+        Err(_) => false,
+    }
+}
+
+/// SIGKILL a pid only when it is still QEMU.
+///
+/// Returns whether the signal was sent, so callers can report the pid reuse instead of
+/// leaving a misleading "killed" impression.
+fn kill_if_qemu(pid: u32) -> bool {
+    if !process_is_qemu(pid) {
+        warn!(
+            "not sending SIGKILL to pid {pid}: it no longer looks like the QEMU process Qlean started (the pid was probably reused)"
+        );
+        return false;
+    }
+    let _ = std::process::Command::new("kill")
+        .arg("-9")
+        .arg(pid.to_string())
+        .output();
+    true
+}
+
 /// Convert a caller-supplied path into a validated guest path for `os`.
 fn guest_path_from(os: GuestOs, path: &Path) -> Result<GuestPath> {
     let text = path.to_str().ok_or_else(|| {
@@ -1685,12 +1724,10 @@ fn local_basename(path: &Path) -> Result<&str> {
 
 impl Drop for Machine {
     fn drop(&mut self) {
-        // Ensure QEMU process is killed
+        // Ensure QEMU process is killed, but only if that pid is still QEMU: killing a
+        // recycled pid would take down an unrelated process.
         if let Some(pid) = self.pid {
-            let _ = std::process::Command::new("kill")
-                .arg("-9")
-                .arg(pid.to_string())
-                .output();
+            kill_if_qemu(pid);
         }
         // Stop swtpm before the run dir disappears underneath its control socket; the
         // explicit take() makes the ordering deterministic instead of relying on field
@@ -1749,6 +1786,38 @@ mod timeout_tests {
             ssh_timeout,
             ..MachineConfig::default()
         }
+    }
+
+    #[test]
+    fn cmdline_is_qemu_only_matches_qemu_programs() {
+        // Real QEMU cmdlines are NUL-separated argv entries.
+        assert!(cmdline_is_qemu(
+            b"qemu-system-x86_64\0-machine\0q35,accel=kvm\0-drive\0file=overlay.img\0"
+        ));
+        assert!(cmdline_is_qemu(
+            b"/usr/bin/qemu-system-aarch64\0-name\0vm\0"
+        ));
+        // The kernel's qemu-kvm symlink is QEMU as well.
+        assert!(cmdline_is_qemu(b"/usr/bin/qemu-kvm\0-machine\0pc\0"));
+
+        assert!(!cmdline_is_qemu(b""));
+        assert!(!cmdline_is_qemu(b"/usr/bin/bash\0-c\0sleep 30\0"));
+        // A later argument mentioning qemu must not make another program look like QEMU.
+        assert!(!cmdline_is_qemu(
+            b"/usr/bin/tee\0/tmp/qemu-system-x86_64.log\0"
+        ));
+        assert!(!cmdline_is_qemu(
+            b"/usr/bin/qemu-img\0convert\0qemu-system-x86_64\0"
+        ));
+        assert!(!cmdline_is_qemu(b"/usr/bin/qemu-img\0create\0disk.qcow2\0"));
+    }
+
+    #[test]
+    fn process_is_qemu_rejects_the_current_test_process() {
+        // Guards the guard: the test binary is not QEMU, and the helper must say so, so a
+        // recycled pid never gets SIGKILLed.
+        assert!(!process_is_qemu(std::process::id()));
+        assert!(!process_is_qemu(u32::MAX));
     }
 
     #[test]

@@ -44,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - DHCP lease lookup took the first row matching the MAC, so after a renewal it dialled the address the guest had already abandoned; the row with the newest expiry now wins, and the timeout error shows each lease's expiry
 - Waiting for the Windows deployment marker treated a dropped session as "not deployed yet" and burned the whole 900s budget
 - `MachinePool::init_all` failed on a Windows machine that had already deployed, and `spawn_all` booted a Windows guest before its deployment
+- `Drop`, `shutdown` and the failed-launch cleanup sent signals to whatever process held the recorded pid; if QEMU had already exited and the pid was reused, an unrelated process was killed. The pid is now verified against `/proc/<pid>/cmdline` (argv[0] must be `qemu-system*`/`qemu-kvm`) before any signal is sent
 - A launch that failed after QEMU started left `swtpm` and the pid behind, and a panicked SSH task detached QEMU entirely
 - Windows DHCP lookup returned the first lease for a MAC, so a dual-stack network could hand a link-local IPv6 address that cannot be dialled
 - `GuestPath::join` accepted an absolute child and silently made it relative on Linux, and reported `\\?\` device paths as UNC
