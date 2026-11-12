@@ -2122,6 +2122,50 @@ mod plan_doc_tests {
     }
 
     #[test]
+    fn the_two_matrix_rows_about_the_revision_history_agree_about_its_time_column() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        // Two rows of the test matrix describe the same guard. R161 taught the time column to say
+        // `不可回溯` instead of an estimate; one of those two rows kept promising that every row
+        // carries a timestamp, so the same table made two opposite claims about one test (F173).
+        let lines: Vec<&str> = PLAN.lines().collect();
+        let start = lines
+            .iter()
+            .position(|line| line.trim_end() == "## 测试矩阵")
+            .expect("the plan has no test matrix");
+        let end = start
+            + 1
+            + lines[start + 1..]
+                .iter()
+                .position(|line| line.starts_with("## "))
+                .expect("the test matrix runs to the end of the document");
+        let rows: Vec<&&str> = lines[start..end]
+            .iter()
+            .filter(|line| line.contains("the_plan_revision_history_is_ordered_newest_first"))
+            .collect();
+        assert!(
+            rows.len() >= 2,
+            "the matrix rows about this guard went missing"
+        );
+
+        let mut states_the_marker = 0;
+        for row in &rows {
+            assert!(
+                !(row.contains("每一行都有") && row.contains("HH:MM:SS")),
+                "a matrix row still promises a timestamp on every revision-history row, but the \
+                 table says `{HISTORY_UNRECORDED}` where the moment was never recorded: {row}"
+            );
+            if row.contains(HISTORY_UNRECORDED) {
+                states_the_marker += 1;
+            }
+        }
+        assert!(
+            states_the_marker >= 1,
+            "no matrix row states the marker rule any more: the table would be back to implying \
+             that every row carries a time"
+        );
+    }
+
+    #[test]
     fn the_plan_and_the_code_agree_on_how_many_failures_end_the_marker_wait() {
         const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
         // The failure-recovery matrix and the test matrix both promise a number ("three
