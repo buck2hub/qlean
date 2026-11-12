@@ -2122,6 +2122,84 @@ mod plan_doc_tests {
     }
 
     #[test]
+    fn the_rollback_table_says_how_its_counts_can_be_recomputed() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        // The rollback table lists how many files each card's revert stages. Those numbers were
+        // measured once, by hand, and one of them was wrong for a hundred rounds (8 where the
+        // revert stages 9) because nothing said how to measure them again (F175).
+        let lines: Vec<&str> = PLAN.lines().collect();
+        let start = lines
+            .iter()
+            .position(|line| line.trim_end() == "### 回滚操作步骤与实测证据")
+            .expect("the plan has no rollback section");
+        let end = start
+            + 1
+            + lines[start + 1..]
+                .iter()
+                .position(|line| line.starts_with("### ") || line.starts_with("## "))
+                .expect("the rollback section runs to the end of the document");
+        let section = lines[start..end].join("\n");
+
+        assert!(
+            section.contains("libra show --name-only") && section.contains("不必再跑回滚"),
+            "the rollback table no longer says how its file counts can be recomputed, so a \
+             wrong number can live on unnoticed"
+        );
+
+        let rows: Vec<&str> = lines[start..end]
+            .iter()
+            .filter(|line| {
+                line.starts_with("| ") && !line.starts_with("| 卡 ") && !line.starts_with("|---")
+            })
+            .copied()
+            .collect();
+        assert_eq!(
+            rows.len(),
+            8,
+            "the rollback table covers seven cards plus the last code commit; it now lists {} rows",
+            rows.len()
+        );
+        let mut subjects = 0;
+        for row in &rows {
+            let cells: Vec<&str> = row.trim_matches('|').split('|').collect();
+            let label = cells[0].trim();
+            let hash = cells[1].trim().trim_matches('`');
+            assert_eq!(
+                hash.len(),
+                7,
+                "the rollback row for `{label}` does not name a seven-character commit"
+            );
+            // Seven card rows have to be the same commits the evidence summary credits; the
+            // eighth row is the last code commit, which the summary does not list per card.
+            if label.starts_with("R102") {
+                continue;
+            }
+            let summary_start = lines
+                .iter()
+                .position(|line| line.trim_end() == "## 实施证据汇总")
+                .expect("the plan has no evidence summary");
+            let summary_end = summary_start
+                + 1
+                + lines[summary_start + 1..]
+                    .iter()
+                    .position(|line| line.starts_with("## "))
+                    .expect("the evidence summary runs to the end of the document");
+            // Searching the whole plan would find the hash in the row itself and prove nothing.
+            let summary = lines[summary_start..summary_end].join("\n");
+            assert!(
+                summary.contains(&format!("`{hash}`")),
+                "the rollback row for `{label}` names `{hash}`, which the evidence summary never \
+                 credits - a subject that only this table knows about"
+            );
+            subjects += 1;
+        }
+        assert_eq!(
+            subjects, 7,
+            "the rollback table no longer covers the seven cards"
+        );
+    }
+
+    #[test]
     fn the_retry_rule_for_a_failed_launch_is_stated_once_and_has_a_test() {
         const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
         // "A failed launch can be retried" was a rule written twice inline - once in `init` and

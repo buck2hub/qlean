@@ -1492,6 +1492,8 @@ libra diff --staged <card-hash>^ -- <该卡的文件>   # 必须为空：回滚�
 libra commit -m "revert: <card>"
 ```
 
+表中的「N 个文件」可以用一条命令重算，不必再跑回滚：`libra show --name-only <提交> | grep -cE "^(src|docs|tests|[A-Z])"`（R166 就是用它把八行全部复核了一遍，`TRN-01` 的 8 是错的，实测 `libra revert -n HEAD` 在 `6711671` 上 staged 9 个文件）。
+
 实测（`libra revert` 于本仓库；该轮的写入时刻不可回溯确证——与上方 R111 登记的同类问题一样，日期原是按轮次顺序填的估计值，故此处不写具体日期，只保留下表可复核的文件数）：
 
 | 卡 | 提交 | 回滚结果 |
@@ -1499,7 +1501,7 @@ libra commit -m "revert: <card>"
 | OSX-01 | `50c8cff` | staged 正好 7 个文件（`CHANGELOG`/`README`/两份计划/`src/image.rs`/`src/lib.rs`/`src/machine.rs`），无冲突 |
 | OSX-02 | `f2fc277` | 9 个文件，`src/firmware.rs` 与 `tests/windows_machine.rs` 为 `D`（本卡新增），无冲突 |
 | OSX-03 | `8812fb4` | 9 个文件，`src/windows.rs` 为 `D`（本卡新增） |
-| TRN-01 | `6711671` | 8 个文件，无新增/删除 |
+| TRN-01 | `6711671` | 9 个文件（R166 `F175` 复核实测：原写 8），无新增/删除 |
 | EXE-01 | `64b1046` | 8 个文件，`src/exec.rs` 为 `D`（本卡新增） |
 | IP-01 | `eb8fd90` | 7 个文件 |
 | FS-01 | `443ec5d` | 10 个文件，`src/guest_path.rs` 为 `D`（本卡新增）；`libra diff 443ec5d^ -- <本卡文件>` 为空 |
