@@ -25,7 +25,10 @@ use crate::{
     is_kvm_available,
     qemu::launch_qemu,
     qmp,
-    ssh::{InteractiveShell, PersistedSshKeypair, Session, connect_ssh, get_ssh_key},
+    ssh::{
+        InteractiveShell, PersistedSshKeypair, Session, connect_ssh, connect_ssh_windows,
+        get_ssh_key,
+    },
     utils::{CommandExt, HEX_ALPHABET, QleanDirs, gen_random_mac, get_free_cid},
     windows::{self, DeploySeed},
 };
@@ -517,6 +520,15 @@ StandardError=journal
     /// Does not use or block the management SSH session used by `exec` / upload.
     /// Requires the machine to already be running (`ssh` and `pid` set after init/spawn).
     pub async fn open_interactive_shell(&self, cols: u32, rows: u32) -> Result<InteractiveShell> {
+        if self.image.guest_os == GuestOs::Windows {
+            // There is no vsock endpoint to open a second session on, and a
+            // half-created TCP Pty would leak a process. Report it plainly instead.
+            bail!(
+                "Interactive PTY shells are not supported for Windows guests; use `exec` to run \
+                 commands and SFTP upload/download for file transfer"
+            );
+        }
+
         if self.ssh.is_none() || self.pid.is_none() {
             bail!(
                 "Machine is not running; initialize or spawn before opening an interactive shell"
@@ -841,6 +853,20 @@ StandardError=journal
         Ok((ssh, cancel_token))
     }
 
+    /// TCP endpoint and pinned host key for a Windows guest.
+    ///
+    /// The address is resolved from the libvirt DHCP lease for this VM's MAC, so it
+    /// never relies on running a command inside the guest.
+    async fn windows_endpoint(&self, timeout: Duration) -> Result<(std::net::SocketAddr, String)> {
+        let host_key = self.ssh_host_key.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Windows guest is missing its per-VM SSH host key; the deployment seed was not staged"
+            )
+        })?;
+        let ip = crate::utils::find_lease_address(&self.mac_address, timeout).await?;
+        Ok((std::net::SocketAddr::new(ip, windows::SSH_PORT), host_key))
+    }
+
     /// Public half of this machine's SSH host key, if the guest uses a per-VM one.
     ///
     /// Windows guests get a fresh host keypair per VM; the public half is returned
@@ -1030,39 +1056,48 @@ StandardError=journal
         let pid = read_pid(&self.id).await?;
         self.pid = Some(pid);
 
-        let mut ssh_handle = tokio::spawn(connect_ssh(
-            self.cid,
-            ssh_timeout,
-            self.keypair.to_owned(),
-            cancel_token.clone(),
-            self.mac_address.to_owned(),
-        ));
-
+        // Windows guests cannot use vsock: resolve the DHCP lease for this VM's MAC
+        // before SSH, then connect with the deploy-time host key pinned. Discovery is
+        // bounded by the same timeout as the connection attempt.
+        let mut windows_endpoint: Option<(std::net::SocketAddr, String)> = None;
         if self.image.guest_os == GuestOs::Windows {
-            // Windows guests have no vsock: the TCP transport (TRN-01) establishes the
-            // session and confirms the first-boot deployment. Until then `init`/`spawn`
-            // only guarantee that QEMU is up and that `is_running` reflects it.
-            //
-            // Give QEMU a moment to fail on invalid firmware or TPM configuration so a
-            // process that already exited is never reported as a successful start.
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            if !Path::new(&format!("/proc/{pid}")).exists() {
-                if let Some(mut swtpm) = self.swtpm.take() {
-                    swtpm.stop().await;
-                }
-                self.pid = None;
-                match qemu_handle.await {
-                    Ok(Ok(())) => bail!("QEMU exited unexpectedly during Windows guest start"),
-                    Ok(Err(e)) => bail!(e),
-                    Err(e) => bail!("QEMU task error: {e}"),
+            match self.windows_endpoint(ssh_timeout).await {
+                Ok(endpoint) => windows_endpoint = Some(endpoint),
+                Err(e) => {
+                    if let Some(pid) = self.pid.take() {
+                        terminate_qemu(pid).await;
+                    }
+                    let _ = qemu_handle.await;
+                    if let Some(mut swtpm) = self.swtpm.take() {
+                        swtpm.stop().await;
+                    }
+                    return Err(e);
                 }
             }
-            info!(
-                "💻 VM-{} started; first-boot deployment is confirmed on the first transport connect",
-                self.id
-            );
-            return Ok(());
         }
+        let windows_ip = windows_endpoint
+            .as_ref()
+            .map(|(addr, _)| addr.ip().to_string());
+
+        let mut ssh_handle = match windows_endpoint {
+            Some((addr, host_key)) => {
+                info!("🔎 VM-{} connecting over tcp to {addr}", self.id);
+                tokio::spawn(connect_ssh_windows(
+                    addr,
+                    ssh_timeout,
+                    self.keypair.to_owned(),
+                    cancel_token.clone(),
+                    host_key.clone(),
+                ))
+            }
+            None => tokio::spawn(connect_ssh(
+                self.cid,
+                ssh_timeout,
+                self.keypair.to_owned(),
+                cancel_token.clone(),
+                self.mac_address.to_owned(),
+            )),
+        };
 
         let ssh_result = tokio::select! {
             result = &mut ssh_handle => {
@@ -1083,6 +1118,10 @@ StandardError=journal
             Ok(session) => {
                 // SSH completed, QEMU continues running
                 self.ssh = Some(session);
+                if windows_ip.is_some() {
+                    // The leased address came from the host, not from inside the guest.
+                    self.ip = windows_ip;
+                }
                 // Windows guests confirm their first-boot deployment on the first
                 // session and drop the seed medium afterwards; no-op for Linux.
                 self.confirm_deployment().await?;

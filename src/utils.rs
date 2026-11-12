@@ -22,6 +22,100 @@ pub(crate) const QLEAN_BRIDGE_NAME: &str = "qlbr0";
 // path. The current implementation is vsock-only, so we avoid keeping unused code
 // that triggers `dead_code` warnings.
 
+/// A DHCP lease observed on Qlean's libvirt network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DhcpLease {
+    /// Lowercase MAC address as reported by libvirt.
+    pub mac: String,
+    /// Address handed to that MAC.
+    pub ip: std::net::IpAddr,
+}
+
+/// Parse `virsh net-dhcp-leases` tabular output.
+///
+/// Example row:
+/// ` 2026-11-12 09:35:00   52:54:00:aa:bb:cc   ipv4       192.168.221.42/24    *  -`
+pub(crate) fn parse_dhcp_leases(output: &str) -> Vec<DhcpLease> {
+    fn looks_like_mac(token: &str) -> bool {
+        let parts = token.split(':').collect::<Vec<_>>();
+        parts.len() == 6
+            && parts
+                .iter()
+                .all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
+    }
+
+    let mut leases = Vec::new();
+    for line in output.lines() {
+        let tokens = line.split_whitespace().collect::<Vec<_>>();
+        let Some(mac_index) = tokens.iter().position(|t| looks_like_mac(t)) else {
+            continue;
+        };
+        // The address column follows the protocol column and carries a prefix.
+        let Some(ip) = tokens[mac_index + 1..].iter().find_map(|t| {
+            let (addr, _prefix) = t.split_once('/')?;
+            addr.parse::<std::net::IpAddr>().ok()
+        }) else {
+            continue;
+        };
+        leases.push(DhcpLease {
+            mac: tokens[mac_index].to_ascii_lowercase(),
+            ip,
+        });
+    }
+    leases
+}
+
+/// Resolve a MAC address to its leased address on Qlean's libvirt network.
+///
+/// Polling is bounded by `timeout` and never runs an unbounded retry loop. The guest
+/// must be given the chance to reach DHCP, so transient "no lease yet" results are
+/// expected until the address appears.
+pub(crate) async fn find_lease_address(
+    mac: &str,
+    timeout: std::time::Duration,
+) -> Result<std::net::IpAddr> {
+    let mac = mac.to_ascii_lowercase();
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut last_seen = Vec::new();
+
+    loop {
+        let output = tokio::process::Command::new("virsh")
+            .arg("-c")
+            .arg(VIRSH_CONNECTION_URI)
+            .arg("net-dhcp-leases")
+            .arg("qlean")
+            .output()
+            .await
+            .context("failed to execute virsh to read DHCP leases for the qlean network")?;
+
+        if output.status.success() {
+            last_seen = parse_dhcp_leases(&String::from_utf8_lossy(&output.stdout));
+            if let Some(lease) = last_seen.iter().find(|lease| lease.mac == mac) {
+                debug!("MAC {} leased {}", lease.mac, lease.ip);
+                return Ok(lease.ip);
+            }
+        } else {
+            debug!(
+                "virsh net-dhcp-leases failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "no DHCP lease for MAC {mac} on the `qlean` network within {}s (leases seen: {:?}).\n\
+                 The guest may still be booting, or it did not bring up its virtio network device.",
+                timeout.as_secs(),
+                last_seen
+                    .iter()
+                    .map(|lease| format!("{}={}", lease.mac, lease.ip))
+                    .collect::<Vec<_>>()
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
 pub(crate) struct QleanDirs {
     pub base: PathBuf,
     pub images: PathBuf,
@@ -129,14 +223,25 @@ impl CommandExt for tokio::process::Command {
     }
 }
 
-/// Ensure host prerequisites for running virtual machines.
-pub(crate) async fn ensure_prerequisites() -> Result<()> {
+/// Ensure the guest-independent host prerequisites (CLI tools and the Qlean network).
+pub(crate) async fn ensure_host_prerequisites() -> Result<()> {
     check_command_available("qemu-system-x86_64").await?;
     check_command_available("qemu-img").await?;
     check_command_available("xorriso").await?;
     check_command_available("virsh").await?;
     ensure_network().await?;
-    ensure_vsock()?;
+    Ok(())
+}
+
+/// Ensure host prerequisites for running virtual machines of `guest_os`.
+///
+/// vsock is only required by Linux guests: Windows guests are reached over the
+/// libvirt NAT network, so a host without `/dev/vhost-vsock` can still run them.
+pub(crate) async fn ensure_prerequisites(guest_os: crate::image::GuestOs) -> Result<()> {
+    ensure_host_prerequisites().await?;
+    if guest_os == crate::image::GuestOs::Linux {
+        ensure_vsock()?;
+    }
     Ok(())
 }
 
@@ -257,4 +362,57 @@ pub(crate) fn gen_random_mac() -> String {
 
 pub(crate) fn qlean_user_agent() -> &'static str {
     "qlean/0.3.0"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LEASES_HEADER: &str = "\
+ Expiry Time           MAC address         Protocol   IP address           Hostname   Client ID or DUID
+---------------------------------------------------------------------------------------------------------
+";
+
+    #[test]
+    fn test_parse_dhcp_leases_maps_mac_to_address() {
+        let output = format!(
+            "{LEASES_HEADER} 2026-11-12 09:35:00   52:54:00:aa:bb:cc   ipv4       192.168.221.42/24    *          -\n\
+             2026-11-12 09:36:00   52:54:00:11:22:33   ipv4       192.168.221.43/24    *          -\n"
+        );
+        let leases = parse_dhcp_leases(&output);
+        assert_eq!(leases.len(), 2);
+        assert_eq!(leases[0].mac, "52:54:00:aa:bb:cc");
+        assert_eq!(leases[0].ip.to_string(), "192.168.221.42");
+        assert_eq!(leases[1].mac, "52:54:00:11:22:33");
+        assert_eq!(leases[1].ip.to_string(), "192.168.221.43");
+    }
+
+    #[test]
+    fn test_parse_dhcp_leases_normalizes_mac_case() {
+        let output = format!(
+            "{LEASES_HEADER} 2026-11-12 09:35:00   52:54:00:AA:BB:CC   ipv4       192.168.221.42/24    *  -\n"
+        );
+        let leases = parse_dhcp_leases(&output);
+        assert_eq!(leases[0].mac, "52:54:00:aa:bb:cc");
+    }
+
+    #[test]
+    fn test_parse_dhcp_leases_ignores_header_and_empty_output() {
+        assert!(parse_dhcp_leases("").is_empty());
+        assert!(parse_dhcp_leases(LEASES_HEADER).is_empty());
+        // A row without a parseable address must not produce a bogus lease.
+        let output =
+            " 2026-11-12 09:35:00   52:54:00:aa:bb:cc   ipv4       <unavailable>    *  -\n";
+        assert!(parse_dhcp_leases(output).is_empty());
+    }
+
+    #[test]
+    fn test_parse_dhcp_leases_handles_ipv6_rows() {
+        let output = format!(
+            "{LEASES_HEADER} 2026-11-12 09:35:00   52:54:00:aa:bb:cc   ipv6       fd00::42/64    *  -\n"
+        );
+        let leases = parse_dhcp_leases(&output);
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].ip.to_string(), "fd00::42");
+    }
 }

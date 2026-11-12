@@ -115,6 +115,30 @@ Linux SSH connect timeout of 180s/300s) and can be tuned with `MachineConfig::ss
 on timeout Qlean keeps the seed medium and returns an error naming the expected marker
 file and this section.
 
+#### Windows transport and security
+
+Windows guests have no vsock, so Qlean reaches them over the libvirt NAT network:
+
+- **Address discovery runs on the host, before SSH.** Qlean polls
+  `virsh net-dhcp-leases qlean` for the MAC address it assigned to that VM and caches the
+  result on the machine, so `Machine::get_ip` never runs a command inside a Windows guest.
+  Discovery and the connection attempt share one bounded budget
+  (`MachineConfig::ssh_timeout`); running out of it returns an error listing the leases
+  that were actually seen.
+- **Host keys are pinned instead of trusted on first use.** Qlean compares the key
+  presented by the guest's `sshd` with the per-VM key it generated during deployment. A
+  different key, or a certificate where a plain key is pinned, aborts the connection.
+  Linux guests keep their historical trust-on-first-use behavior because their vsock
+  endpoint is host-local and cannot be redirected to another machine.
+- **vsock is a Linux-only requirement.** `with_machine` checks `/dev/vhost-vsock` only
+  for `GuestOs::Linux`, and `with_pool` does not require it at all, so a host without
+  vhost-vsock can still run Windows guests.
+- **Pool isolation.** Each VM gets its own MAC address, DHCP lease, seed medium and host
+  key, so pool members never share an address or a pinned key.
+- **Interactive PTY shells are not supported for Windows guests.**
+  `Machine::open_interactive_shell` returns an actionable error instead of opening a
+  half-configured session; use `exec` for commands and SFTP for file transfer.
+
 ### Getting Started
 
 Add the dependency to your `Cargo.toml`:

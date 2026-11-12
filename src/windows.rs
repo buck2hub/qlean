@@ -48,6 +48,16 @@ pub(crate) const GUEST_USERNAME: &str = "qlean";
 /// Marker file written by the image's first-boot task once the deployment is done.
 pub(crate) const GUEST_DEPLOY_MARKER: &str = r"C:\ProgramData\qlean\deployed";
 
+/// TCP port Windows guests expose their OpenSSH server on.
+pub(crate) const SSH_PORT: u16 = 22;
+
+/// Command used as the Windows readiness probe once the session is up.
+///
+/// `cmd /c ver` exercises the transport, the deployed key and a working
+/// non-interactive command channel without depending on PowerShell semantics
+/// (those arrive with the `exec` shell abstraction).
+pub(crate) const READINESS_COMMAND: &str = "cmd /c ver";
+
 /// Default budget for the first-boot deployment.
 ///
 /// This is deliberately independent of the Linux SSH connect budget (180s on KVM,

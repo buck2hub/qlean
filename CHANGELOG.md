@@ -19,12 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Machine::ssh_host_key` exposes the per-VM Windows host key so the transport can pin it instead of trusting the first key seen
 - Windows deployment budget of 900s (`MachineConfig::ssh_timeout` overrides) with an actionable timeout error, independent of the Linux SSH connect timeout
 - README "Windows image contract" describing the required first-boot task, account and ACL rules
+- Windows SSH transport over the libvirt NAT network: the guest address is resolved from its DHCP lease on the host before connecting, so `Machine::get_ip` never runs inside a Windows guest
+- Pinned host keys for Windows SSH sessions: the key presented by the guest must match the per-VM key generated at deploy time, and certificates are rejected; Linux guests keep vsock trust-on-first-use
+- `with_pool` no longer requires `/dev/vhost-vsock`, and `with_machine` requires it only for `GuestOs::Linux`
+- README "Windows transport and security" describing address discovery, host key pinning, the Linux-only vsock requirement and pool isolation
 
 ### Changed
 
 - Cached image metadata records `guest_os`; legacy metadata without the field deserializes as `Linux`, and a cache entry recorded for a different guest OS is rejected with an actionable error
 - Windows image cache entries use a `windows-` name prefix so they can never share a cache slot with a Linux image
 - Windows guests reject TCG: a launch without KVM acceleration now fails with an actionable error instead of silently emulating
+- `Machine::open_interactive_shell` returns an actionable error for `GuestOs::Windows` instead of attempting a vsock shell
 
 ### Migration
 

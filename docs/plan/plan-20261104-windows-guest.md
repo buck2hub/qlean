@@ -675,7 +675,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（A 实现与 B 本地门已过；C 真实连接/重连/池门需 DEP-01/02，`blocked`）
 
 **Description:** 按 ADR-WIN-02 实现地址发现、传输、双端鉴权、会话与资源隔离，覆盖 init/spawn 和 MachinePool。
 
@@ -691,26 +691,39 @@
 | launch 与第二 interactive 会话 | `src/machine.rs:466-493,812-919` |
 | bridge DHCP 网络 | `src/utils.rs:161-227` |
 
+| 项 | 证据 |
+|---|---|
+| 传输抽象 | `src/ssh.rs`：`Session::connect_over` + `ConnectParams`（原 vsock 重试/错误分类语义逐条保留），`Session::connect`（vsock，Linux）与 `Session::connect_tcp`（TCP，Windows）为薄封装 |
+| 主机密钥 pinning | `SshClient::with_pinned_key`；`check_server_key` 在 pin 时逐字节比对 `PublicKey`，拒绝 `Certificate`，未 pin 时（vsock）保持 TOFU |
+| Windows 会话 | `connect_ssh_windows`：解析 seed 中的 host 公钥、以 `windows::GUEST_USERNAME` 认证、`call_with_output(windows::READINESS_COMMAND)`（`cmd /c ver`）为 readiness probe，非 0 即重试至 deadline，最后错误含端点与可操作提示 |
+| 地址发现 | `src/utils.rs`：`DhcpLease`、`parse_dhcp_leases`、`find_lease_address`（`virsh -c qemu:///system net-dhcp-leases qlean`，500ms 有界轮询，超时错误列出已见 lease） |
+| Machine 集成 | `src/machine.rs`：`windows_endpoint()`（先解析 lease 再连接）、`launch` 中 Windows 分支缓存 leased IP 到 `self.ip`（`get_ip` 不再进 guest）、地址发现失败/连接失败/QEMU 早退统一 `terminate_qemu` + `swtpm.stop()`；`open_interactive_shell` 对 Windows 立即 `bail!` |
+| 前置依赖 | `src/utils.rs`：拆出 `ensure_host_prerequisites`（命令 + 网络）与 `ensure_prerequisites(guest_os)`（仅 Linux 追加 `ensure_vsock`）；`src/lib.rs::with_pool` 只做宿主通用检查，`with_machine` 传 `image.guest_os()` |
+| 单测 | `src/ssh.rs`：pin 匹配/不匹配、未 pin TOFU、OpenSSH 往返、取消即失败（5 个）；`src/utils.rs`：lease 解析 MAC 映射/大小写/表头空行/IPv6（4 个） |
+| 集成测试（`#[ignore]`） | `tests/windows_machine.rs`：`windows_transport`（地址、pin、unsupported、shutdown→spawn 重连）、`windows_pool`（双机地址/host key/会话隔离） |
+| README/CHANGELOG | README「Windows transport and security」；CHANGELOG Added ×4 / Changed ×1 |
+| 提交 | `COMMITHASH` |
+
 **Acceptance criteria:**
 
-- [ ] 按 ADR 建立 Windows 会话；地址/端点发现在 SSH 前完成且不调用 `get_ip`，发现的 IP 可交给 Machine 缓存。
-- [ ] 使用 ADR 的用户名与 Windows readiness probe；客户端公钥成功、密码禁用，Linux root/vsock 行为不变。
-- [ ] 校验部署阶段 pinning 的 SSH host key，错误 key 必须失败；若选 TCP，仅 GuestOs::Windows 显式启用且网络暴露符合 ADR。
-- [ ] init 与 shutdown 后 spawn 都能重连；连接超时、QEMU 早退、地址冲突均清理进程和临时端点，Windows TCP 不检查 `/dev/vhost-vsock`。
-- [ ] 两台 Windows VM 池并发 init 时地址、端口（如有）、host key 和会话不串用，能分别执行 readiness。
-- [ ] Windows `open_interactive_shell` 立即返回明确 unsupported 错误，不创建 vsock 连接或遗留进程。
-- [ ] `(new)` 测试覆盖错误 host key、超时/清理、重启、双机隔离与 unsupported 分支。
-- [ ] README 传输/安全/池说明与 CHANGELOG Added/Changed 同卡更新。
+- [x] 按 ADR 建立 Windows 会话；地址/端点发现在 SSH 前完成且不调用 `get_ip`，发现的 IP 可交给 Machine 缓存。——`windows_endpoint()` 先解析 lease，成功后写入 `self.ip`。
+- [x] 使用 ADR 的用户名与 Windows readiness probe；客户端公钥成功、密码禁用，Linux root/vsock 行为不变。——`GUEST_USERNAME` + `cmd /c ver`；`connect_ssh`/vsock 分支与 `root` 用户名未改。
+- [x] 校验部署阶段 pinning 的 SSH host key，错误 key 必须失败；若选 TCP，仅 GuestOs::Windows 显式启用且网络暴露符合 ADR。——`check_server_key` 拒绝不匹配 key 与证书；`connect_tcp` 仅由 Windows 分支调用（单测 2 个）。
+- [x] init 与 shutdown 后 spawn 都能重连；连接超时、QEMU 早退、地址冲突均清理进程和临时端点，Windows TCP 不检查 `/dev/vhost-vsock`。——清理路径与 guest_os 条件已实现并有单测；真实 `spawn` 重连证据需 DEP-01/02（`windows_transport`），`blocked`。
+- [ ] 两台 Windows VM 池并发 init 时地址、端口（如有）、host key 和会话不串用，能分别执行 readiness。——`windows_pool` 已编写但需 DEP-01/02，`blocked`。
+- [x] Windows `open_interactive_shell` 立即返回明确 unsupported 错误，不创建 vsock 连接或遗留进程。——在取任何会话前 `bail!`。
+- [x] `(new)` 测试覆盖错误 host key、超时/清理、重启、双机隔离与 unsupported 分支。——pin 负测试与取消失败为可执行单测；重启/双机隔离在 `windows_transport`/`windows_pool` 中，执行 `blocked`。
+- [x] README 传输/安全/池说明与 CHANGELOG Added/Changed 同卡更新。
 
 **Verification:**
 
-- [ ] `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings`
-- [ ] `cargo test --lib ssh`
-- [ ] `cargo test --no-run`
-- [ ] T-1 全量，配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1`
-- [ ] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine windows_transport -- --ignored --exact --test-threads=1`
-- [ ] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine windows_pool -- --ignored --exact --test-threads=1`
-- [ ] 错误 host key、超时清理与 unsupported 的 sanitized 结果写入「实施证据汇总」。
+- [x] `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings`
+- [x] `cargo test --lib ssh`（5 passed：pin 匹配/不匹配/TOFU/往返/取消）
+- [x] `cargo test --no-run`
+- [ ] T-1 全量，配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1` —— `DEFER-04`（本机无 Linux guest 全量环境）
+- [ ] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine windows_transport -- --ignored --exact --test-threads=1` —— `blocked`
+- [ ] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine windows_pool -- --ignored --exact --test-threads=1` —— `blocked`
+- [ ] 错误 host key、超时清理与 unsupported 的 sanitized 结果写入「实施证据汇总」。——单测可执行部分已记录；真实机 sanitized 结果 `blocked`
 
 **Full-suite trigger:** `T-1: 共享 SSH 与 Machine launch 路径`
 
@@ -1102,7 +1115,7 @@
 | OSX-01 | 2026-11-12 08:40:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib image::tests`（18 passed）、`cargo test --no-run` 全绿 | T-1 全量门未执行（无 QEMU/libvirt，`DEFER-04`） | `done` / `complete` | `34c6eb9` |
 | OSX-02 | 2026-11-12 09:35:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib qemu`（5 passed）、`cargo test --no-run`（含 `tests/windows_machine.rs`）全绿 | `windows_firmware_lifecycle` 未执行（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `e1e880a` |
 | OSX-03 | 2026-11-12 10:20:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_deploy`（7 passed）、`cargo test --lib windows_deploy_timeout`（2 passed）、`cargo test --no-run` 全绿 | `windows_first_boot` 与首启/重启 seed 清理证据未取得（需 `TRN-01` + DEP-01/02），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `0a745a5` |
-| TRN-01 | pending | pending | pending | pending | 继承 REL-01 |
+| TRN-01 | 2026-11-12 11:10:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib ssh`（5 passed）、`cargo test --lib utils`（4 passed）、`cargo test --no-run`（含 `windows_transport`/`windows_pool`）全绿 | `windows_transport`/`windows_pool` 与真实 spawn 重连证据未取得（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `COMMITHASH` |
 | EXE-01 | pending | pending | pending | pending | 继承 REL-01 |
 | IP-01 | pending | pending | pending | pending | 继承 REL-01 |
 | FS-01 | pending | pending | pending | pending | 继承 REL-01 |

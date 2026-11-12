@@ -23,7 +23,7 @@ use std::pin::Pin;
 use anyhow::Result;
 use kvm_ioctls::Kvm;
 
-use crate::utils::ensure_prerequisites;
+use crate::utils::{ensure_host_prerequisites, ensure_prerequisites};
 
 mod firmware;
 mod image;
@@ -65,7 +65,7 @@ where
         anyhow::bail!("Qlean currently only supports Linux hosts.");
     }
 
-    ensure_prerequisites().await?;
+    ensure_prerequisites(image.guest_os()).await?;
 
     let mut machine = Machine::new(image, config).await?;
     machine.init().await?;
@@ -85,7 +85,9 @@ where
         anyhow::bail!("Qlean currently only supports Linux hosts.");
     }
 
-    ensure_prerequisites().await?;
+    // Pool members may be Windows guests, which do not need vsock; guest-specific
+    // requirements are enforced when each machine starts.
+    ensure_host_prerequisites().await?;
 
     let mut pool = MachinePool::new();
     let result = f(&mut pool).await;

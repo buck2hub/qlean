@@ -9,7 +9,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use russh::{
     ChannelMsg, Disconnect,
-    keys::{Algorithm, PrivateKey, PrivateKeyWithHashAlg, ssh_key::LineEnding},
+    keys::{
+        Algorithm, PrivateKey, PrivateKeyWithHashAlg, PublicKey, PublicKeyOrCertificate,
+        ssh_key::LineEnding,
+    },
 };
 use russh_sftp::{client::SftpSession, protocol::OpenFlags};
 use tokio::{
@@ -96,20 +99,64 @@ pub(crate) fn generate_keypair(privkey_path: &Path) -> Result<PersistedSshKeypai
 }
 
 #[derive(Debug, Clone, Default)]
-struct SshClient {}
+struct SshClient {
+    /// Host key the server must present, when the caller knows it in advance.
+    ///
+    /// Linux guests keep the historical trust-on-first-use behavior (`None`): the
+    /// vsock transport is host-local. Windows guests connect over the shared NAT
+    /// network, so the per-VM host key generated at deploy time is pinned here.
+    expected_host_key: Option<PublicKey>,
+}
 
-// More SSH event handlers can be defined in this trait
-//
-// In this example, we're only using Channel, so these aren't needed.
+impl SshClient {
+    fn with_pinned_key(expected: Option<PublicKey>) -> Self {
+        Self {
+            expected_host_key: expected,
+        }
+    }
+}
+
 impl russh::client::Handler for SshClient {
     type Error = russh::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::PublicKeyOrCertificate,
+        server_public_key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        Ok(true)
+        let Some(expected) = self.expected_host_key.as_ref() else {
+            // No pinned key: this transport is host-local (vsock) and cannot be
+            // redirected to another machine's sshd.
+            return Ok(true);
+        };
+        match server_public_key {
+            PublicKeyOrCertificate::PublicKey { key, .. } => {
+                let matches = key == expected;
+                if !matches {
+                    info!("❌ Refusing SSH connection: presented host key is not the pinned key");
+                }
+                Ok(matches)
+            }
+            // A certificate implies a CA we did not pin; never accept it implicitly.
+            PublicKeyOrCertificate::Certificate(_) => {
+                info!(
+                    "❌ Refusing SSH connection: pinned host key was expected but a certificate was presented"
+                );
+                Ok(false)
+            }
+        }
     }
+}
+
+/// Everything a single SSH connection attempt needs besides the transport itself.
+struct ConnectParams {
+    username: &'static str,
+    timeout: Duration,
+    cancel_token: CancellationToken,
+    expected_host_key: Option<PublicKey>,
+    /// Transport name used in error messages ("vsock", "tcp").
+    transport_name: &'static str,
+    /// Message used when `timeout` elapses while the guest is still not listening.
+    timeout_message: &'static str,
 }
 
 /// This struct is a convenience wrapper around a russh client that handles the input/output event
@@ -121,116 +168,122 @@ pub(crate) struct Session {
 }
 
 impl Session {
-    /// Connect to an SSH server via vsock
-    async fn connect(
+    /// Connect to an SSH server over a byte stream produced by `open`.
+    ///
+    /// `open` is retried until `timeout` elapses. Connection errors that only mean
+    /// "the guest is not listening yet" are treated as transient, exactly as the
+    /// historical vsock path did; everything else is reported immediately.
+    async fn connect_over<S, F, Fut>(
+        params: ConnectParams,
         privkey: PrivateKey,
-        username: &str,
-        cid: u32,
-        port: u32,
-        timeout: Duration,
-        cancel_token: CancellationToken,
-    ) -> Result<Self> {
+        mut open: F,
+    ) -> Result<Self>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = std::io::Result<S>>,
+    {
+        let ConnectParams {
+            username,
+            timeout,
+            cancel_token,
+            expected_host_key,
+            transport_name,
+            timeout_message,
+        } = params;
         let config = russh::client::Config {
             keepalive_interval: Some(Duration::from_secs(5)),
             ..<_>::default()
         };
 
         let config = Arc::new(config);
-        let sh = SshClient {};
-
-        let vsock_addr = VsockAddr::new(cid, port);
+        let sh = SshClient::with_pinned_key(expected_host_key);
         let now = Instant::now();
-        let mut session =
-            loop {
-                // Check for cancellation
-                if cancel_token.is_cancelled() {
-                    bail!("SSH connection cancelled");
+        let mut session = loop {
+            // Check for cancellation
+            if cancel_token.is_cancelled() {
+                bail!("SSH connection cancelled");
+            }
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Establish the transport connection
+            let connect_budget = timeout
+                .saturating_sub(now.elapsed())
+                .max(Duration::from_millis(1));
+            let stream = match tokio::time::timeout(connect_budget, open()).await {
+                Ok(Ok(stream)) => stream,
+                Err(_) => {
+                    bail!("Timeout while connecting to VM via {transport_name}.");
                 }
-
-                tokio::time::sleep(Duration::from_millis(100)).await;
-
-                // Establish vsock connection
-                let connect_budget = timeout
-                    .saturating_sub(now.elapsed())
-                    .max(Duration::from_millis(1));
-                let stream =
-                    match tokio::time::timeout(connect_budget, VsockStream::connect(vsock_addr))
-                        .await
-                    {
-                        Ok(Ok(stream)) => stream,
-                        Err(_) => {
-                            bail!("Timeout while connecting to VM via vsock.");
-                        }
-                        Ok(Err(ref e)) if e.raw_os_error() == Some(ERR_EACCES) => {
-                            bail!("Permission denied while connecting via vsock: {e}\n");
-                        }
-                        Ok(Err(ref e)) if e.raw_os_error() == Some(ERR_ENODEV) => {
-                            // ENODEV is commonly observed while QEMU is still booting/initializing the vsock
-                            // transport (e.g. the guest CID isn't ready yet). Treat it as transient and retry
-                            // until the overall timeout is reached.
-                            debug!("SSH vsock connect not ready yet (ENODEV): {e} (will retry)");
-                            if now.elapsed() > timeout {
-                                bail!("Timeout while connecting to VM via vsock.\n");
-                            }
-                            continue;
-                        }
-                        Ok(Err(ref e)) => match e.kind() {
-                            ErrorKind::TimedOut
-                            | ErrorKind::ConnectionRefused
-                            | ErrorKind::ConnectionReset
-                            | ErrorKind::NetworkUnreachable
-                            | ErrorKind::AddrNotAvailable => {
-                                if now.elapsed() > timeout {
-                                    bail!("Timeout while connecting to VM via vsock.");
-                                }
-                                continue;
-                            }
-                            e => {
-                                bail!("SSH vsock connect error: {e}");
-                            }
-                        },
-                    };
-
-                // Connect to SSH via vsock stream
-                let handshake_budget = timeout
-                    .saturating_sub(now.elapsed())
-                    .max(Duration::from_millis(1));
-                match tokio::time::timeout(
-                    handshake_budget,
-                    russh::client::connect_stream(config.clone(), stream, sh.clone()),
-                )
-                .await
-                {
-                    Ok(Ok(x)) => break x,
-                    Err(_) => {
-                        bail!("Timeout establishing SSH handshake over vsock.");
+                Ok(Err(ref e)) if e.raw_os_error() == Some(ERR_EACCES) => {
+                    bail!("Permission denied while connecting via {transport_name}: {e}\n");
+                }
+                Ok(Err(ref e)) if e.raw_os_error() == Some(ERR_ENODEV) => {
+                    // ENODEV is commonly observed while QEMU is still booting/initializing the vsock
+                    // transport (e.g. the guest CID isn't ready yet). Treat it as transient and retry
+                    // until the overall timeout is reached.
+                    debug!("SSH {transport_name} connect not ready yet (ENODEV): {e} (will retry)");
+                    if now.elapsed() > timeout {
+                        bail!("{timeout_message}\n");
                     }
-                    Ok(Err(russh::Error::IO(ref e))) => {
-                        match e.kind() {
-                            // The VM is still booting at this point so we're just ignoring these errors
-                            // for some time.
-                            ErrorKind::ConnectionRefused
-                            | ErrorKind::ConnectionReset
-                            | ErrorKind::UnexpectedEof => {
-                                if now.elapsed() > timeout {
-                                    bail!("Timeout establishing SSH handshake over vsock.");
-                                }
-                            }
-                            e => {
-                                bail!("SSH handshake error: {e}");
-                            }
-                        }
-                    }
-                    Ok(Err(russh::Error::Disconnect)) => {
+                    continue;
+                }
+                Ok(Err(ref e)) => match e.kind() {
+                    ErrorKind::TimedOut
+                    | ErrorKind::ConnectionRefused
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::NetworkUnreachable
+                    | ErrorKind::AddrNotAvailable => {
                         if now.elapsed() > timeout {
-                            bail!("Timeout establishing SSH handshake over vsock.");
+                            bail!("{timeout_message}");
+                        }
+                        continue;
+                    }
+                    e => {
+                        bail!("SSH {transport_name} connect error: {e}");
+                    }
+                },
+            };
+
+            // Perform the SSH handshake (which also validates the host key)
+            let handshake_budget = timeout
+                .saturating_sub(now.elapsed())
+                .max(Duration::from_millis(1));
+            match tokio::time::timeout(
+                handshake_budget,
+                russh::client::connect_stream(config.clone(), stream, sh.clone()),
+            )
+            .await
+            {
+                Ok(Ok(x)) => break x,
+                Err(_) => {
+                    bail!("Timeout establishing SSH handshake over {transport_name}.");
+                }
+                Ok(Err(russh::Error::IO(ref e))) => match e.kind() {
+                    // The VM is still booting at this point so we're just ignoring these errors
+                    // for some time.
+                    ErrorKind::ConnectionRefused
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::UnexpectedEof => {
+                        if now.elapsed() > timeout {
+                            bail!("Timeout establishing SSH handshake over {transport_name}.");
                         }
                     }
-                    Ok(Err(e)) => {
-                        bail!("SSH client error: {e}");
+                    e => {
+                        bail!("SSH handshake error: {e}");
+                    }
+                },
+                Ok(Err(russh::Error::Disconnect)) => {
+                    if now.elapsed() > timeout {
+                        bail!("Timeout establishing SSH handshake over {transport_name}.");
                     }
                 }
-            };
+                Ok(Err(e)) => {
+                    bail!("SSH client error: {e}");
+                }
+            }
+        };
         debug!("Authenticating via SSH");
         let auth_budget = timeout
             .saturating_sub(now.elapsed())
@@ -251,6 +304,59 @@ impl Session {
             session,
             sftp: None,
         })
+    }
+
+    /// Connect to an SSH server via vsock (Linux guests).
+    async fn connect(
+        privkey: PrivateKey,
+        username: &'static str,
+        cid: u32,
+        port: u32,
+        timeout: Duration,
+        cancel_token: CancellationToken,
+    ) -> Result<Self> {
+        let vsock_addr = VsockAddr::new(cid, port);
+        Self::connect_over(
+            ConnectParams {
+                username,
+                timeout,
+                cancel_token,
+                expected_host_key: None,
+                transport_name: "vsock",
+                timeout_message: "Timeout while connecting to VM via vsock.",
+            },
+            privkey,
+            || VsockStream::connect(vsock_addr),
+        )
+        .await
+    }
+
+    /// Connect to an SSH server over TCP (Windows guests).
+    ///
+    /// Only used for `GuestOs::Windows`: the guest has no vsock, so the session runs
+    /// over the libvirt NAT network, and `expected_host_key` is always pinned to the
+    /// per-VM host key that was injected during deployment.
+    async fn connect_tcp(
+        privkey: PrivateKey,
+        username: &'static str,
+        addr: std::net::SocketAddr,
+        timeout: Duration,
+        cancel_token: CancellationToken,
+        expected_host_key: PublicKey,
+    ) -> Result<Self> {
+        Self::connect_over(
+            ConnectParams {
+                username,
+                timeout,
+                cancel_token,
+                expected_host_key: Some(expected_host_key),
+                transport_name: "tcp",
+                timeout_message: "Timeout while connecting to VM via tcp.",
+            },
+            privkey,
+            || tokio::net::TcpStream::connect(addr),
+        )
+        .await
     }
 
     // NOTE: TCP-based SSH fallback intentionally not supported.
@@ -639,6 +745,87 @@ pub(crate) async fn connect_ssh(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Timeout establishing SSH over vsock.")))
 }
 
+/// Connect to a Windows guest over TCP and confirm it is ready for commands.
+///
+/// The address is discovered by the caller (libvirt DHCP lease lookup by MAC); this
+/// function never falls back to a vsock endpoint and never accepts an unpinned host
+/// key. `expected_host_key` is the OpenSSH public key generated during deployment.
+pub(crate) async fn connect_ssh_windows(
+    addr: std::net::SocketAddr,
+    timeout: Duration,
+    keypair: PersistedSshKeypair,
+    cancel_token: CancellationToken,
+    expected_host_key: String,
+) -> Result<Session> {
+    let privkey = PrivateKey::from_openssh(&keypair.privkey_str)?;
+    let pinned = PublicKey::from_openssh(expected_host_key.trim()).with_context(|| {
+        "failed to parse the pinned Windows SSH host key; the deployment seed recorded an invalid key"
+    })?;
+
+    let deadline = Instant::now() + timeout;
+    let mut last_err: Option<anyhow::Error> = None;
+
+    while Instant::now() < deadline {
+        if cancel_token.is_cancelled() {
+            bail!("SSH connection cancelled");
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let per_attempt_timeout = Duration::from_secs(12)
+            .min(remaining.max(Duration::from_secs(1)))
+            .min(Duration::from_secs(25));
+
+        match Session::connect_tcp(
+            privkey.clone(),
+            crate::windows::GUEST_USERNAME,
+            addr,
+            per_attempt_timeout,
+            cancel_token.clone(),
+            pinned.clone(),
+        )
+        .await
+        {
+            Ok(mut session) => {
+                let ready_budget = deadline.saturating_duration_since(Instant::now());
+                if ready_budget == Duration::ZERO {
+                    bail!("SSH connection timed out");
+                }
+                let probe = tokio::time::timeout(
+                    ready_budget,
+                    session
+                        .call_with_output(crate::windows::READINESS_COMMAND, cancel_token.clone()),
+                )
+                .await
+                .context("SSH readiness probe timed out")??;
+                if probe.0 != 0 {
+                    last_err = Some(anyhow::anyhow!(
+                        "Windows readiness probe `{}` exited with {}",
+                        crate::windows::READINESS_COMMAND,
+                        probe.0
+                    ));
+                    sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+                info!(
+                    "✅ Connected to Windows guest over tcp as {}",
+                    crate::windows::GUEST_USERNAME
+                );
+                return Ok(session);
+            }
+            Err(e) => {
+                last_err = Some(e);
+                sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        anyhow::anyhow!(
+            "Timeout establishing SSH over tcp to {addr}; pass the Windows guest's              reachable address and check that sshd accepts the deployed client key"
+        )
+    }))
+}
+
 impl Session {
     /// Recursively create a directory and all of its parent components if they are missing.
     pub(crate) async fn create_dir_all<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
@@ -892,5 +1079,84 @@ impl RemoteDirEntry {
 
     pub(crate) fn file_type(&self) -> &RemoteFileType {
         &self.file_type
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rng;
+    use russh::client::Handler;
+    use russh::keys::Algorithm;
+
+    fn keypair() -> (PrivateKey, PublicKey) {
+        let private = PrivateKey::random(&mut rng(), Algorithm::Ed25519).expect("key generated");
+        let public = private.public_key().clone();
+        (private, public)
+    }
+
+    fn presented(public: &PublicKey) -> PublicKeyOrCertificate {
+        PublicKeyOrCertificate::PublicKey {
+            key: public.clone(),
+            hash_alg: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pinned_host_key_accepts_matching_key() {
+        let (_private, public) = keypair();
+        let mut client = SshClient::with_pinned_key(Some(public.clone()));
+        assert!(client.check_server_key(&presented(&public)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_pinned_host_key_rejects_other_key() {
+        let (_private, pinned) = keypair();
+        let (_other_private, other) = keypair();
+        let mut client = SshClient::with_pinned_key(Some(pinned));
+        assert!(!client.check_server_key(&presented(&other)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_unpinned_host_key_keeps_vsock_trust_on_first_use() {
+        // Linux guests talk to a host-local vsock endpoint; the historical
+        // behavior (accept the presented key) must be preserved.
+        let (_private, public) = keypair();
+        let mut client = SshClient::with_pinned_key(None);
+        assert!(client.check_server_key(&presented(&public)).await.unwrap());
+    }
+
+    #[test]
+    fn test_pinned_host_key_roundtrips_through_openssh() {
+        let (_private, public) = keypair();
+        let openssh = public.to_openssh().expect("public key serializes");
+        let parsed = PublicKey::from_openssh(openssh.trim()).expect("public key parses");
+        assert_eq!(parsed, public);
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_connection_does_not_retry() {
+        let (private, public) = keypair();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let err = Session::connect_over(
+            ConnectParams {
+                username: "qlean",
+                timeout: Duration::from_secs(5),
+                cancel_token: cancel,
+                expected_host_key: Some(public),
+                transport_name: "tcp",
+                timeout_message: "timeout",
+            },
+            private,
+            || async {
+                std::io::Result::<tokio::net::TcpStream>::Err(std::io::Error::other("never used"))
+            },
+        )
+        .await
+        .err()
+        .expect("cancelled connection must fail")
+        .to_string();
+        assert!(err.contains("cancelled"), "{err}");
     }
 }

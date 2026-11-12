@@ -16,7 +16,7 @@
 //! instead of silently skipping.
 
 use anyhow::{Result, bail};
-use qlean::{GuestOs, Image, ImageConfig, Machine, MachineConfig};
+use qlean::{GuestOs, Image, ImageConfig, Machine, MachineConfig, MachinePool};
 use serial_test::serial;
 
 mod utils;
@@ -107,5 +107,89 @@ async fn windows_first_boot() -> Result<()> {
     assert!(String::from_utf8_lossy(&keys.stdout).contains("ssh-ed25519"));
 
     vm.shutdown().await?;
+    Ok(())
+}
+
+/// Transport: address discovery, pinned host key, reconnect after shutdown, and
+/// the explicit unsupported answer for interactive PTYs.
+#[tokio::test]
+#[ignore = "needs a licensed Windows image (DEP-01) and a Windows KVM host (DEP-02)"]
+#[serial]
+async fn windows_transport() -> Result<()> {
+    tracing_subscriber_init();
+
+    let image = Image::new(windows_image_config()?).await?;
+    let mut vm = Machine::new(&image, &MachineConfig::default()).await?;
+    let pinned = vm
+        .ssh_host_key()
+        .ok_or_else(|| anyhow::anyhow!("Windows guests must expose a per-VM SSH host key"))?
+        .to_string();
+
+    vm.init().await?;
+    // The leased address is discovered from libvirt, never read inside the guest.
+    let ip = vm.get_ip().await?;
+    assert!(
+        ip.parse::<std::net::IpAddr>().is_ok(),
+        "unexpected ip: {ip}"
+    );
+    assert_eq!(vm.ssh_host_key().unwrap(), pinned);
+
+    // Interactive PTYs are not supported for Windows guests and must fail without
+    // spawning a vsock connection.
+    let err = vm.open_interactive_shell(80, 24).await.err();
+    let message = err.map(|e| e.to_string()).unwrap_or_default();
+    assert!(message.contains("not supported"), "{message}");
+
+    vm.shutdown().await?;
+    assert!(!vm.is_running().await?);
+
+    // `spawn` reconnects without re-attaching the seed medium.
+    vm.spawn().await?;
+    let out = vm.exec("cmd /c echo spawned").await?;
+    assert!(String::from_utf8_lossy(&out.stdout).contains("spawned"));
+    vm.shutdown().await?;
+
+    Ok(())
+}
+
+/// Two Windows VMs in one pool must not share addresses, host keys or sessions.
+#[tokio::test]
+#[ignore = "needs a licensed Windows image (DEP-01) and a Windows KVM host (DEP-02)"]
+#[serial]
+async fn windows_pool() -> Result<()> {
+    tracing_subscriber_init();
+
+    let image = Image::new(windows_image_config()?).await?;
+    let mut pool = MachinePool::new();
+    pool.add("win-a", &image, &MachineConfig::default()).await?;
+    pool.add("win-b", &image, &MachineConfig::default()).await?;
+    pool.init_all().await?;
+
+    let mut addresses = Vec::new();
+    let mut host_keys = Vec::new();
+    for name in ["win-a", "win-b"] {
+        let mut machine = pool
+            .get(name)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("machine {name} missing from the pool"))?;
+        addresses.push(machine.get_ip().await?);
+        host_keys.push(
+            machine
+                .ssh_host_key()
+                .ok_or_else(|| anyhow::anyhow!("{name} is missing its per-VM host key"))?
+                .to_string(),
+        );
+        let out = machine.exec("cmd /c hostname").await?;
+        assert!(out.status.success(), "{name} is not reachable");
+    }
+
+    addresses.sort();
+    addresses.dedup();
+    assert_eq!(addresses.len(), 2, "pool machines share an address");
+    host_keys.sort();
+    host_keys.dedup();
+    assert_eq!(host_keys.len(), 2, "pool machines share a host key");
+
+    pool.shutdown_all().await?;
     Ok(())
 }
