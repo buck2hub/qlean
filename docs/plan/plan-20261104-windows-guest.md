@@ -117,7 +117,7 @@
 
 | 2026-11-12 13:45:00 UTC | review R6（实施后逐卡 review；修订提交 `496b471`） | 逐卡核对 `OSX-01`~`FS-01` 实现与门禁；F1~F4 修复（`Drop`/`swtpm` 顺序、证据表 Review 列语义、`GuestPath::join` 不可达分支、`TRN-01` 提交号更正）；`REL-01` 维持 `blocked` | N/A（无拆合卡、无 AC 变更） | 实施证据汇总、Review log、`src/machine.rs`、`src/firmware.rs`、`src/guest_path.rs`、plan-status |
 
-| 2026-11-12 14:05:00 UTC | review R7（结构复核） | 修复文档结构：恢复丢失的 `OSX-01` 标题与 `Task type` 行；`SPK-01`/`SPK-02` 卡片状态由 `pending` 更正为 `blocked` 并写入阻塞审计证据，与状态视图、实施证据汇总一致 | N/A（无拆合卡、无 AC 变更） | 任务卡、Review log、plan-status |
+| 2026-11-12 14:20:00 UTC | review R7（结构复核） | 修复文档结构：恢复丢失的 `OSX-01` 标题与 `Task type` 行；`SPK-01`/`SPK-02` 卡片状态由 `pending` 更正为 `blocked` 并写入阻塞审计证据；删除 `OSX-03` 重复的第二个 `Verification` 块（与首个块矛盾且把已跑通的本地门标为未做），三处状态视图一致 | N/A（无拆合卡、无 AC 变更） | 任务卡、Review log、plan-status |
 
 ## 已决议设计决策
 
@@ -640,16 +640,6 @@
 | 日志安全 | seed 只记录目录路径与文件名清单，不记录密钥内容；`DeploySeed` 自定义 `Debug` |
 | README | “Windows image contract”：virtio 驱动、OpenSSH Server、`sysprep /generalize`、`qlean` 账号、ACL 规则、首启任务步骤、seed 生命周期、900s 预算 |
 | 提交 | `8812fb4` |
-
-**Verification:**
-
-- [ ] `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings`
-- [ ] `cargo test --lib windows_deploy`
-- [ ] `cargo test --no-run`
-- [ ] T-1 全量，配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1`
-- [ ] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine windows_first_boot -- --ignored --exact --test-threads=1`
-- [ ] 首启后关机、spawn 与 host-key seed 清理的 sanitized 手工/测试证据写入「实施证据汇总」。
-- [ ] `cargo test --lib windows_deploy_timeout`（新增超时维度单测：默认值与超时错误路径）。
 
 **Full-suite trigger:** `T-1: 共享 seed 与 Machine 初始化路径`
 
@@ -1191,7 +1181,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R4 | P2 缺口修订（OSX-02 资源默认值、OSX-03 部署超时） | PASS | 无开放项；GAP-08/09 已修复 | 无 residual risk | 审计表重算：`OSX-02` AC=8/8、VER=5/8；`OSX-03` AC=8/8、VER=7/8（均在上限内）；追溯表补 `windows_deploy_timeout`；风险表新增两行；事实基线/性能摘要同步；plan-status 状态与时间戳同步；新增 AC 不扩大行为轴、不引入新依赖 |
 | R5 | 环境消歧（DEP-01/DEP-02 不可用）与依赖边重排 | PASS | 无开放项；spike 阻塞已登记，ADR 临时接受已写明 revisit 条件 | 残余风险：Windows 实测证据缺失（由 `SPK-01`/`SPK-02` 与 `REL-01` 阻塞承载），具名接受人=计划 Owner | 审计命令输出（`command -v` 全缺、`sudo -n` 需密码、`/dev/kvm` 存在）；依赖图无环复核；`SPK-02 -> OSX-01` 取消理由=OSX-01 无 Phase 0 输入；粒度审计表 deps 列同步 |
 | R6 | 实施后逐卡 review：`OSX-01`~`FS-01` 的实现产物、AC 对照与逐卡门禁 | PASS | 无 P0/P1 开放 | F1~F4 已在本轮修复；残余风险：真实 Windows KVM 证据与独立第二人 review 仍缺（由 `SPK-01`/`SPK-02`/`REL-01` 阻塞承载） | 逐卡门禁重跑：`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、8 个 focused filter 全绿（`image::tests` 18、`qemu` 5、`windows_deploy` 7+2、`ssh::tests` 5、`utils::tests` 4、`windows_exec` 5、`windows_ip` 6、`windows_path` 9）、`cargo test --lib` 69 passed、`cargo test --no-run`；F1~F3 修订见下表 |
-| R7 | 文档结构与状态一致性复核（10 张卡的标题/字段/状态机对齐 `plan-status.md`） | PASS | 无开放项 | 修复 R7 前存在 2 处结构缺陷（`OSX-01` 标题与 `Task type` 行丢失、`SPK-01`/`SPK-02` 卡头仍为 `pending`） | 逐卡字段审计脚本比对 10 张卡：每卡含标题、`Task type`、`Lifecycle / Acceptance` 与全部模板字段；状态与 `plan-status.md`、实施证据汇总三处一致 |
+| R7 | 文档结构与状态一致性复核（10 张卡的标题/字段/状态机对齐 `plan-status.md`） | PASS | 无开放项 | 修复 R7 前存在 3 处结构缺陷（`OSX-01` 标题与 `Task type` 行丢失、`SPK-01`/`SPK-02` 卡头仍为 `pending`、`OSX-03` 重复的第二个 `Verification` 块） | 逐卡字段审计脚本比对 10 张卡：每卡含标题、`Task type`、`Lifecycle / Acceptance` 与全部模板字段且无重复字段；状态与 `plan-status.md`、实施证据汇总三处一致 |
 
 ### R1 findings 与修订对照
 
