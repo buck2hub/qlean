@@ -1440,6 +1440,11 @@ StandardError=journal
 
     /// Check if the machine is currently running.
     ///
+    /// `false` means this run directory is free: no live QEMU answers for it. A guest that
+    /// stopped is not a machine that left — a paused guest, a guest stopped by `io-error` on a
+    /// full host disk, an `internal-error` or a panic all still have a QEMU process that owns
+    /// the overlay, so the liveness check reads the QMP run state and not the guest CPU flag.
+    ///
     /// A failed QMP query is reported instead of being folded into `false`: the callers use
     /// `false` to decide that a launch is safe, and starting a second QEMU on a live domain's
     /// disk would corrupt it. A missing socket is proof that the domain is gone only when the

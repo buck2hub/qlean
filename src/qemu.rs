@@ -47,7 +47,7 @@ fn resolve_qemu_wait_timeout() -> Option<Duration> {
     }
 }
 
-fn qemu_system_program(arch: GuestArch) -> &'static str {
+pub(crate) fn qemu_system_program(arch: GuestArch) -> &'static str {
     match arch {
         GuestArch::Amd64 => "qemu-system-x86_64",
         GuestArch::Aarch64 => "qemu-system-aarch64",
