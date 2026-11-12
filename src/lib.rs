@@ -1215,6 +1215,48 @@ mod plan_doc_tests {
 
     /// The seven ignored Windows smoke tests all stop at the precondition the plan describes.
     ///
+    /// The number of ignored unit tests the plan runs is the number the crate has.
+    ///
+    /// The test matrix says the container snapshot runs "all 11" of them; a twelfth `#[ignore]`
+    /// would quietly leave the snapshot looking complete while covering less, and nobody would
+    /// see it because the count and the code are two places that never compared.
+    #[test]
+    fn the_plan_runs_the_ignored_unit_tests_it_counts() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        let ignored: usize = CRATE_SOURCES
+            .iter()
+            .filter(|(path, _)| path.starts_with("src/"))
+            .map(|(_, source)| {
+                source
+                    .lines()
+                    .filter(|line| line.trim_start().starts_with("#[ignore"))
+                    .count()
+            })
+            .sum();
+        assert!(
+            ignored >= 5,
+            "the crate has only {ignored} ignored tests: the scan is not reading the sources"
+        );
+
+        let row = PLAN
+            .lines()
+            .find(|line| line.starts_with("| 真程序证据全量快照 |"))
+            .expect("the test matrix has no container snapshot row");
+        let stated = row
+            .split("跑全部 ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|word| word.strip_suffix('条').or(Some(word)))
+            .and_then(|word| word.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                panic!("the snapshot row does not say how many tests it runs: {row}")
+            });
+        assert_eq!(
+            stated, ignored,
+            "the plan says the snapshot runs {stated} ignored tests, the crate has {ignored}"
+        );
+    }
+
     /// The plan quotes the prerequisite error the Windows gate prints, word for word.
     ///
     /// The plan tells a reader what happens once the image variables are set: the gate hands
