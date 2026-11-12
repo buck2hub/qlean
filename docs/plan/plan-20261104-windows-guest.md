@@ -168,6 +168,7 @@
 | 2026-11-13 01:10:00 UTC | review R56（一个预算管整段首启，不是每段各发一份） | F61：计划与 README 都写「部署预算 900s **约束首启的两半**：等 sshd 应答 + 等部署标记」，代码却是**三段各发一份**：`find_lease_address` 拿满 900s，`connect_ssh_windows` 再拿满 900s，`confirm_deployment` 又新开一个 900s。于是一个卡住的首启可以烧掉 45 分钟，而文档承诺的是 15 分钟——**用户按文档设的 `ssh_timeout` 完全不成立**，排障时也无法解释「为什么它等了一个多小时」。这类「文档承诺与实现不一致」比崩溃更耗人：它让所有时间判断都失去参考价值。修：首启引入**一个共享 deadline**（`Machine::first_boot_deadline`，仅 `init` + Windows 时设置），DHCP 发现、`sshd` 连接、部署标记三段都从它扣减；`remaining_budget` 是纯函数（到点即 `None`，不会把已耗尽的 deadline 变成新的等待），耗尽的报错用 `spent_first_boot_budget` 点名**没轮到的阶段**并说明「预算覆盖整段首启、后段不会重新发一份」，给出 `ssh_timeout` 这条唯一旋钮。README 同段改写为「一个 deadline 管整段首启」。`spawn`/Linux 路径不带 deadline，语义不变。新增 2 个单测（deadline 耗尽不复用、消息点名阶段与整段语义）。`cargo test --lib` 152 → 154 | N/A（`EXE-01` 既有 AC：首启时间盒与失败可诊断；无卡拆合） | `EXE-01` 实现证据、Review log、`src/machine.rs`、README、CHANGELOG、plan-status |
 | 2026-11-13 01:35:00 UTC | review R57（非 UTF-8 镜像名不再共用一个缓存槽） | F62：`image::cache_name_from_source` 对**非 UTF-8** 的本地文件名回退成字面量 `custom-image`，于是**所有**这类镜像共用一个缓存文件。两个不同的 Windows qcow2（数 GB）会互相顶掉：`Image::load` 命中后重算哈希发现不符，转而重新下载，**每次在两者之间切换都要重下一遍**。调试时表现为「明明缓存过，怎么又在下」，几乎不可能指向真正原因（文件名编码）。修：新增 `local_cache_stem`——文件名是合法 UTF-8 时行为不变（仍取 stem），否则回退名带上**原始字节的 FNV-1a 哈希**（`custom-image-<16 hex>`），稳定且互不相同；URL 分支不动。新增 2 个单测（两个不同非 UTF-8 名必须得到不同缓存名且可重复、UTF-8 名保持原 stem）。`cargo test --lib` 154 → 156 | N/A（`IP-01`/镜像缓存既有契约：不同来源不得共享缓存；无卡拆合） | `IP-01` 实现证据、Review log、`src/image.rs`、CHANGELOG、plan-status |
 | 2026-11-13 02:05:00 UTC | review R58（标记探测要加引号；测试目录的“唯一”后缀并不唯一） | F63 两项，都是「守卫看着在守、其实没守」：① 部署标记探测拼成 `cmd /c if exist {marker} echo deployed`，**路径没有引号**——`cmd` 按空格切分，一旦标记路径带空格（或未来改成 `%ProgramData%` 展开出空格），探测就永远「文件不存在」，于是**部署已完成的 guest 会被判成没完成**，用户白等满整个预算才知道是探测写错了；② `firmware::tests::temp_dir` 的「唯一」后缀用 `Instant::now().elapsed().as_nanos()`——从紧邻创建的那一刻算起，永远是几个纳秒，**等于常量**：同 tag 的两次调用会拿到同一目录，上一轮遗留的只读 vars 模板会让「复制一次」「只读也能用」这些断言变得毫无意义。修：① 新增 `marker_probe_command()` + `MARKER_PRESENT_TOKEN`，路径加引号，`machine::deploy_marker_present` 改用它们（匹配词也走常量，避免命令文本与判据漂移）；② `temp_dir` 改用进程内 `AtomicU64` 计数器。新增 3 个单测（引号形态、只有 echo 词跟在路径之后、同 tag 两次调用必不冲突）。`cargo test --lib` 156 → 159 | N/A（`EXE-01` 既有 AC：部署完成判定必须可信；无卡拆合） | `EXE-01` 实现证据、Review log、`src/windows.rs`、`src/machine.rs`、`src/firmware.rs`、CHANGELOG、plan-status |
+| 2026-11-13 02:35:00 UTC | review R59（闭包自己的失败不能被收尾失败顶掉） | F64：`with_machine` 是 `let result = f(&mut machine).await; machine.shutdown().await?; result`——**收尾失败会用 `?` 提前返回，把闭包里真正的原因丢掉**。对一个测试库来说这是最坏的失效方向：用例失败时读者看到的只有「cleanup failed」，于是去查错误的地方；Windows guest 恰恰让收尾更容易失败（忽略 ACPI 电源键、seed 介质仍被占用、QMP 不再应答）。`with_pool` 同样。修：抽出纯函数 `combine_outcome(outcome, shutdown)`——闭包的错误保持为主错误、收尾错误以 context 形式挂在它下面；只有闭包成功时收尾错误才独立成错（没能停掉的 VM 仍是资源泄漏，必须报）；两条入口都改走它。新增 3 个单测（双失败保住主因、成功+收尾失败仍报错、干净收尾原样返回）。`cargo test --lib` 159 → 162 | N/A（`OSX-02`/`OSX-03` 既有 AC：失败必须给出真实原因、VM 不得泄漏；无卡拆合） | `OSX-03` 实现证据、Review log、`src/lib.rs`、CHANGELOG、plan-status |
 
 ## 已决议设计决策
 
@@ -770,6 +771,7 @@
 | 集成测试（`#[ignore]`） | `tests/windows_machine.rs`：`windows_transport`（地址、pin、unsupported、shutdown→spawn 重连）、`windows_pool`（双机地址/host key/会话隔离） |
 | README/CHANGELOG | README「Windows transport and security」；CHANGELOG Added ×4 / Changed ×1 |
 | 地址发现与 QEMU 退出 race | `launch` 把 DHCP lease 轮询与 `qemu_handle`、cancel token 一起 `select!`，QEMU 启动即退出时立即返回其真实错误并停 `swtpm`（R12，`src/machine.rs`） |
+| 失败原因优先 | 闭包/用例自身的失败是主错误，收尾错误只作 context（R59，`36f4d2b`） |
 | 探测命令可信 | 标记路径加引号，判据词走常量，探测文本与匹配不漂移（R58，`6d1bbd7`） |
 | 缓存名唯一 | 不同来源不得映射到同一缓存槽，含非 UTF-8 文件名（R57，`c942947`） |
 | 预算只有一个 | 首启共享一个 deadline，耗尽时点名没轮到的阶段（R56，`c197e81`） |
@@ -1346,6 +1348,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R56 | 一个预算管整段首启 | PASS | 无开放项 | F61：首启三段各拿满一份部署预算，实际可烧 3× 文档承诺的时长，`ssh_timeout` 形同虚设 | 共享 `first_boot_deadline` + `remaining_budget`/`spent_first_boot_budget`（`c197e81`）；README 同步；新增 2 个单测；`cargo test --lib` 154 passed |
 | R57 | 非 UTF-8 镜像名各有缓存槽 | PASS | 无开放项 | F62：非 UTF-8 本地文件名统一回退 `custom-image`，不同镜像共用缓存、切换即重下 | `local_cache_stem` 对原始字节取 FNV-1a 作回退名（`c942947`）；新增 2 个单测；`cargo test --lib` 156 passed |
 | R58 | 标记探测加引号、测试目录真唯一 | PASS | 无开放项 | F63：标记路径未加引号会让已完成的部署被判成未完成；测试目录的唯一后缀恒为常量，遗留文件可污染断言 | `marker_probe_command()`/`MARKER_PRESENT_TOKEN` + 引号（`6d1bbd7`）；`temp_dir` 改 `AtomicU64`；新增 3 个单测；`cargo test --lib` 159 passed |
+| R59 | 闭包失败保持主因 | PASS | 无开放项 | F64：`with_machine`/`with_pool` 用 `shutdown().await?` 提前返回，收尾失败吞掉闭包的真实失败原因 | `combine_outcome` 纯函数 + 两条入口改走（`36f4d2b`）；新增 3 个单测；`cargo test --lib` 162 passed |
 
 ### R1 findings 与修订对照
 
