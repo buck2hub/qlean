@@ -141,6 +141,35 @@ mod plan_doc_tests {
         ),
     ];
 
+    /// The lines of the plan's dependency registry.
+    fn dependency_registry(plan: &str) -> Vec<&str> {
+        let lines: Vec<&str> = plan.lines().collect();
+        let start = lines
+            .iter()
+            .position(|line| line.trim_end() == "### 依赖登记表")
+            .expect("the plan has no dependency registry");
+        let end = lines[start + 1..]
+            .iter()
+            .position(|line| line.starts_with("### "))
+            .map(|offset| start + 1 + offset)
+            .expect("the dependency registry is the last section of its level");
+        lines[start..end].to_vec()
+    }
+
+    /// The row of a markdown table whose first cell is `id`.
+    fn table_row<'a>(text: &'a str, id: &str) -> Option<&'a str> {
+        let prefix = format!("| {id} |");
+        text.lines().find(|line| line.starts_with(&prefix))
+    }
+
+    /// The digits after `marker`, if the text states one.
+    fn number_after<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
+        let at = text.find(marker)?;
+        let after = &text[at + marker.len()..];
+        let digits: &str = after.split(|c: char| !c.is_ascii_digit()).next()?;
+        (!digits.is_empty()).then_some(digits)
+    }
+
     /// The `<n>` of the first `<n> passed` in `text`, if the text carries one.
     fn claimed_passes(text: &str) -> Option<usize> {
         let marker = " passed";
@@ -519,6 +548,47 @@ mod plan_doc_tests {
             "the trace table's 指定测试 column yielded only {checked} labels"
         );
     }
+    /// The plan names the CI jobs the workflow actually runs.
+    ///
+    /// DEP-03's success criterion is that four named jobs are green on the pushed commit. Those
+    /// names are typed into two documents by hand while the workflow is edited elsewhere, so a
+    /// renamed job - or a fifth one added - leaves the criterion describing a CI that no longer
+    /// exists. Nobody can check the colour of the jobs from here; this checks that the names being
+    /// watched are the names that run.
+    #[test]
+    fn the_plan_names_the_ci_jobs_the_workflow_runs() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        const WORKFLOW: &str = include_str!("../.github/workflows/check-and-test.yml");
+
+        let mut ran: Vec<&str> = WORKFLOW
+            .lines()
+            .filter_map(|line| line.strip_prefix("    name: "))
+            .map(str::trim)
+            .collect();
+        ran.sort_unstable();
+        assert_eq!(
+            ran.len(),
+            4,
+            "the workflow runs {} jobs: {ran:?}",
+            ran.len()
+        );
+
+        // Only the plan names the jobs; the status view refers to them by count.
+        let registry = dependency_registry(PLAN).join("\n");
+        let plan_row = table_row(&registry, "DEP-03").expect("the plan registry has no DEP-03 row");
+        let at = plan_row
+            .find("job（")
+            .expect("the plan's DEP-03 row no longer lists the CI jobs");
+        let after = &plan_row[at + "job（".len()..];
+        let list = &after[..after.find('）').expect("the job list is unclosed")];
+        let mut named: Vec<&str> = list.split(" / ").map(str::trim).collect();
+        named.sort_unstable();
+        assert_eq!(
+            named, ran,
+            "the plan watches {named:?} but the workflow runs {ran:?}"
+        );
+    }
+
     /// The push backlog is one number, whichever document states it.
     ///
     /// Two documents describe the same blocked dependency: the plan's dependency registry says how
@@ -532,39 +602,13 @@ mod plan_doc_tests {
         const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
         const STATUS: &str = include_str!("../docs/plan/plan-status.md");
 
-        fn registry(plan: &str) -> Vec<&str> {
-            let lines: Vec<&str> = plan.lines().collect();
-            let start = lines
-                .iter()
-                .position(|line| line.trim_end() == "### 依赖登记表")
-                .expect("the plan has no dependency registry");
-            let end = lines[start + 1..]
-                .iter()
-                .position(|line| line.starts_with("### "))
-                .map(|offset| start + 1 + offset)
-                .expect("the dependency registry is the last section of its level");
-            lines[start..end].to_vec()
-        }
-
-        fn backlog<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
-            let at = text.find(marker)?;
-            let after = &text[at + marker.len()..];
-            let digits: &str = after.split(|c: char| !c.is_ascii_digit()).next()?;
-            (!digits.is_empty()).then_some(digits)
-        }
-
-        let plan_registry = registry(PLAN).join("\n");
-        let status_row = STATUS
-            .lines()
-            .find(|line| line.starts_with("| DEP-03 |"))
-            .expect("the status view has no DEP-03 row");
-        let plan_row = plan_registry
-            .lines()
-            .find(|line| line.starts_with("| DEP-03 |"))
-            .expect("the plan registry has no DEP-03 row");
+        let plan_registry = dependency_registry(PLAN).join("\n");
+        let policy_row =
+            table_row(&plan_registry, "DEP-03").expect("the plan registry has no DEP-03 row");
+        let status_row = table_row(STATUS, "DEP-03").expect("the status view has no DEP-03 row");
 
         let stated = [
-            ("the plan", plan_row, "领先远端 "),
+            ("the plan", policy_row, "领先远端 "),
             ("the status view", status_row, "届时推送 "),
         ];
         let counts: Vec<(&str, &str)> = stated
@@ -572,7 +616,7 @@ mod plan_doc_tests {
             .map(|(who, row, marker)| {
                 (
                     *who,
-                    backlog(row, marker).unwrap_or_else(|| {
+                    number_after(row, marker).unwrap_or_else(|| {
                         panic!("{who} no longer states the push backlog as `{marker}N 个提交`")
                     }),
                 )
@@ -598,7 +642,7 @@ mod plan_doc_tests {
         }
         assert_eq!(
             first_stamp(status_row),
-            first_stamp(plan_row),
+            first_stamp(policy_row),
             "the two DEP-03 rows describe retests at different times, so one of them is stale"
         );
     }
