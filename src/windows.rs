@@ -887,12 +887,59 @@ mod tests {
         assert!(!cmd.contains('"'), "{cmd}");
     }
 
+    /// Decode a base64 payload back to the bytes a real `powershell` would receive.
+    ///
+    /// Deliberately written as a decoder rather than "encode, then compare with the
+    /// encoder": the point of these tests is to check the payload against the encoding
+    /// `-EncodedCommand` documents, and comparing an encoder with itself cannot fail.
+    fn decode_base64(payload: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut buffer = 0u32;
+        let mut bits = 0u32;
+        for byte in payload.bytes() {
+            let value = match byte {
+                b'A'..=b'Z' => byte - b'A',
+                b'a'..=b'z' => byte - b'a' + 26,
+                b'0'..=b'9' => byte - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                b'=' => break,
+                other => panic!("not base64: {:?}", other as char),
+            };
+            buffer = (buffer << 6) | u32::from(value);
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((buffer >> bits) as u8);
+            }
+        }
+        out
+    }
+
+    /// The text a Windows guest's `powershell -EncodedCommand` would actually run.
+    fn decoded_script(command: &str) -> String {
+        let payload = command
+            .rsplit(' ')
+            .next()
+            .expect("the command ends with the payload");
+        let bytes = decode_base64(payload);
+        assert_eq!(
+            bytes.len() % 2,
+            0,
+            "a UTF-16LE payload has an even number of bytes: {bytes:?}"
+        );
+        let units: Vec<u16> = (0..bytes.len() / 2)
+            .map(|index| u16::from_le_bytes([bytes[index * 2], bytes[index * 2 + 1]]))
+            .collect();
+        String::from_utf16(&units).expect("the payload must be valid UTF-16")
+    }
+
     #[test]
     fn test_base64_utf16le_matches_the_powershell_encoding() {
-        // Known vectors from RFC 4648 over UTF-16LE input.
+        // Vectors computed with an independent encoder (`base64.b64encode(text
+        // .encode('utf-16-le'))`), not with the function under test.
         let encode = |text: &str| {
-            let command = powershell_command(text);
-            command
+            powershell_command(text)
                 .rsplit(' ')
                 .next()
                 .expect("the command ends with the payload")
@@ -902,11 +949,39 @@ mod tests {
         assert_eq!(encode("f"), "ZgA=");
         assert_eq!(encode("fo"), "ZgBvAA==");
         assert_eq!(encode("foo"), "ZgBvAG8A");
-        // Non-ASCII exercises the surrogate-free BMP path.
-        assert_eq!(
-            encode("\u{4f60}"),
-            "oA==".to_string().replace("oA==", &encode("\u{4f60}"))
-        );
+        // A BMP character: UTF-16LE is one unit, so the payload must be `YE8=`, not the
+        // three-byte UTF-8 encoding of the same character.
+        assert_eq!(encode("\u{4f60}"), "YE8=");
+        // A non-BMP character becomes a surrogate pair: `YQA92ADe` is `a`, then the two
+        // big-endian-looking halves D83D/DE00 stored little-endian.
+        assert_eq!(encode("a\u{1f600}"), "YQA92ADe");
+    }
+
+    #[test]
+    fn test_the_encoded_payload_is_the_utf16le_bytes_of_the_real_scripts() {
+        // Every production probe goes through the same encoder, so these are the real
+        // scripts: truncation, double encoding, a missing surrogate half or a payload that
+        // is really UTF-8 with an even byte count all show up here.
+        for script in [
+            GUEST_IP_QUERY.to_string(),
+            copy_file_script("C:/Program Files/a$b`c", "C:/Users/qlean/\u{4f60}.txt"),
+        ] {
+            let command = powershell_command(&script);
+            let payload = command
+                .rsplit(' ')
+                .next()
+                .expect("the command ends with the payload");
+            let expected = script
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<u8>>();
+            assert_eq!(
+                decode_base64(payload),
+                expected,
+                "the payload of {command:?} must be the UTF-16LE bytes of the script"
+            );
+            assert_eq!(decoded_script(&command), script);
+        }
     }
 
     #[test]
