@@ -1319,11 +1319,7 @@ impl Machine {
                 escape(Cow::Borrowed(from.as_str())),
                 escape(Cow::Borrowed(to.as_str()))
             ),
-            GuestOs::Windows => format!(
-                "powershell -NoProfile -NonInteractive -Command \"Copy-Item -LiteralPath {} -Destination {} -Force\"",
-                windows::powershell_literal(from.as_str()),
-                windows::powershell_literal(to.as_str())
-            ),
+            GuestOs::Windows => windows::copy_file_command(from.as_str(), to.as_str()),
         };
         let (code, _stdout, stderr) = ssh.call_with_output(&cmd, cancel_token).await?;
         if code != 0 {

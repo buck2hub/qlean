@@ -379,6 +379,21 @@ pub(crate) fn powershell_literal(text: &str) -> String {
     format!("'{}'", text.replace('\'', "''"))
 }
 
+/// PowerShell command copying one file, for `Machine::copy`.
+///
+/// The guest's default shell is already PowerShell (see the README Windows image
+/// contract), so the cmdlet runs as the command itself. It must *not* be wrapped in
+/// `powershell -Command "..."`: the outer shell would parse that double-quoted string
+/// and expand `$` in a path such as `C:/Program Files/a$b`, silently redirecting the
+/// copy to a different file.
+pub(crate) fn copy_file_command(from: &str, to: &str) -> String {
+    format!(
+        "Copy-Item -LiteralPath {} -Destination {} -Force",
+        powershell_literal(from),
+        powershell_literal(to)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,6 +562,19 @@ mod tests {
         assert!(GUEST_IP_QUERY.contains("169.254.*"));
         assert!(GUEST_IP_QUERY.contains("Get-NetIPAddress"));
         assert!(!GUEST_IP_QUERY.contains("hostname -I"));
+    }
+
+    #[test]
+    fn windows_copy_command_keeps_interpolation_sensitive_paths_literal() {
+        let cmd = copy_file_command("C:/Program Files/a$b.txt", "C:/Users/qlean/target `x.txt");
+        assert_eq!(
+            cmd,
+            "Copy-Item -LiteralPath 'C:/Program Files/a$b.txt' -Destination 'C:/Users/qlean/target `x.txt' -Force"
+        );
+        // No nested PowerShell invocation: the default shell already is PowerShell, and a
+        // `powershell -Command "..."` wrapper would interpolate `$b` before the copy runs.
+        assert!(!cmd.contains("-Command"), "{cmd}");
+        assert!(!cmd.contains('"'), "{cmd}");
     }
 
     #[test]
