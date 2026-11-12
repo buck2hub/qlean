@@ -1095,6 +1095,25 @@ mod plan_doc_tests {
             );
         }
 
+        // A backlog count is a fact with one home. R123 fixed two documents that disagreed about
+        // it; R153 found the same fact stated a third time - in REL-01's evidence row - where no
+        // guard was watching and where it had been stale for ninety-two commits. The row now
+        // points at the registry instead of repeating the number, and this scan keeps it that way.
+        for (name, text, row) in [
+            ("the plan", PLAN, policy_row),
+            ("the status view", STATUS, status_row),
+        ] {
+            for line in text.lines() {
+                if line == row || !line.contains("尚未推送") || !line.contains("个提交") {
+                    continue;
+                }
+                panic!(
+                    "{name} states the push backlog a second time in another row: {line}. \
+                     The count belongs in the DEP-03 row, so reference it from here instead"
+                );
+            }
+        }
+
         fn first_stamp(row: &str) -> &str {
             let at = row
                 .find(" UTC 复测")
