@@ -235,6 +235,9 @@ impl Machine {
         let seed_dir = run_dir.join("seed");
         tokio::fs::create_dir_all(&run_dir).await?;
         tokio::fs::create_dir_all(&seed_dir).await?;
+        // The run directory holds the per-VM host private key, the seed medium and the
+        // disk overlay: keep it owner-only regardless of the host umask.
+        crate::utils::restrict_dir(&run_dir)?;
 
         // Create overlay image
         let mut qemu_img_command = tokio::process::Command::new("qemu-img");

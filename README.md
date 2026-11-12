@@ -143,6 +143,9 @@ Windows guests have no vsock, so Qlean reaches them over the libvirt NAT network
   different key, or a certificate where a plain key is pinned, aborts the connection.
   Linux guests keep their historical trust-on-first-use behavior because their vsock
   endpoint is host-local and cannot be redirected to another machine.
+- **Deployment material is owner-only.** The run directory, the seed directory and the
+  seed medium are `0700`/`0600`, and the seed is deleted once the guest reports a finished
+  deployment; the per-VM host private key never outlives the deployment on the medium.
 - **vsock is a Linux-only requirement.** `with_machine` checks `/dev/vhost-vsock` only
   for `GuestOs::Linux`, and `with_pool` does not require it at all, so a host without
   vhost-vsock can still run Windows guests.

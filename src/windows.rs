@@ -199,6 +199,10 @@ impl DeploySeed {
         tokio::fs::create_dir_all(&root).await.with_context(|| {
             format!("failed to create Windows seed directory {}", root.display())
         })?;
+        // The seed holds the guest's SSH host private key until deployment finishes, so
+        // neither the directory nor the medium itself may be readable by other users.
+        crate::utils::restrict_dir(&dir)?;
+        crate::utils::restrict_dir(&root)?;
 
         let authorized_keys = ensure_trailing_newline(client_pubkey);
         let authorized_keys_path = root.join("authorized_keys");
@@ -277,6 +281,9 @@ impl DeploySeed {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
+        // `xorriso` creates the file with the process umask (typically world-readable),
+        // and the medium carries the guest host private key: seal it before QEMU attaches it.
+        seal_seed_medium(&self.iso).await?;
         Ok(())
     }
 
@@ -353,6 +360,19 @@ pub(crate) fn deploy_timeout_message(timeout: Duration) -> String {
 fn ensure_trailing_newline(content: &str) -> String {
     let trimmed = content.trim();
     format!("{trimmed}\n")
+}
+
+/// Seal the built seed medium so only the owning user can read it.
+///
+/// Split out of [`DeploySeed::build`] because `build` needs `xorriso`: the permission
+/// change is the part that must not regress, and it can be exercised on any file.
+async fn seal_seed_medium(path: &Path) -> Result<()> {
+    set_owner_only(path).await.with_context(|| {
+        format!(
+            "failed to restrict the Windows seed medium {} to 0600",
+            path.display()
+        )
+    })
 }
 
 async fn set_owner_only(path: &Path) -> Result<()> {
@@ -446,6 +466,28 @@ mod tests {
             let mode = std::fs::metadata(root.join(name))?.permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "{name} should be 0600, got {mode:o}");
         }
+        // The directories must not be traversable either: the host private key and the
+        // seed medium live inside them.
+        for path in [tmp.path().join("seed"), root] {
+            let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{path:?} should be 0700, got {mode:o}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_seed_medium_is_sealed_after_the_build() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir()?;
+        let iso = tmp.path().join("seed.iso");
+        // `xorriso` leaves the medium with the process umask.
+        std::fs::write(&iso, b"seed")?;
+        std::fs::set_permissions(&iso, std::fs::Permissions::from_mode(0o644))?;
+
+        seal_seed_medium(&iso).await?;
+        let mode = std::fs::metadata(&iso)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "seed medium should be 0600, got {mode:o}");
         Ok(())
     }
 

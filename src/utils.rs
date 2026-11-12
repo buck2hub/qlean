@@ -214,6 +214,28 @@ pub(crate) fn create_dir(purpose: &str, path: &Path) -> Result<()> {
         debug!("{purpose} dir {path:?} doesn't exist yet, creating");
         std::fs::create_dir_all(path).expect("Failed to create directory");
     }
+    // Qlean's directories hold the client private key, per-VM host keys and seed media,
+    // so they must not be traversable by other local users even when the umask allows it.
+    restrict_dir(path)
+}
+
+/// Make a directory owner-only (`0700`).
+///
+/// Applied to every directory Qlean creates and to the per-VM run directory, so the
+/// private keys and seed media inside are protected by their enclosing directory as well
+/// as by their own mode.
+pub(crate) fn restrict_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(
+            |error| anyhow::anyhow!("failed to restrict {} to 0700: {error}", path.display()),
+        )?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
     Ok(())
 }
 
@@ -524,6 +546,30 @@ mod tests {
             ""
         );
         assert_eq!(parse_lease_expiry(""), "");
+    }
+
+    #[test]
+    fn test_create_dir_is_owner_only_even_with_a_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "qlean-create-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let existing = root.join("pre-existing");
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        for path in [root.join("fresh"), existing.clone()] {
+            create_dir("test", &path).unwrap();
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{path:?} should be 0700, got {mode:o}");
+        }
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
