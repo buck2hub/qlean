@@ -185,6 +185,7 @@
 | 2026-11-13 09:40:00 UTC | review R73（守卫要覆盖真正出问题的那条消息） | F78：`shutdown` 里那条最不该被误读的错误（SIGKILL 之后进程还在 = **机器没有关掉**）在源码里是两行字符串，但第二行的续行符丢了，于是用户读到的是 `...the machine was not shut down.` 后面跟 **30 个空格** 再跟 `Kill pid N manually...`。更值得注意的是：仓库里**早就有** `user_facing_messages_have_no_runs_of_spaces` 这个回归守卫，但它的清单里没有这条消息——守卫只覆盖了当时想到的两条，所以这条一直带着空格发布。修：把消息抽成 `unkillable_message(pid)`（可测），用真正的 `\` 续行让它成为一句话，并**把它加进那个守卫的清单**；新增单测断言含 `still running after SIGKILL`、含 `Kill pid 4242 manually`、以 `again` 结尾。另做了一次全仓扫描（`[^ ] {2,}[^ "]` 排除注释行）确认同类伪影只此一处，其余多空格均为表格对齐/emoji/测试数据。`cargo test --lib` 183 → 184 | `OSX-03`（关停语义）、`TRN-01`（会话收尾）| `src/machine.rs`、CHANGELOG、Review log、覆盖矩阵、plan-status |
 | 2026-11-13 10:10:00 UTC | review R74（失败的方向指错了机器） | F79：`find_lease_address` 的轮询里，`virsh net-dhcp-leases` **失败**时只写一行 `debug!`，然后继续轮询；预算耗尽后统一抛出「no DHCP lease for MAC ... the guest may still be booting, or it did not bring up its virtio network device」。也就是说：如果 libvirt 根本连不上（服务没起、socket 权限、URI 不对），用户等满 300s/900s 后被告知**去看 guest**——而 guest 从未被检查过，`(leases seen: [])` 也解释不了任何事。这与本仓库已经修过的 `virsh net-list` 那一条（失败被读成「网络不存在」）是同一族：**把基础设施失败说成对象状态**。修：轮询里分别记录 `saw_a_listing` 与最后一次 `virsh` 的 stderr，超时消息抽成 `lease_timeout_message(...)`（可测）：从没成功过 → 明说「读不到租约表、根本没检查过 guest」，附 `virsh` 原话与 `virsh -c ... net-list --all` 的验证命令；成功过 → 保持原诊断（附已见租约）并把最后一次 `virsh` 错误当 context 附在末尾。新增 3 个单测覆盖两个分支与 context 分支。`cargo test --lib` 184 → 187 | `TRN-01`（地址发现）、`IP-01`（`get_ip`）| `src/utils.rs`、CHANGELOG、Review log、覆盖矩阵、plan-status |
 | 2026-11-13 10:40:00 UTC | review R75（预算必须能打断单次调用） | F80：`find_lease_address` 的文档写着「Polling is bounded by `timeout`」，但循环体里 `virsh ... .output().await` **没有单次上限**——它只检查两次调用之间的 deadline。也就是说：budget 是对「循环」的，不是对「卡住」的；`libvirtd` 若在一次 RPC 上僵住，检查 deadline 的那行代码永远不会被执行到，300s/900s 的承诺只在「每次都返回」这个前提成立时才成立。这与 R71（`xorriso` 无预算）同族，且是同一个 helper 能解决的事。修：把 R71 的 `bounded_output` 从 `windows.rs` 挪到 `utils.rs`（单一实现，两个调用点共用），`find_lease_address` 每次调用都用 `min(剩余预算, ≥1ms)` 作为上限，超时把错误记入 `last_error` 交给 R74 的两支诊断——于是「单次调用被放弃」会被如实归因为 libvirt 读不到，而不是 guest 没上网。原 `windows::tests` 里的 2 个 `bounded_output` 单测一并迁到 `utils::tests`。`cargo test --lib` 187 不变（迁移，无新增） | `TRN-01`（地址发现预算）、`IP-01`（`get_ip`）| `src/utils.rs`、`src/windows.rs`、CHANGELOG、Review log、覆盖矩阵、plan-status |
+| 2026-11-13 11:10:00 UTC | review R76（同一个操作有两份实现，只有一份有预算） | F81：R71 给 Windows 的 seed ISO 构建加了预算，但**同样的构建在 `machine.rs` 里还有一份**（Linux cloud-init seed），它仍然是裸 `.output().await`；同理 `qemu-img create`（建 overlay）、`qemu-img resize`、以及 `ensure_network` 的 6 处 `virsh`、依赖探测的 `<program> --version` 全都没有上限。于是「启动路径上的本地工具都有预算」这句话只在 Windows 分支为真。修：`machine.rs` 三处改用共享的 `crate::utils::bounded_output` + 新常量 `LOCAL_TOOL_BUDGET=120s`；`utils.rs` 的 6 处 `virsh` 用 `VIRSH_CALL_BUDGET=60s`、依赖探测用 `PROBE_BUDGET=10s`；并新增源码守卫 `test_production_code_never_awaits_a_command_without_a_budget`（`include_str!` 扫 8 个生产文件，禁止字面量 `.output().await`，守卫自身的匹配串用 `concat!` 拆开以免自匹配）。现在 `rg -n '\.output\(\)' src/*.rs` 只剩 helper 自身与 `image.rs` 的测试辅助函数。`cargo test --lib` 187 → 188 | `EXE-01`/`TRN-01`（启动路径）、`IP-01`（`get_ip`）| `src/machine.rs`、`src/utils.rs`、CHANGELOG、Review log、覆盖矩阵、plan-status |
 
 ## 已决议设计决策
 
@@ -787,6 +788,7 @@
 | 集成测试（`#[ignore]`） | `tests/windows_machine.rs`：`windows_transport`（地址、pin、unsupported、shutdown→spawn 重连）、`windows_pool`（双机地址/host key/会话隔离） |
 | README/CHANGELOG | README「Windows transport and security」；CHANGELOG Added ×4 / Changed ×1 |
 | 地址发现与 QEMU 退出 race | `launch` 把 DHCP lease 轮询与 `qemu_handle`、cancel token 一起 `select!`，QEMU 启动即退出时立即返回其真实错误并停 `swtpm`（R12，`src/machine.rs`） |
+| 同一个操作只有一份实现 | seed 构建、`virsh` 调用、超时文案都必须共用同一处代码，否则修了一半等于没修（R71→R76，`700a35e`） |
 | 预算是针对单次调用，不是针对循环 | 「有 deadline」不等于「能打断卡住的那一步」：每次外部调用都要用自己的上限（`剩余预算` 或显式常量）（R71/R75，`1ad7cc2`） |
 | 基础设施失败不能说成对象状态 | libvirt/进程/网络的失败必须按失败本身报错，不能折叠成「对象还没就绪」（R? `virsh net-list`、R74，`d29f468`） |
 | 守卫清单要跟着消息走 | 新增或修改用户可见消息时，必须把它加进覆盖那一类缺陷的守卫清单——「有守卫」不等于「守卫覆盖了它」（R73，`864514c`） |
@@ -1397,6 +1399,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R73 | 守卫要覆盖真正出问题的那条消息 | PASS | 无开放项 | F78：`unkillable` 错误里有 30 个空格，且既有 no-runs-of-spaces 守卫没列它 | 抽出 `unkillable_message`、修续行、**把消息加进守卫清单**，1 新单测（`864514c`） |
 | R74 | 失败的方向要指对机器 | PASS | 无开放项 | F79：`virsh` 一直失败时超时消息仍让用户去查 guest | `lease_timeout_message` 分两支（libvirt 不可读 / guest 无租约），3 新单测（`d29f468`） |
 | R75 | 预算必须能打断单次调用 | PASS | 无开放项 | F80：`virsh` 调用无单次上限，僵住的 libvirtd 可越过 deadline | `bounded_output` 迁入 `utils` 并用于每次 `virsh` 调用（`1ad7cc2`） |
+| R76 | 同一个操作不能有两份实现 | PASS | 宿主工具链（DEP-02）仍是外部阻塞 | F81：Linux seed 构建/`qemu-img`/`virsh`/`--version` 仍无预算，只有 Windows 分支被 R71 覆盖 | 全部改走 `bounded_output` + 源码守卫（`700a35e`） |
 
 ### R1 findings 与修订对照
 
