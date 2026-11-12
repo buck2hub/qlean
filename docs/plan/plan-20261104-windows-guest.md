@@ -42,6 +42,8 @@
 ## 事实基线
 
 > 所有行号和源码锚点必须在开工当天刷新；下表是 2026-11-04 当前 checkout 的成稿基线。
+>
+> **行号锚定在基线提交 `69002eb`**（`50c8cff` 之前最后一次计划提交，即尚未落地任何实现卡时的代码）。实现落地后这些「当前事实」已不成立，所以核对时不要看工作区，用 `libra show 69002eb:src/machine.rs | sed -n '220,399p'` 这类命令按基线提交复核。抽样核对（2026-11-13）：`src/machine.rs:220` 是 cloud-init `MetaData` 起点、`src/qemu.rs:74` 是 `launch_qemu` 起点、`src/ssh.rs:831` 是 `get_remote_ip` 的 `hostname -I` 一行——三处均与表中描述一致。当前的实现状态见「实施证据汇总」与各任务卡的 `Implementation evidence`。
 
 | 类别 | 当前事实 | 证据 |
 |---|---|---|
