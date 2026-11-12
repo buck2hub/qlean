@@ -716,7 +716,7 @@
 | 池内关停的未知分支 | `src/pool.rs::shutdown_step`（纯函数）+ `Machine::shutdown_if_started`：探针 `Ok(true)`→关、`Ok(false)`→跳、`Err`→**照样关**并保留探针原因；`started(pid, ssh)` 与 `shutdown` 的拒绝条件共用一份实现；4 单测 + `#[ignore]` 真 QEMU 用例（活 QEMU + 缺控制 socket 必须被关掉）（R94，`2c2cf0a`） |
 | 关不掉必须说关不掉 | `src/machine.rs::force_kill`（`KillOutcome{Gone,Killed,Refused}`）+ 纯函数 `kill_step`：拒绝时 `shutdown` 报错并**保留 `self.pid`**，不得把「SIGKILL 被拒绝」当成「进程已不在」；env-gated `#[ignore]` 用例用另一个 uid 拥有的 qemu 命名进程真实验证（R95，`74530d3`） |
 | 启动参数整条命令行 | `src/qemu.rs::test_the_windows_launch_argument_list_is_realized_by_a_real_qemu`（`#[ignore]`）：真 QEMU/`swtpm`/OVMF/`xorriso`/`qemu-img` 上按生产顺序启动，`query-block` 断言 pflash0=code、pflash1=vars、virtio0=overlay、ide0-cd0=seed（inserted、只读）（R96，`953d508`） |
-| SSH 身份材料 | `src/ssh.rs::create_private_file` / `write_private_key` / `PersistedSshKeypair::verify`：私钥以 `OpenOptionsExt::mode(0o600)` 创建、经 0600 临时文件 + `rename` 原子安装、读回时解析并与 `.pub` 互相验证、复用前收紧权限、`Debug` 脱敏；每 VM 主机密钥（`windows::generate_host_key`）与 Linux 共用的客户端身份走**同一份**实现（R97，`0758cbf`） |
+| SSH 身份材料 | `src/utils.rs::write_owner_only_atomically` + `src/ssh.rs::PersistedSshKeypair::{from_dir, verify}`：私钥以 `OpenOptionsExt::mode(0o600)` 创建、经同目录 0600 临时文件 + `rename` 原子安装、读回时解析并与 `.pub` 互相验证、复用前收紧权限、`Debug` 脱敏；每 VM 主机密钥（`src/windows.rs::generate_host_key`）与 Linux 共用的客户端身份走**同一份**实现（R97，`0758cbf`；R134 更正：本格原先写的 `create_private_file`/`write_private_key` 两个符号在本仓库任何提交里都不存在，原子写入的真实入口是 `utils::write_owner_only_atomically`） |
 | seed 介质的权限 | `DeploySeed::build` 在 `xorriso` 之前以 `crate::utils::create_owner_only` 建好 `seed.iso`（`xorriso -o` 保留已有权限，真 1.5.6 实测），事后 `ensure_seed_medium_is_sealed` 只检查不 chmod；staged 主机私钥走 `write_owner_only_atomically`；真 `xorriso` 用例检查标签、Joliet 名字、字节与 0600（R98，`c065bf6`） |
 | TPM 2.0 优雅停止 | `Swtpm::stop` 必须让真 `swtpm` 把状态写完：真程序 + 状态文件（`tpm2-00.permall`）内容在停止后必须变化（R102，`536a4f1`） |
 | 秘密目录的创建位 | `tpm/`、run 目录、seed 目录创建即 0700（`DirBuilder::mode`），不靠事后 `chmod`（R102，`536a4f1`） |
@@ -981,8 +981,8 @@
 | 宿主路径字节保真 | `src/utils.rs::path_argument`：`key=path` 以 `OsString` 拼接，非 UTF-8 家目录不再 panic 也不再被 `U+FFFD` 改写成另一个路径（R36，`450a647`） |
 | 下载完整性 | `src/image.rs::truncation_problem` + `verify_fetched`：rename 前比对 `Content-Length`，截断/超长分别归因；校验失败删除产物（R35，`4efb45c`） |
 | 前置缺口聚合 | `src/utils.rs::program_problems`：四个宿主程序一次探测、一条错误报全，`--version` 失败与文件缺失分开归因（R34，`ca4996c`） |
-| 信号对象校验 | `src/machine.rs::kill_if_qemu`：任何 SIGKILL 之前都校验 `/proc/<pid>/cmdline` 的 argv[0] 仍为 QEMU，pid 被复用时跳过并告警，不误杀无关进程（R33，`23f387c`） |
-| 物料权限 | `src/utils.rs::restrict_dir` + `src/windows.rs::seal_seed_medium`：Qlean 目录 `0700`、seed 目录 `0700`、seed 介质 `0600`（含每 VM 主机私钥），不依赖宿主 umask 或家目录权限（R32，`80a57f7`） |
+| 信号对象校验 | `src/machine.rs::process_is_qemu`（内部用 `cmdline_is_qemu` 读 `/proc/<pid>/cmdline`，`kill_step` 把拒绝与「已不是我们的进程」分成两种结果）：任何 SIGKILL 之前都校验 argv[0] 仍为 QEMU，pid 被复用时跳过并告警，不误杀无关进程（R33，`23f387c`；R95 把它从 `bool` 改成三态 `KillOutcome`；R134 更正：本格原先写的 `kill_if_qemu` 在本仓库任何提交里都不存在） |
+| 物料权限 | `src/utils.rs::restrict_dir` + `src/windows.rs::ensure_seed_medium_is_sealed` + `src/windows.rs::set_owner_only`：Qlean 目录 `0700`、seed 目录 `0700`、seed 介质 `0600`（含每 VM 主机私钥），不依赖宿主 umask 或家目录权限（R32，`80a57f7`；R134 更正：本格原先写的 `seal_seed_medium` 在本仓库任何提交里都不存在） |
 | 仅接受最新 IPv4 lease | `src/utils.rs::lease_address_for`：同 MAC 多行租约时按到期时间取最新一行（`DhcpLease.expiry` 字典序即时间序），超时错误附每行到期时间（R31，`3cdf5a3`） |
 | 仅接受 IPv4 lease | `lease_address_for` 跳过双栈下的 IPv6 行：链路本地地址无 scope id 不可达，误选后连接循环不会重试（R13，`src/utils.rs`） |
 | 池化启停分流 | `MachinePool::init_all`/`spawn_all` 按 `wants_init`/`needs_first_boot` 选择 `init` 或 `spawn`，Windows 二次启停与未部署池启动都走正确路径（R15，`src/pool.rs`） |

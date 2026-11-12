@@ -1215,6 +1215,66 @@ mod plan_doc_tests {
 
     /// The seven ignored Windows smoke tests all stop at the precondition the plan describes.
     ///
+    /// Every `src/file.rs::symbol` the plan points at names something that is there.
+    ///
+    /// The write-set rows exist so a reader can go and look at the implementation. Three of them
+    /// named functions that no commit in this repository ever contained, which is worse than a
+    /// stale name: the reader cannot tell "renamed" from "never existed" and has nothing to
+    /// search for. The revision history is exempt because it quotes the past on purpose.
+    #[test]
+    fn the_plan_points_only_at_symbols_the_named_files_contain() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        let mut checked = 0;
+        let mut in_history = false;
+        for line in PLAN.lines() {
+            let trimmed = line.trim_end();
+            if trimmed.starts_with("## ") || trimmed.starts_with("### ") {
+                in_history = trimmed == "### 修订历史";
+            }
+            if in_history {
+                continue;
+            }
+            let mut rest = line;
+            while let Some(at) = rest.find("src/") {
+                rest = &rest[at..];
+                let Some(colon) = rest.find("::") else {
+                    rest = &rest[1..];
+                    continue;
+                };
+                let path = &rest[..colon];
+                if !path.ends_with(".rs") || path.contains(' ') {
+                    rest = &rest[1..];
+                    continue;
+                }
+                let after = &rest[colon + 2..];
+                let symbol: String = after
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
+                    .collect();
+                rest = &rest[colon + 2..];
+                if symbol.is_empty() {
+                    continue;
+                }
+                let leaf = symbol.split("::").next().expect("a split has one part");
+                let source = CRATE_SOURCES
+                    .iter()
+                    .find(|(crate_path, _)| *crate_path == path)
+                    .map(|(_, source)| *source)
+                    .unwrap_or_else(|| panic!("the plan names {path}, which is not a crate file"));
+                checked += 1;
+                assert!(
+                    source.contains(leaf),
+                    "the plan points at {path}::{symbol}, but {path} does not contain {leaf}: \
+                     either the name is stale or it never existed"
+                );
+            }
+        }
+        assert!(
+            checked >= 30,
+            "the plan yielded only {checked} symbol citations: the scan is not looking at them"
+        );
+    }
+
     /// The number of ignored unit tests the plan runs is the number the crate has.
     ///
     /// The test matrix says the container snapshot runs "all 11" of them; a twelfth `#[ignore]`
