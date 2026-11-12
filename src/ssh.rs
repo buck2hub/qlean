@@ -149,6 +149,24 @@ impl russh::client::Handler for SshClient {
     }
 }
 
+/// Explain a rejected host key in terms of what the caller can check.
+///
+/// A pinned key that does not match is a security decision, not a transient failure, so
+/// the message must say which endpoint answered, why the key is pinned, and what makes
+/// the two disagree — never just `UnknownKey`.
+fn host_key_rejection_message(transport_name: &str, pinned: bool) -> String {
+    if pinned {
+        format!(
+            "The {transport_name} endpoint presented an SSH host key that is not the one deployed for this VM.\n             Qlean pins the per-VM Windows host key created during deployment, so either a different \
+             guest answers on this address (for example after a DHCP lease moved) or the VM was \
+             re-deployed and now has a new key.\n             Check that `get_ip` returns this VM's own address; a VM deployed by a different host \
+             cannot be reached from here."
+        )
+    } else {
+        format!("The {transport_name} endpoint presented an unexpected SSH host key.")
+    }
+}
+
 /// Everything a single SSH connection attempt needs besides the transport itself.
 struct ConnectParams {
     username: &'static str,
@@ -199,6 +217,7 @@ impl Session {
         };
 
         let config = Arc::new(config);
+        let pinned_host_key = expected_host_key.is_some();
         let sh = SshClient::with_pinned_key(expected_host_key);
         let now = Instant::now();
         let mut session = loop {
@@ -280,6 +299,14 @@ impl Session {
                     if now.elapsed() > timeout {
                         bail!("Timeout establishing SSH handshake over {transport_name}.");
                     }
+                }
+                // russh reports a rejected `check_server_key` as `UnknownKey`, which on
+                // its own does not say which check failed or what the caller can do.
+                Ok(Err(russh::Error::UnknownKey)) => {
+                    bail!(
+                        "{}",
+                        host_key_rejection_message(transport_name, pinned_host_key)
+                    );
                 }
                 Ok(Err(e)) => {
                     bail!("SSH client error: {e}");
@@ -1105,6 +1132,20 @@ mod tests {
             key: public.clone(),
             hash_alg: None,
         }
+    }
+
+    #[test]
+    fn test_host_key_rejection_reports_what_to_check() {
+        let pinned = host_key_rejection_message("tcp", true);
+        // The diagnostic must name the failed decision and both plausible causes.
+        assert!(pinned.contains("not the one deployed"), "{pinned}");
+        assert!(pinned.contains("DHCP lease moved"), "{pinned}");
+        assert!(pinned.contains("get_ip"), "{pinned}");
+        assert!(!pinned.contains("UnknownKey"), "{pinned}");
+
+        let unpinned = host_key_rejection_message("vsock", false);
+        assert!(unpinned.contains("unexpected SSH host key"), "{unpinned}");
+        assert!(!unpinned.contains("pins the per-VM"), "{unpinned}");
     }
 
     #[tokio::test]
