@@ -1176,13 +1176,24 @@ StandardError=journal
         );
         let (ssh, cancel_token) = self.get_ssh("download files")?;
 
-        // Check remote path type
+        // Classify the path itself, not what it points at: `stat` follows a link, so a
+        // symlink to a regular file would pass for a file and `download_file` would copy the
+        // target's bytes as if the link had been the thing asked for. The walk reports a
+        // link as a link, and so does this first step.
         let remote_meta = {
             let sftp = ssh.get_sftp().await?;
-            sftp.metadata(remote_path.as_str()).await.map_err(|e| {
-                anyhow::anyhow!("Failed to stat remote path {}: {}", remote_path.as_str(), e)
-            })?
+            sftp.symlink_metadata(remote_path.as_str())
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to stat remote path {}: {}", remote_path.as_str(), e)
+                })?
         };
+        if remote_meta.file_type().is_symlink() {
+            bail!(
+                "cannot download the symbolic link {} as a link; download its target instead",
+                remote_path.as_str()
+            );
+        }
 
         if !remote_meta.is_dir() {
             // Decide final local target path (dir vs file path)

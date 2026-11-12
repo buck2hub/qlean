@@ -239,11 +239,14 @@ Path rules for Windows guests:
   or dot, and reserved device names (`CON`, `NUL`, `COM1`, `LPT1`, ...).
 - UNC (`\\server\share`) and device (`\\?\`, `\\.\`) paths are rejected rather
   than guessed at.
-- Nothing is silently skipped: uploading a tree that contains a symlink, or downloading
-  one, fails with an error naming the path; so does any entry the walk cannot read, such as
-  a directory it is not allowed to list. A `download` either copies the whole tree or
-  returns an error. This applies to Linux guests too, where the link is recreated and a
-  failure is reported.
+- Nothing is silently skipped: any entry the walk cannot read (a directory it is not allowed
+  to list, an entry whose own attributes it cannot fetch) fails the operation with an error
+  naming the path, and a `download` either copies the whole tree or returns an error.
+- Symlinks follow the guest: uploading a tree to a Windows guest fails with an error naming
+  the first link, while uploading to a Linux guest recreates each link on the guest and
+  reports a failure to do so. Downloading never turns a link into its target: a link
+  anywhere in the tree, or the path the download was asked for, is reported as a link
+  instead of being followed.
 - The walk never follows a link on its own: it asks for each entry's own attributes, so a
   link is reported as a link. A link to a directory is not folded into the copy as if it
   were a directory, and a broken link can still be seen - and still be deleted by

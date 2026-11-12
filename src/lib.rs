@@ -1408,6 +1408,77 @@ mod plan_doc_tests {
         );
     }
 
+    /// `download` classifies the remote path it was handed, not what that path points at.
+    ///
+    /// `walk_remote_dir` was taught to ask for each entry's own attributes, but the caller
+    /// still opened with `sftp.metadata` (a following `stat`), so a symlink to a regular file
+    /// classified as a file, `download_file` opened it, and the copy held the target's bytes -
+    /// a silent follow, on the one path that never reaches the walk. A local `sftp-server`
+    /// proves the two requests disagree on the same path (`STAT` answers `perms=0o100644`,
+    /// `LSTAT` answers `perms=0o120777`) and that `OPEN` + `READ` on the link returns the
+    /// target's bytes. The guard reads `Machine::download` and requires the own-attribute
+    /// request plus a link refusal, and rejects the following `stat` coming back.
+    #[test]
+    fn the_download_root_is_classified_without_following_links() {
+        let body = function_body(
+            include_str!("machine.rs"),
+            "    pub async fn download<P: AsRef<Path>, Q: AsRef<Path>>(",
+        );
+
+        let classification = {
+            let end = body
+                .find("if !remote_meta.is_dir()")
+                .expect("`download` no longer branches on the root's type");
+            &body[..end]
+        };
+        assert!(
+            classification.matches("symlink_metadata(").count() == 1,
+            "the download root has to be stat'ed once, without following links"
+        );
+        assert!(
+            !body.contains("sftp.metadata("),
+            "`sftp.metadata` follows links, so a link to a file would be copied as its target"
+        );
+        assert!(
+            classification.contains("cannot download the symbolic link"),
+            "a link handed to `download` must be refused by name, not followed"
+        );
+        assert!(
+            classification.contains("file_type().is_symlink()"),
+            "the refusal has to be decided from the entry's own attributes"
+        );
+    }
+
+    /// The README states the symlink rules per guest, and the code keeps them.
+    ///
+    /// The bullet used to say that uploading a tree with a symlink and downloading one both
+    /// fail, then added that on Linux "the link is recreated" - two clauses that contradict
+    /// each other and the code, where a Windows upload refuses the link while a Linux upload
+    /// recreates it. It also said nothing about a `download` whose own path is a link, which
+    /// is exactly the case `download` used to follow. The guard pins each rule to its guest
+    /// and to the direction of the copy.
+    #[test]
+    fn the_readme_states_the_symlink_rules_the_code_implements() {
+        const README: &str = include_str!("../README.md");
+        let flat = README.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        for sentence in [
+            "uploading a tree to a Windows guest fails with an error naming the first link",
+            "uploading to a Linux guest recreates each link on the guest",
+            "Downloading never turns a link into its target",
+            "or the path the download was asked for, is reported as a link",
+        ] {
+            assert!(
+                flat.contains(sentence),
+                "the README no longer states `{sentence}`"
+            );
+        }
+        assert!(
+            !flat.contains("uploading a tree that contains a symlink, or downloading one, fails"),
+            "that blanket claim is false for Linux uploads and says nothing about the root path"
+        );
+    }
+
     /// Both tables in the plan have the number of columns their own header declares.
     ///
     /// The `## Review log` header has six columns and `### 修订历史` has five, but 42 review
