@@ -544,9 +544,7 @@ that was written around them must be adapted:
   actually failed will now fail. Exit codes outside `0..=255` (for example Windows
   `0xC0000005`) are returned as an error instead of being truncated.
 - **Empty or whitespace-only `exec` commands are rejected** with an actionable error
-  instead of sending an empty shell request, and an absolute path passed as the
-  *destination* of `upload`/`download` is an error instead of being silently treated as a
-  path relative to the destination directory.
+  instead of sending an empty shell request to the guest shell.
 
 This release is a `0.x` minor bump because the `ImageConfig` change cannot be expressed as
 a non-breaking addition.
