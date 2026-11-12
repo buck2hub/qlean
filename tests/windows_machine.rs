@@ -147,6 +147,17 @@ async fn windows_transport() -> Result<()> {
     vm.spawn().await?;
     let out = vm.exec("cmd /c echo spawned").await?;
     assert!(String::from_utf8_lossy(&out.stdout).contains("spawned"));
+    // The pinned key survives the reboot because it is the key installed in the image.
+    assert_eq!(vm.ssh_host_key().unwrap(), pinned);
+
+    // The one-shot deployment really consumed its seed: a second `init` is refused
+    // instead of booting a guest whose installed host key would no longer match.
+    let err = vm
+        .init()
+        .await
+        .expect_err("a deployed Windows guest must not be initialized again");
+    assert!(err.to_string().contains("already completed"), "{err}");
+
     vm.shutdown().await?;
 
     Ok(())
