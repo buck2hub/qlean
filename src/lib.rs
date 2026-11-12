@@ -2121,6 +2121,81 @@ mod plan_doc_tests {
         );
     }
 
+    /// `## 兼容与文档收口` mixes finished audits with one item that waits for the release.
+    ///
+    /// Two of the finished audits sat in unchecked boxes, so a reader walking the section
+    /// could not tell "verified, nothing to do" from "not looked at yet" - and the plan's own
+    /// completion criterion is that this section is closed except for the release. The
+    /// directory list next to them was a hand-copied `ls tests/`, which goes stale the moment
+    /// an integration test file is added (R171).
+    #[test]
+    fn the_compatibility_section_keeps_no_unchecked_item_but_the_release() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        let section = section(PLAN, "## 兼容与文档收口");
+        let unchecked: Vec<&str> = section
+            .lines()
+            .filter(|line| line.starts_with("- [ ]"))
+            .collect();
+        assert_eq!(
+            unchecked.len(),
+            1,
+            "only the 0.4.0 CHANGELOG entry may stay open in this section, and it must: {unchecked:#?}"
+        );
+        assert!(
+            unchecked[0].contains("CHANGELOG 按 Keep a Changelog"),
+            "the one open box must be the release item, not an audit that is already done: {}",
+            unchecked[0]
+        );
+    }
+
+    /// The plan's inventory of `tests/` must be the directory's, not a memory of it.
+    ///
+    /// A hand-written list of filenames cannot report its own staleness: adding
+    /// `tests/windows_something.rs` leaves the sentence claiming a five-file directory looking
+    /// correct. This reads the directory and compares both ways, so the sentence can only be
+    /// right when someone updates it (R171).
+    #[test]
+    fn the_tests_directory_list_names_every_file_there() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        let row = section(PLAN, "## 兼容与文档收口")
+            .lines()
+            .find(|line| line.contains("`tests/INDEX.md`"))
+            .expect("the compatibility section lost its `tests/INDEX.md` row");
+
+        let mut on_disk: Vec<String> =
+            std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/tests"))
+                .expect("the tests directory must exist")
+                .map(|entry| entry.expect("a readable directory entry").file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .filter(|name| name.ends_with(".rs"))
+                .collect();
+        on_disk.sort();
+        assert!(
+            on_disk.len() >= 5,
+            "the guard read {on_disk:?}; it is not looking at the integration tests"
+        );
+        for name in &on_disk {
+            assert!(
+                row.contains(&format!("`{name}`")),
+                "`tests/{name}` exists but the plan's inventory does not name it: {row}"
+            );
+        }
+        // The other direction: a name in the sentence that is no longer a file is a stale
+        // entry, which is the same defect seen from the other side.
+        for quoted in row.split('`').skip(1).step_by(2) {
+            // Only a filename counts: the sentence also mentions the bare suffix `.rs` when it
+            // says what the guard compares, and that is not an inventory entry.
+            let looks_like_a_file = quoted.len() > 4
+                && quoted.ends_with(".rs")
+                && quoted[..quoted.len() - 3]
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+            if looks_like_a_file && !on_disk.iter().any(|name| name == quoted) {
+                panic!("the inventory names `{quoted}`, which is not in `tests/`: stale entry");
+            }
+        }
+    }
+
     #[test]
     fn the_blank_command_refusal_is_tested_where_it_can_run() {
         const MACHINE: &str = include_str!("../src/machine.rs");

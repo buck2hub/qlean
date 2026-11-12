@@ -1563,8 +1563,8 @@ libra commit -m "revert: <card>"
 - [x] README Host Setup/API/Migration/示例/支持矩阵与各 unsupported 接口已同步（R90 逐项审计：Host Setup 的 5 个宿主缺口——`/dev/kvm`、OVMF、`swtpm`、`xorriso`、`virsh`/`libvirt`——与 `host_support_problems` 的 6 个参数一致，`OVMF_CANDIDATES` 的 Arch/Debian/Fedora 路径与 `.ms`/`secboot` vars 优先顺序、`QLEAN_OVMF_CODE`/`QLEAN_OVMF_VARS` 必须成对、`QLEAN_SWTPM` 均在 README 与代码两侧逐一核对；`ImageConfig`/`MachineConfig` 的字段摘录逐项核对（其中 `ssh_timeout`/`guest_os` 已由单测逐字比对，改任一侧即失败），`with_pool`/`is_kvm_available` 等顶层接口与源码签名一致；Migration 的 0.3.x → 0.4.0 覆盖新增公开字段与退出码语义；支持矩阵行与 `Image::new` 的 Windows 校验、`windows-` 缓存命名空间一致；unsupported 接口 `hard_link`/`read_link`/`set_permissions`/symlink/UNC/device path/PTY 在 README 与 `bail!` 文案中一一对应。审计中发现的唯一漂移是 `ssh_timeout` 的 API 文档仍写「SSH over vsock」，已修并被新单测固定（`b440292`）。
 - [ ] CHANGELOG 按 Keep a Changelog 写入 `[0.4.0]` Added/Changed/Migration。
 - [x] CI push/PR 触发与 format/clippy/test 命令已同步（R22：`push`(main)+`pull_request` 双触发、clippy `--all-targets --all-features`、`cargo test --lib`、`cargo test --no-run --all-targets`、rustdoc 门；run `43197579979` 全绿）。
-- [ ] `tests/INDEX.md` 当前不存在，`N/A`（R90 复核：`ls tests/` 只有 `machine_pool.rs`、`muti_distro.rs`、`single_machine.rs`、`utils.rs`、`windows_machine.rs`）。
-- [ ] LICENSE 未改动（R90 复核：仓库根 `LICENSE` 存在且本轮无改动）。
+- [x] `tests/INDEX.md` 当前不存在，`N/A`（R90 复核；R171 更正勾选状态：这一行是「已经核过、无需动作」，勾框不该留空，否则读者会把一个查完的 `N/A` 当成待办）。清单以 `ls tests/` 的输出为唯一来源，当下是 `machine_pool.rs`、`muti_distro.rs`、`single_machine.rs`、`utils.rs`、`windows_machine.rs`，由 `plan_doc_tests::the_tests_directory_list_names_every_file_there` 守着：目录里每个 `.rs` 都必须在行内被点名，行内也不许出现目录里没有的名字——一份手抄的目录清单，新增一个集成测试文件就会悄悄过期。
+- [x] LICENSE 未改动（R90 复核：仓库根 `LICENSE` 存在且本轮无改动；R171 更正勾选状态：这是核对结论，不是待办）。`## 兼容与文档收口` 里唯一允许留空的勾框是 `CHANGELOG` 的 0.4.0 条目——它随 `REL-01` 发布才成立，由 `plan_doc_tests::the_compatibility_section_keeps_no_unchecked_item_but_the_release` 守着。
 
 ## 实施证据汇总
 
