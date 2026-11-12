@@ -938,7 +938,7 @@
 | 单测 | `src/guest_path.rs` 9 个（盘符/根/分隔符、空格与非 ASCII、非法与不支持形式、非法字符与保留名、`..` 与 join 逃逸、join/parent、ancestors、strip_prefix、POSIX-only 拒绝 + Linux 可用、Linux 原样），`cargo test --lib windows_path` 过滤 |
 | 集成测试（`#[ignore]`） | `tests/windows_machine.rs::windows_files`：`C:\qlean-fs-test` 下建目录、写/读/`read_to_string`、`copy`、`rename`、`remove_dir_all`、文件与目录 `upload`/`download` 往返、`read_link` 报错 |
 | README/CHANGELOG | README 新增「Windows file operations」支持矩阵与路径规则；CHANGELOG Added 四条 |
-| 提交 | `COMMITHASH` |
+| 提交 | `443ec5d` |
 
 **Acceptance criteria:**
 
@@ -1158,7 +1158,7 @@
 | TRN-01 | 2026-11-12 11:40:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib ssh`（5 passed）、`cargo test --lib utils`（4 passed）、`cargo test --no-run`（含 `windows_transport`/`windows_pool`）全绿 | `windows_transport`/`windows_pool` 与真实 spawn 重连证据未取得（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `64b1046` |
 | EXE-01 | 2026-11-12 12:10:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_exec`（5 passed）、`cargo test --no-run` 全绿 | `windows_exec` 真实 PowerShell 冒烟未取得（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `64b1046` |
 | IP-01 | 2026-11-12 12:50:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_ip`（6 passed）、`cargo test --no-run` 全绿 | `windows_get_ip` 与双机一致性未取得（DEP-01/02 不可用） | `in-progress` / `locally-accepted` | `eb8fd90` |
-| FS-01 | 2026-11-12 13:20:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_path`（9 passed）、`cargo test --lib`（69 passed）、`cargo test --no-run` 全绿 | `windows_files` 与 Linux 文件回归未取得（DEP-01/02、DEFER-04） | `in-progress` / `locally-accepted` | `COMMITHASH` |
+| FS-01 | 2026-11-12 13:20:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_path`（9 passed）、`cargo test --lib`（69 passed）、`cargo test --no-run` 全绿 | `windows_files` 与 Linux 文件回归未取得（DEP-01/02、DEFER-04） | `in-progress` / `locally-accepted` | `443ec5d` |
 | REL-01 | pending | pending | pending | pending | pending |
 
 ## Review log
