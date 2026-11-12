@@ -1522,7 +1522,7 @@ libra commit -m "revert: <card>"
 | OVMF/swtpm 缺失 | 无运行 VM | 清晰报错并清理已创建 run dir | 静默降级、半启动 VM |
 | 地址发现/连接超时 | 可保留 sanitized 日志 | 有界重试后终止 QEMU、释放端点并清理 | 遗留 QEMU、调用 get_ip 循环等待 |
 | QEMU 启动即退出（发现 lease 期间） | 无运行 VM | 与 lease 轮询 race，立即报 QEMU 的真实错误并停 `swtpm` | 等满部署预算后误报「无 DHCP lease」 |
-| QEMU 在 SSH 阶段退出 / SSH 任务 panic | 无运行 VM | 统一失败分支：终止 QEMU、清 `pid`、停 `swtpm`，再返回错误 | TPM 进程残留、`is_running` 误报、seed 介质随 VM 继续运行 |
+| QEMU 在 SSH 阶段退出 / SSH 任务 panic | 无运行 VM | 统一失败分支 `tear_down_failed_launch`：关会话、终止 QEMU、有界回收启动任务（`reap_launch_task`）、清 `pid`、停 `swtpm`，再返回错误；三个失败出口（没有 lease、没确认部署、SSH 失败）共用这一份实现（R167 `F176`） | TPM 进程残留、`is_running` 误报、seed 介质随 VM 继续运行、无界 `await` 让原始错误被挂死掩盖 |
 | 首启部署期间会话断开（guest 重启） | seed 仍在 run 目录，可重试 | 连续 3 次探测失败即报错并提示 `spawn` 重试，不再等满部署预算 | 15 分钟后误报「部署未完成」 |
 | 池内 Windows VM 二次启停 | 无运行 VM | `init_all` 对已部署的 VM 走 `spawn`，`spawn_all` 对未部署的 VM 走 `init` | `already completed its Windows first-boot deployment` 或启动成不可达 guest |
 | host key 不匹配 | 无会话 | 立即失败并清理，不自动接受新 key | 静默信任任意 key |

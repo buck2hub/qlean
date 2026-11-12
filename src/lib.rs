@@ -2122,6 +2122,79 @@ mod plan_doc_tests {
     }
 
     #[test]
+    fn the_failed_launch_teardown_is_written_once_and_is_bounded() {
+        const MACHINE: &str = include_str!("../src/machine.rs");
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        // Three failure exits of a launch have to leave the same four facts behind, and one of
+        // them used to await the launch task without a budget while its siblings bounded it:
+        // a wedged QEMU could hide the original error behind a hang (F176).
+        let body = function_body(MACHINE, "async fn tear_down_failed_launch<T>");
+        assert!(
+            body.contains("reap_launch_task(qemu_handle"),
+            "the shared launch teardown no longer reaps the launch task through the bounded helper"
+        );
+        for step in [
+            "self.ssh = None;",
+            "self.pid.take()",
+            "swtpm.stop()",
+            "terminate_qemu",
+        ] {
+            assert!(
+                body.contains(step),
+                "the shared launch teardown no longer performs `{step}`"
+            );
+        }
+        assert_eq!(
+            MACHINE.matches("fn tear_down_failed_launch").count(),
+            1,
+            "the launch teardown was copied instead of shared"
+        );
+        let callers = MACHINE
+            .matches("self.tear_down_failed_launch(qemu_handle)")
+            .count();
+        assert!(
+            callers >= 3,
+            "only {callers} failure exits of a launch use the shared teardown; the lease, the \
+             deployment confirmation and the SSH session are its three callers"
+        );
+        // No path may await the launch task directly again: the bounded reaper is the only
+        // way to wait for it, and the one direct await left is the already-finished branch.
+        for line in MACHINE.lines() {
+            if !line.contains("qemu_handle.await") {
+                continue;
+            }
+            assert!(
+                line.contains("qemu_exit_before_lease(") || line.contains("reap_launch_task("),
+                "the launch task is awaited outside the bounded reaper: {}",
+                line.trim()
+            );
+        }
+        let tests = test_names_in(&[("src/machine.rs", MACHINE)]);
+        assert!(
+            tests
+                .iter()
+                .any(|name| name.contains("a_failed_launch_teardown_leaves_nothing_behind")),
+            "the shared launch teardown has no test of its own"
+        );
+        // The recovery matrix is the contract a reader trusts; it has to name the mechanism.
+        let matrix: Vec<&str> = PLAN
+            .lines()
+            .filter(|line| line.starts_with("| ") && line.contains("统一失败分支"))
+            .collect();
+        assert_eq!(
+            matrix.len(),
+            1,
+            "the recovery matrix lost its launch-failure row"
+        );
+        assert!(
+            matrix[0].contains("tear_down_failed_launch") && matrix[0].contains("reap_launch_task"),
+            "the recovery matrix describes the launch failure without naming the shared \
+             teardown and its bounded reaper: {}",
+            matrix[0]
+        );
+    }
+
+    #[test]
     fn the_rollback_table_says_how_its_counts_can_be_recomputed() {
         const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
         // The rollback table lists how many files each card's revert stages. Those numbers were

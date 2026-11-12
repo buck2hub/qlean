@@ -826,6 +826,31 @@ StandardError=journal
         self.ip = None;
     }
 
+    /// Tear down a launch that failed after QEMU was started.
+    ///
+    /// The three ways out of a launch that already has a live QEMU - the leased address was
+    /// never discovered, the guest never confirmed its deployment, the SSH session failed -
+    /// have to leave the same facts behind: no session, no pid, no TPM, and no launch task
+    /// still being awaited. Written once, because a branch that forgets one of the four steps
+    /// leaves a VM that `is_running` reports and a TPM that outlives it.
+    ///
+    /// The wait for QEMU to exit is bounded and abandons the task: a wedged QEMU must not
+    /// hide the original launch error behind a hang (F176).
+    async fn tear_down_failed_launch<T>(&mut self, qemu_handle: tokio::task::JoinHandle<T>) {
+        if let Some(ssh) = self.ssh.as_mut() {
+            let _ = ssh.close().await;
+        }
+        self.ssh = None;
+        self.ip = None;
+        if let Some(pid) = self.pid.take() {
+            terminate_qemu(pid).await;
+        }
+        reap_launch_task(qemu_handle, Duration::from_secs(5)).await;
+        if let Some(mut swtpm) = self.swtpm.take() {
+            swtpm.stop().await;
+        }
+    }
+
     /// Open a dedicated interactive SSH shell (PTY) over a new vsock session.
     ///
     /// Does not use or block the management SSH session used by `exec` / upload.
@@ -1510,29 +1535,6 @@ StandardError=journal
             bail!("Failed to read QEMU pid file at {:?}", pid_file_path);
         }
 
-        // Helper: terminate QEMU process best-effort.
-        async fn terminate_qemu(pid: u32) {
-            if !process_is_qemu(pid) {
-                warn!("QEMU pid {pid} is gone; nothing to terminate");
-                return;
-            }
-            if let Err(error) = signal_term(pid) {
-                warn!("failed to send SIGTERM to QEMU pid {pid}: {error}");
-            }
-
-            // Give it a moment to exit; then SIGKILL.
-            let start = std::time::Instant::now();
-            while start.elapsed() < Duration::from_secs(5) {
-                if process_is_gone(pid) {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            if let KillOutcome::Refused(reason) = force_kill(pid) {
-                warn!("{}", kill_not_shut_down_message(pid, &reason));
-            }
-        }
-
         // `launch` is only reached through `init`/`spawn`, which set the token; check
         // instead of panicking so a future caller cannot turn this into a crash.
         let Some(cancel_token) = self.ssh_cancel_token.clone() else {
@@ -1662,13 +1664,7 @@ StandardError=journal
             match discovered {
                 Ok(endpoint) => windows_endpoint = Some(endpoint),
                 Err(e) => {
-                    if let Some(pid) = self.pid.take() {
-                        terminate_qemu(pid).await;
-                    }
-                    reap_launch_task(qemu_handle, Duration::from_secs(5)).await;
-                    if let Some(mut swtpm) = self.swtpm.take() {
-                        swtpm.stop().await;
-                    }
+                    self.tear_down_failed_launch(qemu_handle).await;
                     return Err(e);
                 }
             }
@@ -1749,32 +1745,16 @@ StandardError=journal
                     // has the seed medium (client public key plus per-VM host private
                     // key) attached. Tear the VM down instead of returning an error
                     // while leaving QEMU, swtpm and the seed behind.
-                    if let Some(ssh) = self.ssh.as_mut() {
-                        let _ = ssh.close().await;
-                    }
-                    self.ssh = None;
-                    self.ip = None;
-                    if let Some(pid) = self.pid.take() {
-                        terminate_qemu(pid).await;
-                    }
-                    let _ = qemu_handle.await;
-                    if let Some(mut swtpm) = self.swtpm.take() {
-                        swtpm.stop().await;
-                    }
+                    self.tear_down_failed_launch(qemu_handle).await;
                     return Err(e);
                 }
                 Ok(())
             }
             Err(e) => {
-                // SSH failed, QEMU should exit
-                // Here we proactively terminate QEMU process to avoid leaving a zombie process, but we don't set the flag `qemu_should_exit` to true because the failure of SSH is unexpected.
-                if let Some(pid) = self.pid.take() {
-                    terminate_qemu(pid).await;
-                }
-                reap_launch_task(qemu_handle, Duration::from_secs(5)).await;
-                if let Some(mut swtpm) = self.swtpm.take() {
-                    swtpm.stop().await;
-                }
+                // SSH failed, QEMU should exit. Kill it here rather than waiting for the
+                // guest to notice: the failure of SSH is unexpected, and a zombie QEMU would
+                // keep reporting itself as a running machine.
+                self.tear_down_failed_launch(qemu_handle).await;
                 bail!(e)
             }
         }
@@ -2192,6 +2172,35 @@ fn signal_term(pid: u32) -> std::io::Result<()> {
     Err(std::io::Error::last_os_error())
 }
 
+/// Stop a QEMU process this crate started, best effort.
+///
+/// `SIGTERM` first so the guest gets a chance to shut down, then `SIGKILL` after a bounded
+/// wait. Both signals go through the pid only while it still belongs to QEMU, because a
+/// recycled pid would take an unrelated process down with it. Failures are warnings: this
+/// runs on paths that are already returning an error, and a teardown that cannot finish must
+/// not hide that error.
+async fn terminate_qemu(pid: u32) {
+    if !process_is_qemu(pid) {
+        warn!("QEMU pid {pid} is gone; nothing to terminate");
+        return;
+    }
+    if let Err(error) = signal_term(pid) {
+        warn!("failed to send SIGTERM to QEMU pid {pid}: {error}");
+    }
+
+    // Give it a moment to exit; then SIGKILL.
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        if process_is_gone(pid) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if let KillOutcome::Refused(reason) = force_kill(pid) {
+        warn!("{}", kill_not_shut_down_message(pid, &reason));
+    }
+}
+
 /// Wait for a launch task to finish, but never forever.
 ///
 /// The failure paths of `launch` must surface the original error: a QEMU that refuses to die
@@ -2585,6 +2594,29 @@ mod shutdown_tests {
             "the retry still carries the token of the launch that failed"
         );
         assert!(!machine.already_started());
+    }
+
+    #[tokio::test]
+    async fn a_failed_launch_teardown_leaves_nothing_behind() {
+        // The three failure exits of a launch (no lease, no deployment confirmation, no
+        // session) share one teardown, and it has to clear the state that `is_running` reads
+        // and that the next `init`/`spawn` refuses on (F176).
+        let mut machine = Machine::for_tests_with_pid(None);
+        machine.ip = Some("10.0.0.5".to_string());
+        let task = tokio::spawn(async {});
+        tokio::task::yield_now().await;
+
+        let started = std::time::Instant::now();
+        machine.tear_down_failed_launch(task).await;
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the teardown waited on a launch task that had already finished"
+        );
+        assert!(machine.ssh.is_none(), "the teardown kept a session");
+        assert_eq!(machine.ip, None, "the teardown kept the leased address");
+        assert_eq!(machine.pid, None, "the teardown kept a QEMU pid");
+        assert!(machine.swtpm.is_none(), "the teardown kept the TPM");
     }
 
     #[test]
