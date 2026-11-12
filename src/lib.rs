@@ -519,6 +519,56 @@ mod plan_doc_tests {
             "the trace table's 指定测试 column yielded only {checked} labels"
         );
     }
+    /// The status view names the newest review round, so the two documents agree on where work
+    /// stopped.
+    ///
+    /// `plan-status.md` exists so a reader has one place to learn how far the plan has got. It is
+    /// updated by hand every round, and the failure mode is silent: the plan keeps growing while
+    /// the status view quietly stops one round short, and the reader takes the stale round for the
+    /// current one.
+    #[test]
+    fn the_status_view_is_not_behind_the_plan() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        const STATUS: &str = include_str!("../docs/plan/plan-status.md");
+
+        let lines: Vec<&str> = PLAN.lines().collect();
+        let heading = lines
+            .iter()
+            .position(|line| line.trim_end() == "## Review log")
+            .expect("the plan has no Review log section");
+        let planned = lines[heading + 1..]
+            .iter()
+            .take_while(|line| !line.starts_with("## "))
+            .filter_map(|line| line.strip_prefix("| R"))
+            .map(|rest| {
+                rest.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+            })
+            .filter(|digits| !digits.is_empty())
+            .filter_map(|digits| digits.parse::<u32>().ok())
+            .max()
+            .expect("the review log has no rounds");
+
+        let reported = STATUS
+            .match_indices('R')
+            .filter_map(|(at, _)| {
+                let digits: String = STATUS[at + 1..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                digits.parse::<u32>().ok()
+            })
+            .max()
+            .expect("the status view names no review round");
+
+        assert_eq!(
+            reported, planned,
+            "the plan's newest round is R{planned} but the status view stops at R{reported}: \
+             a reader would take the stale round for the current one"
+        );
+    }
+
     /// Every round in the review log that can name its commit does name one.
     ///
     /// The log's whole value is that a reader can walk from a round number to the code. Ten early
