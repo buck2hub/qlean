@@ -618,11 +618,11 @@ StandardError=journal
             );
         }
 
-        let cancel = self
-            .ssh_cancel_token
-            .as_ref()
-            .expect("Machine not initialized or spawned")
-            .clone();
+        let Some(cancel) = self.ssh_cancel_token.as_ref().cloned() else {
+            bail!(
+                "Machine is not running; initialize or spawn before opening an interactive shell"
+            );
+        };
 
         let session = connect_ssh(
             self.cid,
@@ -649,23 +649,14 @@ StandardError=journal
             );
         }
         info!("🧬 Executing command `{}` on VM-{}", cmd_ref, self.id);
-        if let Some(ssh) = self.ssh.as_mut() {
-            let cancel_token = self
-                .ssh_cancel_token
-                .as_ref()
-                .expect("Machine not initialized or spawned")
-                .clone();
+        let (ssh, cancel_token) = self.get_ssh("run a command")?;
+        let (exit_code, stdout, stderr) = ssh.call_with_output(cmd_ref, cancel_token).await?;
 
-            let (exit_code, stdout, stderr) = ssh.call_with_output(cmd_ref, cancel_token).await?;
-
-            Ok(Output {
-                status: crate::exec::exit_status_from_code(cmd_ref, exit_code)?,
-                stdout,
-                stderr,
-            })
-        } else {
-            Err(anyhow::anyhow!("SSH session not established"))
-        }
+        Ok(Output {
+            status: crate::exec::exit_status_from_code(cmd_ref, exit_code)?,
+            stdout,
+            stderr,
+        })
     }
 
     /// Shutdown the machine.
@@ -751,7 +742,7 @@ StandardError=journal
             remote_path.as_str(),
             self.id
         );
-        let (ssh, cancel_token) = self.get_ssh()?;
+        let (ssh, cancel_token) = self.get_ssh("upload files")?;
 
         let meta = tokio::fs::metadata(local_path).await?;
         if meta.is_file() {
@@ -863,7 +854,7 @@ StandardError=journal
             self.id,
             local_path
         );
-        let (ssh, cancel_token) = self.get_ssh()?;
+        let (ssh, cancel_token) = self.get_ssh("download files")?;
 
         // Check remote path type
         let remote_meta = {
@@ -970,17 +961,14 @@ StandardError=journal
     }
 
     /// Helper to get SSH session and cancellation token
-    fn get_ssh(&mut self) -> Result<(&mut Session, CancellationToken)> {
-        let ssh = self
-            .ssh
-            .as_mut()
-            .expect("Machine not initialized or spawned");
-        let cancel_token = self
-            .ssh_cancel_token
-            .as_ref()
-            .cloned()
-            .expect("Machine not initialized or spawned");
-        Ok((ssh, cancel_token))
+    fn get_ssh(&mut self, operation: &str) -> Result<(&mut Session, CancellationToken)> {
+        let machine_id = self.id.clone();
+        session_or_operation_error(
+            &mut self.ssh,
+            self.ssh_cancel_token.as_ref(),
+            operation,
+            &machine_id,
+        )
     }
 
     /// Public half of this machine's SSH host key, if the guest uses a per-VM one.
@@ -1089,7 +1077,7 @@ StandardError=journal
             // MAC instead of falling back to `hostname -I` or another VM's lease.
             self.query_windows_ip().await?
         } else {
-            let (ssh, _) = self.get_ssh()?;
+            let (ssh, _) = self.get_ssh("query the guest address")?;
             ssh.get_remote_ip().await?
         };
         self.ip = Some(ip.to_owned());
@@ -1098,7 +1086,7 @@ StandardError=journal
 
     /// Ask a Windows guest for its own address and match it against this VM's MAC.
     async fn query_windows_ip(&mut self) -> Result<String> {
-        let (ssh, cancel_token) = self.get_ssh()?;
+        let (ssh, cancel_token) = self.get_ssh("query the guest address")?;
         let (code, stdout, stderr) = ssh
             .call_with_output(windows::GUEST_IP_QUERY, cancel_token)
             .await?;
@@ -1413,7 +1401,7 @@ impl Machine {
         let os = self.image.guest_os;
         let from = guest_path_from(os, from.as_ref())?;
         let to = guest_path_from(os, to.as_ref())?;
-        let (ssh, cancel_token) = self.get_ssh()?;
+        let (ssh, cancel_token) = self.get_ssh("copy files")?;
 
         // Validate source and destination semantics to mirror std::fs::copy
         {
@@ -1459,7 +1447,7 @@ impl Machine {
     pub async fn create_dir<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         let os = self.image.guest_os;
         let path = guest_path_from(os, path.as_ref())?;
-        let (ssh, _) = self.get_ssh()?;
+        let (ssh, _) = self.get_ssh("create a directory")?;
 
         let sftp = ssh.get_sftp().await?;
         sftp.create_dir(path.as_str()).await?;
@@ -1471,7 +1459,7 @@ impl Machine {
     pub async fn create_dir_all<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         let os = self.image.guest_os;
         let path = guest_path_from(os, path.as_ref())?;
-        let (ssh, _) = self.get_ssh()?;
+        let (ssh, _) = self.get_ssh("create a directory")?;
 
         ssh.create_dir_all(&path).await?;
 
@@ -1482,7 +1470,7 @@ impl Machine {
     pub async fn exists<P: AsRef<Path>>(&mut self, path: P) -> Result<bool> {
         let os = self.image.guest_os;
         let path = guest_path_from(os, path.as_ref())?;
-        let (ssh, _) = self.get_ssh()?;
+        let (ssh, _) = self.get_ssh("check a path")?;
 
         let sftp = ssh.get_sftp().await?;
         Ok(sftp.try_exists(path.as_str()).await?)
@@ -1501,7 +1489,7 @@ impl Machine {
         let original = guest_path_from(os, original.as_ref())?;
         let link = guest_path_from(os, link.as_ref())?;
         ensure_supported(os, PosixOnlyOperation::HardLink, &original)?;
-        let (ssh, _) = self.get_ssh()?;
+        let (ssh, _) = self.get_ssh("create a hard link")?;
 
         let sftp = ssh.get_sftp().await?;
         sftp.hardlink(original.as_str(), link.as_str()).await?;
@@ -1513,7 +1501,7 @@ impl Machine {
     pub async fn metadata<P: AsRef<Path>>(&mut self, path: P) -> Result<Metadata> {
         let os = self.image.guest_os;
         let path = guest_path_from(os, path.as_ref())?;
-        let (ssh, _) = self.get_ssh()?;
+        let (ssh, _) = self.get_ssh("read metadata")?;
 
         let sftp = ssh.get_sftp().await?;
         Ok(sftp.metadata(path.as_str()).await?)
@@ -1523,7 +1511,7 @@ impl Machine {
     pub async fn read<P: AsRef<Path>>(&mut self, path: P) -> Result<Vec<u8>> {
         let os = self.image.guest_os;
         let path = guest_path_from(os, path.as_ref())?;
-        let (ssh, _) = self.get_ssh()?;
+        let (ssh, _) = self.get_ssh("read a file")?;
 
         let sftp = ssh.get_sftp().await?;
         Ok(sftp.read(path.as_str()).await?)
@@ -1533,7 +1521,7 @@ impl Machine {
     pub async fn read_dir<P: AsRef<Path>>(&mut self, path: P) -> Result<ReadDir> {
         let os = self.image.guest_os;
         let path = guest_path_from(os, path.as_ref())?;
-        let (ssh, _) = self.get_ssh()?;
+        let (ssh, _) = self.get_ssh("list a directory")?;
 
         let sftp = ssh.get_sftp().await?;
         Ok(sftp.read_dir(path.as_str()).await?)
@@ -1546,7 +1534,7 @@ impl Machine {
         let os = self.image.guest_os;
         let path = guest_path_from(os, path.as_ref())?;
         ensure_supported(os, PosixOnlyOperation::ReadLink, &path)?;
-        let (ssh, _) = self.get_ssh()?;
+        let (ssh, _) = self.get_ssh("read a symlink")?;
 
         let sftp = ssh.get_sftp().await?;
         Ok(PathBuf::from(sftp.read_link(path.as_str()).await?))
@@ -1556,7 +1544,7 @@ impl Machine {
     pub async fn read_to_string<P: AsRef<Path>>(&mut self, path: P) -> Result<String> {
         let os = self.image.guest_os;
         let path = guest_path_from(os, path.as_ref())?;
-        let (ssh, _) = self.get_ssh()?;
+        let (ssh, _) = self.get_ssh("read a file")?;
 
         let sftp = ssh.get_sftp().await?;
         let bytes = sftp.read(path.as_str()).await?;
@@ -1567,24 +1555,17 @@ impl Machine {
     pub async fn remove_dir_all<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         let os = self.image.guest_os;
         let path = guest_path_from(os, path.as_ref())?;
-        let cancel_token = self
-            .ssh_cancel_token
-            .as_ref()
-            .expect("Machine not initialized or spawned")
-            .clone();
-
         // Collect the tree first, then delete children before their parents.
-        let entries = {
-            let (ssh, _) = self.get_ssh()?;
-            ssh.walk_remote_dir(&path, /*follow_links=*/ false, cancel_token.clone())
-                .await?
-        };
+        let (ssh, cancel_token) = self.get_ssh("remove a directory tree")?;
+        let entries = ssh
+            .walk_remote_dir(&path, /*follow_links=*/ false, cancel_token.clone())
+            .await?;
 
         for entry in entries.iter().rev() {
             if cancel_token.is_cancelled() {
                 bail!("remove_dir_all cancelled");
             }
-            let (ssh, _) = self.get_ssh()?;
+            let (ssh, _) = self.get_ssh("remove a file")?;
             let sftp = ssh.get_sftp().await?;
             if entry.file_type().is_dir() {
                 sftp.remove_dir(entry.path().as_str()).await.map_err(|e| {
@@ -1612,7 +1593,7 @@ impl Machine {
     pub async fn remove_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         let os = self.image.guest_os;
         let path = guest_path_from(os, path.as_ref())?;
-        let (ssh, _) = self.get_ssh()?;
+        let (ssh, _) = self.get_ssh("remove a file")?;
 
         let sftp = ssh.get_sftp().await?;
         sftp.remove_file(path.as_str()).await?;
@@ -1625,7 +1606,7 @@ impl Machine {
         let os = self.image.guest_os;
         let from = guest_path_from(os, from.as_ref())?;
         let to = guest_path_from(os, to.as_ref())?;
-        let (ssh, _) = self.get_ssh()?;
+        let (ssh, _) = self.get_ssh("rename a path")?;
 
         let sftp = ssh.get_sftp().await?;
         sftp.rename(from.as_str(), to.as_str()).await?;
@@ -1645,7 +1626,7 @@ impl Machine {
         let os = self.image.guest_os;
         let path = guest_path_from(os, path.as_ref())?;
         ensure_supported(os, PosixOnlyOperation::SetPermissions, &path)?;
-        let (ssh, _) = self.get_ssh()?;
+        let (ssh, _) = self.get_ssh("set permissions")?;
 
         {
             let sftp = ssh.get_sftp().await?;
@@ -1674,7 +1655,7 @@ impl Machine {
         let os = self.image.guest_os;
         let path = guest_path_from(os, path.as_ref())?;
         let contents = contents.as_ref();
-        let (ssh, _) = self.get_ssh()?;
+        let (ssh, _) = self.get_ssh("write a file")?;
 
         let sftp = ssh.get_sftp().await?;
         let _ = sftp.create(path.as_str()).await?;
@@ -1723,6 +1704,39 @@ impl Drop for Machine {
     }
 }
 
+/// Why a session-scoped operation cannot run: the machine is not up.
+///
+/// Every `Machine` operation that talks to the guest goes through this one message, so a
+/// machine that was never started, failed to start, or was already shut down reports the
+/// same actionable reason instead of panicking on an `expect`.
+fn not_running_error(operation: &str, machine_id: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "cannot {operation} on VM-{machine_id} because it is not running; start it first \
+     (`init` for the first boot, `spawn` for a boot after that) and keep it running until \
+     the operation finishes"
+    )
+}
+
+/// Borrow the SSH session of a running machine, or explain why there is none.
+///
+/// Split out of [`Machine::get_ssh`] so the error path is testable without a guest: the
+/// previous version used `expect`, which turned "not running" into a panic for every
+/// caller (`upload`, `download`, the file helpers) while `exec` alone returned an error.
+fn session_or_operation_error<'a>(
+    ssh: &'a mut Option<Session>,
+    cancel_token: Option<&CancellationToken>,
+    operation: &str,
+    machine_id: &str,
+) -> Result<(&'a mut Session, CancellationToken)> {
+    let Some(cancel_token) = cancel_token.cloned() else {
+        return Err(not_running_error(operation, machine_id));
+    };
+    match ssh.as_mut() {
+        Some(session) => Ok((session, cancel_token)),
+        None => Err(not_running_error(operation, machine_id)),
+    }
+}
+
 #[cfg(test)]
 mod timeout_tests {
     use super::*;
@@ -1731,6 +1745,37 @@ mod timeout_tests {
         MachineConfig {
             ssh_timeout,
             ..MachineConfig::default()
+        }
+    }
+
+    #[test]
+    fn not_running_error_names_the_machine_and_the_way_to_start_it() {
+        let error = not_running_error("upload files", "abc123").to_string();
+        assert!(
+            error.contains("cannot upload files on VM-abc123"),
+            "{error}"
+        );
+        assert!(error.contains("not running"), "{error}");
+        assert!(
+            error.contains("`init`") && error.contains("`spawn`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_machine_without_a_session_reports_an_error_instead_of_panicking() {
+        // The state after a failed `spawn` (token set, no session) and the state of a
+        // machine that was never started must both come back as errors.
+        let mut ssh: Option<Session> = None;
+        let token = CancellationToken::new();
+        for cancel_token in [Some(&token), None] {
+            let error =
+                match session_or_operation_error(&mut ssh, cancel_token, "run a command", "vm-1") {
+                    Ok(_) => panic!("a machine without a session must not look like a running one"),
+                    Err(error) => error.to_string(),
+                };
+            assert!(error.contains("cannot run a command on VM-vm-1"), "{error}");
+            assert!(error.contains("not running"), "{error}");
         }
     }
 

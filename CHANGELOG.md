@@ -61,6 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A second `init` on an already-deployed Windows machine is rejected with an actionable error (use `spawn`), instead of booting without the consumed seed medium
 - Windows first boot waited only for the 180s/300s Linux connect budget before giving up on `sshd`, so the 900s deployment budget could never be reached; `init` now waits within the deployment budget and later boots keep the connect budget
 - `Machine::exec` reported every non-zero exit code as success: the SSH exit status was passed to `ExitStatus::from_raw` as if it were a wait status, so `status.code()` always returned `0`. Exit codes are now converted correctly, which is a behavior change for callers that relied on the previous (incorrect) `status.success()` result
+- Operations that need a live guest (`exec`, `upload`, `download`, `remove_dir_all` and the file helpers) panicked on an internal `expect` when the machine was not running, while `exec` alone returned `SSH session not established`; they now share one actionable error that names the operation and how to start the machine
 
 ### Migration
 
