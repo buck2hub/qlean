@@ -120,7 +120,7 @@
 | 2026-11-12 15:20:00 UTC | review R9（硬件对接面） | F9~F11 修复：vsock 设备仅为 Linux 添加（`f42a942`）；OVMF code/vars 等长校验改为「vars 不得大于 code」（`8ae13ec`）；swtpm 控制 socket 改 `mode=0600`（`3e7ebd0`） | N/A（`OSX-01`/`OSX-02` 既有 AC，无卡拆合） | `OSX-01`/`OSX-02` 实现证据、Review log、`src/qemu.rs`、`src/firmware.rs`、CHANGELOG |
 | 2026-11-12 15:50:00 UTC | review R9 补记（Secure Boot vars 与首启介质前置） | F12 修复：`OVMF_CANDIDATES` 为每个 code 镜像列出多个 vars 模板，secboot 优先 Microsoft 已注册的 `.ms`/`.secboot` 模板，普通模板仅作 fallback（setup mode）；F13 修复：`ensure_host_support` 增加 `xorriso`（首启 seed 介质的必需构建器），与其他缺口一次性报出（`7ddc686`） | N/A（细化 ADR-WIN-02 的 Secure Boot 判定与 `OSX-02` 前置检查，不改变既有决策） | `OSX-02` 实现证据、Review log、ADR-WIN-02、`src/firmware.rs`、README、CHANGELOG |
 | 2026-11-12 16:10:00 UTC | review R10（Windows 命令构造） | F14 修复：`Machine::copy` 的 Windows 分支改为直接执行 `Copy-Item`（`windows::copy_file_command`），不再套 `powershell -Command "..."`，避免外层 PowerShell 二次解析把路径中的 `$` 展开成空 | N/A（`FS-01` 既有 AC「Windows 文件语义」，无卡拆合） | `FS-01` 实现证据、Review log、`src/windows.rs`、`src/machine.rs`、CHANGELOG |
-| 2026-11-12 16:30:00 UTC | review R11（失败启动的可恢复性） | F15 修复：`init`/`spawn` 把 cancel token 当「已启动」标记，启动失败后 token 残留，之后每次尝试都报 `Machine already initialized`/`already spawned`，且残留的连接任务不会被取消；现在只在机器确实在运行时拒绝重复启动，失败时取消并清除 token（`bf0710c`） | N/A（`OSX-03`/`TRN-01` 既有「有界重试后清理」AC 与故障恢复矩阵，无卡拆合） | `OSX-03` 实现证据、故障恢复矩阵、Review log、`src/machine.rs`、CHANGELOG |
+| 2026-11-12 16:30:00 UTC | review R11（失败启动的可恢复性） | F15 修复：`init`/`spawn` 把 cancel token 当「已启动」标记，启动失败后 token 残留，之后每次尝试都报 `Machine already initialized`/`already spawned`，且残留的连接任务不会被取消；现在只在机器确实在运行时拒绝重复启动，失败时取消并清除 token（`bf0710c`） | N/A（`OSX-03`/`TRN-01` 既有「有界重试后清理」AC 与故障恢复矩阵，无卡拆合） | `OSX-03` 实现证据、故障恢复矩阵、Review log、`src/machine.rs`、README（Windows 状态说明改为「已实现但未发布/未支持」）、CHANGELOG |
 
 ## 已决议设计决策
 

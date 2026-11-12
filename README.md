@@ -414,10 +414,11 @@ records `guest_os`: metadata written before this field existed defaults to `Linu
 and a cache entry whose recorded OS does not match the request is rejected instead
 of being handed to the wrong guest.
 
-> **Status:** Windows guest VMs are not supported yet in this release line. The
-> `GuestOs` dimension currently covers image configuration, validation and cache
-> isolation only; Windows deployment, transport and command semantics land in the
-> same 0.4.0 release train.
+> **Status:** Windows guest support is implemented on `main` but not released or
+> supported yet. The `GuestOs` dimension, OVMF/TPM lifecycle, first-boot deployment,
+> transport, `exec`, `get_ip` and file semantics are all in the tree, but the plan's
+> core acceptance needs real Windows KVM smoke evidence that has not been recorded
+> yet, so the support matrix below still lists Linux only and 0.4.0 is unpublished.
 
 ### Image Interface
 
