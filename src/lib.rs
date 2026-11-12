@@ -2041,6 +2041,59 @@ mod plan_doc_tests {
     /// describes exactly that. The two summaries are now the same sentence, name both
     /// mechanisms, and the unqualified wording is rejected.
     #[test]
+    fn the_plan_and_the_code_agree_on_how_many_failures_end_the_marker_wait() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        // The failure-recovery matrix and the test matrix both promise a number ("three
+        // consecutive failures"), and the loop has to stop on exactly that number. A constant in
+        // one file and the same number spelled out in another are two facts until something
+        // compares them.
+        let machine = CRATE_SOURCES
+            .iter()
+            .find(|(path, _)| *path == "src/machine.rs")
+            .map(|(_, source)| *source)
+            .expect("src/machine.rs is not in CRATE_SOURCES");
+        let limit = number_after(machine, "MAX_CONSECUTIVE_MARKER_ERRORS: u32 = ")
+            .expect("the marker wait no longer declares how many failures end it")
+            .to_owned();
+
+        let mut checked = 0;
+        for line in PLAN.lines() {
+            let mut rest = line;
+            while let Some(at) = rest.find("连续 ") {
+                let after = &rest[at + "连续 ".len()..];
+                let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+                rest = after;
+                if digits.is_empty() || !after[digits.len()..].starts_with(" 次") {
+                    continue;
+                }
+                checked += 1;
+                assert_eq!(
+                    digits, limit,
+                    "the plan promises {digits} consecutive failures but the code gives up after \
+                     {limit}: {line}"
+                );
+            }
+        }
+        assert!(checked >= 2, "the plan states the number {checked} times");
+
+        // The rule lives in `MarkerWatch`; a literal comparison in the loop would be a second
+        // place to change and would drift from the constant above.
+        let wait = body_of(machine, "pub(crate) async fn confirm_deployment(");
+        // The condition has to be the verdict itself: `false && watch.observe(..)` mentions the
+        // name and never gives up, and a guard that only greps for the name would pass it.
+        assert_eq!(
+            wait.matches("if watch.observe(marker_poll_outcome(&poll)) {")
+                .count(),
+            1,
+            "the deployment wait no longer ends on what MarkerWatch decides"
+        );
+        assert!(
+            !wait.contains(">= 3"),
+            "the deployment wait compares against a literal three instead of the constant"
+        );
+    }
+
+    #[test]
     fn a_first_boot_is_described_the_same_way_in_the_library_and_the_readme() {
         const README: &str = include_str!("../README.md");
         let bullet = README

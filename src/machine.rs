@@ -1311,25 +1311,23 @@ StandardError=journal
         // session may have died because the guest rebooted. Retrying that for the whole
         // budget would report "deployment did not finish" 15 minutes later, so give up
         // after a few consecutive transport failures with an actionable message.
-        const MAX_CONSECUTIVE_TRANSPORT_ERRORS: u32 = 3;
-        let mut transport_errors = 0;
+        let mut watch = MarkerWatch::default();
         loop {
-            match self.deploy_marker_present().await {
-                Ok(true) => break,
-                Ok(false) => transport_errors = 0,
-                Err(e) => {
-                    transport_errors += 1;
-                    if transport_errors >= MAX_CONSECUTIVE_TRANSPORT_ERRORS {
-                        return Err(e).with_context(|| {
-                            format!(
-                                "lost the SSH session to VM-{} while waiting for the Windows \
-                                 deployment marker; the guest probably rebooted or stopped sshd. \
-                                 Retry with `spawn` once the guest is reachable again",
-                                self.id
-                            )
-                        });
-                    }
-                }
+            let poll = self.deploy_marker_present().await;
+            match marker_poll_outcome(&poll) {
+                MarkerPoll::Deployed => break,
+                MarkerPoll::NotYet | MarkerPoll::TransportError => {}
+            }
+            if watch.observe(marker_poll_outcome(&poll)) {
+                let error = poll.expect_err("only a transport error can end the wait");
+                return Err(error).with_context(|| {
+                    format!(
+                        "lost the SSH session to VM-{} while waiting for the Windows \
+                         deployment marker; the guest probably rebooted or stopped sshd. \
+                         Retry with `spawn` once the guest is reachable again",
+                        self.id
+                    )
+                });
             }
             if start.elapsed() >= remaining {
                 bail!("{}", windows::deploy_timeout_message(timeout));
@@ -2422,6 +2420,59 @@ pub(crate) fn start_actions(guest_os: GuestOs, deployment_pending: bool) -> Star
     }
 }
 
+/// How many transport failures in a row end the deployment-marker wait.
+///
+/// The failure-recovery matrix promises this number: three consecutive failures report the lost
+/// session instead of waiting out the whole 900s budget. One success in between resets the count,
+/// because a guest that keeps answering is deploying, not unreachable.
+pub(crate) const MAX_CONSECUTIVE_MARKER_ERRORS: u32 = 3;
+
+/// What one deployment-marker poll means for the wait loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MarkerPoll {
+    /// The marker is on disk: the guest is deployed.
+    Deployed,
+    /// The guest answered and has not finished deploying yet.
+    NotYet,
+    /// The probe could not reach the guest, which says nothing about the deployment.
+    TransportError,
+}
+
+/// Classify one marker poll.
+pub(crate) fn marker_poll_outcome(poll: &Result<bool>) -> MarkerPoll {
+    match poll {
+        Ok(true) => MarkerPoll::Deployed,
+        Ok(false) => MarkerPoll::NotYet,
+        Err(_) => MarkerPoll::TransportError,
+    }
+}
+
+/// Count consecutive transport failures and say when the wait must end.
+///
+/// Kept apart from the loop so the counting rule is testable without a guest: counting all
+/// failures instead of consecutive ones aborts a slow deployment, and never resetting does the
+/// same for a boot that briefly loses sshd.
+#[derive(Debug, Default)]
+pub(crate) struct MarkerWatch {
+    consecutive_errors: u32,
+}
+
+impl MarkerWatch {
+    /// Feed one poll in; `true` means "give up now and report the transport error".
+    pub(crate) fn observe(&mut self, poll: MarkerPoll) -> bool {
+        match poll {
+            MarkerPoll::TransportError => {
+                self.consecutive_errors += 1;
+                self.consecutive_errors >= MAX_CONSECUTIVE_MARKER_ERRORS
+            }
+            MarkerPoll::NotYet | MarkerPoll::Deployed => {
+                self.consecutive_errors = 0;
+                false
+            }
+        }
+    }
+}
+
 /// Refuse to `init` a machine whose route is not `init`.
 ///
 /// The pool decides a start with [`start_actions`]; the public entry point has to answer the
@@ -3246,6 +3297,44 @@ mod timeout_tests {
                 "init_all/spawn_all for a {guest_os:?} guest with deployment_pending={pending}"
             );
         }
+    }
+
+    #[test]
+    fn the_marker_wait_gives_up_on_the_third_consecutive_transport_error() {
+        let mut watch = MarkerWatch::default();
+        assert!(!watch.observe(MarkerPoll::TransportError), "first");
+        assert!(!watch.observe(MarkerPoll::TransportError), "second");
+        assert!(watch.observe(MarkerPoll::TransportError), "third");
+
+        // A guest that answers resets the count: three failures spread over a boot that keeps
+        // reporting "not deployed yet" are not three failures in a row.
+        let mut watch = MarkerWatch::default();
+        for round in 0..5 {
+            assert!(!watch.observe(MarkerPoll::TransportError), "round {round}");
+            assert!(!watch.observe(MarkerPoll::TransportError), "round {round}");
+            assert!(!watch.observe(MarkerPoll::NotYet), "round {round}");
+        }
+
+        // Two failures, one answer, two failures: still not three in a row.
+        let mut watch = MarkerWatch::default();
+        assert!(!watch.observe(MarkerPoll::TransportError));
+        assert!(!watch.observe(MarkerPoll::TransportError));
+        assert!(!watch.observe(MarkerPoll::Deployed));
+        assert!(!watch.observe(MarkerPoll::TransportError));
+        assert!(!watch.observe(MarkerPoll::TransportError));
+    }
+
+    #[test]
+    fn a_marker_poll_is_classified_by_what_it_tells_the_wait() {
+        // The wait ends on `Ok(true)` and must not treat "answered no" as an error: that would
+        // abort every slow first boot on its third poll instead of its third failure.
+        assert_eq!(marker_poll_outcome(&Ok(true)), MarkerPoll::Deployed);
+        assert_eq!(marker_poll_outcome(&Ok(false)), MarkerPoll::NotYet);
+        assert_eq!(
+            marker_poll_outcome(&Err(anyhow::anyhow!("the session is gone"))),
+            MarkerPoll::TransportError
+        );
+        assert_eq!(MAX_CONSECUTIVE_MARKER_ERRORS, 3);
     }
 
     #[test]
