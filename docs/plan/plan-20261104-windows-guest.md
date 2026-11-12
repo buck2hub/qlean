@@ -201,6 +201,7 @@
 | 2026-11-13 17:35:00 UTC | review R87（租约的唯一把手要交给真程序确认） | F92：Windows 传输的唯一把手是 MAC——`find_lease_address` 拿本机 `mac_address` 去租约表里找，之后 transport / `get_ip` / 文件操作全部挂在这条租约上。但 `-device virtio-net-pci,netdev=net0,mac=…` 只被字符串单测覆盖：`mac=` 被删掉、写错或落到别的 netdev 时，QEMU 仍会启动、NIC 仍在桥上（QEMU 会分配自己的 `52:54:00:12:34:56`），租约永远匹配不上，而症状是一个耗尽的部署预算。修：抽出 `netdev_option()` / `nic_device_option(mac)` 两个生产字符串，新增 `#[ignore]` 用例 `test_the_guest_nic_carries_the_mac_that_lease_lookup_searches_for`：真 `qemu-system-x86_64` + `-netdev bridge,id=net0,br=qlbr0` + `-device <生产字符串>`，QMP `human-monitor-command info network` 断言 `macaddr=<本次生成的 MAC>` 且后端为 `net0: index=0,type=tap … br=qlbr0`。宿主无 `qlbr0`/无 `qemu-bridge-helper` 或 ACL 未放行时以 `SMOKE-UNAVAILABLE` 明确跳过（报告 QEMU 的原始错误），不伪装成通过。守卫有效性实测：删掉 `mac=` → QEMU 自选 `52:54:00:12:34:56`，断言失败并打印监控输出；容器内（`--privileged` 建 `qlbr0` 并 `allow qlbr0`）通过：`real QEMU reports net0 with the searched-for MAC 52:54:00:95:2b:ca on qlbr0`。`cargo test --lib` 199 passed / ignored 5 → 6 | `TRN-01`（传输发现）、`IP-01`（地址归属）、`OSX-02`（网络接线）、`REL-01` | `src/qemu.rs`、Review log、覆盖矩阵、测试矩阵、plan-status |
 | 2026-11-13 18:00:00 UTC | review R88（等不来的东西要立刻说；前置条件要在门口一次报全） | F93：`virsh` 缺失时 `find_lease_address` 把它当成「libvirt 故障」继续轮询到预算耗尽。Windows 首启的租约查找跑在整份 900s 部署预算里，于是一个装个包就解决的事被报成：15 分钟后、且措辞指向 libvirt 访问权限或 guest 的 DHCP（变异实测原文：`could not read DHCP leases … (last error: No such file or directory)` + `Fix libvirt access first`，耗时 30.08s）。同一事实本可以在门口一次报全，但 `host_support_problems` 只查了 KVM / OVMF / swtpm / xorriso，**没查租约工具**。修两处：① `find_lease_address` 改调 `find_lease_address_with(mac, timeout, program)`，循环用 `run_bounded` 的**类型化**失败，`BoundedFailure::NotRun` 立即 `bail!`，消息给出 `virsh`、`net-dhcp-leases` 与 `install the libvirt package`；② `host_support_problems` 增第 6 个缺口 `virsh`（`LEASE_TOOL`），`ensure_host_support` 传入 `command_available`。新增单测 `test_a_missing_lease_tool_fails_at_once_instead_of_polling`（用不存在的 `/nonexistent/virsh`，断言消息含程序名与 `libvirt`、且 `elapsed < 5s`；**不**改 `PATH`，避免干扰并行测试）。守卫有效性实测：把 `NotRun` 分支退回「记录错误继续轮询」→ 用例 30.08s 后失败并打印上述误导性文案。`cargo test --lib` 199 → 200 passed / 6 ignored | `TRN-01`（传输发现）、`IP-01`（地址归属）、`OSX-02`、`REL-01` | `src/utils.rs`、`src/firmware.rs`、Review log、覆盖矩阵、测试矩阵、plan-status |
 | 2026-11-13 18:25:00 UTC | review R89（断言不能自己证明自己） | F94：`-EncodedCommand` 的交付质量完全取决于「脚本被编码成 base64(UTF-16LE)」，而唯一覆盖它的用例最后一行是 `assert_eq!(encode("你"), "oA==".replace("oA==", &encode("你")))`——把编码器的输出和它自己比较，恒真，等于对非 ASCII 路径毫无断言（`oA==` 也不是 `你` 的 UTF-16LE 编码：真值是 `YE8=`）。变异实测证明它是空转的：把生产编码器改成 `chars().map(|c| c as u16)`（静默截断非 BMP 字符的高位代理项，真 Windows guest 会执行残缺脚本），**旧**用例照样 `1 passed`，新用例立刻失败（`YQAA9g==` vs `YQA92ADe`）。修：① 把 `oA==` 恒真断言换成独立计算的向量 `YE8=`（`你`，BMP）与 `YQA92ADe`（`a😀`，代理对）；② 新增 `decode_base64` / `decoded_script` 两个**解码器**（与生产编码器互为独立实现），新用例 `test_the_encoded_payload_is_the_utf16le_bytes_of_the_real_scripts` 对**真实生产脚本**（`GUEST_IP_QUERY`、带 `$`/反引号/`你` 的 `copy_file_script`）断言「payload 解出来的字节 == std 自己算的 UTF-16LE 字节」且「解回来等于原脚本」，捕获截断、双重编码、代理项缺失与「其实是 UTF-8 恰好奇数/偶数长度」四类缺陷。宿主交叉核对：另写独立 Rust 程序 + python `base64.b64encode(s.encode('utf-16-le'))` 对 7 组输入（含代理对、`é`、`$`、反引号）逐字节一致。`cargo test --lib` 200 → 201 passed / 6 ignored | `OSX-02`、`OSX-03`、`TRN-01`、`IP-01`、`FS-01`、`REL-01` | `src/windows.rs`、Review log、覆盖矩阵、测试矩阵、plan-status |
+| 2026-11-13 19:00:00 UTC | review R90（手抄的副本必须由测试比对） | F95：`MachineConfig::ssh_timeout` 的 API 文档写的是「Timeout in seconds for SSH over vsock to wait during launch, defaults to `180` with KVM and `300` under TCG」，但 Windows guest **没有 vsock**：同一个旋钮在首启时是整份部署预算（默认 900s），在后续启动时是寻址+连接预算（R84 已把三个阶段绑到同一截止时间）。而这个文档字符串有**两份副本**：`src/machine.rs` 的 rustdoc（`cargo doc` 发布出去的那份）和 README「API Reference」里手抄的 `MachineConfig` 摘录；改一份忘另一份不会有任何测试失败，于是 README 向用户承诺的语义与代码实际行为相反（“180s 后超时”→ 实际 900s）。审计同一节时把 `ImageConfig::guest_os` 的措辞也对齐到 rustdoc（原文“an amd64 image plus an explicit `source` and `digest`” → “requires `arch = GuestArch::Amd64`, `source` and `digest`”）。修：两份副本同时改写为「Linux over vsock 180/300；Windows 首启为部署预算默认 900，后续启动为普通预算」，并新增单测 `the_readme_documents_the_config_fields_the_way_the_crate_does`：从 README 与 crate 源码里各提取 `pub ssh_timeout: Option<u64>,` / `pub guest_os: GuestOs,` 上方的 `///` 文档块，空白归一后**逐字相等**，缺失声明或任一侧改写都直接失败。变异实测：README 的 `900`→`180` 失败；crate 的 “has no vsock”→“also uses vsock” 失败 | `OSX-01`、`OSX-03`、`REL-01` | `src/machine.rs`、`README.md`、Review log、覆盖矩阵、测试矩阵、plan-status |
 
 ## 已决议设计决策
 
@@ -629,6 +630,7 @@
 - [x] `cargo test --lib qemu`：5 passed（固件参数 2、加速选择 3）
 - [x] `cargo test --no-run`：包含 `tests/windows_machine.rs` 在内全部 target 编译通过
 - [x] `-EncodedCommand` 的 payload 是真实脚本的 UTF-16LE 字节（独立解码器 + 外部向量 `YE8=`/`YQA92ADe`；截断代理项的变异即失败）（R89，`8cd6a66`）
+- [x] README 的 API 摘录与 crate 文档不再各自漂移：`ssh_timeout`/`guest_os` 两侧的 `///` 文档块由单测逐字比对，改任一侧（`900`→`180`、`has no vsock`→`also uses vsock`）即失败（R90，`b440292`）
 - [x] 租约工具缺失时立即失败且消息可执行（`virsh` 不存在 → `elapsed < 5s`，消息含 `virsh`/`libvirt`；退回轮询的变异 30.08s 失败）（R88，`0e17b65`）
 - [x] 宿主准入一次报全 5 个缺口，含 `virsh net-dhcp-leases`（R88，`0e17b65`）
 - [x] guest NIC 真的带着租约查找用的 MAC（真 QEMU + HMP `info network`：`macaddr=<生成的 MAC>`、后端 `net0: index=0,type=tap … br=qlbr0`；删掉 `mac=` 变异即失败）（R87，`e4d84d6`）
@@ -821,6 +823,7 @@
 | README/CHANGELOG | README「Windows transport and security」；CHANGELOG Added ×4 / Changed ×1 |
 | 地址发现与 QEMU 退出 race | `launch` 把 DHCP lease 轮询与 `qemu_handle`、cancel token 一起 `select!`，QEMU 启动即退出时立即返回其真实错误并停 `swtpm`（R12，`src/machine.rs`） |
 | 断言不能自己证明自己 | 若断言的期望值由被测函数算出（`assert_eq!(f(x), g(f(x)))`、`replace` 自比），它就永远是绿的：期望值必须来自外部（RFC 向量、独立编码器/解码器、真程序输出），否则该路径等于零覆盖（R89，`8cd6a66`） |
+| 手抄的副本必须由测试比对 | 同一段文档/常量存在两份人工维护的副本（rustdoc 与 README 摘录、示例代码与真实签名）时，就必须有测试把两侧拉到一起逐字比对；否则「文档说 180s、代码做 900s」这类漂移在编译、clippy、rustdoc 全绿的情况下永远无人发现（R90，`b440292`） |
 | 等不来的东西要立刻说 | 如果某个前置条件缺失**不可能**靠等待变好（程序没装、路径不存在），就必须在第一次探测时失败，并把「装什么」写进消息；轮询只适用于「可能稍后成立」的事实（R88，`0e17b65`） |
 | 前置条件要在门口一次报全 | 门口（`ensure_host_support`）要列出这次操作会用到的**每一个**宿主程序；漏掉一个，就等于把该缺口的发现推迟到最贵的时刻（R88，`0e17b65`） |
 | 租约的把手要被证实 | 当某个字符串是整条链路唯一的匹配键（如 DHCP 租约靠 MAC），就必须让真程序报出它确实以这个键存在；否则失败会伪装成「超时」（R87，`e4d84d6`） |
@@ -1279,6 +1282,7 @@
 | 首启预算 `(new)` | 首启三阶段共享一个截止时间，到期不再发放新预算 | `cargo test --lib remaining_first_boot_budget` + `cargo test --lib the_first_boot_deadline_is_read_in_exactly_one_place` |
 | QMP 控制通道 `(new)` | 真 QEMU 上 `query-status` 与 `system_powerdown` 真实往返（含 capability 协商） | 装了 `qemu-system-x86` 的机器：`cargo test --lib -- --ignored qmp_control_channel`（CI 不装，故 `#[ignore]`） |
 | 宿主参数契约 `(new)` | 真 QEMU/`swtpm` 接受 Windows 固件参数并实例化 TPM 2.0（`-S`，不跑 guest） | 装了 `qemu-system-x86`+`swtpm`+固件包的机器：`cargo test --lib -- --ignored qemu_firmware_contract`（CI 不装，故 `#[ignore]`） |
+| 文档副本一致性 `(new)` | README「API Reference」里手抄的字段文档必须与 crate 的 rustdoc 逐字一致（`ssh_timeout` 在 Windows 首启是 900s 部署预算，不是 vsock 的 180s） | `cargo test --lib the_readme_documents_the_config_fields_the_way_the_crate_does`（改任一侧即失败） |
 | 宿主固件解析 `(new)` | 真实 `edk2-ovmf`/`ovmf` 布局：候选路径、Secure Boot 标志、vars 尺寸关系、回退通知 | 装了固件包的机器：`cargo test --lib -- --ignored firmware_resolve`（CI 不装固件包，故 `#[ignore]`） |
 | seed 介质契约 `(new)` | 真实 `xorriso` 产出的卷标 `QLEANSEED`、Joliet 目录布局、解包字节、ISO `0600` | 有 `xorriso` 的机器：`cargo test --lib -- --ignored windows_seed_medium`（CI 不装 `xorriso`，故 `#[ignore]`） |
 | 编译门槛 | CI 编译所有 target，包括 ignored Windows 测试 | `cargo test --no-run --all-targets` |
@@ -1349,11 +1353,11 @@
 
 ## 兼容与文档收口
 
-- [ ] README Host Setup/API/Migration/示例/支持矩阵与各 unsupported 接口已同步。
+- [x] README Host Setup/API/Migration/示例/支持矩阵与各 unsupported 接口已同步（R90 逐项审计：Host Setup 的 5 个宿主缺口——`/dev/kvm`、OVMF、`swtpm`、`xorriso`、`virsh`/`libvirt`——与 `host_support_problems` 的 6 个参数一致，`OVMF_CANDIDATES` 的 Arch/Debian/Fedora 路径与 `.ms`/`secboot` vars 优先顺序、`QLEAN_OVMF_CODE`/`QLEAN_OVMF_VARS` 必须成对、`QLEAN_SWTPM` 均在 README 与代码两侧逐一核对；`ImageConfig`/`MachineConfig` 的字段摘录逐项核对（其中 `ssh_timeout`/`guest_os` 已由单测逐字比对，改任一侧即失败），`with_pool`/`is_kvm_available` 等顶层接口与源码签名一致；Migration 的 0.3.x → 0.4.0 覆盖新增公开字段与退出码语义；支持矩阵行与 `Image::new` 的 Windows 校验、`windows-` 缓存命名空间一致；unsupported 接口 `hard_link`/`read_link`/`set_permissions`/symlink/UNC/device path/PTY 在 README 与 `bail!` 文案中一一对应。审计中发现的唯一漂移是 `ssh_timeout` 的 API 文档仍写「SSH over vsock」，已修并被新单测固定（`b440292`）。
 - [ ] CHANGELOG 按 Keep a Changelog 写入 `[0.4.0]` Added/Changed/Migration。
 - [x] CI push/PR 触发与 format/clippy/test 命令已同步（R22：`push`(main)+`pull_request` 双触发、clippy `--all-targets --all-features`、`cargo test --lib`、`cargo test --no-run --all-targets`、rustdoc 门；run `43197579979` 全绿）。
-- [ ] `tests/INDEX.md` 当前不存在，`N/A`。
-- [ ] LICENSE 未改动。
+- [ ] `tests/INDEX.md` 当前不存在，`N/A`（R90 复核：`ls tests/` 只有 `machine_pool.rs`、`muti_distro.rs`、`single_machine.rs`、`utils.rs`、`windows_machine.rs`）。
+- [ ] LICENSE 未改动（R90 复核：仓库根 `LICENSE` 存在且本轮无改动）。
 
 ## 实施证据汇总
 
@@ -1469,6 +1473,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R87 | 租约的唯一把手要交给真程序确认 | PASS | 真实 Windows 首启（DEP-01/02）仍阻塞 | F92：guest NIC 的 MAC 是租约匹配的唯一把手，但只有字符串单测；`mac=` 丢失时 QEMU 自选 MAC，租约永不匹配 | 抽 `netdev_option`/`nic_device_option` 供生产与测试共用；`#[ignore]` 用例用真 QEMU + HMP `info network` 断言 `macaddr=` 与 `br=qlbr0`；删 `mac=` 变异即失败（`e4d84d6`） |
 | R88 | 等不来的东西要立刻说；前置条件要在门口一次报全 | PASS | 真实 Windows 首启（DEP-01/02）仍阻塞 | F93：`virsh` 缺失被当成 libvirt 故障轮询到 900s 预算耗尽，且措辞指向 libvirt 访问/guest DHCP；`host_support_problems` 也不查租约工具 | `find_lease_address_with` 用类型化 `BoundedFailure::NotRun` 立即失败并给出 `libvirt` 安装指令；主机准入加 `virsh` 缺口；退回轮询的变异用例 30.08s 失败（`0e17b65`） |
 | R89 | 断言不能自己证明自己 | PASS | 真实 Windows 首启（DEP-01/02）仍阻塞 | F94：`-EncodedCommand` 的唯一用例用 `replace(x, &encode(x))` 自比，恒真；截断代理项的变异仍通过，非 ASCII/非 BMP 路径实际零覆盖 | 换独立计算的向量（`YE8=`/`YQA92ADe`）+ 测试内独立解码器 + 对真实生产脚本断言 UTF-16LE 逐字节；变异 `chars() as u16` 旧用例通过、新用例失败（`8cd6a66`） |
+| R90 | 手抄的副本必须由测试比对 | PASS | 真实 Windows 首启（DEP-01/02）仍阻塞 | F95：`ssh_timeout` 的 rustdoc 与 README 里手抄的 `MachineConfig` 摘录**两份**都写着「SSH over vsock, 180/300」，而 Windows 首启拿它当 900s 部署预算；改一份忘另一份无测试会失败，README 向用户承诺的语义与代码相反 | 两份副本同时改写为「Linux over vsock 180/300；Windows 首启部署预算 900，后续启动为普通预算」；新增 `the_readme_documents_the_config_fields_the_way_the_crate_does`（README 与 crate 各自的 `///` 块空白归一后逐字相等）；README `900`→`180` 与 crate “has no vsock”→“also uses vsock” 两个变异均失败（`b440292`） |
 
 ### R1 findings 与修订对照
 
