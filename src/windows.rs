@@ -160,6 +160,15 @@ pub(crate) const DEPLOY_TIMEOUT_SECS: u64 = 900;
 /// How often the guest is probed for the deploy marker while waiting.
 pub(crate) const DEPLOY_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Budget for building the seed ISO with `xorriso`.
+///
+/// The medium holds three small files (a public key, a per-VM host key and the
+/// contract), so a healthy run takes milliseconds. Without a budget a stuck
+/// `xorriso` — an unreachable network mount under the staging directory, a hung
+/// FUSE mount — would block `Machine::init` forever before the first-boot deadline
+/// is even started, which is the same class of hang the QMP and SSH budgets close.
+pub(crate) const SEED_BUILD_BUDGET: Duration = Duration::from_secs(120);
+
 /// Contract written to `qlean/deploy.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct DeployContract {
@@ -287,9 +296,11 @@ impl DeploySeed {
             ));
         debug!("Creating Windows seed ISO with command:\n{:?}", cmd);
 
-        let output = cmd.output().await.with_context(|| {
-            "failed to run `xorriso` to build the Windows seed ISO; install the `xorriso` package"
-        })?;
+        let output = bounded_output(cmd, SEED_BUILD_BUDGET, "build the Windows seed ISO")
+            .await
+            .with_context(|| {
+                "failed to run `xorriso` to build the Windows seed ISO; install the `xorriso` package"
+            })?;
         if !output.status.success() {
             bail!(
                 "failed to build the Windows seed ISO: {}",
@@ -469,6 +480,27 @@ pub(crate) fn copy_file_script(from: &str, to: &str) -> String {
 /// shell expand `$` in a path such as `C:/Program Files/a$b` before the copy runs.
 pub(crate) fn copy_file_command(from: &str, to: &str) -> String {
     powershell_command(&copy_file_script(from, to))
+}
+
+/// Run `cmd` and collect its output, but never wait longer than `budget`.
+///
+/// `kill_on_drop` is what makes the budget real: dropping the output future at the
+/// deadline kills the child instead of leaving an orphan that keeps writing the ISO.
+async fn bounded_output(
+    mut cmd: tokio::process::Command,
+    budget: Duration,
+    what: &str,
+) -> Result<std::process::Output> {
+    let program = cmd.as_std().get_program().to_string_lossy().into_owned();
+    cmd.kill_on_drop(true);
+    match tokio::time::timeout(budget, cmd.output()).await {
+        Ok(output) => Ok(output?),
+        Err(_) => bail!(
+            "`{program}` did not finish within {budget:?} while trying to {what}; \
+             the process was killed. Check that the staging directory is on a responsive \
+             local filesystem"
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -831,5 +863,38 @@ mod tests {
         assert!(message.contains(SEED_VOLUME_LABEL), "{message}");
         assert!(message.contains("seed medium is kept"), "{message}");
         assert!(!message.contains("PRIVATE KEY"));
+    }
+
+    #[tokio::test]
+    async fn test_bounded_output_returns_a_finished_command() {
+        let mut cmd = tokio::process::Command::new("/bin/echo");
+        cmd.arg("hi");
+        let output = bounded_output(cmd, Duration::from_secs(30), "echo")
+            .await
+            .expect("echo finishes well within the budget");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hi");
+    }
+
+    #[tokio::test]
+    async fn test_bounded_output_kills_a_hung_command_at_the_deadline() {
+        // A stuck `xorriso` must not hang `Machine::init` forever: the budget has to
+        // end the wait, name the program, and say how long it waited.
+        let mut cmd = tokio::process::Command::new("/bin/sleep");
+        cmd.arg("30");
+        let started = std::time::Instant::now();
+        let error = bounded_output(cmd, Duration::from_millis(150), "prove the budget")
+            .await
+            .expect_err("sleep 30 must not finish inside a 150ms budget")
+            .to_string();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the budget must end the wait, took {:?}",
+            started.elapsed()
+        );
+        assert!(error.contains("/bin/sleep"), "{error}");
+        assert!(error.contains("150ms"), "{error}");
+        assert!(error.contains("prove the budget"), "{error}");
+        assert!(error.contains("killed"), "{error}");
     }
 }
