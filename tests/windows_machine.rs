@@ -193,3 +193,61 @@ async fn windows_pool() -> Result<()> {
     pool.shutdown_all().await?;
     Ok(())
 }
+
+/// PowerShell `exec` semantics: verbatim command strings, separated streams and the
+/// exit-code contract from ADR-WIN-05.
+#[tokio::test]
+#[ignore = "needs a licensed Windows image (DEP-01) and a Windows KVM host (DEP-02)"]
+#[serial]
+async fn windows_exec() -> Result<()> {
+    tracing_subscriber_init();
+
+    let image = Image::new(windows_image_config()?).await?;
+    let mut vm = Machine::new(&image, &MachineConfig::default()).await?;
+    vm.init().await?;
+
+    // An empty command has no defined result and must be refused before hitting SSH.
+    let err = vm.exec("   ").await.expect_err("empty command must fail");
+    assert!(err.to_string().contains("non-empty"), "{err}");
+
+    // `whoami` succeeds and reports the documented deployment account.
+    let whoami = vm.exec("whoami").await?;
+    assert!(whoami.status.success());
+    assert_eq!(whoami.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&whoami.stdout)
+            .to_ascii_lowercase()
+            .contains("qlean"),
+        "unexpected whoami output"
+    );
+
+    // Quotes and spaces reach PowerShell verbatim instead of being re-split by a host
+    // shell or escaped as a POSIX argument.
+    let quoted = vm.exec("Write-Output 'a b  c'").await?;
+    assert_eq!(
+        String::from_utf8_lossy(&quoted.stdout).trim(),
+        "a b  c",
+        "quoting/whitespace was reinterpreted"
+    );
+
+    // A non-zero exit code is a failure and is retrievable unchanged.
+    let failing = vm.exec("cmd /c exit 3").await?;
+    assert!(!failing.status.success());
+    assert_eq!(failing.status.code(), Some(3));
+
+    // stderr stays on its own stream while stdout is unaffected.
+    let streams = vm
+        .exec("Write-Output out; [Console]::Error.WriteLine('err')")
+        .await?;
+    assert!(String::from_utf8_lossy(&streams.stdout).contains("out"));
+    assert!(String::from_utf8_lossy(&streams.stderr).contains("err"));
+    assert!(!String::from_utf8_lossy(&streams.stdout).contains("err"));
+
+    // Exit codes above 255 cannot be represented and must not be truncated.
+    let large = vm.exec("cmd /c exit 300").await;
+    let err = large.expect_err("exit code 300 must be rejected");
+    assert!(err.to_string().contains("300"), "{err}");
+
+    vm.shutdown().await?;
+    Ok(())
+}

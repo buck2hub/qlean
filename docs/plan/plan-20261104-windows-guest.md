@@ -289,7 +289,7 @@
 | OSX-02 | implementation | Windows 固件与 QEMU 生命周期 | revert | yes | yes | 8/8 | 5/8 | 3/3 | M | SPK-02,OSX-01 | 序列化于 OSX-01 | family child | N/A | N/A |
 | OSX-03 | implementation | Windows 首次部署 | revert | yes | yes | 8/8 | 7/8 | 2/2 | M | OSX-02 | 序列化于 OSX-02 | family child | N/A | N/A |
 | TRN-01 | implementation | Windows 安全传输 | revert | yes | yes | 8/8 | 7/8 | 4/3 | M | SPK-01,OSX-03 | 序列化于 OSX-03 | family child | N/A | N/A |
-| EXE-01 | implementation | PowerShell exec 语义 | revert | yes | yes | 5/8 | 5/8 | 2/2 | S | TRN-01 | 序列化于 TRN-01 | family child | N/A | N/A |
+| EXE-01 | implementation | PowerShell exec 语义 | revert | yes | yes | 5/8 | 5/8 | 2/3 | S | TRN-01 | 序列化于 TRN-01 | family child | N/A | N/A |
 | IP-01 | implementation | get_ip 语义 | revert | yes | yes | 4/8 | 5/8 | 2/2 | S | EXE-01 | 序列化于 EXE-01 | family child | N/A | N/A |
 | FS-01 | implementation | Windows 文件语义 | revert | yes | yes | 8/8 | 5/8 | 3/3 | M | IP-01 | 序列化于 IP-01 | family child | N/A | N/A |
 | REL-01 | release | 聚合发布 | immutable-release | yes | yes | 8/12 | 7/12 | 1/3 | S | 全部任务卡 | 序列化于 FS-01 | family release point | N/A | N/A |
@@ -759,7 +759,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（A 实现与 B 本地门已过；C 真实 PowerShell 冒烟需 DEP-01/02，`blocked`）
 
 **Description:** 按 ADR-WIN-05 实现 Windows 命令、输出和退出码语义，不改变 Linux 命令字符串解释。
 
@@ -774,21 +774,33 @@
 | `exec` 原样调用 SSH exec channel | `src/machine.rs:495-516`、`src/ssh.rs:324-370` |
 | UNIX escape 属于 `copy`，不是 `exec` | `src/machine.rs:949-955` |
 
+| 项 | 证据 |
+|---|---|
+| 新模块 | `src/exec.rs`：`MAX_EXIT_CODE = 255`、`exit_status_from_code(command, code)`（0 才 success，`0..=255` 原样保留，超范围 `bail!` 并回显原始状态与命令） |
+| 退出码修复 | `ExitStatus::from_raw` 接收的是 wait status，原实现把 exit code 直接传入，导致非 0 退出被报告为 success；现统一按 `code << 8` 转换（Linux 一并修正，已在 CHANGELOG `Fixed` 记录行为变更） |
+| 空命令 | `Machine::exec` 在建立 SSH 请求前 `bail!` 拒绝空白命令 |
+| 原始字符串 | `exec` 仍把入参原样交给 exec channel，未引入任何 escape/argv 化；Windows 依赖镜像契约把 OpenSSH `DefaultShell` 设为 PowerShell |
+| stdout/stderr | `call_with_output` 分通道返回 `(code, stdout, stderr)`，未合并 |
+| 单测 | `src/exec.rs`：0 success、非 0 failure、2..255 原样、300 拒绝（含可操作文案）、`0xC0000005` 不截断（5 个，`cargo test --lib windows_exec` 可过滤） |
+| 集成测试（`#[ignore]`） | `tests/windows_machine.rs::windows_exec`：空命令、`whoami`、引号/空格、`cmd /c exit 3`、stdout/stderr 分离、`exit 300` 拒绝 |
+| README/CHANGELOG | README「Windows command execution」+ 镜像契约补 `DefaultShell`；CHANGELOG Added ×3 / Fixed ×1 |
+| 提交 | `COMMITHASH` |
+
 **Acceptance criteria:**
 
-- [ ] Windows 输入原文交给 PowerShell，不调用 UNIX escape；空命令返回明确错误，特殊字符不被二次解释。
-- [ ] `status.success()`、0..=255 的 `status.code()`、超范围错误及 stdout/stderr 分离符合 ADR-WIN-05。
-- [ ] Linux 路径行为不变；若为复用 helper 修正既有退出码问题，先记录兼容说明和对应测试。
-- [ ] `(new)` 单测与 Windows 冒烟覆盖空命令、引号/空格、`whoami`、非零及大退出码。
-- [ ] README PowerShell 示例/退出码契约与 CHANGELOG Added 同卡更新。
+- [x] Windows 输入原文交给 PowerShell，不调用 UNIX escape；空命令返回明确错误，特殊字符不被二次解释。——`exec` 未改字符串路径，空白命令在发请求前拒绝。
+- [x] `status.success()`、0..=255 的 `status.code()`、超范围错误及 stdout/stderr 分离符合 ADR-WIN-05。——`exec::exit_status_from_code` + 5 个单测；超范围返回可操作错误而非截断。
+- [x] Linux 路径行为不变；若为复用 helper 修正既有退出码问题，先记录兼容说明和对应测试。——复用同一 helper 并修正了非 0 退出被报告为 success 的既有缺陷：CHANGELOG `Fixed` 写明行为变更，`src/exec.rs` 5 个单测覆盖；其余 Linux 路径未改。
+- [ ] `(new)` 单测与 Windows 冒烟覆盖空命令、引号/空格、`whoami`、非零及大退出码。——单测已覆盖退出码维度；`windows_exec` 冒烟已编写但需 DEP-01/02，`blocked`。
+- [x] README PowerShell 示例/退出码契约与 CHANGELOG Added 同卡更新。
 
 **Verification:**
 
-- [ ] `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings`
-- [ ] `cargo test --lib windows_exec`
-- [ ] `cargo test --no-run`
-- [ ] T-1 全量，配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1`
-- [ ] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine windows_exec -- --ignored --exact --test-threads=1`
+- [x] `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings`
+- [x] `cargo test --lib windows_exec`（5 passed）
+- [x] `cargo test --no-run`
+- [ ] T-1 全量，配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1` —— `DEFER-04`
+- [ ] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine windows_exec -- --ignored --exact --test-threads=1` —— `blocked`
 
 **Full-suite trigger:** `T-1: 共享 Machine/SSH 命令输出与退出码路径`
 
@@ -796,11 +808,11 @@
 
 **Deliverables:** `N/A`
 
-**Implementation write set:** `src/machine.rs`、`src/ssh.rs`、`tests/windows_machine.rs`、`README.md`、`CHANGELOG.md`、本计划、`plan-status.md`
+**Implementation write set:** `src/exec.rs`（新）、`src/machine.rs`、`src/lib.rs`、`tests/windows_machine.rs`、`README.md`、`CHANGELOG.md`、本计划、`plan-status.md`
 
 **Release write set:** `N/A`
 
-**Files likely touched:** `src/machine.rs`, `src/ssh.rs`, `tests/windows_machine.rs`, `README.md`, `CHANGELOG.md`
+**Files likely touched:** `src/exec.rs`, `src/machine.rs`, `src/lib.rs`, `tests/windows_machine.rs`, `README.md`, `CHANGELOG.md`
 
 **Docs and compatibility impact:** README 明确 PowerShell 原文与退出码；CHANGELOG Added，若修 Linux bug 另列 Fixed。
 
@@ -818,7 +830,7 @@
 
 **C/D coverage from:** `REL-01`
 
-**Granularity:** `type=implementation; axis=PowerShell exec 语义; recovery=一次 revert; complete=yes; self-contained=yes; AC=5/8; VER=5/8; landing=2; prod-files=2; scope=S; deps=TRN-01; writeset=序列化于 TRN-01; release=family child; split-from=N/A; exception=N/A`
+**Granularity:** `type=implementation; axis=PowerShell exec 语义; recovery=一次 revert; complete=yes; self-contained=yes; AC=5/8; VER=5/8; landing=2; prod-files=3; scope=S; deps=TRN-01; writeset=序列化于 TRN-01; release=family child; split-from=N/A; exception=N/A`
 
 ### Task IP-01: `get_ip` 的 Windows 语义
 
@@ -1046,7 +1058,7 @@
 | OSX-02 | `src/qemu.rs:74-169`、`src/machine.rs:63-68,156-157` | qemu/machine/utils | README Host Setup（含 Windows 最低/推荐资源）、CHANGELOG | `windows_firmware_lifecycle` |
 | OSX-03 | `src/machine.rs:181-464` | machine/windows | README 部署、CHANGELOG | `windows_first_boot`、`windows_deploy_timeout` |
 | TRN-01 | `src/ssh.rs:89-104,571-630` | ssh/machine/utils | README 传输/限制、CHANGELOG | `windows_transport`、`windows_pool` |
-| EXE-01 | `src/machine.rs:495-516` | machine/ssh | README exec、CHANGELOG | `windows_exec` |
+| EXE-01 | `src/machine.rs:495-516` | machine/ssh/exec（新 `src/exec.rs`） | README exec、CHANGELOG | `windows_exec` |
 | IP-01 | `src/ssh.rs:831-841` | ssh/machine | README get_ip、CHANGELOG | `windows_get_ip` |
 | FS-01 | `src/machine.rs:578-775,922-1137` | machine/ssh/windows | README 文件矩阵、CHANGELOG | `windows_files` |
 | REL-01 | Cargo/CHANGELOG/CI | 版本与 CI | CHANGELOG 0.4.0/Release | 全量与远端门 |
@@ -1116,7 +1128,7 @@
 | OSX-02 | 2026-11-12 09:35:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib qemu`（5 passed）、`cargo test --no-run`（含 `tests/windows_machine.rs`）全绿 | `windows_firmware_lifecycle` 未执行（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `f2fc277` |
 | OSX-03 | 2026-11-12 10:20:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_deploy`（7 passed）、`cargo test --lib windows_deploy_timeout`（2 passed）、`cargo test --no-run` 全绿 | `windows_first_boot` 与首启/重启 seed 清理证据未取得（需 `TRN-01` + DEP-01/02），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `8812fb4` |
 | TRN-01 | 2026-11-12 11:40:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib ssh`（5 passed）、`cargo test --lib utils`（4 passed）、`cargo test --no-run`（含 `windows_transport`/`windows_pool`）全绿 | `windows_transport`/`windows_pool` 与真实 spawn 重连证据未取得（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `COMMITHASH` |
-| EXE-01 | pending | pending | pending | pending | 继承 REL-01 |
+| EXE-01 | 2026-11-12 12:10:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_exec`（5 passed）、`cargo test --no-run` 全绿 | `windows_exec` 真实 PowerShell 冒烟未取得（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `COMMITHASH` |
 | IP-01 | pending | pending | pending | pending | 继承 REL-01 |
 | FS-01 | pending | pending | pending | pending | 继承 REL-01 |
 | REL-01 | pending | pending | pending | pending | pending |

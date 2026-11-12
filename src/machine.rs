@@ -1,6 +1,6 @@
 use std::{
     fs::Permissions,
-    os::unix::{fs::PermissionsExt, process::ExitStatusExt},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Output,
     sync::{
@@ -554,8 +554,17 @@ StandardError=journal
     }
 
     /// Execute a command on the machine and return the output.
+    ///
+    /// The command string is passed through verbatim: Linux guests run it in their
+    /// configured shell, Windows guests in PowerShell (see `README`), and no argument
+    /// escaping is applied on either path.
     pub async fn exec<S: AsRef<str>>(&mut self, cmd: S) -> Result<Output> {
         let cmd_ref = cmd.as_ref();
+        if cmd_ref.trim().is_empty() {
+            bail!(
+                "`exec` requires a non-empty command; an empty string would be sent as an                  empty shell request with no defined result"
+            );
+        }
         info!("🧬 Executing command `{}` on VM-{}", cmd_ref, self.id);
         if let Some(ssh) = self.ssh.as_mut() {
             let cancel_token = self
@@ -567,7 +576,7 @@ StandardError=journal
             let (exit_code, stdout, stderr) = ssh.call_with_output(cmd_ref, cancel_token).await?;
 
             Ok(Output {
-                status: std::process::ExitStatus::from_raw(exit_code as i32),
+                status: crate::exec::exit_status_from_code(cmd_ref, exit_code)?,
                 stdout,
                 stderr,
             })

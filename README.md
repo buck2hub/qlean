@@ -102,7 +102,10 @@ already be generalized and ship a first-boot task that consumes Qlean's seed med
    - installs `qlean/ssh_host_ed25519_key` as `C:\ProgramData\ssh\ssh_host_ed25519_key`
      with the same owner-only ACL, so the host key Qlean pins really is the per-VM key;
    - writes an `sshd_config` with `PubkeyAuthentication yes`, `PasswordAuthentication no`
-     and a `sftp` subsystem, then restarts `sshd`;
+     and a `sftp` subsystem, sets the OpenSSH default shell to PowerShell
+     (`HKLM:\SOFTWARE\OpenSSH` -> `DefaultShell` =
+     `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`, which Qlean's
+     `exec` semantics assume), then restarts `sshd`;
    - writes `C:\ProgramData\qlean\deployed` once all of the above succeeded.
 4. Leave the image shut down and unconfigured; Qlean creates a per-VM overlay, a per-VM
    `ovmf_vars.fd`, a per-VM TPM 2.0 state and a per-VM seed medium on every `init`.
@@ -138,6 +141,28 @@ Windows guests have no vsock, so Qlean reaches them over the libvirt NAT network
 - **Interactive PTY shells are not supported for Windows guests.**
   `Machine::open_interactive_shell` returns an actionable error instead of opening a
   half-configured session; use `exec` for commands and SFTP for file transfer.
+
+#### Windows command execution
+
+`Machine::exec` sends the command string to the guest's shell **verbatim**: no argument
+escaping, no re-quoting and no POSIX translation is applied on any guest OS. Windows
+guests run it in PowerShell (see the image contract above), so write PowerShell syntax:
+
+```rust
+let out = machine.exec(r#"Write-Output "hello from $env:COMPUTERNAME""#).await?;
+assert!(out.status.success());
+```
+
+The reported status follows `std::process::ExitStatus` semantics on every guest OS,
+which is what makes Windows results meaningful:
+
+- `status.success()` is true only for exit code `0`.
+- `status.code()` returns `0..=255` unchanged.
+- Exit codes outside `0..=255` (for example a Windows failure such as `0xC0000005`) are
+  reported as an error instead of being truncated into a smaller, misleading code.
+- stdout and stderr are kept in separate buffers as raw bytes.
+- An empty or whitespace-only command is rejected with an error before any SSH request is
+  sent.
 
 ### Getting Started
 

@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pinned host keys for Windows SSH sessions: the key presented by the guest must match the per-VM key generated at deploy time, and certificates are rejected; Linux guests keep vsock trust-on-first-use
 - `with_pool` no longer requires `/dev/vhost-vsock`, and `with_machine` requires it only for `GuestOs::Linux`
 - README "Windows transport and security" describing address discovery, host key pinning, the Linux-only vsock requirement and pool isolation
+- Windows `exec` semantics: command strings are passed verbatim to PowerShell (the image contract now requires OpenSSH's `DefaultShell` to be PowerShell), and exit codes outside `0..=255` are reported as errors instead of being truncated
+- Empty and whitespace-only `exec` commands are rejected with an actionable error before an SSH request is sent
+- README "Windows command execution" documenting the verbatim command contract, stream separation and exit-code rules
 
 ### Changed
 
@@ -30,6 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Windows image cache entries use a `windows-` name prefix so they can never share a cache slot with a Linux image
 - Windows guests reject TCG: a launch without KVM acceleration now fails with an actionable error instead of silently emulating
 - `Machine::open_interactive_shell` returns an actionable error for `GuestOs::Windows` instead of attempting a vsock shell
+
+### Fixed
+
+- `Machine::exec` reported every non-zero exit code as success: the SSH exit status was passed to `ExitStatus::from_raw` as if it were a wait status, so `status.code()` always returned `0`. Exit codes are now converted correctly, which is a behavior change for callers that relied on the previous (incorrect) `status.success()` result
 
 ### Migration
 
