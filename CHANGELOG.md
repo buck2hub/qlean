@@ -41,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- DHCP lease lookup took the first row matching the MAC, so after a renewal it dialled the address the guest had already abandoned; the row with the newest expiry now wins, and the timeout error shows each lease's expiry
 - Waiting for the Windows deployment marker treated a dropped session as "not deployed yet" and burned the whole 900s budget
 - `MachinePool::init_all` failed on a Windows machine that had already deployed, and `spawn_all` booted a Windows guest before its deployment
 - A launch that failed after QEMU started left `swtpm` and the pid behind, and a panicked SSH task detached QEMU entirely

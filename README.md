@@ -134,9 +134,10 @@ Windows guests have no vsock, so Qlean reaches them over the libvirt NAT network
 - **Address discovery runs on the host, before SSH.** Qlean polls
   `virsh net-dhcp-leases qlean` for the MAC address it assigned to that VM and caches the
   result on the machine, so `Machine::get_ip` never runs a command inside a Windows guest.
-  Discovery and the connection attempt share one bounded budget
-  (`MachineConfig::ssh_timeout`); running out of it returns an error listing the leases
-  that were actually seen.
+  Only IPv4 leases are dialled, and when the table holds several rows for that MAC (an
+  expiring lease next to the one renewed after it) the newest one wins. Discovery and the
+  connection attempt share one bounded budget (`MachineConfig::ssh_timeout`); running out
+  of it returns an error listing the leases that were actually seen.
 - **Host keys are pinned instead of trusted on first use.** Qlean compares the key
   presented by the guest's `sshd` with the per-VM key it generated during deployment. A
   different key, or a certificate where a plain key is pinned, aborts the connection.

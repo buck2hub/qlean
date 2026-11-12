@@ -29,6 +29,11 @@ pub(crate) struct DhcpLease {
     pub mac: String,
     /// Address handed to that MAC.
     pub ip: std::net::IpAddr,
+    /// Expiry exactly as libvirt printed it (`YYYY-MM-DD HH:MM:SS`), empty if absent.
+    ///
+    /// The table can hold several rows for one MAC (an expiring lease next to the one
+    /// renewed after it), so rows are compared by this field to pick the current address.
+    pub expiry: String,
 }
 
 /// Parse `virsh net-dhcp-leases` tabular output.
@@ -60,9 +65,43 @@ pub(crate) fn parse_dhcp_leases(output: &str) -> Vec<DhcpLease> {
         leases.push(DhcpLease {
             mac: tokens[mac_index].to_ascii_lowercase(),
             ip,
+            expiry: parse_lease_expiry(line),
         });
     }
     leases
+}
+
+/// `YYYY-MM-DD HH:MM:SS` prefix of a lease row, or an empty string.
+///
+/// Kept as a string on purpose: that format sorts chronologically, so the newest lease
+/// can be selected without pulling in a date/time crate.
+fn parse_lease_expiry(line: &str) -> String {
+    fn looks_like_date(token: &str) -> bool {
+        let parts = token.split('-').collect::<Vec<_>>();
+        parts.len() == 3
+            && parts[0].len() == 4
+            && parts[1].len() == 2
+            && parts[2].len() == 2
+            && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit()))
+    }
+
+    let tokens = line.split_whitespace().collect::<Vec<_>>();
+    match tokens.as_slice() {
+        [date, time, ..]
+            if looks_like_date(date)
+                && time.len() == 8
+                && time.chars().enumerate().all(|(index, c)| {
+                    if index % 3 == 2 {
+                        c == ':'
+                    } else {
+                        c.is_ascii_digit()
+                    }
+                }) =>
+        {
+            format!("{date} {time}")
+        }
+        _ => String::new(),
+    }
 }
 
 /// Leased IPv4 address of `mac`, if the lease table has one.
@@ -71,10 +110,15 @@ pub(crate) fn parse_dhcp_leases(output: &str) -> Vec<DhcpLease> {
 /// address is often link-local (`fe80::/10`), which is useless without a scope id.
 /// Only IPv4 is returned; an IPv6-only guest keeps polling and then fails with the
 /// lease list instead of connecting to an unusable address.
+///
+/// libvirt keeps a row per lease, so one MAC can appear twice after a renewal. The
+/// newest row (latest expiry) is the address the guest is actually using; taking the
+/// first row instead dials the address it has already abandoned.
 fn lease_address_for(leases: &[DhcpLease], mac: &str) -> Option<std::net::IpAddr> {
     leases
         .iter()
-        .find(|lease| lease.mac == mac && lease.ip.is_ipv4())
+        .filter(|lease| lease.mac == mac && lease.ip.is_ipv4())
+        .max_by(|a, b| a.expiry.cmp(&b.expiry))
         .map(|lease| lease.ip)
 }
 
@@ -122,7 +166,7 @@ pub(crate) async fn find_lease_address(
                 timeout.as_secs(),
                 last_seen
                     .iter()
-                    .map(|lease| format!("{}={}", lease.mac, lease.ip))
+                    .map(|lease| format!("{}={} (expires {})", lease.mac, lease.ip, lease.expiry))
                     .collect::<Vec<_>>()
             );
         }
@@ -449,6 +493,37 @@ mod tests {
             lease_address_for(&leases, "52:54:00:11:22:33").map(|ip| ip.to_string()),
             Some("192.168.221.43".to_string())
         );
+    }
+
+    #[test]
+    fn test_lease_address_for_prefers_the_newest_lease_of_one_mac() {
+        // libvirt keeps the expiring row next to the renewed one; the older row is
+        // listed first, so a first-match selector would dial an abandoned address.
+        let output = format!(
+            "{LEASES_HEADER} 2026-11-12 09:35:00   52:54:00:aa:bb:cc   ipv4       192.168.221.42/24    *  -\n\
+             2026-11-12 10:05:00   52:54:00:aa:bb:cc   ipv4       192.168.221.77/24    *  -\n"
+        );
+        let leases = parse_dhcp_leases(&output);
+        assert_eq!(leases.len(), 2);
+        assert_eq!(leases[0].expiry, "2026-11-12 09:35:00");
+        assert_eq!(leases[1].expiry, "2026-11-12 10:05:00");
+        assert_eq!(
+            lease_address_for(&leases, "52:54:00:aa:bb:cc").map(|ip| ip.to_string()),
+            Some("192.168.221.77".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_lease_expiry_ignores_rows_without_a_timestamp() {
+        assert_eq!(
+            parse_lease_expiry(" 2026-11-12 09:35:00   52:54:00:aa:bb:cc"),
+            "2026-11-12 09:35:00"
+        );
+        assert_eq!(
+            parse_lease_expiry("52:54:00:aa:bb:cc  ipv4  192.168.221.42/24"),
+            ""
+        );
+        assert_eq!(parse_lease_expiry(""), "");
     }
 
     #[test]
