@@ -238,6 +238,29 @@ fn seed_drive_option(seed: &Path) -> anyhow::Result<String> {
     ))
 }
 
+/// `-drive` argument for the per-VM disk overlay.
+///
+/// Extracted for the same reason as [`seed_drive_option`]: the exact string is part of the
+/// argument list a real QEMU is asked to realize, so the disk the guest boots from cannot
+/// drift away from the one the tests ran.
+fn disk_drive_option(overlay: &Path) -> anyhow::Result<String> {
+    Ok(format!(
+        "file={},if=virtio,cache=writeback",
+        qemu_option_path("guest disk overlay", overlay)?
+    ))
+}
+
+/// `-chardev` argument that tees the serial console into the run directory.
+///
+/// The console is the guest's own account of a first boot that never finished, so the
+/// argument that captures it is shared with the real-QEMU launch test as well.
+fn serial_chardev_option(log: &Path) -> anyhow::Result<String> {
+    Ok(format!(
+        "stdio,id=char0,mux=on,signal=off,logfile={},logappend=on",
+        qemu_option_path("serial log", log)?
+    ))
+}
+
 pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
     // Prepare QEMU command
     let is_windows = params.image.guest_os == GuestOs::Windows;
@@ -267,10 +290,7 @@ pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> 
 
     qemu_cmd.args(qmp_chardev_args(&qmp_socket)?);
 
-    let disk_drive = format!(
-        "file={},if=virtio,cache=writeback",
-        qemu_option_path("guest disk overlay", &params.image.overlay)?
-    );
+    let disk_drive = disk_drive_option(&params.image.overlay)?;
     qemu_cmd
         // Disk
         .args(["-drive", &disk_drive])
@@ -289,10 +309,7 @@ pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> 
     // Output redirection
     // We multiplex QEMU monitor + guest serial onto stdio AND tee it into a file under the run dir.
     let serial_log = run_dir.join("serial.log");
-    let serial_chardev = format!(
-        "stdio,id=char0,mux=on,signal=off,logfile={},logappend=on",
-        qemu_option_path("serial log", &serial_log)?
-    );
+    let serial_chardev = serial_chardev_option(&serial_log)?;
     qemu_cmd
         .args(["-chardev", &serial_chardev])
         .args(["-serial", "chardev:char0"])
@@ -938,31 +955,12 @@ mod tests {
         let _ = child.wait().await;
     }
 
-    ///
-    /// The deployment depends on the guest finding the seed ISO on a bus its early boot
-    /// scans. QEMU accepts almost any `-drive` line, so a device that ends up unattached,
-    /// on a bus the firmware never probes, or not read-only still yields a running VM and a
-    /// 900s wait for a marker the guest could never write. `query-block` is the only thing
-    /// that distinguishes "the argument was accepted" from "the guest has this CD-ROM".
-    #[tokio::test]
-    #[ignore = "needs qemu-system-x86_64 and xorriso on the host"]
-    async fn test_the_seed_medium_really_is_an_ide_cdrom() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let qemu = Path::new(qemu_system_program(GuestArch::Amd64));
-        if !program_runs(qemu) {
-            assert!(smoke_unavailable(&format!(
-                "`{}` is not runnable",
-                qemu.display()
-            )));
-            return;
-        }
+    /// Build the smoke seed ISO the Windows first boot reads, or `None` when `xorriso` is
+    /// not runnable on this host.
+    async fn build_a_smoke_seed_iso(run_dir: &Path) -> Option<PathBuf> {
         if !program_runs(Path::new(crate::firmware::SEED_ISO_BUILDER)) {
-            assert!(smoke_unavailable("`xorriso` is not runnable"));
-            return;
+            return None;
         }
-
-        let run_dir = std::env::temp_dir().join(format!("qlean-qemu-seed-{}", std::process::id()));
         std::fs::create_dir_all(run_dir.join("seed")).expect("test run dir");
         std::fs::write(
             run_dir.join("seed").join("deploy.json"),
@@ -990,6 +988,37 @@ mod tests {
         .await
         .expect("seed ISO built");
         assert!(iso.is_file(), "xorriso did not produce {}", iso.display());
+        Some(iso)
+    }
+
+    ///
+    /// The deployment depends on the guest finding the seed ISO on a bus its early boot
+    /// scans. QEMU accepts almost any `-drive` line, so a device that ends up unattached,
+    /// on a bus the firmware never probes, or not read-only still yields a running VM and a
+    /// 900s wait for a marker the guest could never write. `query-block` is the only thing
+    /// that distinguishes "the argument was accepted" from "the guest has this CD-ROM".
+    #[tokio::test]
+    #[ignore = "needs qemu-system-x86_64 and xorriso on the host"]
+    async fn test_the_seed_medium_really_is_an_ide_cdrom() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let qemu = Path::new(qemu_system_program(GuestArch::Amd64));
+        if !program_runs(qemu) {
+            assert!(smoke_unavailable(&format!(
+                "`{}` is not runnable",
+                qemu.display()
+            )));
+            return;
+        }
+        if !program_runs(Path::new(crate::firmware::SEED_ISO_BUILDER)) {
+            assert!(smoke_unavailable("`xorriso` is not runnable"));
+            return;
+        }
+
+        let run_dir = std::env::temp_dir().join(format!("qlean-qemu-seed-{}", std::process::id()));
+        let iso = build_a_smoke_seed_iso(&run_dir)
+            .await
+            .expect("xorriso was checked as runnable above");
 
         let drive = seed_drive_option(&iso).expect("seed drive argument");
         let mut child = tokio::process::Command::new(qemu)
@@ -1062,6 +1091,256 @@ mod tests {
         let _ = child.start_kill();
         let _ = child.wait().await;
         let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    /// Talk to a QMP socket without the typed client, so the raw reply can be asserted on.
+    ///
+    /// Returns every reply line after capability negotiation; the caller looks for the
+    /// fields it cares about instead of decoding the whole schema.
+    async fn qmp_reply_text(socket: &Path, commands: &[&str]) -> String {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let stream = tokio::net::UnixStream::connect(socket)
+            .await
+            .expect("connect to the QMP socket");
+        let (read_half, mut write_half) = stream.into_split();
+        let mut lines = BufReader::new(read_half).lines();
+        let greeting = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+            .await
+            .expect("QMP must greet within 10s")
+            .expect("read the greeting")
+            .expect("greeting line");
+        assert!(greeting.contains("\"QMP\""), "{greeting}");
+
+        write_half
+            .write_all(b"{\"execute\":\"qmp_capabilities\"}\n")
+            .await
+            .expect("write the capability negotiation");
+        for command in commands {
+            write_half
+                .write_all(format!("{command}\n").as_bytes())
+                .await
+                .expect("write a QMP command");
+        }
+        let mut replies = String::new();
+        while let Ok(Ok(Some(line))) =
+            tokio::time::timeout(Duration::from_millis(500), lines.next_line()).await
+        {
+            replies.push_str(&line);
+            replies.push('\n');
+        }
+        replies
+    }
+
+    /// Ask a real QEMU to realize the *whole* Windows launch argument list.
+    ///
+    /// Every piece of that list has a real-tool test of its own (firmware plus TPM, seed
+    /// medium, NIC), and each of them starts QEMU on its own small command line. Nothing ran
+    /// the argument list Qlean actually launches: the machine type, two pflash units, the
+    /// TPM, the virtio system disk, the stdio multiplexed serial console and the IDE seed
+    /// medium all at once. Those pieces compete for the same buses, units and chardev ids, so
+    /// a unit that collides, a `-drive` that lands on another bus, or a device the production
+    /// machine type does not have still yields a booting QEMU and an answered QMP greeting.
+    /// `query-block` is what tells the difference: a guest that boots without its seed medium
+    /// spends the whole deployment budget waiting for a marker nobody can write.
+    ///
+    /// The VM has no bootable medium, so it reaches the firmware's own "no bootable device"
+    /// screen and needs no Windows image; the QMP socket answering `running` is the same
+    /// state `Machine::is_running` waits for in production.
+    /// ```text
+    /// cargo test --lib -- --ignored test_the_windows_launch_argument_list_is_realized
+    /// ```
+    #[tokio::test]
+    #[ignore = "needs qemu-system-x86_64 + swtpm + OVMF + xorriso; run with --ignored on a real host"]
+    async fn test_the_windows_launch_argument_list_is_realized_by_a_real_qemu() {
+        let qemu = Path::new(qemu_system_program(GuestArch::Amd64));
+        if !program_runs(qemu) {
+            assert!(smoke_unavailable(&format!(
+                "`{}` is not runnable",
+                qemu.display()
+            )));
+            return;
+        }
+        let Ok(resolved) = crate::firmware::resolve_ovmf() else {
+            assert!(smoke_unavailable("no OVMF firmware pair on this host"));
+            return;
+        };
+
+        let run_dir =
+            std::env::temp_dir().join(format!("qlean-qemu-launch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&run_dir);
+        std::fs::create_dir_all(&run_dir).expect("test run dir");
+        let Some(iso) = build_a_smoke_seed_iso(&run_dir).await else {
+            assert!(smoke_unavailable("`xorriso` is not runnable"));
+            let _ = std::fs::remove_dir_all(&run_dir);
+            return;
+        };
+        let vars = crate::firmware::prepare_vars(&run_dir, &resolved).expect("vars image");
+        let mut tpm = match crate::firmware::Swtpm::start(&run_dir).await {
+            Ok(tpm) => tpm,
+            Err(error) => {
+                assert!(smoke_unavailable(&format!(
+                    "`swtpm` did not start: {error}"
+                )));
+                let _ = std::fs::remove_dir_all(&run_dir);
+                return;
+            }
+        };
+
+        // A real qcow2 overlay, exactly as `Machine::new` leaves behind: production never
+        // boots a raw file, and an unspecified format would add a probe warning that the
+        // real launch never prints.
+        let overlay = run_dir.join("overlay.img");
+        let mut qemu_img = tokio::process::Command::new("qemu-img");
+        qemu_img
+            .arg("create")
+            .arg("-f")
+            .arg("qcow2")
+            .arg(&overlay)
+            .arg("1G");
+        crate::utils::run_bounded(
+            qemu_img,
+            Duration::from_secs(120),
+            "create the smoke overlay",
+        )
+        .await
+        .expect("qemu-img created the overlay");
+
+        let socket = run_dir.join("qmp.sock");
+        let _ = std::fs::remove_file(&socket);
+        let firmware = VmFirmware {
+            code: resolved.code.clone(),
+            vars: vars.clone(),
+            secure_boot: resolved.secure_boot,
+        };
+
+        // Exactly what `launch_qemu` builds for a Windows first boot. The NIC is left out:
+        // attaching it needs the bridge helper and a bridge, which its own real-QEMU test
+        // already requires, and it competes for no unit with anything below.
+        let mut args = windows_firmware_args(&firmware, Some(tpm.socket())).expect("firmware args");
+        args.extend(qmp_chardev_args(&socket).expect("qmp args"));
+        args.push("-drive".to_string());
+        args.push(disk_drive_option(&overlay).expect("disk drive argument"));
+        args.push("-nographic".to_string());
+        args.push("-chardev".to_string());
+        args.push(serial_chardev_option(&run_dir.join("serial.log")).expect("serial chardev"));
+        for extra in [
+            "-serial",
+            "chardev:char0",
+            "-mon",
+            "chardev=char0,mode=readline",
+        ] {
+            args.push(extra.to_string());
+        }
+        args.push("-drive".to_string());
+        args.push(seed_drive_option(&iso).expect("seed drive argument"));
+        for extra in ["-m", "512", "-smp", "2"] {
+            args.push(extra.to_string());
+        }
+
+        let mut child = tokio::process::Command::new(qemu)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn qemu");
+        let mut stderr = child.stderr.take().expect("qemu stderr");
+
+        // The production control channel is the QMP socket, so the launch is only accepted
+        // when that socket answers. A rejected option exits QEMU before the socket exists.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut running = false;
+        let mut last = String::new();
+        while std::time::Instant::now() < deadline {
+            if child.try_wait().expect("qemu state").is_some() {
+                break;
+            }
+            match crate::qmp::query_running(&socket).await {
+                Ok(true) => {
+                    running = true;
+                    break;
+                }
+                Ok(false) => last = "query-status reported a stopped VM".to_string(),
+                Err(error) => last = format!("{error:#}"),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let mut issues = Vec::new();
+        let mut buffer = [0u8; 4096];
+        let block = if running {
+            qmp_reply_text(&socket, &["{\"execute\":\"query-block\"}"]).await
+        } else {
+            issues.push(format!(
+                "the control channel never reported a running VM: {last}"
+            ));
+            String::new()
+        };
+        {
+            use tokio::io::AsyncReadExt;
+            while let Ok(Ok(read)) =
+                tokio::time::timeout(Duration::from_millis(200), stderr.read(&mut buffer)).await
+            {
+                if read == 0 {
+                    break;
+                }
+                issues.push(String::from_utf8_lossy(&buffer[..read]).to_string());
+            }
+        }
+        let issues = issues.join("");
+        let alive = child.try_wait().expect("qemu state").is_none();
+
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        tpm.stop().await;
+        let _ = std::fs::remove_dir_all(&run_dir);
+
+        assert!(
+            alive && running,
+            "real QEMU did not accept the Windows launch argument list: {issues}"
+        );
+        assert!(
+            !issues.contains("tpm-emulator"),
+            "the TPM handshake failed even though QEMU kept running: {issues}"
+        );
+
+        // pflash0 is the read-only code image and pflash1 the per-VM vars template: the pair
+        // the guest boots from has to be the pair Qlean copied, not two devices that happen to
+        // be named alike.
+        assert!(
+            block.contains("\"device\": \"pflash0\"")
+                && block.contains(&format!("\"file\": \"{}\"", resolved.code.display())),
+            "the firmware code image did not end up in the read-only pflash unit: {block}"
+        );
+        assert!(
+            block.contains("\"device\": \"pflash1\"")
+                && block.contains(&format!("\"file\": \"{}\"", vars.display())),
+            "the per-VM vars image did not end up in the writable pflash unit: {block}"
+        );
+        // The system disk competes with the pflash units for the machine's devices; a disk that
+        // landed on another bus still runs the guest, just not the one Qlean configured.
+        assert!(
+            block.contains("\"device\": \"virtio0\"")
+                && block.contains(&format!("\"file\": \"{}\"", overlay.display())),
+            "the disk overlay is not the guest's virtio system disk: {block}"
+        );
+        // The deployment depends on this one: the seed medium has to be the read-only CD-ROM
+        // the firmware's early boot scans, next to the TPM and the two pflash units.
+        assert!(
+            block.contains("\"device\": \"ide0-cd0\"")
+                && block.contains(&format!("\"file\": \"{}\"", iso.display())),
+            "the seed medium is not the guest's IDE CD-ROM: {block}"
+        );
+        assert!(
+            block.contains("\"tray_open\": false"),
+            "the seed medium is not inserted: {block}"
+        );
+        println!(
+            "real QEMU realized the whole Windows launch argument list: {}",
+            args.join(" ")
+        );
     }
 
     #[test]
