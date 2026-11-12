@@ -190,6 +190,7 @@
 | 2026-11-13 11:10:00 UTC | review R76（同一个操作有两份实现，只有一份有预算） | F81：R71 给 Windows 的 seed ISO 构建加了预算，但**同样的构建在 `machine.rs` 里还有一份**（Linux cloud-init seed），它仍然是裸 `.output().await`；同理 `qemu-img create`（建 overlay）、`qemu-img resize`、以及 `ensure_network` 的 6 处 `virsh`、依赖探测的 `<program> --version` 全都没有上限。于是「启动路径上的本地工具都有预算」这句话只在 Windows 分支为真。修：`machine.rs` 三处改用共享的 `crate::utils::bounded_output` + 新常量 `LOCAL_TOOL_BUDGET=120s`；`utils.rs` 的 6 处 `virsh` 用 `VIRSH_CALL_BUDGET=60s`、依赖探测用 `PROBE_BUDGET=10s`；并新增源码守卫 `test_production_code_never_awaits_a_command_without_a_budget`（`include_str!` 扫 8 个生产文件，禁止字面量 `.output().await`，守卫自身的匹配串用 `concat!` 拆开以免自匹配）。现在 `rg -n '\.output\(\)' src/*.rs` 只剩 helper 自身与 `image.rs` 的测试辅助函数。`cargo test --lib` 187 → 188 | `EXE-01`/`TRN-01`（启动路径）、`IP-01`（`get_ip`）| `src/machine.rs`、`src/utils.rs`、CHANGELOG、Review log、覆盖矩阵、plan-status |
 | 2026-11-13 11:40:00 UTC | review R77（给挂住的程序开「重新安装」处方） | F82：R76 给依赖探测加了 10s 预算，但预算超时被归类成 `ProgramProbe::Missing`，于是消息变成「`virsh` is required but was not found (`virsh` did not finish within 10s … the process was killed): install it and try again」——一句话里同时说「找不到」和「跑了 10 秒」，并且**处方是错的**：它明明装着，只是卡住了（等一个陈旧锁、一个不可达的挂载点）。用户照做会重装一个本来就正常的包，然后再次卡住。这是 R74 的同一族缺陷：把「阻塞」说成「不存在」。修：`bounded_output` 拆成 `run_bounded`（返回带类型的 `BoundedFailure::{NotRun, Killed}`）与薄封装 `bounded_output`（拍平成 `anyhow`，既有 8 个调用点一字不改）；探测改用 `run_bounded`，`Killed` 映射到新变体 `ProgramProbe::Unusable`，消息改为「装着但没应答，查它在等什么（陈旧锁 / 不可达挂载），别重装」。新增 2 个单测：`NotRun`/`Killed` 分流、以及 `Unusable` 的消息不得含 `was not found` 或 `install it and try again`。`cargo test --lib` 188 → 190 | 依赖检查（`ensure_prerequisites`）、`TRN-01` | `src/utils.rs`、CHANGELOG、Review log、覆盖矩阵、plan-status |
 | 2026-11-13 12:10:00 UTC | review R78（把文件的状态当成进程的状态） | F83：`is_running` 的文档写着「Only a missing socket is proof that the domain is gone」，但 `running_check` 只看两件事：`self.pid.is_some()` 与 `socket.exists()`。于是「pid 在、socket 不在」被归为 `NoControlSocket` 并返回 `Ok(false)` ——**从未检查过那个 pid 是否还活着、是否还是我们的 QEMU**。socket 只是一个文件；它不在只说明文件不在，不说明进程死了（`tmpfiles` 清理、用户 `rm`、启动瞬间尚未创建都会造成同一现象）。而 `Ok(false)` 的用途恰恰是「可以安全启动」：`pool::init_all`/`spawn_all` 会因此在**活着的 QEMU 的 overlay 上**再起一个 QEMU——正是本仓库反复强调的「不可逆的用户状态」。修：`running_check` 增加第三个事实 `qemu_alive`（`!process_is_gone(pid) && process_is_qemu(pid)`，都是仓库里已有的判据），新增 `RunningCheck::LiveWithoutSocket`，返回 `Err` 而不是 `Ok(false)`，消息明说「socket 没了，不是域没了，先看进程」。新增 1 个单测，并把原来那个两参数表格测试改成三参数。`cargo test --lib` 190 → 191 | `FS-01`/`EXE-01`（池与生命周期）、`TRN-01` | `src/machine.rs`、CHANGELOG、Review log、覆盖矩阵、plan-status |
+| 2026-11-13 12:40:00 UTC | review R79（基线行号在实现后不可复核） | F84：「事实基线」表有一句「行号和源码锚点必须在开工当天刷新」，但 10 张实现卡落地之后，表里 88 个 `src/*.rs:NN` 锚点已经全部指向别的代码（例如 `src/machine.rs:220-399` 现在讲的是 `MachineConfig` 文档而不是 cloud-init seed 构建）。表头写的是「2026-11-04 成稿基线」，读起来像是当前事实，实际既不能按工作区核对、也没有说清该按哪个快照核对——一份不能被复核的「现状」证据等于没有证据。没有出现行号越界（`src/qemu.rs:74-169` 等仍在文件长度内），所以这种漂移不会自己暴露，只能靠人读。修：把整张表的行号锚定到基线提交 `69002eb`（`50c8cff` 之前最后一次计划提交，即尚未落地实现卡的代码），写出核对命令 `libra show 69002eb:src/<file> | sed -n '<range>p'`，并注明「实现落地后这些陈述已不成立，当前状态见实施证据汇总与各卡」。抽样三个锚点核对通过：`machine.rs:220`=cloud-init `MetaData` 起点、`qemu.rs:74`=`launch_qemu` 起点、`ssh.rs:831`=`get_remote_ip` 的 `hostname -I` | N/A（不新增卡；不改变任何 AC 或状态机） | 事实基线、Review log、覆盖矩阵、plan-status |
 
 ## 已决议设计决策
 
@@ -792,6 +793,7 @@
 | 集成测试（`#[ignore]`） | `tests/windows_machine.rs`：`windows_transport`（地址、pin、unsupported、shutdown→spawn 重连）、`windows_pool`（双机地址/host key/会话隔离） |
 | README/CHANGELOG | README「Windows transport and security」；CHANGELOG Added ×4 / Changed ×1 |
 | 地址发现与 QEMU 退出 race | `launch` 把 DHCP lease 轮询与 `qemu_handle`、cancel token 一起 `select!`，QEMU 启动即退出时立即返回其真实错误并停 `swtpm`（R12，`src/machine.rs`） |
+| 证据要能被复核 | 指向源码的证据必须写成「可重放的命令 + 快照」，否则它描述的只是写它那天的代码（R79，`6283a6e`） |
 | 文件的状态不是进程的状态 | 判定「谁还活着」必须看进程，不能看它留下的文件（R78，`faf4c9e`） |
 | 处方要跟着诊断走 | 报错里的下一步必须对得上真实原因：卡住 ≠ 没装，缺依赖 ≠ 配置错（R74/R77，`48fc514`） |
 | 同一个操作只有一份实现 | seed 构建、`virsh` 调用、超时文案都必须共用同一处代码，否则修了一半等于没修（R71→R76，`700a35e`） |
@@ -1408,6 +1410,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R76 | 同一个操作不能有两份实现 | PASS | 宿主工具链（DEP-02）仍是外部阻塞 | F81：Linux seed 构建/`qemu-img`/`virsh`/`--version` 仍无预算，只有 Windows 分支被 R71 覆盖 | 全部改走 `bounded_output` + 源码守卫（`700a35e`） |
 | R77 | 处方要跟着诊断走 | PASS | 宿主工具链（DEP-02）仍是外部阻塞 | F82：探测超时被归类为「未安装」，给出错误的重装建议 | `BoundedFailure` 类型化 + `ProgramProbe::Unusable`，2 新单测（`48fc514`） |
 | R78 | 文件的状态不是进程的状态 | PASS | 真实 Windows KVM 冒烟（DEP-01/02）仍阻塞 | F83：socket 缺失被当成域已退出，可能在活 VM 的盘上再起一个 QEMU | `running_check` 增加 `qemu_alive` 事实 + `LiveWithoutSocket` 报错，1 新单测（`faf4c9e`） |
+| R79 | 证据要能被复核 | PASS | 真实 Windows KVM 冒烟（DEP-01/02）仍阻塞 | F84：事实基线的 88 个行号锚点在实现后全部漂移且未锚定到快照 | 全表锚定基线提交 `69002eb` + 核对命令 + 3 处抽样核对（`6283a6e`） |
 
 ### R1 findings 与修订对照
 
