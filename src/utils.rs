@@ -65,6 +65,19 @@ pub(crate) fn parse_dhcp_leases(output: &str) -> Vec<DhcpLease> {
     leases
 }
 
+/// Leased IPv4 address of `mac`, if the lease table has one.
+///
+/// A dual-stack network reports a separate IPv6 lease for the same MAC, and its
+/// address is often link-local (`fe80::/10`), which is useless without a scope id.
+/// Only IPv4 is returned; an IPv6-only guest keeps polling and then fails with the
+/// lease list instead of connecting to an unusable address.
+fn lease_address_for(leases: &[DhcpLease], mac: &str) -> Option<std::net::IpAddr> {
+    leases
+        .iter()
+        .find(|lease| lease.mac == mac && lease.ip.is_ipv4())
+        .map(|lease| lease.ip)
+}
+
 /// Resolve a MAC address to its leased address on Qlean's libvirt network.
 ///
 /// Polling is bounded by `timeout` and never runs an unbounded retry loop. The guest
@@ -90,9 +103,9 @@ pub(crate) async fn find_lease_address(
 
         if output.status.success() {
             last_seen = parse_dhcp_leases(&String::from_utf8_lossy(&output.stdout));
-            if let Some(lease) = last_seen.iter().find(|lease| lease.mac == mac) {
-                debug!("MAC {} leased {}", lease.mac, lease.ip);
-                return Ok(lease.ip);
+            if let Some(ip) = lease_address_for(&last_seen, &mac) {
+                debug!("MAC {mac} leased {ip}");
+                return Ok(ip);
             }
         } else {
             debug!(
@@ -104,7 +117,8 @@ pub(crate) async fn find_lease_address(
         if tokio::time::Instant::now() >= deadline {
             bail!(
                 "no DHCP lease for MAC {mac} on the `qlean` network within {}s (leases seen: {:?}).\n\
-                 The guest may still be booting, or it did not bring up its virtio network device.",
+                 The guest may still be booting, or it did not bring up its virtio network device.\n\
+                 Only IPv4 leases are usable: an IPv6-only lease is reported above but never dialled.",
                 timeout.as_secs(),
                 last_seen
                     .iter()
@@ -404,6 +418,37 @@ mod tests {
         let output =
             " 2026-11-12 09:35:00   52:54:00:aa:bb:cc   ipv4       <unavailable>    *  -\n";
         assert!(parse_dhcp_leases(output).is_empty());
+    }
+
+    #[test]
+    fn test_lease_address_for_prefers_ipv4_on_a_dual_stack_network() {
+        let output = format!(
+            "{LEASES_HEADER} 2026-11-12 09:35:00   52:54:00:aa:bb:cc   ipv6       fe80::42/64    *  -\n\
+             2026-11-12 09:35:00   52:54:00:aa:bb:cc   ipv4       192.168.221.42/24    *  -\n"
+        );
+        let leases = parse_dhcp_leases(&output);
+        assert_eq!(leases.len(), 2);
+        // The IPv6 row comes first, but a link-local address cannot be dialled without
+        // a scope id, so the IPv4 lease must win.
+        assert_eq!(
+            lease_address_for(&leases, "52:54:00:aa:bb:cc").map(|ip| ip.to_string()),
+            Some("192.168.221.42".to_string())
+        );
+    }
+
+    #[test]
+    fn test_lease_address_for_ignores_ipv6_only_and_other_macs() {
+        let output = format!(
+            "{LEASES_HEADER} 2026-11-12 09:35:00   52:54:00:aa:bb:cc   ipv6       fd00::42/64    *  -\n\
+             2026-11-12 09:35:00   52:54:00:11:22:33   ipv4       192.168.221.43/24    *  -\n"
+        );
+        let leases = parse_dhcp_leases(&output);
+        assert!(lease_address_for(&leases, "52:54:00:aa:bb:cc").is_none());
+        assert!(lease_address_for(&leases, "52:54:00:de:ad:be").is_none());
+        assert_eq!(
+            lease_address_for(&leases, "52:54:00:11:22:33").map(|ip| ip.to_string()),
+            Some("192.168.221.43".to_string())
+        );
     }
 
     #[test]
