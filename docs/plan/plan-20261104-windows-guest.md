@@ -193,6 +193,7 @@
 | 2026-11-13 12:40:00 UTC | review R79（基线行号在实现后不可复核） | F84：「事实基线」表有一句「行号和源码锚点必须在开工当天刷新」，但 10 张实现卡落地之后，表里 88 个 `src/*.rs:NN` 锚点已经全部指向别的代码（例如 `src/machine.rs:220-399` 现在讲的是 `MachineConfig` 文档而不是 cloud-init seed 构建）。表头写的是「2026-11-04 成稿基线」，读起来像是当前事实，实际既不能按工作区核对、也没有说清该按哪个快照核对——一份不能被复核的「现状」证据等于没有证据。没有出现行号越界（`src/qemu.rs:74-169` 等仍在文件长度内），所以这种漂移不会自己暴露，只能靠人读。修：把整张表的行号锚定到基线提交 `69002eb`（`50c8cff` 之前最后一次计划提交，即尚未落地实现卡的代码），写出核对命令 `libra show 69002eb:src/<file> | sed -n '<range>p'`，并注明「实现落地后这些陈述已不成立，当前状态见实施证据汇总与各卡」。抽样三个锚点核对通过：`machine.rs:220`=cloud-init `MetaData` 起点、`qemu.rs:74`=`launch_qemu` 起点、`ssh.rs:831`=`get_remote_ip` 的 `hostname -I` | N/A（不新增卡；不改变任何 AC 或状态机） | 事实基线、Review log、覆盖矩阵、plan-status |
 | 2026-11-13 13:10:00 UTC | review R80（凭契约写下的介质从没被真工具验过一次） | F85：README 的 “Windows image contract” 与 `OSX-03` 都建立在同一个前提上——seed 介质带卷标 `QLEANSEED`、里面是 `qlean/authorized_keys`、`qlean/ssh_host_ed25519_key`、`qlean/deploy.json`，镜像的首启任务就是照这个前提找盘、找文件的。但仓库里**没有任何测试碰过真实的 `xorriso`**：4 个 seed 单测只检查暂存目录（写出来的三个文件、`0600`、每 VM 密钥不同）和把一份**假文件** `chmod 0600` 的封装函数，`DeploySeed::build` 的参数表（`-V QLEANSEED -J -R -o … -graft-points qlean=<dir>`）从来没被执行过。参数错一位（漏 `-J`、`qlean=` 写成 `qlean`、`-V` 拼错）都会让介质上少一层目录、名字被截成 8.3 或卷标对不上，而三个真实用例全是 `#[ignore]`，所以这个错误要等到 DEP-01/02 齐了才会暴露——那时排查成本最高。修：`src/windows.rs::tests` 新增 `#[ignore]` 用例 `test_windows_seed_medium_has_the_documented_label_and_layout`，用**真实 `xorriso`** 跑 `DeploySeed::build`，然后核对四件事：PVD 里 `Volume Id    : QLEANSEED`、关掉 Rock Ridge 只看 Joliet 时 `/qlean` 下三个文件名齐全（Windows 读的就是这份视图）、把 `/qlean` 解包回来逐字节比对客户端公钥/本 VM host key/`deploy.json` 契约、以及 `xorriso` 产出的 ISO 本身是 `0600`（即 `seal_seed_medium` 在生产路径上真的生效）。`xorriso` 不是 CI 依赖，故 `#[ignore]` 并在注释里写明运行命令；本机 Arch 容器（`xorriso` 1.5.8）实跑通过。`cargo test --lib` 191 不变（新增 1 个 ignored） | `OSX-03`（seed 介质契约）、`SPK-02`（部署方案可行性） | `src/windows.rs`、Review log、覆盖矩阵、plan-status |
 | 2026-11-13 13:50:00 UTC | review R81（被跳过的更严格选择必须说明原因） | F86：README 写着「`secboot` 代码镜像配不到带 Microsoft 密钥的 vars 模板时 Qlean **拒绝启动**」，但 `resolve_ovmf_with` 的真实行为是**跳过**这一对、继续找普通镜像（早前某一轮正是为了不误伤其余宿主故意改成跳过的，测试 `test_a_secboot_pair_without_keys_does_not_hide_a_plain_candidate` 就在守这条）。于是同一件事有两份说法，而代码那份**不告诉用户**：`ResolvedFirmware.skipped` 里已经攒好了「为什么跳过 secboot 那对」，却只在**全部候选都不可用**时才拼进错误里；回退成功时那几行被直接丢掉，连 `debug!` 都没有。这不是学术问题：2026-11-13 在真实 Arch 容器里装 `edk2-ovmf` 后实测，宿主只有 `OVMF_CODE.4m.fd`/`OVMF_CODE.secboot.4m.fd`/`OVMF_VARS.4m.fd`——**没有 `.ms` 模板**，即解析结果必然是 `secure_boot=false`，而 `resolve_ovmf_with` 的 `skipped` 恰为「secboot 对缺 Microsoft 密钥」。也就是说在主流滚动发行版上，Windows guest **每次都**在无 Secure Boot 下启动，而 Windows 11 会因此拒绝安装，用户看到的却是 Windows 自己的「不满足要求」错误，完全不知道是固件被降级了。修：新增 `secure_boot_skipped_notice(skipped)`（纯函数，可测）把跳过的每一对连同原因和「Win11 需要 Secure Boot / 用 `QLEAN_OVMF_VARS` 指向已注册模板」写成一条 `warn!`，在 `resolve_ovmf` 回退到非 Secure Boot 对时输出；README 那句「拒绝启动」改成真实行为（跳过 → 警告 → 无可用对时才拒绝并列出每一对的原因）；CHANGELOG `Fixed` 同步。新增 3 个单测（回退必有通知且含原因与 `QLEAN_OVMF_VARS`、Secure Boot 命中时不得误报、多条跳过原因逐条列出）+ 1 个 `#[ignore]` 真机用例：用宿主真实 `edk2-ovmf` 布局跑 `resolve_ovmf()` 与 `resolve_ovmf_with(is_file, 真实密钥探测)`，核对路径存在、尺寸关系、Secure Boot 标志由文件名决定，并断言「非 Secure Boot 回退 ⇔ 有通知」。`cargo test --lib` 191 → 194（+2 ignored） | `OSX-02`（OVMF/Secure Boot）、`SPK-02`（固件可行性）、`REL-01`（支持矩阵需按真实宿主写） | `src/firmware.rs`、README、CHANGELOG、Review log、覆盖矩阵、plan-status |
+| 2026-11-13 14:35:00 UTC | review R82（字符串单测不能代替真程序接受参数） | F87：`windows_firmware_args`/`swtpm_args` 至今只被**字符串比对**守着——单测断言参数数组长得对，但没有任何东西证明宿主上真实的 QEMU 和 `swtpm` **接受**这些参数、并且真的把 TPM 2.0 设备实例化了。这类失败完全不在字符串里：QEMU 跨版本会改名/改语义（`tpm-tis`/`tpm-crb`、`-machine` 属性），而 `-device`/`-tpmdev` 只要写错一个字符就不会有 TPM，QEMU 仍照常启动并给 Windows 一台**没有 TPM** 的机器（Windows 11 随后在自己的检查里失败，qlean 侧毫无痕迹）。更糟的是 `swtpm` 侧：`--flags not-need-init,startup-clear`、`--ctrl` 的 owner-only socket、`--tpmstate` 目录是否被创建，只有真 `swtpm` 才能判卷。修：新增 `#[ignore]` 用例 `test_windows_firmware_arguments_are_accepted_by_real_qemu`——用宿主真实 OVMF 走 `resolve_ovmf()` + `prepare_vars()`，真 `Swtpm::start()`，把 `windows_firmware_args` 的产物交给真 `qemu-system-x86_64`（`-S`，不跑 guest 代码、不需要 Windows 镜像、不需要 KVM），断言 (a) 收到 QMP 问候（说明 machine/pflash 对/选项语法全部被接受）、(b) QMP `query-tpm` 返回 `model=tpm-tis` 且 `chardev=chrtpm`（说明 TPM 真的被实例化，而不是被静默丢弃）、(c) 进程仍在运行、(d) stderr 无 `tpm-emulator` 握手失败。**守卫已验证会咬人**：临时删掉 `-device tpm-tis,tpmdev=tpm0` 后该用例立刻失败（`QEMU did not realize the configured TPM 2.0 device: {"return": {}}`），恢复后通过。真实环境：Arch 容器内 `QEMU 11.1.3` + `swtpm 0.10.2` + `edk2-ovmf` 通过；宿主缺工具时打印 `SMOKE-UNAVAILABLE` 并跳过（不伪装成通过）。边界写清：`-S` 只验宿主侧参数与设备实例化，**不是** Windows 冒烟，首启仍 `blocked`。`cargo test --lib` 194 不变（+1 ignored） | `OSX-02`（固件/TPM 参数）、`SPK-02`、`REL-01` | `src/qemu.rs`、Review log、覆盖矩阵、plan-status |
 
 ## 已决议设计决策
 
@@ -620,6 +621,7 @@
 - [x] `cargo fmt --check` 与 `cargo clippy --all-targets --all-features -- -D warnings` 通过（0 warning）
 - [x] `cargo test --lib qemu`：5 passed（固件参数 2、加速选择 3）
 - [x] `cargo test --no-run`：包含 `tests/windows_machine.rs` 在内全部 target 编译通过
+- [x] 宿主参数契约（真 QEMU + 真 `swtpm`，`-S` 不跑 guest，不需要 Windows 镜像与 KVM）：`cargo test --lib -- --ignored qemu_firmware_contract` —— QMP 问候到达、`query-tpm` 返回 `model=tpm-tis`/`chardev=chrtpm`、进程存活、stderr 无 `tpm-emulator`；Arch 容器 QEMU 11.1.3 + swtpm 0.10.2 通过，删一行 `-device` 即失败（R82，`b2a2199`）
 - [x] 宿主固件解析（真实 `edk2-ovmf`，不依赖 Windows 镜像）：`cargo test --lib -- --ignored firmware_resolve` —— 真实 Arch 布局只解析到 `OVMF_CODE.4m.fd` + `OVMF_VARS.4m.fd`（`secure_boot=false`），`skipped` 恰为「secboot 对缺 Microsoft 密钥」，且「非 Secure Boot 回退 ⇔ 有通知」成立（R81，`9ab1f4b`）
 - [ ] T-1 全量，配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1` —— 环境缺口 `DEFER-04`
 - [ ] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=... QLEAN_WINDOWS_DIGEST=... cargo test --test windows_machine windows_firmware_lifecycle -- --ignored --exact --test-threads=1` —— `blocked`（无 QEMU/OVMF/swtpm 宿主与 Windows 镜像）
@@ -642,6 +644,7 @@
 | Secure Boot vars | `OVMF_CANDIDATES` 为每个 code 镜像携带 vars 候选列表，secboot 镜像优先 `OVMF_VARS_4M.ms.fd` / `OVMF_VARS.4m.ms.fd` / `OVMF_VARS.secboot.fd`，普通模板仅 fallback（setup mode，Win11 拒绝）；单测覆盖优先与回退两条路径（R9，`src/firmware.rs`） |
 | 首启介质前置 | `ensure_host_support` 一次性报告 KVM/OVMF/`swtpm`/`xorriso` 四类缺口，`SEED_ISO_BUILDER` 与 `DeploySeed::build` 共用同一程序名（R9，`7ddc686`） |
 | 宿主前置聚合 | `host_support_problems` 纯函数 + 3 个单测：KVM/OVMF/`swtpm`/`xorriso` 全部缺失时一次性列出 4 条、齐全时为空、只缺一项时只报该项（R17，`src/firmware.rs`） |
+| 宿主参数契约 | `src/qemu.rs::tests::test_windows_firmware_arguments_are_accepted_by_real_qemu`（`#[ignore]`）：真 `qemu-system-x86_64` + 真 `Swtpm` + 真 OVMF，`-S` 启动，断言 QMP 问候、`query-tpm` 的 `tpm-tis`/`chrtpm`、无 `tpm-emulator` 错误；缺工具时打印 `SMOKE-UNAVAILABLE` 跳过（R82，`b2a2199`） |
 | Secure Boot 回退可见 | `secure_boot_skipped_notice`：回退到非 Secure Boot 对时把每个被跳过配对的原因连同「Win11 需要 Secure Boot / 用 `QLEAN_OVMF_VARS` 指向已注册模板」写成 `warn!`；3 单测 + 1 真机 ignored 用例（R81，`9ab1f4b`） |
 | 提交 | `f2fc277` |
 
@@ -799,6 +802,7 @@
 | 集成测试（`#[ignore]`） | `tests/windows_machine.rs`：`windows_transport`（地址、pin、unsupported、shutdown→spawn 重连）、`windows_pool`（双机地址/host key/会话隔离） |
 | README/CHANGELOG | README「Windows transport and security」；CHANGELOG Added ×4 / Changed ×1 |
 | 地址发现与 QEMU 退出 race | `launch` 把 DHCP lease 轮询与 `qemu_handle`、cancel token 一起 `select!`，QEMU 启动即退出时立即返回其真实错误并停 `swtpm`（R12，`src/machine.rs`） |
+| 字符串单测不能代替真程序接受参数 | 参数数组长得对不等于宿主上的程序认它：QEMU 跨版本改名、`-device` 拼错都只会得到「能启动但没有设备」的运行中 VM，所以关键参数契约必须交给真程序判卷（R82，`b2a2199`） |
 | 被跳过的更严格选择必须说明原因 | 解析器为了可用性跳过更严格的候选（Secure Boot 配对）是对的，但跳过必须说出来：用户看到的将是下游产品（Windows 11「不满足要求」）的错误，而不是固件被降级的真相（R81，`9ab1f4b`） |
 | 契约要拿真工具验一次 | 只要契约由外部工具产出（`xorriso` 的卷标与目录布局、`virsh` 的输出格式），就必须有一条真跑该工具的用例，否则契约只是一句承诺（R80，`f708b36`） |
 | 证据要能被复核 | 指向源码的证据必须写成「可重放的命令 + 快照」，否则它描述的只是写它那天的代码（R79，`6283a6e`） |
@@ -1241,6 +1245,7 @@
 | Windows 传输/池 `(new)` | host key、重连、双机端点与 readiness | `cargo test --test windows_machine windows_transport -- --ignored --exact --test-threads=1`；`windows_pool` 同理 |
 | Windows 语义 `(new)` | exec/get_ip/文件与目录往返/unsupported | `cargo test --test windows_machine windows_exec -- --ignored --exact --test-threads=1`；`windows_get_ip`、`windows_files` 同理 |
 | Windows 全量核心门 | 上述所有 Windows 用例，每个支持版本 | 设置镜像 env 后：`cargo test --test windows_machine -- --ignored --test-threads=1` |
+| 宿主参数契约 `(new)` | 真 QEMU/`swtpm` 接受 Windows 固件参数并实例化 TPM 2.0（`-S`，不跑 guest） | 装了 `qemu-system-x86`+`swtpm`+固件包的机器：`cargo test --lib -- --ignored qemu_firmware_contract`（CI 不装，故 `#[ignore]`） |
 | 宿主固件解析 `(new)` | 真实 `edk2-ovmf`/`ovmf` 布局：候选路径、Secure Boot 标志、vars 尺寸关系、回退通知 | 装了固件包的机器：`cargo test --lib -- --ignored firmware_resolve`（CI 不装固件包，故 `#[ignore]`） |
 | seed 介质契约 `(new)` | 真实 `xorriso` 产出的卷标 `QLEANSEED`、Joliet 目录布局、解包字节、ISO `0600` | 有 `xorriso` 的机器：`cargo test --lib -- --ignored windows_seed_medium`（CI 不装 `xorriso`，故 `#[ignore]`） |
 | 编译门槛 | CI 编译所有 target，包括 ignored Windows 测试 | `cargo test --no-run --all-targets` |
@@ -1253,7 +1258,7 @@
 | SPK-01 | `src/ssh.rs:89-104,571-630` | 无生产代码 | ADR-WIN-02 | 手工连接/SFTP 证据 |
 | SPK-02 | `src/qemu.rs:74-169` | 无生产代码 | ADR-WIN-03 | 手工首启/重启证据 |
 | OSX-01 | `src/image.rs:68-81,645-717` | image/lib/machine | README API/Migration、CHANGELOG | `guest_os_default`、`guest_os_legacy_json`、`guest_os_cache_mismatch` |
-| OSX-02 | `src/qemu.rs:74-169`、`src/machine.rs:63-68,156-157` | qemu/machine/utils/firmware | README Host Setup（含 Windows 最低/推荐资源）、CHANGELOG | `windows_firmware_lifecycle`、`firmware_resolve` |
+| OSX-02 | `src/qemu.rs:74-169`、`src/machine.rs:63-68,156-157` | qemu/machine/utils/firmware | README Host Setup（含 Windows 最低/推荐资源）、CHANGELOG | `windows_firmware_lifecycle`、`firmware_resolve`、`qemu_firmware_contract` |
 | OSX-03 | `src/machine.rs:181-464` | machine/windows | README 部署、CHANGELOG | `windows_first_boot`、`windows_deploy_timeout`、`windows_seed_medium` |
 | TRN-01 | `src/ssh.rs:89-104,571-630` | ssh/machine/utils | README 传输/限制、CHANGELOG | `windows_transport`、`windows_pool` |
 | EXE-01 | `src/machine.rs:495-516` | machine/ssh/exec（新 `src/exec.rs`） | README exec、CHANGELOG | `windows_exec` |
@@ -1423,6 +1428,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R79 | 证据要能被复核 | PASS | 真实 Windows KVM 冒烟（DEP-01/02）仍阻塞 | F84：事实基线的 88 个行号锚点在实现后全部漂移且未锚定到快照 | 全表锚定基线提交 `69002eb` + 核对命令 + 3 处抽样核对（`6283a6e`） |
 | R80 | 契约要拿真工具验一次 | PASS | 真实 Windows KVM 首启（DEP-01/02）仍阻塞 | F85：seed 介质的卷标与目录布局只有 README 的承诺，没有任何测试跑过真实 `xorriso` | 新增 `#[ignore]` 用例用真实 `xorriso` 构建并核对卷标/Joliet 布局/解包字节/`0600`，Arch 容器实跑通过（`f708b36`） |
 | R81 | 被跳过的更严格选择必须说明原因 | PASS | 真实 Windows KVM 首启（DEP-01/02）仍阻塞 | F86：README 说「缺 Microsoft 密钥的 secboot 配对会拒绝启动」，代码却静默回退到无 Secure Boot 的普通镜像并丢弃跳过原因（真实 Arch 宿主即此布局） | 新增 `secure_boot_skipped_notice` + 回退时 `warn!`，README/CHANGELOG 改成真实行为，3 单测 + 1 真机 ignored 用例（`9ab1f4b`） |
+| R82 | 字符串单测不能代替真程序接受参数 | PASS | 真实 Windows 首启（DEP-01/02）仍阻塞 | F87：`windows_firmware_args`/`swtpm_args` 只有字符串断言，真 QEMU/`swtpm` 是否接受、TPM 是否真被实例化从未验证；写错一个字符就得到「能启动但没有 TPM」的 Windows 机器 | 新增真程序用例（QMP 问候 + `query-tpm` + 进程存活 + 无 `tpm-emulator` 错误），删一行 `-device` 即可让它失败；Arch 容器 QEMU 11.1.3/swtpm 0.10.2 实跑通过（`b2a2199`） |
 
 ### R1 findings 与修订对照
 
