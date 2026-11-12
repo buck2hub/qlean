@@ -784,7 +784,7 @@
 | 单测 | `src/exec.rs`：0 success、非 0 failure、2..255 原样、300 拒绝（含可操作文案）、`0xC0000005` 不截断（5 个，`cargo test --lib windows_exec` 可过滤） |
 | 集成测试（`#[ignore]`） | `tests/windows_machine.rs::windows_exec`：空命令、`whoami`、引号/空格、`cmd /c exit 3`、stdout/stderr 分离、`exit 300` 拒绝 |
 | README/CHANGELOG | README「Windows command execution」+ 镜像契约补 `DefaultShell`；CHANGELOG Added ×3 / Fixed ×1 |
-| 提交 | `COMMITHASH` |
+| 提交 | `64b1046` |
 
 **Acceptance criteria:**
 
@@ -1127,8 +1127,8 @@
 | OSX-01 | 2026-11-12 08:40:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib image::tests`（18 passed）、`cargo test --no-run` 全绿 | T-1 全量门未执行（无 QEMU/libvirt，`DEFER-04`） | `done` / `complete` | `50c8cff` |
 | OSX-02 | 2026-11-12 09:35:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib qemu`（5 passed）、`cargo test --no-run`（含 `tests/windows_machine.rs`）全绿 | `windows_firmware_lifecycle` 未执行（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `f2fc277` |
 | OSX-03 | 2026-11-12 10:20:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_deploy`（7 passed）、`cargo test --lib windows_deploy_timeout`（2 passed）、`cargo test --no-run` 全绿 | `windows_first_boot` 与首启/重启 seed 清理证据未取得（需 `TRN-01` + DEP-01/02），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `8812fb4` |
-| TRN-01 | 2026-11-12 11:40:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib ssh`（5 passed）、`cargo test --lib utils`（4 passed）、`cargo test --no-run`（含 `windows_transport`/`windows_pool`）全绿 | `windows_transport`/`windows_pool` 与真实 spawn 重连证据未取得（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `COMMITHASH` |
-| EXE-01 | 2026-11-12 12:10:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_exec`（5 passed）、`cargo test --no-run` 全绿 | `windows_exec` 真实 PowerShell 冒烟未取得（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `COMMITHASH` |
+| TRN-01 | 2026-11-12 11:40:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib ssh`（5 passed）、`cargo test --lib utils`（4 passed）、`cargo test --no-run`（含 `windows_transport`/`windows_pool`）全绿 | `windows_transport`/`windows_pool` 与真实 spawn 重连证据未取得（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `64b1046` |
+| EXE-01 | 2026-11-12 12:10:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_exec`（5 passed）、`cargo test --no-run` 全绿 | `windows_exec` 真实 PowerShell 冒烟未取得（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `64b1046` |
 | IP-01 | pending | pending | pending | pending | 继承 REL-01 |
 | FS-01 | pending | pending | pending | pending | 继承 REL-01 |
 | REL-01 | pending | pending | pending | pending | pending |
