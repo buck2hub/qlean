@@ -25,6 +25,48 @@ use tracing::{debug, info};
 
 use crate::guest_path::GuestPath;
 
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bounded_passes_a_fast_operation_through() {
+        let result = bounded(Duration::from_secs(5), "quick", async { Ok(7u8) }).await;
+        assert_eq!(result.unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn bounded_passes_the_operation_error_through() {
+        let error = bounded(Duration::from_secs(5), "quick", async {
+            Err::<u8, _>(anyhow::anyhow!("guest said no"))
+        })
+        .await
+        .expect_err("propagated");
+        assert_eq!(error.to_string(), "guest said no");
+    }
+
+    #[tokio::test]
+    async fn bounded_reports_its_own_limit_rather_than_a_guest_timeout() {
+        let started = std::time::Instant::now();
+        let error = bounded(Duration::from_millis(50), "Get-NetIPAddress", async {
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            Ok(1u8)
+        })
+        .await
+        .expect_err("must not wait for the guest");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the wait must be bounded"
+        );
+
+        let message = error.to_string();
+        assert!(message.contains("Get-NetIPAddress"), "{message}");
+        assert!(message.contains("Qlean's own probe limit"), "{message}");
+        // The guest command itself is untouched, and saying otherwise would be a lie.
+        assert!(message.contains("may still be running"), "{message}");
+    }
+}
+
 const ERR_EACCES: i32 = 13; // Permission denied
 const ERR_ENODEV: i32 = 19; // No such device
 
@@ -161,6 +203,31 @@ impl russh::client::Handler for SshClient {
 /// the real reason with "still not reachable" after the whole budget is spent. Detection and
 /// construction therefore share this one string instead of matching on prose twice.
 const PINNED_KEY_REJECTED: &str = "presented an SSH host key that is not the one deployed";
+
+/// Budget for one of Qlean's own guest probes (deploy marker, address query, file copy).
+///
+/// These run without a user watching them, so a wedged channel has to fail instead of
+/// silently consuming the caller's whole budget. It is not a timeout on the guest: user
+/// commands through `Machine::exec` stay unbounded, because `sleep 600` or a long package
+/// install is a legitimate silent command.
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Run `operation` with a budget, naming it as Qlean's own limit rather than the guest's.
+async fn bounded<T>(
+    budget: Duration,
+    command: &str,
+    operation: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(budget, operation).await {
+        Ok(result) => result,
+        Err(_) => bail!(
+            "Qlean gave up on `{command}` after {}s: the SSH channel accepted the command but \
+             produced no exit status. This is Qlean's own probe limit, not a timeout inside the \
+             guest, so the command may still be running there",
+            budget.as_secs()
+        ),
+    }
+}
 
 fn host_key_rejection_message(transport_name: &str, pinned: bool) -> String {
     if pinned {
@@ -489,6 +556,37 @@ impl Session {
 
     /// Call a command via SSH and capture its output.
     pub(crate) async fn call_with_output(
+        &mut self,
+        command: &str,
+        cancel_token: CancellationToken,
+    ) -> Result<(u32, Vec<u8>, Vec<u8>)> {
+        self.call_with_output_budget(command, cancel_token, None)
+            .await
+    }
+
+    /// Run one of Qlean's own probes, bounded by [`PROBE_TIMEOUT`].
+    pub(crate) async fn call_probe(
+        &mut self,
+        command: &str,
+        cancel_token: CancellationToken,
+    ) -> Result<(u32, Vec<u8>, Vec<u8>)> {
+        self.call_with_output_budget(command, cancel_token, Some(PROBE_TIMEOUT))
+            .await
+    }
+
+    async fn call_with_output_budget(
+        &mut self,
+        command: &str,
+        cancel_token: CancellationToken,
+        budget: Option<Duration>,
+    ) -> Result<(u32, Vec<u8>, Vec<u8>)> {
+        match budget {
+            Some(budget) => bounded(budget, command, self.run_command(command, cancel_token)).await,
+            None => self.run_command(command, cancel_token).await,
+        }
+    }
+
+    async fn run_command(
         &mut self,
         command: &str,
         cancel_token: CancellationToken,

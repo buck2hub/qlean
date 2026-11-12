@@ -1137,7 +1137,7 @@ StandardError=journal
             "cmd /c if exist {} echo deployed",
             windows::GUEST_DEPLOY_MARKER
         );
-        let (code, stdout, stderr) = ssh.call_with_output(&cmd, cancel_token).await?;
+        let (code, stdout, stderr) = ssh.call_probe(&cmd, cancel_token).await?;
         if code != 0 {
             bail!(
                 "deployment marker probe `{cmd}` exited with {code}: {}",
@@ -1178,7 +1178,7 @@ StandardError=journal
     async fn query_windows_ip(&mut self) -> Result<String> {
         let (ssh, cancel_token) = self.get_ssh("query the guest address")?;
         let (code, stdout, stderr) = ssh
-            .call_with_output(windows::GUEST_IP_QUERY, cancel_token)
+            .call_probe(windows::GUEST_IP_QUERY, cancel_token)
             .await?;
         if code != 0 {
             bail!(
@@ -1537,7 +1537,7 @@ impl Machine {
             ),
             GuestOs::Windows => windows::copy_file_command(from.as_str(), to.as_str()),
         };
-        let (code, _stdout, stderr) = ssh.call_with_output(&cmd, cancel_token).await?;
+        let (code, _stdout, stderr) = ssh.call_probe(&cmd, cancel_token).await?;
         if code != 0 {
             bail!(
                 "Failed to copy file {} to {} (exit code {}): {}",
