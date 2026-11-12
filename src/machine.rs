@@ -993,14 +993,23 @@ StandardError=journal
                             "QEMU process {} did not exit within timeout, force killing",
                             pid
                         );
-                        if kill_if_qemu(pid) {
-                            kill_sent = true;
-                        } else {
-                            // The pid no longer belongs to our QEMU, so there is nothing left
-                            // for teardown to wait for.
-                            break;
+                        match kill_step(&force_kill(pid)) {
+                            KillStep::KeepPolling => {
+                                kill_sent = true;
+                                tokio::time::sleep(poll_interval).await;
+                            }
+                            KillStep::NothingLeft => {
+                                // The pid no longer belongs to our QEMU, so there is nothing
+                                // left for teardown to wait for.
+                                break;
+                            }
+                            KillStep::NotShutDown(reason) => {
+                                // The process is still our QEMU and still alive. Leave
+                                // `self.pid` set: reporting a clean shutdown here would let
+                                // the next start rebuild the overlay of a live guest.
+                                bail!("{}", kill_not_shut_down_message(pid, &reason));
+                            }
                         }
-                        tokio::time::sleep(poll_interval).await;
                     }
                     TeardownStep::Unkillable => {
                         // Leave `self.pid` set: the process is still running, so reporting a
@@ -1514,7 +1523,9 @@ StandardError=journal
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            kill_if_qemu(pid);
+            if let KillOutcome::Refused(reason) = force_kill(pid) {
+                warn!("{}", kill_not_shut_down_message(pid, &reason));
+            }
         }
 
         // `launch` is only reached through `init`/`spawn`, which set the token; check
@@ -2096,23 +2107,72 @@ fn process_is_qemu(pid: u32) -> bool {
     }
 }
 
-/// SIGKILL a pid only when it is still QEMU.
+/// What one SIGKILL attempt achieved.
 ///
-/// Returns whether the signal was delivered, so callers can report pid reuse or a refused
-/// signal instead of leaving a misleading "killed" impression. A process that is already
-/// gone counts as delivered: that is the state the caller wanted.
-fn kill_if_qemu(pid: u32) -> bool {
+/// A single `bool` used to carry this and conflated two very different worlds: "the pid is
+/// no longer our QEMU" (nothing left to wait for) and "SIGKILL was refused" (our QEMU is
+/// still alive). Treating the second like the first made `shutdown` report a clean stop while
+/// a live guest still held its disk.
+#[derive(Debug, PartialEq, Eq)]
+enum KillOutcome {
+    /// The pid no longer belongs to Qlean's QEMU: it exited, or the pid was reused.
+    Gone,
+    /// SIGKILL was delivered; the process still has to leave `/proc`.
+    Killed,
+    /// The pid is still our QEMU and the signal was refused, so it is alive and ours.
+    Refused(String),
+}
+
+/// What teardown should do after one SIGKILL attempt.
+#[derive(Debug, PartialEq, Eq)]
+enum KillStep {
+    /// The signal landed; keep polling until the process is gone.
+    KeepPolling,
+    /// Nothing left that belongs to us.
+    NothingLeft,
+    /// The signal was refused: the machine was not shut down.
+    NotShutDown(String),
+}
+
+/// The teardown loop action implied by a kill attempt.
+fn kill_step(outcome: &KillOutcome) -> KillStep {
+    match outcome {
+        KillOutcome::Killed => KillStep::KeepPolling,
+        KillOutcome::Gone => KillStep::NothingLeft,
+        KillOutcome::Refused(reason) => KillStep::NotShutDown(reason.clone()),
+    }
+}
+
+/// Message for a refused kill, which must never read like a completed shutdown.
+fn kill_not_shut_down_message(pid: u32, reason: &str) -> String {
+    format!(
+        "QEMU process {pid} is still running: the machine was not shut down because SIGKILL \
+         was refused ({reason}). Kill pid {pid} manually before starting it again"
+    )
+}
+
+/// SIGKILL a pid only when it is still QEMU, reporting what actually happened.
+///
+/// The refusal case must stay distinguishable from the gone case: a callback that cannot
+/// tell them apart reports success while the guest keeps its overlay open.
+fn force_kill(pid: u32) -> KillOutcome {
+    force_kill_with(pid, signal_kill)
+}
+
+/// `force_kill` with an injectable signal delivery, so the refusal path is testable against
+/// a real process instead of a mock pid.
+fn force_kill_with(pid: u32, signal: impl Fn(u32) -> std::io::Result<()>) -> KillOutcome {
     if !process_is_qemu(pid) {
         warn!(
             "not sending SIGKILL to pid {pid}: it no longer looks like the QEMU process Qlean started (the pid was probably reused)"
         );
-        return false;
+        return KillOutcome::Gone;
     }
-    match signal_kill(pid) {
-        Ok(()) => true,
+    match signal(pid) {
+        Ok(()) => KillOutcome::Killed,
         Err(error) => {
             warn!("failed to send SIGKILL to pid {pid}: {error}");
-            false
+            KillOutcome::Refused(error.to_string())
         }
     }
 }
@@ -2211,7 +2271,7 @@ impl Drop for Machine {
         // Ensure QEMU process is killed, but only if that pid is still QEMU: killing a
         // recycled pid would take down an unrelated process.
         if let Some(pid) = self.pid {
-            kill_if_qemu(pid);
+            force_kill(pid);
         }
         // Stop swtpm before the run dir disappears underneath its control socket; the
         // explicit take() makes the ordering deterministic instead of relying on field
@@ -2700,6 +2760,144 @@ mod timeout_tests {
     }
 
     #[test]
+    fn a_kill_step_never_turns_a_refusal_into_a_missing_process() {
+        // The two "false" worlds of the old `bool` were "the pid is no longer ours" and
+        // "our QEMU is still alive because SIGKILL was refused". Only the first may end
+        // teardown quietly.
+        assert_eq!(kill_step(&KillOutcome::Killed), KillStep::KeepPolling);
+        assert_eq!(kill_step(&KillOutcome::Gone), KillStep::NothingLeft);
+        assert_eq!(
+            kill_step(&KillOutcome::Refused("Operation not permitted".into())),
+            KillStep::NotShutDown("Operation not permitted".into())
+        );
+    }
+
+    #[test]
+    fn a_refused_kill_names_the_pid_and_the_reason() {
+        let message = kill_not_shut_down_message(4242, "Operation not permitted (os error 1)");
+        assert!(message.contains("still running"), "{message}");
+        assert!(
+            message.contains("was not shut down"),
+            "a refusal must not read like a completed shutdown: {message}"
+        );
+        assert!(
+            message.contains("Operation not permitted (os error 1)"),
+            "the reason must travel with the failure: {message}"
+        );
+        assert!(message.contains("Kill pid 4242 manually"), "{message}");
+    }
+
+    /// Start a real process whose `argv[0]` looks like QEMU, so the kernel-level checks in
+    /// `force_kill_with` see the same thing they see for a real QEMU.
+    fn spawn_fake_qemu() -> Option<std::process::Child> {
+        // `exec -a` (a bash builtin) sets argv[0]; a plain Rust `Command` cannot.
+        let child = std::process::Command::new("bash")
+            .arg("-c")
+            .arg("exec -a qemu-system-x86_64 sleep 60")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        // Wait until the exec has replaced bash, so `/proc/<pid>/cmdline` is the QEMU name.
+        for _ in 0..100 {
+            if process_is_qemu(child.id()) {
+                return Some(child);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        None
+    }
+
+    #[test]
+    fn a_refused_signal_leaves_the_live_process_reported_as_still_running() {
+        let Some(mut child) = spawn_fake_qemu() else {
+            eprintln!("SMOKE-UNAVAILABLE: cannot start a process with a qemu-system argv[0]");
+            return;
+        };
+        let pid = child.id();
+        let outcome = force_kill_with(pid, |_| Err(std::io::Error::from_raw_os_error(libc::EPERM)));
+        match &outcome {
+            KillOutcome::Refused(reason) => {
+                assert!(
+                    reason.contains("Operation not permitted"),
+                    "the refusal reason must be kept: {reason}"
+                );
+            }
+            other => panic!("a refused signal must not be reported as {other:?}"),
+        }
+        assert!(
+            !process_is_gone(pid),
+            "the fake QEMU was never signalled, so it must still be alive"
+        );
+
+        // The real signal path still works on the same process, which is what makes the
+        // negative case above meaningful.
+        assert_eq!(force_kill(pid), KillOutcome::Killed);
+        let _ = child.wait();
+        for _ in 0..200 {
+            if process_is_gone(pid) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("SIGKILL was delivered but pid {pid} is still there");
+    }
+
+    /// The end-to-end refusal path: `shutdown` must not report a clean stop for a QEMU it
+    /// cannot signal.
+    ///
+    /// Needs a real `qemu-system*` argv[0] owned by another uid **and** a process that lacks
+    /// CAP_KILL, which no ordinary checkout has. The recipe lives in the plan's R95 evidence;
+    /// without `QLEAN_REFUSED_KILL_PID` this case reports itself as unavailable instead of
+    /// pretending to have run.
+    #[tokio::test]
+    #[ignore = "needs a live qemu-named pid that this process cannot signal (QLEAN_REFUSED_KILL_PID)"]
+    async fn test_a_refused_kill_is_not_reported_as_a_shutdown() {
+        let Some(pid) = std::env::var("QLEAN_REFUSED_KILL_PID")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+        else {
+            eprintln!("SMOKE-UNAVAILABLE: set QLEAN_REFUSED_KILL_PID to an unsignalable qemu pid");
+            return;
+        };
+        assert!(process_is_qemu(pid), "pid {pid} does not look like QEMU");
+        assert!(!process_is_gone(pid), "pid {pid} is already gone");
+        // Signal 0 asks the kernel about permission without delivering anything, so this
+        // precondition check cannot hide the very refusal the test is about.
+        // SAFETY: signal 0 only tests whether the process exists and is signalable.
+        assert_ne!(
+            unsafe { libc::kill(pid as libc::pid_t, 0) },
+            0,
+            "pid {pid} is signalable here, so this test cannot observe a refusal"
+        );
+
+        let mut machine = Machine::for_tests_with_pid(Some(pid));
+        let error = machine
+            .shutdown()
+            .await
+            .expect_err("a refused kill is not a shutdown");
+        let message = error.to_string();
+        assert!(message.contains("was not shut down"), "{message}");
+        assert!(message.contains(&pid.to_string()), "{message}");
+        assert!(
+            !process_is_gone(pid),
+            "the fake QEMU must still be running after the refusal"
+        );
+        assert_eq!(
+            machine.pid,
+            Some(pid),
+            "a machine whose QEMU survived must keep its pid, or the next start rebuilds              the overlay of a live guest"
+        );
+    }
+
+    #[test]
+    fn a_pid_that_is_not_qemu_is_reported_as_gone_instead_of_killed() {
+        // Our own test process is not QEMU, so nothing may be signalled and teardown has
+        // nothing left to wait for.
+        assert_eq!(force_kill(std::process::id()), KillOutcome::Gone);
+    }
+
+    #[test]
     fn teardown_step_keeps_waiting_while_the_guest_shuts_down() {
         use std::time::Duration;
         let grace = Duration::from_secs(30);
@@ -2848,6 +3046,7 @@ mod timeout_tests {
             // This one shipped with a 30-space hole where a `\` continuation was meant to
             // be, and the guard did not list it, so nothing caught it.
             unkillable_message(4242),
+            kill_not_shut_down_message(4242, "Operation not permitted (os error 1)"),
         ];
         for message in messages {
             for line in message.lines() {
