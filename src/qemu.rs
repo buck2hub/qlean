@@ -208,6 +208,22 @@ fn qmp_chardev_args(socket: &Path) -> anyhow::Result<Vec<String>> {
     ])
 }
 
+/// `-netdev` argument that puts the guest on the network Qlean reads DHCP leases from.
+fn netdev_option() -> String {
+    format!("bridge,id=net0,br={QLEAN_BRIDGE_NAME}")
+}
+
+/// `-device` argument for the guest NIC, carrying the MAC Qlean looks up in DHCP leases.
+///
+/// The MAC is the only link between this NIC and the lease Qlean waits for on a Windows
+/// first boot, and it is generated independently of QEMU. If the guest ended up with a
+/// different MAC, the lease search would never match and the failure would only surface as
+/// a spent deployment budget, so the argument is shared with a real-QEMU test that asks the
+/// monitor which MAC the NIC actually has.
+fn nic_device_option(mac_address: &str) -> String {
+    format!("virtio-net-pci,netdev=net0,mac={mac_address}")
+}
+
 /// `-drive` argument that attaches the first-boot seed medium.
 ///
 /// Kept separate from [`launch_qemu`] for the same reason as [`qmp_chardev_args`]: the exact
@@ -262,14 +278,8 @@ pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> 
         .arg("-nographic");
 
     qemu_cmd
-        .args([
-            "-netdev",
-            &format!("bridge,id=net0,br={}", QLEAN_BRIDGE_NAME),
-        ])
-        .args([
-            "-device",
-            &format!("virtio-net-pci,netdev=net0,mac={}", params.mac_address),
-        ]);
+        .args(["-netdev", &netdev_option()])
+        .args(["-device", &nic_device_option(&params.mac_address)]);
 
     // Memory and CPUs
     qemu_cmd
@@ -717,7 +727,123 @@ mod tests {
         let _ = std::fs::remove_dir_all(&run_dir);
     }
 
-    /// Check the first-boot seed medium against a real QEMU.
+    /// Check that the guest NIC really carries the MAC Qlean searches DHCP leases for.
+    ///
+    /// Windows discovery has no other handle on the guest: `find_lease_address` looks the
+    /// machine's MAC up in the network's lease table, and every later step (transport, ip,
+    /// files) hangs off that lease. A NIC whose `mac=` was dropped, mis-spelled or attached
+    /// to a different netdev still boots and still shows up on the bridge, so only the
+    /// monitor's own view of the device distinguishes the two.
+    #[tokio::test]
+    #[ignore = "needs qemu-system-x86_64 and a usable qlbr0 bridge"]
+    async fn test_the_guest_nic_carries_the_mac_that_lease_lookup_searches_for() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let qemu = Path::new(qemu_system_program(GuestArch::Amd64));
+        if !program_runs(qemu) {
+            assert!(smoke_unavailable(&format!(
+                "`{}` is not runnable",
+                qemu.display()
+            )));
+            return;
+        }
+        let mac = crate::utils::gen_random_mac();
+        let mut child = tokio::process::Command::new(qemu)
+            .args([
+                "-netdev",
+                &netdev_option(),
+                "-device",
+                &nic_device_option(&mac),
+                "-m",
+                "256",
+                "-display",
+                "none",
+                "-S",
+                "-qmp",
+                "stdio",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn qemu");
+        let mut stdout = child.stdout.take().expect("qemu stdout");
+        let mut stderr = child.stderr.take().expect("qemu stderr");
+        let mut qmp_stdin = child.stdin.take().expect("qemu stdin");
+
+        let mut greeting = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            let read = tokio::time::timeout(Duration::from_secs(20), stdout.read(&mut byte))
+                .await
+                .expect("QEMU must emit the QMP greeting within 20s")
+                .expect("read qemu stdout");
+            if read == 0 {
+                break;
+            }
+            greeting.push(byte[0]);
+            if greeting.ends_with(b"\n") && greeting.windows(4).any(|w| w == b"QMP\"") {
+                break;
+            }
+        }
+        let greeting = String::from_utf8_lossy(&greeting).to_string();
+        if !greeting.contains("\"QMP\"") {
+            // No bridge, no ACL entry for it, or no bridge helper: the argument list is not
+            // what failed, so this host cannot answer the question.
+            let mut issues = Vec::new();
+            let mut buffer = [0u8; 4096];
+            while let Ok(Ok(read)) =
+                tokio::time::timeout(Duration::from_millis(200), stderr.read(&mut buffer)).await
+            {
+                if read == 0 {
+                    break;
+                }
+                issues.extend_from_slice(&buffer[..read]);
+            }
+            assert!(smoke_unavailable(&format!(
+                "QEMU could not attach to `{}`: {}",
+                QLEAN_BRIDGE_NAME,
+                String::from_utf8_lossy(&issues).trim()
+            )));
+            return;
+        }
+
+        qmp_stdin
+            .write_all(
+                b"{\"execute\":\"qmp_capabilities\"}\n{\"execute\":\"human-monitor-command\",\
+                  \"arguments\":{\"command-line\":\"info network\"}}\n",
+            )
+            .await
+            .expect("write qmp commands");
+        let mut replies = Vec::new();
+        let mut chunk = [0u8; 8192];
+        while let Ok(Ok(read)) =
+            tokio::time::timeout(Duration::from_millis(300), stdout.read(&mut chunk)).await
+        {
+            if read == 0 {
+                break;
+            }
+            replies.extend_from_slice(&chunk[..read]);
+        }
+        let replies = String::from_utf8_lossy(&replies).to_string();
+        // The monitor prints the device and the backend separately: the NIC line carries
+        // `macaddr=`, the backend line carries `net0: … br=`.
+        assert!(
+            replies.contains(&format!("macaddr={mac}")),
+            "the guest NIC does not carry the MAC that lease lookup searches for ({mac}): {replies}"
+        );
+        assert!(
+            replies.contains("net0: index=0,type=tap")
+                && replies.contains(&format!("br={QLEAN_BRIDGE_NAME}")),
+            "the NIC is not attached to the bridge Qlean reads leases from: {replies}"
+        );
+        println!("real QEMU reports net0 with the searched-for MAC {mac} on {QLEAN_BRIDGE_NAME}");
+
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+
     ///
     /// The deployment depends on the guest finding the seed ISO on a bus its early boot
     /// scans. QEMU accepts almost any `-drive` line, so a device that ends up unattached,
