@@ -120,6 +120,79 @@ fn combine_outcome<T>(outcome: Result<T>, shutdown: Result<()>) -> Result<T> {
 }
 
 #[cfg(test)]
+mod plan_doc_tests {
+    /// The revision history is one timeline, newest first.
+    ///
+    /// Half of it used to grow downwards (R1 at the top, appended after the header) and the
+    /// other half grew upwards (each new round prepended), so the newest change sat in the
+    /// middle of the table and a reader could not tell which end to read from — while every
+    /// summary in the plan and in `plan-status.md` refers to "the latest R<n> row". Ordering
+    /// by review number is what makes that sentence true; the `R9 补记` follow-up is allowed
+    /// to sit next to R9.
+    #[test]
+    fn the_plan_revision_history_is_ordered_newest_first() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        const HEADING: &str = "### 修订历史";
+
+        let lines: Vec<&str> = PLAN.lines().collect();
+        let heading = lines
+            .iter()
+            .position(|line| line.trim_end() == HEADING)
+            .expect("the plan has no 修订历史 section");
+        let header = lines[heading..]
+            .iter()
+            .position(|line| line.starts_with("| 时间 |"))
+            .map(|offset| heading + offset)
+            .expect("the 修订历史 section has no table header");
+        let body: Vec<&str> = lines[header + 2..]
+            .iter()
+            .take_while(|line| line.starts_with('|'))
+            .copied()
+            .collect();
+        assert!(body.len() > 10, "the revision history table looks empty");
+
+        let mut last: Option<u32> = None;
+        let mut seen: Vec<u32> = Vec::new();
+        for row in body {
+            let cells: Vec<&str> = row.split('|').map(str::trim).collect();
+            let (time, trigger) = (cells[1], cells[2]);
+            assert!(
+                time.len() == 23 && time.ends_with(" UTC"),
+                "a revision history row has no `YYYY-MM-DD HH:MM:SS UTC` timestamp: {row}"
+            );
+            if let Some(number) = trigger.strip_prefix("review R").and_then(|rest| {
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                digits.parse::<u32>().ok()
+            }) {
+                if let Some(previous) = last {
+                    assert!(
+                        number <= previous,
+                        "R{number} is listed after R{previous}: the table must run newest first"
+                    );
+                    assert!(
+                        !seen.contains(&number) || number == previous,
+                        "R{number} appears twice, separated from its own row"
+                    );
+                }
+                if !seen.contains(&number) {
+                    seen.push(number);
+                }
+                last = Some(number);
+            }
+        }
+        assert_eq!(
+            seen.first().copied(),
+            seen.iter().copied().max(),
+            "the newest review is not the first row of the table"
+        );
+        assert!(
+            seen.windows(2).all(|pair| pair[0] > pair[1]),
+            "the review numbers in the table are not strictly descending: {seen:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod outcome_tests {
     use super::combine_outcome;
 
