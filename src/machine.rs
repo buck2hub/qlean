@@ -426,10 +426,11 @@ impl Machine {
         let machine_id = nanoid!(12, &HEX_ALPHABET);
         let run_dir = Path::new(&dirs.runs).join(&machine_id);
         let seed_dir = run_dir.join("seed");
-        tokio::fs::create_dir_all(&run_dir).await?;
-        tokio::fs::create_dir_all(&seed_dir).await?;
         // The run directory holds the per-VM host private key, the seed medium and the
-        // disk overlay: keep it owner-only regardless of the host umask.
+        // disk overlay: it has to be owner-only from the moment it exists, not after a
+        // `chmod` (the private key is written into it further down).
+        crate::utils::create_owner_only_dir_all(&run_dir)?;
+        crate::utils::create_owner_only_dir_all(&seed_dir)?;
         crate::utils::restrict_dir(&run_dir)?;
         // Everything below writes into `run_dir`; if it fails, the directory must not
         // outlive the failed construction.

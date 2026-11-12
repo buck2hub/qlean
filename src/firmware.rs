@@ -619,22 +619,11 @@ impl Swtpm {
     /// Start `swtpm` for the VM in `run_dir` and wait until its control socket exists.
     pub(crate) async fn start(run_dir: &Path) -> Result<Self> {
         let state_dir = run_dir.join("tpm");
-        tokio::fs::create_dir_all(&state_dir)
-            .await
+        // The TPM state is per-VM secret material and `swtpm` starts writing into it as soon
+        // as it runs, so the directory has to be owner-only from creation: creating it with
+        // the umask's permissions and `chmod`ing it afterwards is the window R97 closed.
+        crate::utils::create_owner_only_dir_all(&state_dir)
             .with_context(|| format!("failed to create TPM state dir {}", state_dir.display()))?;
-        // The TPM state is per-VM secret material: keep it owner-only.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to restrict TPM state dir permissions on {}",
-                        state_dir.display()
-                    )
-                })?;
-        }
         let socket = run_dir.join("swtpm.sock");
         if socket.exists() {
             let _ = std::fs::remove_file(&socket);
@@ -1158,6 +1147,49 @@ mod tests {
         assert!(elapsed < SHUTDOWN_GRACE, "took {elapsed:?}");
         let status = swtpm.child.try_wait().expect("try_wait works");
         assert!(status.is_some(), "child must be gone after a graceful stop");
+    }
+
+    /// Name of the state file a real `swtpm` writes its TPM 2.0 state into.
+    const TPM_STATE_FILE: &str = "tpm2-00.permall";
+
+    /// The graceful stop has to reach the real `swtpm`, not just a `sleep`.
+    ///
+    /// `stop` promises that `swtpm` gets to flush its state, because a `SIGKILL` leaves the
+    /// guest without the TPM identity it sealed secrets against (on Windows: BitLocker
+    /// recovery prompts). `swtpm` rewrites `tpm2-00.permall` on the way out, so the file
+    /// must differ from its startup contents afterwards. A fake child cannot show that;
+    /// this needs the real program.
+    #[ignore = "needs a real `swtpm` on the host"]
+    #[tokio::test]
+    async fn test_a_real_swtpm_flushes_its_state_when_it_is_stopped() {
+        let run_dir = temp_dir("swtpm-flush");
+        let state = run_dir.join("tpm").join(TPM_STATE_FILE);
+
+        let mut tpm = match Swtpm::start(&run_dir).await {
+            Ok(tpm) => tpm,
+            Err(error) => panic!("a real swtpm is required for this test: {error}"),
+        };
+        let at_startup = std::fs::read(&state).unwrap_or_else(|error| {
+            panic!(
+                "swtpm created no state file at {}: {error}",
+                state.display()
+            )
+        });
+
+        tpm.stop().await;
+        let after_stop = std::fs::read(&state).unwrap_or_else(|error| {
+            panic!("swtpm left no state file at {}: {error}", state.display())
+        });
+
+        assert_ne!(
+            at_startup,
+            after_stop,
+            "`swtpm` wrote {} bytes at startup and the same {} bytes after the stop: it was \
+             killed instead of asked to terminate, so the TPM state was never flushed",
+            at_startup.len(),
+            after_stop.len()
+        );
+        let _ = std::fs::remove_dir_all(&run_dir);
     }
 
     #[tokio::test]

@@ -446,13 +446,11 @@ fn project_dir_or_explain(dirs: Option<ProjectDirs>) -> Result<ProjectDirs> {
 }
 
 pub(crate) fn create_dir(purpose: &str, path: &Path) -> Result<()> {
-    if !path.exists() {
-        debug!("{purpose} dir {path:?} doesn't exist yet, creating");
-        std::fs::create_dir_all(path)
-            .with_context(|| format!("failed to create the {purpose} directory {path:?}"))?;
-    }
+    create_owner_only_dir_all(path)
+        .with_context(|| format!("failed to create the {purpose} directory {path:?}"))?;
     // Qlean's directories hold the client private key, per-VM host keys and seed media,
     // so they must not be traversable by other local users even when the umask allows it.
+    // Creation already applies 0700; this also tightens a directory that existed before.
     restrict_dir(path)
 }
 
@@ -465,6 +463,32 @@ pub(crate) fn path_argument(prefix: &str, path: &Path) -> std::ffi::OsString {
     let mut argument = std::ffi::OsString::from(prefix);
     argument.push(path.as_os_str());
     argument
+}
+
+/// Create a directory path with owner-only permission **at creation time**.
+///
+/// The directory counterpart of [`create_owner_only`]: `create_dir_all` plus a `chmod` opens
+/// exactly the window R97 closed for files — the tree exists with the umask's permissions
+/// (0755 under the usual 022) until the `chmod` runs, and that window holds whatever the
+/// caller writes into it next (a private key, TPM state, a seed medium) as well as the
+/// directory itself. `DirBuilder::mode` applies the mode to every level it creates, so no
+/// umask can widen the result; directories that already exist are left alone (call
+/// [`restrict_dir`] for those).
+pub(crate) fn create_owner_only_dir_all(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
 }
 
 /// Create `path` with owner-only permission **at creation time**.
@@ -1813,6 +1837,84 @@ mod owner_only_tests {
                 .nth(1)
                 .is_some_and(|after| after.contains("write_owner_only_atomically")),
             "the staged host private key must not be written with a plain write plus `chmod`"
+        );
+    }
+
+    /// A directory that will hold secrets has to be restricted when it is created.
+    ///
+    /// `create_dir_all` plus `chmod` is the same two-step the file writer was fixed for: for
+    /// as long as the `chmod` has not run, the directory exists with the umask's permissions,
+    /// and the caller writes the private key, the seed medium or the TPM state into it right
+    /// afterwards. The end state looks identical, so only creation can be inspected.
+    #[test]
+    fn test_owner_only_directories_are_created_that_way_and_never_chmoded() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nested = dir.path().join("a").join("b");
+        create_owner_only_dir_all(&nested).expect("nested directory");
+        assert!(nested.is_dir(), "the helper must create parents too");
+        for path in [nested.clone(), dir.path().join("a")] {
+            let mode = std::fs::metadata(&path)
+                .expect("created dir")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "{} came out as {mode:o}", path.display());
+        }
+
+        fn region<'a>(source: &'a str, from: &str, to: &str) -> &'a str {
+            let start = source.find(from).expect("region start");
+            let rest = &source[start..];
+            let end = rest.find(to).expect("region end");
+            &rest[..end]
+        }
+
+        let source = include_str!("utils.rs");
+        let helper = region(
+            source,
+            "pub(crate) fn create_owner_only_dir_all",
+            "pub(crate) fn create_owner_only(",
+        );
+        assert!(
+            helper.contains(".mode(0o700)"),
+            "the directory must be created with `DirBuilderExt::mode(0o700)`"
+        );
+        assert!(
+            !helper.contains("set_permissions") && !helper.contains("set_mode"),
+            "the mode must come from creation, not from a `chmod` that leaves a window"
+        );
+
+        // Every directory Qlean fills with secrets has to go through it.
+        let firmware = include_str!("firmware.rs");
+        let tpm = region(
+            firmware,
+            "let state_dir = run_dir.join(\"tpm\")",
+            "let socket =",
+        );
+        assert!(
+            tpm.contains("create_owner_only_dir_all(&state_dir)"),
+            "the per-VM TPM state dir must be created owner-only"
+        );
+        assert!(
+            !tpm.contains("set_permissions"),
+            "the per-VM TPM state dir must not be `chmod`ed after creation"
+        );
+
+        let machine = include_str!("machine.rs");
+        let run_dir = region(
+            machine,
+            "let seed_dir = run_dir.join(\"seed\")",
+            "RunDirGuard::new",
+        );
+        assert!(
+            run_dir.contains("create_owner_only_dir_all(&run_dir)")
+                && run_dir.contains("create_owner_only_dir_all(&seed_dir)"),
+            "the run directory and its seed directory must be created owner-only"
+        );
+        assert!(
+            !run_dir.contains("create_dir_all(&run_dir)"),
+            "the run directory must not be created with the umask's permissions"
         );
     }
 }
