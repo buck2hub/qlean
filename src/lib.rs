@@ -1316,6 +1316,64 @@ mod plan_doc_tests {
         );
     }
 
+    /// A tree walk that cannot read an entry fails instead of skipping it.
+    ///
+    /// `walk_remote_dir` backs `Machine::download` and `remove_dir_all`. It used to log a
+    /// failed `read_dir`/`metadata` at debug level and `continue`, so downloading a tree
+    /// that held a broken symlink (stat follows the link and fails) or an unreadable
+    /// directory returned `Ok` with those entries missing - the copy was silently
+    /// incomplete while the README promised that a link is never silently skipped. The
+    /// guard reads the function body and requires the two failures to be reported with the
+    /// path, and rejects the debug-and-continue shape coming back.
+    #[test]
+    fn the_remote_walk_reports_entries_it_cannot_read() {
+        let source = include_str!("ssh.rs");
+        let start = source
+            .find("pub(crate) async fn walk_remote_dir(")
+            .expect("`walk_remote_dir` must still exist");
+        let body = {
+            let mut depth = 0usize;
+            let mut started = false;
+            let mut end = source.len();
+            for (offset, ch) in source[start..].char_indices() {
+                match ch {
+                    '{' => {
+                        depth += 1;
+                        started = true;
+                    }
+                    '}' => {
+                        depth -= 1;
+                        if started && depth == 0 {
+                            end = start + offset;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            &source[start..end]
+        };
+
+        assert!(
+            !body.contains("debug!"),
+            "a skipped entry makes the copy silently incomplete; report it instead"
+        );
+        for phrase in [
+            "Failed to read the remote directory",
+            "Failed to stat",
+            "while walking",
+        ] {
+            assert!(
+                body.contains(phrase),
+                "the walk must name what it could not read: `{phrase}` is gone"
+            );
+        }
+        assert!(
+            !body.contains("best-effort"),
+            "best-effort traversal is exactly what the documented contract forbids"
+        );
+    }
+
     /// The `source`/`digest` docs state the rule the code enforces, not a softer one.
     ///
     /// `ImageConfig::validate` refuses a half-set pair outright - an image is never fetched

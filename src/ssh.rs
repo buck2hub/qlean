@@ -1368,9 +1368,14 @@ impl Session {
                 match sftp.read_dir(dir.as_str()).await {
                     Ok(e) => e,
                     Err(e) => {
-                        // If directory can't be read, skip (best-effort)
-                        debug!("Failed to read_dir {:?}: {}", dir, e);
-                        continue;
+                        // A skipped directory means `download` reports success for a tree
+                        // it did not copy, so the failure has to reach the caller.
+                        bail!(
+                            "Failed to read the remote directory {} while walking {}: {}",
+                            dir.as_str(),
+                            root.as_str(),
+                            e
+                        );
                     }
                 }
             };
@@ -1387,8 +1392,15 @@ impl Session {
                     match sftp.metadata(child_path.as_str()).await {
                         Ok(a) => a,
                         Err(e) => {
-                            debug!("Failed to stat {}: {}", child_path.as_str(), e);
-                            continue;
+                            // An entry that cannot be stat'ed is either a broken symlink or
+                            // one this walk cannot classify; either way the copy would be
+                            // incomplete, so name it instead of dropping it.
+                            bail!(
+                                "Failed to stat {} while walking {}: {}",
+                                child_path.as_str(),
+                                root.as_str(),
+                                e
+                            );
                         }
                     }
                 };
