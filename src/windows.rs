@@ -291,24 +291,26 @@ impl DeploySeed {
     ///
     /// Failing to clean up is not fatal: the seed holds only a public key, a
     /// per-VM host key and the contract, and it is never attached again. The
-    /// error is returned so callers can log it.
+    /// error is returned so callers can log it — [`Machine::confirm_deployment`]
+    /// warns instead of failing a deployment that already succeeded.
+    ///
+    /// Both paths are removed even if one of them fails, and a path that is
+    /// already gone is success: this runs after a guest-side reboot, so a
+    /// previous attempt may have cleaned up one half already.
     pub(crate) async fn remove(self) -> Result<()> {
         let mut first_error: Option<anyhow::Error> = None;
         for path in [&self.iso, &self.dir] {
             let result = if path == &self.dir {
                 tokio::fs::remove_dir_all(path).await
             } else {
-                match tokio::fs::remove_file(path).await {
-                    Ok(()) => Ok(()),
-                    // Already gone is success for an idempotent cleanup.
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    Err(e) => Err(e),
-                }
+                tokio::fs::remove_file(path).await
             };
-            if let Err(e) = result
-                && first_error.is_none()
-            {
-                first_error = Some(e.into());
+            match result {
+                Ok(()) => {}
+                // Already gone is success for an idempotent cleanup.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) if first_error.is_none() => first_error = Some(e.into()),
+                Err(_) => {}
             }
         }
         match first_error {
@@ -499,6 +501,20 @@ mod tests {
         assert!(debug.contains("DeploySeed"));
         assert!(!debug.contains("PRIVATE KEY"));
         assert!(!debug.contains(host_key.privkey_str.trim()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_windows_deploy_seed_cleanup_is_idempotent() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let (seed, _host_key) = stage(tmp.path()).await?;
+        std::fs::write(seed.iso_path(), b"fake iso")?;
+        // Half of the cleanup already happened, for instance when the guest rebooted
+        // between two attempts: that is not a failure.
+        std::fs::remove_dir_all(tmp.path().join("seed"))?;
+
+        seed.remove().await?;
+        assert!(!tmp.path().join("seed.iso").exists());
         Ok(())
     }
 

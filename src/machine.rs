@@ -1098,10 +1098,16 @@ StandardError=journal
 
         if let Some(seed) = self.deploy_seed.take() {
             let iso = seed.iso_path().to_path_buf();
-            seed.remove()
-                .await
-                .with_context(|| format!("failed to delete the deployed seed medium {iso:?}"))?;
-            debug!("VM-{} deployed; seed medium removed", self.id);
+            match seed.remove().await {
+                Ok(()) => debug!("VM-{} deployed; seed medium removed", self.id),
+                // The guest is deployed and the machine is usable: a leftover seed file
+                // must not turn a successful first boot into a failure. It stays inside
+                // the owner-only run directory, so report it and move on.
+                Err(e) => warn!(
+                    "VM-{} deployed, but the seed medium {iso:?} could not be removed: {e:#}",
+                    self.id
+                ),
+            }
         }
         Ok(())
     }
