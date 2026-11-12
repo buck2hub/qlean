@@ -1316,6 +1316,35 @@ mod plan_doc_tests {
         );
     }
 
+    /// The cells of a Markdown table row, honoring escaped pipes.
+    fn table_cells(line: &str) -> Vec<String> {
+        let mut cells = Vec::new();
+        let mut current = String::new();
+        let mut chars = line.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\\' => match chars.peek() {
+                    Some('|') => {
+                        current.push('|');
+                        chars.next();
+                    }
+                    _ => current.push(ch),
+                },
+                '|' => {
+                    cells.push(current.trim().to_string());
+                    current.clear();
+                }
+                _ => current.push(ch),
+            }
+        }
+        // A row starts with a delimiter, so the first cell is the empty prefix; every cell
+        // after it is pushed when its closing delimiter is met.
+        if !cells.is_empty() {
+            cells.remove(0);
+        }
+        cells
+    }
+
     /// The body of the function whose signature starts at `signature`, brace-matched.
     fn function_body(source: &'static str, signature: &str) -> &'static str {
         let start = source
@@ -1377,6 +1406,83 @@ mod plan_doc_tests {
             !body.contains("best-effort"),
             "best-effort traversal is exactly what the documented contract forbids"
         );
+    }
+
+    /// Both tables in the plan have the number of columns their own header declares.
+    ///
+    /// The `## Review log` header has six columns and `### 修订历史` has five, but 42 review
+    /// rows had lost the `P2 处置` cell (the evidence text slid one column left) and one had
+    /// gained an extra cell, while nine history rows carried unescaped `|` inside code spans
+    /// (`| <卡号> |`, `chars().map(|c| c as u16)`, `| Round |`) that split the row into
+    /// phantom cells when rendered. Nothing checked either table, so the drift survived 140
+    /// rounds. A row now has to match its header, the review log's `P2 处置` cell has to say
+    /// something, and rows that render short or long are named by round.
+    #[test]
+    fn every_table_row_has_the_columns_its_header_declares() {
+        let plan = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+
+        for (heading, columns, row_prefix, marker) in [
+            ("## Review log", 6usize, "| R", "| PASS"),
+            ("### 修订历史", 5usize, "| 20", " UTC | "),
+        ] {
+            // Match the heading as a whole line: the same text appears inside a history row.
+            let at = plan
+                .lines()
+                .position(|line| line.trim_end() == heading)
+                .unwrap_or_else(|| panic!("`{heading}` must still exist as its own line"));
+            let mut lines = plan
+                .lines()
+                .skip(at + 1)
+                // Skip the prose between the heading and its table.
+                .skip_while(|line| !line.starts_with('|'));
+            let header = lines.next().unwrap_or_default();
+            assert_eq!(
+                table_cells(header).len(),
+                columns,
+                "`{heading}`: the header is not the width the test knows ({} cells): {header}",
+                table_cells(header).len()
+            );
+            let mut checked = 0usize;
+            let mut offenders = Vec::new();
+            for line in lines {
+                if line.starts_with('#') {
+                    break;
+                }
+                if !line.starts_with(row_prefix) || line.starts_with("|---") {
+                    continue;
+                }
+                checked += 1;
+                let cells = table_cells(line);
+                let label: String = line.chars().take(12).collect();
+                if cells.len() != columns {
+                    offenders.push(format!("{label} has {} cells", cells.len()));
+                } else if columns == 6 && cells[4].is_empty() {
+                    offenders.push(format!("{label} leaves `P2 处置` empty"));
+                }
+            }
+            assert!(
+                offenders.is_empty(),
+                "`{heading}` rows do not match the {columns}-column header: {offenders:?}"
+            );
+            assert!(
+                checked >= 100,
+                "`{heading}`: only {checked} rows scanned, the section heading or row shape moved"
+            );
+            // A row that loses its leading `|` stops looking like a row at all, so count the
+            // mark every row of this table carries and hold it against the rows surveyed.
+            let marked = plan
+                .lines()
+                .skip(at + 1)
+                .take_while(|line| !line.starts_with('#'))
+                // The result cell is `PASS` or `FAIL`, sometimes with a qualifier.
+                .filter(|line| line.contains(marker) || line.contains("| FAIL"))
+                .count();
+            assert_eq!(
+                marked, checked,
+                "`{heading}`: {marked} lines carry the row mark but {checked} rows were \
+                 surveyed — a row lost its leading `|`"
+            );
+        }
     }
 
     /// The walk classifies each entry as itself, not as whatever it points at.
