@@ -2,7 +2,7 @@ use std::{
     borrow::Cow,
     fs::Permissions,
     os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Output,
     sync::{
         Arc,
@@ -1111,7 +1111,7 @@ StandardError=journal
                         entry.path()
                     )
                 })?;
-                let remote_entry = remote_root.join(rel.to_string_lossy())?;
+                let remote_entry = remote_root.join(guest_relative_path(rel)?)?;
 
                 if ty.is_dir() {
                     ssh.create_dir_all(&remote_entry).await?;
@@ -2299,6 +2299,29 @@ async fn upload_symbolic_link(
     Ok(())
 }
 
+/// Render the relative path of a walked local entry as a guest path.
+///
+/// `to_string_lossy` is not a converter: it replaces every non-UTF-8 byte with `U+FFFD`, so
+/// two entries that differ only in such a byte (`f\xff` and `f\xfe`) render as the same
+/// guest name and the second upload silently overwrites the first. A guest path is a
+/// `String`, so an entry that cannot be spelled cannot be uploaded at all - the error names
+/// the component instead of uploading it under a different name.
+pub(crate) fn guest_relative_path(rel: &Path) -> Result<String> {
+    let mut parts = Vec::new();
+    for component in rel.components() {
+        match component {
+            Component::Normal(name) => parts.push(name.to_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "local path component {name:?} is not valid UTF-8, so it has no guest name; \
+                     rename it to upload it (qlean will not upload it under a different name)"
+                )
+            })?),
+            other => bail!("unsupported local path component {other:?} in {rel:?}"),
+        }
+    }
+    Ok(parts.join("/"))
+}
+
 fn local_basename(path: &Path) -> Result<&str> {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -2447,6 +2470,61 @@ mod shutdown_tests {
             .await
             .expect_err("must refuse");
         assert!(error.to_string().contains("not running"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod upload_name_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    fn os_path(bytes: &[u8]) -> PathBuf {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    }
+
+    #[test]
+    fn a_tree_entry_keeps_its_name_on_the_guest() {
+        // The walked paths arrive as host `Path`s; the guest spelling is the same name with
+        // `/` between the components, on every guest.
+        assert_eq!(
+            guest_relative_path(Path::new("dir/sub/file name.txt")).unwrap(),
+            "dir/sub/file name.txt"
+        );
+        assert_eq!(
+            guest_relative_path(Path::new("dir/日本語.txt")).unwrap(),
+            "dir/日本語.txt"
+        );
+        // The root of the walk has no relative path at all.
+        assert_eq!(guest_relative_path(Path::new("")).unwrap(), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_that_is_not_valid_utf8_is_refused_by_name() {
+        let error = guest_relative_path(&os_path(b"dir/f\xff"))
+            .expect_err("a byte that is not UTF-8 has no guest name");
+        let text = error.to_string();
+        assert!(text.contains("not valid UTF-8"), "{text}");
+        assert!(
+            text.contains("f\\xff") || text.contains("\"f\\xFF\""),
+            "the message must name the component that cannot be uploaded: {text}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_entries_that_differ_only_in_a_non_utf8_byte_never_share_a_guest_name() {
+        // `to_string_lossy` rendered both as `dir/f\u{fffd}`, so the second upload silently
+        // overwrote the first and the tree on the guest did not mirror the local one.
+        let a = guest_relative_path(&os_path(b"dir/f\xff"));
+        let b = guest_relative_path(&os_path(b"dir/f\xfe"));
+        assert!(a.is_err() && b.is_err(), "neither name can be spelled");
+        // The control: the same names in valid UTF-8 are distinct and kept.
+        assert_ne!(
+            guest_relative_path(Path::new("dir/f\u{00ff}")).unwrap(),
+            guest_relative_path(Path::new("dir/f\u{00fe}")).unwrap()
+        );
     }
 }
 

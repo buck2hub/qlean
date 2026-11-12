@@ -2546,6 +2546,76 @@ mod plan_doc_tests {
         }
     }
 
+    /// A guest name that cannot be spelled is refused, not approximated.
+    ///
+    /// `to_string_lossy` is not a converter: it renders every non-UTF-8 byte as `U+FFFD`, so
+    /// two entries that differ only in such a byte get one guest name and the second upload
+    /// silently overwrites the first. The rule only holds if the README says it *and* the
+    /// converter does it, so this guard reads both - a README paragraph describing code that
+    /// no longer exists is exactly what a wording-only check would bless.
+    #[test]
+    fn the_readme_states_that_a_non_utf8_name_is_refused_and_the_upload_refuses_it() {
+        #[cfg(unix)]
+        use std::os::unix::ffi::OsStrExt;
+
+        #[cfg(unix)]
+        let unspellable = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(b"tree/f\xff"));
+        #[cfg(not(unix))]
+        let unspellable = std::path::PathBuf::from("tree/f");
+        let error = crate::machine::guest_relative_path(&unspellable)
+            .expect_err("a name that is not valid UTF-8 has no guest spelling");
+        assert!(
+            error.to_string().contains("not valid UTF-8"),
+            "the refusal must say why the entry cannot be uploaded: {error}"
+        );
+        #[cfg(unix)]
+        {
+            let colliding = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(b"tree/f\xfe"));
+            assert!(
+                crate::machine::guest_relative_path(&colliding).is_err(),
+                "the entry that would have collided with the one above must also be refused"
+            );
+        }
+        // The control: a valid UTF-8 name is accepted and kept, so the guard is not just
+        // asserting that the function fails.
+        assert_eq!(
+            crate::machine::guest_relative_path(std::path::Path::new("tree/f\u{00ff}"))
+                .expect("a valid UTF-8 name"),
+            "tree/f\u{00ff}"
+        );
+
+        // The refusal must be on the path `upload` actually takes: the helper can be perfect
+        // while the walk keeps rendering names lossily.
+        const MACHINE: &str = include_str!("../src/machine.rs");
+        let upload = function_body(MACHINE, "pub async fn upload<");
+        assert!(
+            !upload.contains("to_string_lossy"),
+            "`Machine::upload` renders a walked entry lossily again"
+        );
+        assert!(
+            upload.contains("guest_relative_path("),
+            "`Machine::upload` no longer goes through `guest_relative_path`"
+        );
+
+        const README: &str = include_str!("../README.md");
+        let row = README
+            .split("\n\n")
+            .flat_map(|chunk| chunk.lines())
+            .find(|line| line.starts_with("| `upload` / `download` (file and directory)"))
+            .expect("the README must still have the upload/download support row");
+        let flat = row.split_whitespace().collect::<Vec<_>>().join(" ");
+        for claim in [
+            "an entry whose name is not valid UTF-8 is refused by name",
+            "instead of being uploaded under `U+FFFD`",
+        ] {
+            assert!(
+                flat.contains(claim),
+                "the README no longer states `{claim}`, which is what `guest_relative_path` \
+                 does for a name that cannot be spelled"
+            );
+        }
+    }
+
     /// The newest round's evidence reads the same in the plan and in the status view.
     ///
     /// Each round's summary is written twice - once in the revision history, once in the status

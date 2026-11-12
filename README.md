@@ -224,7 +224,7 @@ entries inside an uploaded or downloaded tree, so a file named `a\b` is not addr
 
 | Operation | Windows guest | Linux guest |
 |---|---|---|
-| `upload` / `download` (file and directory) | supported; recursive trees keep spaces and non-ASCII names | unchanged |
+| `upload` / `download` (file and directory) | supported; recursive trees keep spaces and non-ASCII names, and an entry whose name is not valid UTF-8 is refused by name instead of being uploaded under `U+FFFD` (a guest path is a UTF-8 string, so two such names would otherwise collide) | unchanged |
 | `create_dir` / `create_dir_all` / `exists` / `metadata` / `read` / `read_to_string` / `write` | supported | unchanged |
 | `read_dir` / `remove_file` / `remove_dir_all` / `rename` | supported (`remove_dir_all` deletes the tree) | unchanged |
 | `copy` | PowerShell `Copy-Item -LiteralPath ... -Destination ...`; never `cp` | `cp -p --` as before |
