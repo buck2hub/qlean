@@ -161,6 +161,7 @@
 | 2026-11-12 22:10:00 UTC | review R49（启动失败路径不得无限挂起） | F54：`launch` 的两条失败清理路径都是「`terminate_qemu(pid)` 之后 `let _ = qemu_handle.await;`」——**无限等待**。若 QEMU 杀不掉（EPERM、被 ptrace 暂停、pid 已不是 QEMU），`qemu_handle` 永远不会结束（它还在读 QEMU 的 stdout/stderr 管道），于是 `launch` 永不返回，**原始失败原因永不呈现**——而 Windows 首启失败的诊断（固件/TPM/部署日志）恰恰全在这条路径上，等于把最有价值的证据锁死。`terminate_qemu` 本身也用的是外部 `kill` 程序并丢弃退出码，杀掉失败会被当成杀掉成功。修：新增 `signal_term`（`libc::kill`，与 R48 的 `signal_kill` 一对，拒绝时 `warn!`）与泛型 `reap_launch_task(task, grace)`——有界等待（5s）后 `abort()` 并记录，两条失败路径都改用它，保证 `return Err(e)`/`bail!(e)` 一定能到达。新增 2 个单测：已结束的任务不被 abort；拒绝结束的任务在 50ms 内放弃而不是挂住（断言耗时上限）。`cargo test --lib` 136 → 138 | N/A（`OSX-02` 既有 AC：启动失败必须给出可诊断原因；无卡拆合） | `OSX-02` 实现证据、Review log、`src/machine.rs`、CHANGELOG、plan-status |
 | 2026-11-12 22:35:00 UTC | review R50（已部署的 guest 不因清理失败被判失败） | F55：`DeploySeed::remove` 只对 **ISO** 的 `NotFound` 宽容，对**目录**的 `remove_dir_all` 不宽容——而这个函数跑在「guest 侧已经重启」之后，半途清理是正常情形，于是**首启成功**却被报成 `failed to delete the deployed seed medium`（正中 `windows_first_boot` 的核心验收）。更糟的是文档与调用点自相矛盾：`remove` 的注释写「清理失败不致命，返回错误只为让调用者记录」，而 `confirm_deployment` 直接 `?`——把一个**已经可用**的 VM 判成失败。修：`remove` 两条路径都容忍 `NotFound`（其余错误仍逐条保留第一条并继续清理另一半），`confirm_deployment` 改为 `warn!` 并带上 seed 路径（它就落在 0700 的运行目录里，不是泄漏）。新增 1 个单测：目录已被清掉（模拟两次尝试之间 guest 重启）时 `remove` 必须成功且 ISO 仍被删除。`cargo test --lib` 138 → 139 | N/A（`EXE-01` 既有 AC：部署成功后 VM 必须立即可用；无卡拆合） | `EXE-01` 实现证据、Review log、`src/windows.rs`、`src/machine.rs`、CHANGELOG、plan-status |
 | 2026-11-12 23:00:00 UTC | review R51（guest 地址只在 IPv4 里选） | F56：`select_guest_address` 不筛地址族，只按 MAC 匹配——「只用 IPv4」这条判据被放在**生产者**（`GUEST_IP_QUERY` 里的 `-AddressFamily IPv4`）而不是**选择点**。双栈适配器同时报出 `192.168.221.42` 与 `fe80::…` 时，会因「同 MAC 多个地址」被判为 ambiguous 而**拒绝一个完全可用的地址**；若哪天查询里丢了过滤，则会直接把无 scope id 的链路本地 IPv6 交给传输层。旁边的 `lease_address_for` 恰恰是在选择点过滤的（注释还专门解释了原因），同一份代码里两种做法，说明这不是疏漏而是没统一。修：`parse_adapter_addresses` 丢弃非 IPv4 行，`select_guest_address` 的匹配与「多地址」诊断**都**加 `ip.is_ipv4()`（纵深防御：选择点自己守规矩，不依赖调用者），文档口径改为「恰好一个 IPv4 地址」。新增 3 个单测：双栈只取 IPv4、仅 IPv6 时报错且消息提到 IPv4、绕过解析器直接传 IPv6 也不会被选中。`cargo test --lib` 139 → 142 | N/A（`IP-01` 既有 AC：地址必须来自本 VM 且可用；无卡拆合） | `IP-01` 实现证据、Review log、`src/windows.rs`、CHANGELOG、plan-status |
+| 2026-11-12 23:25:00 UTC | review R52（Qlean 自己的探测要有预算，用户命令不要） | F57：`Session::call_with_output` **没有超时**，只靠 cancel token——而 cancel token 只在 `Drop`/`shutdown` 时才被取消。于是 Windows 的部署标记探测、`get_ip`、`copy` 一旦遇到「通道接受命令但 guest 侧永不返回」，就**永久挂住**。尤其致命的是 `confirm_deployment`：它的 15 分钟预算只在**两次探测之间**检查，单次探测挂住就等于预算形同虚设——`windows_first_boot` 的失败会表现为「qlean 卡住不动」，而不是任何一条可诊断的信息（R49 是启动路径的同一形状，这里是传输层）。修：新增 `bounded(budget, command, operation)` 与 `Session::call_probe`（`PROBE_TIMEOUT = 120s`），把 Qlean **自己**的三处探测（部署标记、`GUEST_IP_QUERY`、文件复制）切到有界版本；用户 `exec` 保持无界——`sleep 600` 是合法的静默命令，给传输层加全局空闲超时会把正常的用户命令杀掉（**这条边界是修复的重点，不是副产品**）。错误文案明确写「这是 Qlean 自己的探测上限，不是 guest 内的超时，命令可能仍在 guest 里跑」，不撒一个自己不知道的谎。新增 3 个单测：快速操作原样通过、原错误原样上抛、超预算时快速失败且文案含命令名与「Qlean 自己的上限」。`cargo test --lib` 142 → 145 | N/A（`EXE-01` 既有 AC：首启失败必须可诊断；无卡拆合） | `EXE-01` 实现证据、Review log、`src/ssh.rs`、`src/machine.rs`、CHANGELOG、plan-status |
 
 ## 已决议设计决策
 
@@ -763,6 +764,7 @@
 | 集成测试（`#[ignore]`） | `tests/windows_machine.rs`：`windows_transport`（地址、pin、unsupported、shutdown→spawn 重连）、`windows_pool`（双机地址/host key/会话隔离） |
 | README/CHANGELOG | README「Windows transport and security」；CHANGELOG Added ×4 / Changed ×1 |
 | 地址发现与 QEMU 退出 race | `launch` 把 DHCP lease 轮询与 `qemu_handle`、cancel token 一起 `select!`，QEMU 启动即退出时立即返回其真实错误并停 `swtpm`（R12，`src/machine.rs`） |
+| 探测预算分层 | `src/ssh.rs::bounded`/`call_probe`：Qlean 自己的探测有界，用户 `exec` 保持无界（R52，`bc98828`） |
 | 地址判据在选择点 | `src/windows.rs::select_guest_address` 只接受 IPv4，双栈不再误判 ambiguous（R51，`25e82c9`） |
 | 清理幂等且不致命 | `src/windows.rs::DeploySeed::remove` + `confirm_deployment` 的 `warn!`：半途清理不算失败（R50，`0b10e09`） |
 | 失败路径可终止 | `src/machine.rs::reap_launch_task`：清理阶段有界等待 QEMU，原始启动错误必定返回（R49，`0cb5988`） |
@@ -1325,6 +1327,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R49 | 启动失败路径不得无限挂起 | PASS | 无开放项 | F54：失败清理里 `qemu_handle.await` 无界等待，QEMU 杀不掉时 `launch` 永不返回、原始错误永不呈现 | `reap_launch_task` 有界等待 + `abort`，`signal_term` 走 `libc::kill`（`0cb5988`）；新增 2 个单测；`cargo test --lib` 138 passed |
 | R50 | 已部署的 guest 不因清理失败被判失败 | PASS | 无开放项 | F55：`remove` 对目录的 `NotFound` 不宽容、调用点把「清理失败」当「部署失败」，与函数文档相反 | 两条路径都幂等 + `confirm_deployment` 只 `warn!`（`0b10e09`）；新增 1 个单测；`cargo test --lib` 139 passed |
 | R51 | guest 地址只在 IPv4 里选 | PASS | 无开放项 | F56：地址选择只按 MAC 匹配，不筛地址族，双栈时被判 ambiguous、或把链路本地 IPv6 交给传输层 | 解析器与选择点双重过滤 `is_ipv4()`（`25e82c9`）；新增 3 个单测；`cargo test --lib` 142 passed |
+| R52 | 探测有预算、用户命令无预算 | PASS | 无开放项 | F57：控制面探测无超时，单次探测挂住会吃掉整个部署预算，表现为「卡住」而非可诊断失败 | `bounded` + `call_probe` 只约束 Qlean 自己的探测（`bc98828`）；新增 3 个单测；`cargo test --lib` 145 passed |
 
 ### R1 findings 与修订对照
 
