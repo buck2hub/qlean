@@ -3469,6 +3469,52 @@ mod plan_doc_tests {
         );
     }
 
+    /// `CRATE_SOURCES` lists every crate source that exists, and nothing that does not.
+    ///
+    /// The list is hand-written, so a new module under `src/` would silently sit outside every
+    /// guard that walks it: the guards would keep passing while covering one file fewer, and no
+    /// test would say so - a hand-written list cannot report that it has gone stale. Only `src/`
+    /// is required to be complete: it is the crate, and every file in it is compiled. The other
+    /// integration suites under `tests/` are Linux suites the plan never reasons about
+    /// (`DEFER-04`), so listing them is optional but naming a file that is not there is not.
+    #[test]
+    fn the_guarded_source_list_covers_every_crate_source() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        let listed: Vec<&str> = CRATE_SOURCES.iter().map(|(name, _)| *name).collect();
+
+        let mut on_disk: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(root.join("src")).expect("the crate has a `src` directory") {
+            let path = entry.expect("a readable directory entry").path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("a source file name is UTF-8");
+                on_disk.push(format!("src/{name}"));
+            }
+        }
+        on_disk.sort();
+
+        let mut missing = on_disk.clone();
+        missing.retain(|name| !listed.contains(&name.as_str()));
+        assert!(
+            missing.is_empty(),
+            "these crate sources exist but no guard reads them, so add them to `CRATE_SOURCES`: {missing:?}"
+        );
+
+        let mut absent: Vec<&str> = listed
+            .iter()
+            .copied()
+            .filter(|name| !root.join(name).is_file())
+            .collect();
+        absent.sort_unstable();
+        assert!(
+            absent.is_empty(),
+            "`CRATE_SOURCES` names sources that are not there: {absent:?}"
+        );
+    }
+
     /// The budgets the README promises are the ones the code uses.
     ///
     /// `README.md` is the only place a reader learns how long a Windows first boot may take: "The
