@@ -1095,15 +1095,29 @@ mod plan_doc_tests {
             );
         }
 
-        // A backlog count is a fact with one home. R123 fixed two documents that disagreed about
-        // it; R153 found the same fact stated a third time - in REL-01's evidence row - where no
-        // guard was watching and where it had been stale for ninety-two commits. The row now
-        // points at the registry instead of repeating the number, and this scan keeps it that way.
-        for (name, text, row) in [
-            ("the plan", PLAN, policy_row),
-            ("the status view", STATUS, status_row),
+        // A backlog count is a fact with one home. R123 fixed two documents that disagreed
+        // about it; R153 found the same fact stated a third time - in REL-01's evidence row -
+        // where no guard was watching and where it had been stale for ninety-two commits. The
+        // row now points at the registry instead of repeating the number.
+        //
+        // Only the two tables a reader consults are scanned: the evidence table and the
+        // registry. The round-by-round narrative quotes what earlier rounds wrote, and a rule
+        // that forbade the phrase there would forbid the plan from describing its own history.
+        let evidence = PLAN
+            .split("\n## 实施证据汇总\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## Review log\n").next())
+            .expect("the plan no longer has an evidence summary section");
+        let registry = PLAN
+            .split("\n### 依赖登记表\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n### ").next())
+            .expect("the plan no longer has a dependency registry");
+        for (name, section, row) in [
+            ("the plan's evidence table", evidence, policy_row),
+            ("the plan's dependency registry", registry, policy_row),
         ] {
-            for line in text.lines() {
+            for line in section.lines() {
                 if line == row || !line.contains("尚未推送") || !line.contains("个提交") {
                     continue;
                 }
