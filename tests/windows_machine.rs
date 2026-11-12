@@ -80,6 +80,21 @@ fn pflash_vars_file(arguments: &str) -> Option<String> {
     })
 }
 
+/// The `file=` of the QEMU argument that boots the guest disk overlay.
+///
+/// The overlay is `if=virtio` with a writeback cache while the seed medium is an IDE CD-ROM,
+/// so "the drive the guest boots from" is distinguishable from "the medium it deploys from".
+fn overlay_disk_file(arguments: &str) -> Option<String> {
+    arguments.split(' ').find_map(|argument| {
+        if !argument.contains("cache=writeback") {
+            return None;
+        }
+        argument
+            .split(',')
+            .find_map(|part| part.strip_prefix("file=").map(str::to_owned))
+    })
+}
+
 /// The `file=` of the QEMU argument that attaches the seed medium as a CD-ROM.
 fn seed_iso_file(arguments: &str) -> Option<String> {
     arguments.split(' ').find_map(|argument| {
@@ -130,8 +145,10 @@ fn the_host_process_helpers_parse_the_paths_the_launch_builds() {
     let swtpm = "swtpm socket --tpm2 --tpmstate dir=/run/qlean/VM-1/tpm                  --ctrl type=unixio,path=/run/qlean/VM-1/swtpm.sock,mode=0600";
     assert_eq!(tpm_state_dir(swtpm).as_deref(), Some("/run/qlean/VM-1/tpm"));
 
+    // The shapes below are the ones `qemu.rs` builds: `seed_drive_option` and
+    // `disk_drive_option`. A fixture that drifts from them tests the fixture.
     let seeded = "qemu-system-x86_64 -drive file=/run/qlean/VM-1/seed.iso,if=ide,media=cdrom,readonly=on \
-                   -drive file=/run/qlean/VM-1/overlay.img,if=none,id=virtio0";
+                   -drive file=/run/qlean/VM-1/overlay.img,if=virtio,cache=writeback";
     assert_eq!(
         seed_iso_file(seeded).as_deref(),
         Some("/run/qlean/VM-1/seed.iso"),
@@ -139,11 +156,16 @@ fn the_host_process_helpers_parse_the_paths_the_launch_builds() {
     );
     assert!(has_cdrom(seeded));
     let after_deployment =
-        "qemu-system-x86_64 -drive file=/run/qlean/VM-1/overlay.img,if=none,id=virtio0";
+        "qemu-system-x86_64 -drive file=/run/qlean/VM-1/overlay.img,if=virtio,cache=writeback";
     assert_eq!(seed_iso_file(after_deployment), None);
     assert!(
         !has_cdrom(after_deployment),
         "a boot without the seed medium must not attach any CD-ROM"
+    );
+    assert_eq!(
+        overlay_disk_file(seeded).as_deref(),
+        Some("/run/qlean/VM-1/overlay.img"),
+        "the guest boots from the overlay, not from the deployment medium"
     );
     assert_eq!(
         tpm_state_dir("swtpm socket --tpm2 --ctrl type=unixio"),
@@ -227,7 +249,7 @@ async fn windows_firmware_lifecycle() -> Result<()> {
         1,
         "the first boot must start exactly one swtpm: {swtpm_now:#?}"
     );
-    let vars = {
+    let (vars, overlay) = {
         let qemu = newly_started(&qemu_before, &host_processes_matching("qemu-system"));
         assert_eq!(
             qemu.len(),
@@ -241,7 +263,9 @@ async fn windows_firmware_lifecycle() -> Result<()> {
             std::path::Path::new(&vars).is_file(),
             "OVMF vars {vars} must exist on the host after the first boot"
         );
-        vars
+        let overlay = overlay_disk_file(arguments)
+            .unwrap_or_else(|| panic!("QEMU has no guest disk overlay: {arguments}"));
+        (vars, overlay)
     };
     let tpm_dir = tpm_state_dir(&swtpm_now[0].1)
         .unwrap_or_else(|| panic!("swtpm has no --tpmstate dir: {}", swtpm_now[0].1));
@@ -259,8 +283,9 @@ async fn windows_firmware_lifecycle() -> Result<()> {
         "shutdown left a process holding TPM state {tpm_dir}: {leaked:#?}"
     );
 
-    // Restart reuses the same overlay, OVMF vars and TPM state: same files, and a TPM state that
-    // was written during the first boot instead of a fresh one.
+    // Restart reuses the same overlay, OVMF vars and TPM state: same files (all three are read
+    // back off the restarted QEMU and swtpm command lines), and a TPM state that was written
+    // during the first boot instead of a fresh one.
     assert!(
         std::fs::read_dir(&tpm_dir)
             .map(|entries| entries
@@ -282,6 +307,20 @@ async fn windows_firmware_lifecycle() -> Result<()> {
         vars_again, vars,
         "the restart booted with different OVMF vars, so the first boot's NVRAM was dropped"
     );
+    {
+        let qemu = newly_started(&qemu_before, &host_processes_matching("qemu-system"));
+        let (_, arguments) = &qemu[0];
+        let overlay_again = overlay_disk_file(arguments)
+            .unwrap_or_else(|| panic!("the restarted QEMU has no guest disk: {arguments}"));
+        assert_eq!(
+            overlay_again, overlay,
+            "the restart booted a different disk, so the deployed installation was left behind"
+        );
+        assert!(
+            std::path::Path::new(&overlay_again).is_file(),
+            "the overlay {overlay_again} is gone after the restart"
+        );
+    }
     let tpm_dir_again =
         tpm_state_dir(&newly_started(&swtpm_before, &host_processes_matching("swtpm socket"))[0].1)
             .expect("the restarted swtpm has no --tpmstate dir");
