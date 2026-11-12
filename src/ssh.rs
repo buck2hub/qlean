@@ -23,6 +23,9 @@ use tokio_util::sync::CancellationToken;
 use tokio_vsock::{VsockAddr, VsockStream};
 use tracing::{debug, info};
 
+use crate::guest_path::GuestPath;
+use crate::image::GuestOs;
+
 const ERR_EACCES: i32 = 13; // Permission denied
 const ERR_ENODEV: i32 = 19; // No such device
 
@@ -828,33 +831,35 @@ pub(crate) async fn connect_ssh_windows(
 
 impl Session {
     /// Recursively create a directory and all of its parent components if they are missing.
-    pub(crate) async fn create_dir_all<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
-        let path = path.as_ref();
-        // Build path incrementally like mkdir -p
-        let mut cur = PathBuf::new();
-        for comp in path.components() {
-            cur.push(comp);
-            if cur.as_os_str().is_empty() {
+    pub(crate) async fn create_dir_all(&mut self, path: &GuestPath) -> Result<()> {
+        // Build the path incrementally like mkdir -p, using guest path semantics so a
+        // Windows `C:/Users/qlean` never becomes a host-relative `C:/` prefix.
+        for cur in path.ancestors() {
+            if cur.is_root() && path.guest_os() == GuestOs::Linux {
+                // "/" always exists.
                 continue;
             }
             // Limit SFTP borrow scope to avoid conflicts with self in recursion
             let create_res = {
                 let sftp = self.get_sftp().await?;
-                sftp.create_dir(cur.to_string_lossy()).await
+                sftp.create_dir(cur.as_str()).await
             };
             match create_res {
                 Ok(_) => {}
                 Err(e) => {
                     let meta_res = {
                         let sftp = self.get_sftp().await?;
-                        sftp.metadata(cur.to_string_lossy()).await
+                        sftp.metadata(cur.as_str()).await
                     };
                     if let Ok(attr) = meta_res {
                         if !attr.is_dir() {
-                            bail!("Remote path exists and is not a directory: {:?}", cur);
+                            bail!(
+                                "Remote path exists and is not a directory: {}",
+                                cur.as_str()
+                            );
                         }
                     } else {
-                        bail!("Failed to create remote directory {:?}: {}", cur, e);
+                        bail!("Failed to create remote directory {}: {}", cur.as_str(), e);
                     }
                 }
             }
@@ -863,20 +868,18 @@ impl Session {
     }
 
     /// Upload a single file via SFTP.
-    pub(crate) async fn upload_file<P: AsRef<Path>, Q: AsRef<Path>>(
+    pub(crate) async fn upload_file(
         &mut self,
-        local: P,
-        remote: Q,
+        local: &Path,
+        remote: &GuestPath,
         cancel_token: CancellationToken,
     ) -> anyhow::Result<()> {
-        let local = local.as_ref();
-        let remote = remote.as_ref();
         let mut src = tokio::fs::File::open(local).await?;
         // Scope SFTP borrow
         let mut dst = {
             let sftp = self.get_sftp().await?;
             sftp.open_with_flags(
-                remote.to_string_lossy(),
+                remote.as_str(),
                 OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
             )
             .await?
@@ -899,17 +902,15 @@ impl Session {
     }
 
     /// Download a single file via SFTP.
-    pub(crate) async fn download_file<P: AsRef<Path>, Q: AsRef<Path>>(
+    pub(crate) async fn download_file(
         &mut self,
-        remote: P,
-        local: Q,
+        remote: &GuestPath,
+        local: &Path,
         cancel_token: CancellationToken,
     ) -> anyhow::Result<()> {
-        let remote = remote.as_ref();
-        let local = local.as_ref();
         let mut src = {
             let sftp = self.get_sftp().await?;
-            sftp.open(remote.to_string_lossy()).await?
+            sftp.open(remote.as_str()).await?
         };
         let mut dst = tokio::fs::File::create(local).await?;
 
@@ -930,22 +931,21 @@ impl Session {
 
     /// Walk a remote directory tree over SFTP, similar to walkdir.
     /// Returns a depth-first list of entries including the root.
-    pub(crate) async fn walk_remote_dir<P: AsRef<Path>>(
+    pub(crate) async fn walk_remote_dir(
         &mut self,
-        root: P,
+        root: &GuestPath,
         follow_links: bool,
         cancel_token: CancellationToken,
     ) -> Result<Vec<RemoteDirEntry>> {
-        let root = root.as_ref();
         let mut out = Vec::new();
 
         // Stat root
         let root_meta = {
             let sftp = self.get_sftp().await?;
-            sftp.metadata(root.to_string_lossy()).await?
+            sftp.metadata(root.as_str()).await?
         };
         let root_type = RemoteFileType::from_attrs(&root_meta);
-        out.push(RemoteDirEntry::new(root.to_path_buf(), root_type));
+        out.push(RemoteDirEntry::new(root.clone(), root_type));
 
         // If root is not a dir, nothing more to traverse
         if !out[0].file_type.is_dir() {
@@ -953,7 +953,7 @@ impl Session {
         }
 
         // DFS stack of directories to visit
-        let mut stack = vec![root.to_path_buf()];
+        let mut stack = vec![root.clone()];
         while let Some(dir) = stack.pop() {
             if cancel_token.is_cancelled() {
                 bail!("Walk cancelled");
@@ -961,7 +961,7 @@ impl Session {
 
             let entries = {
                 let sftp = self.get_sftp().await?;
-                match sftp.read_dir(dir.to_string_lossy()).await {
+                match sftp.read_dir(dir.as_str()).await {
                     Ok(e) => e,
                     Err(e) => {
                         // If directory can't be read, skip (best-effort)
@@ -977,13 +977,13 @@ impl Session {
                     continue;
                 }
 
-                let child_path = dir.join(&name);
+                let child_path = dir.join(&name)?;
                 let attrs = {
                     let sftp = self.get_sftp().await?;
-                    match sftp.metadata(child_path.to_string_lossy()).await {
+                    match sftp.metadata(child_path.as_str()).await {
                         Ok(a) => a,
                         Err(e) => {
-                            debug!("Failed to stat {:?}: {}", child_path, e);
+                            debug!("Failed to stat {}: {}", child_path.as_str(), e);
                             continue;
                         }
                     }
@@ -997,19 +997,23 @@ impl Session {
                     // If it's a symlink and we're following links, stat the target
                     let target_path = {
                         let sftp = self.get_sftp().await?;
-                        match sftp.read_link(child_path.to_string_lossy()).await {
-                            Ok(tp) => PathBuf::from(tp),
+                        match sftp.read_link(child_path.as_str()).await {
+                            Ok(tp) => GuestPath::new(child_path.guest_os(), tp)?,
                             Err(e) => {
-                                bail!("Failed to read_link {:?}: {}", child_path, e);
+                                bail!("Failed to read_link {}: {}", child_path.as_str(), e);
                             }
                         }
                     };
                     let target_attrs = {
                         let sftp = self.get_sftp().await?;
-                        match sftp.metadata(target_path.to_string_lossy()).await {
+                        match sftp.metadata(target_path.as_str()).await {
                             Ok(a) => a,
                             Err(e) => {
-                                bail!("Failed to stat symlink target {:?}: {}", target_path, e);
+                                bail!(
+                                    "Failed to stat symlink target {}: {}",
+                                    target_path.as_str(),
+                                    e
+                                );
                             }
                         }
                     };
@@ -1065,15 +1069,15 @@ impl RemoteFileType {
 
 #[derive(Clone, Debug)]
 pub(crate) struct RemoteDirEntry {
-    path: PathBuf,
+    path: GuestPath,
     file_type: RemoteFileType,
 }
 
 impl RemoteDirEntry {
-    fn new(path: PathBuf, file_type: RemoteFileType) -> Self {
+    fn new(path: GuestPath, file_type: RemoteFileType) -> Self {
         Self { path, file_type }
     }
-    pub(crate) fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &GuestPath {
         &self.path
     }
 

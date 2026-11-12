@@ -170,6 +170,37 @@ which is what makes Windows results meaningful:
 - An empty or whitespace-only command is rejected with an error before any SSH request is
   sent.
 
+#### Windows file operations
+
+Every remote path is converted to a guest path before it reaches SFTP
+(`GuestPath`), so a Windows drive path is never reinterpreted with host `Path`
+semantics. Both `/` and `\` are accepted on input, and paths are sent to the guest with
+`/` separators, which `sshd` accepts on both operating systems.
+
+| Operation | Windows guest | Linux guest |
+|---|---|---|
+| `upload` / `download` (file and directory) | supported; recursive trees keep spaces and non-ASCII names | unchanged |
+| `create_dir` / `create_dir_all` / `exists` / `metadata` / `read` / `read_to_string` / `write` | supported | unchanged |
+| `read_dir` / `remove_file` / `remove_dir_all` / `rename` | supported (`remove_dir_all` deletes the tree) | unchanged |
+| `copy` | PowerShell `Copy-Item -LiteralPath ... -Destination ...`; never `cp` | `cp -p --` as before |
+| `hard_link` | unsupported: returns an error | unchanged |
+| `read_link` | unsupported: returns an error | unchanged |
+| `set_permissions` | unsupported: Windows uses ACLs, not POSIX mode bits | unchanged |
+
+Path rules for Windows guests:
+
+- A drive letter is required (`C:\Users\qlean`); drive-relative (`C:foo`), root-relative
+  (`\Users\qlean`) and bare names are rejected with an actionable error.
+- `..` components are rejected, and every joined child is validated again, so a relative
+  walk cannot escape the directory being uploaded or downloaded.
+- Names Windows cannot store are rejected: `<>:"|?*`, control characters, trailing space
+  or dot, and reserved device names (`CON`, `NUL`, `COM1`, `LPT1`, ...).
+- UNC (`\\server\share`) and device (`\\?\`, `\\.\`) paths are rejected rather
+  than guessed at.
+- Symlinks are never silently skipped: uploading a tree that contains one, or downloading
+  one, fails with an error naming the path. This applies to Linux guests too, where the
+  link is recreated and a failure is reported.
+
 ### Getting Started
 
 Add the dependency to your `Cargo.toml`:

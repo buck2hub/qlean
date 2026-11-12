@@ -282,3 +282,82 @@ async fn windows_get_ip() -> Result<()> {
     other.shutdown().await?;
     Ok(())
 }
+
+/// Windows file semantics: upload/download round-trip (files and directories), recursive
+/// delete, rename and copy, plus the explicit rejections for POSIX-only operations.
+#[tokio::test]
+#[ignore = "needs a licensed Windows image (DEP-01) and a Windows KVM host (DEP-02)"]
+#[serial]
+async fn windows_files() -> Result<()> {
+    tracing_subscriber_init();
+
+    let image = Image::new(windows_image_config()?).await?;
+    let mut vm = Machine::new(&image, &MachineConfig::default()).await?;
+    vm.init().await?;
+
+    let root = std::path::Path::new(r"C:\qlean-fs-test");
+    let nested = root.join("nested dir");
+    let unicode = nested.join("döner 报告.txt");
+    let contents = b"qlean windows file round-trip\n";
+
+    // Directories, spaces and non-ASCII names.
+    vm.create_dir_all(&nested).await?;
+    assert!(vm.exists(&nested).await?);
+    vm.write(&unicode, contents).await?;
+    assert_eq!(vm.read(&unicode).await?, contents);
+    assert_eq!(
+        vm.read_to_string(&unicode).await?,
+        std::str::from_utf8(contents)?
+    );
+
+    // Copy must not depend on POSIX `cp`.
+    let copied = nested.join("copied.txt");
+    vm.copy(&unicode, &copied).await?;
+    assert_eq!(vm.read(&copied).await?, contents);
+
+    // Rename and recursive delete.
+    let renamed = nested.join("renamed.txt");
+    vm.rename(&copied, &renamed).await?;
+    assert!(!vm.exists(&copied).await?);
+    assert!(vm.exists(&renamed).await?);
+    vm.remove_dir_all(root).await?;
+    assert!(!vm.exists(root).await?);
+
+    // File and directory upload/download round-trip from the host.
+    let host = tempfile::tempdir()?;
+    let host_file = host.path().join("upload me.txt");
+    std::fs::write(&host_file, contents)?;
+    let tree = host.path().join("tree");
+    std::fs::create_dir_all(tree.join("sub dir"))?;
+    std::fs::write(tree.join("sub dir").join("a.txt"), contents)?;
+
+    let remote_file = root.join("upload me.txt");
+    vm.upload(&host_file, &remote_file).await?;
+    assert_eq!(vm.read(&remote_file).await?, contents);
+
+    let remote_tree = root.join("tree");
+    vm.upload(&tree, root).await?;
+    assert!(
+        vm.exists(&remote_tree.join("sub dir").join("a.txt"))
+            .await?
+    );
+
+    let download_dir = host.path().join("downloaded");
+    std::fs::create_dir_all(&download_dir)?;
+    vm.download(&remote_tree, &download_dir).await?;
+    let downloaded = download_dir.join("tree").join("sub dir").join("a.txt");
+    assert!(downloaded.is_file());
+    assert_eq!(std::fs::read(&downloaded)?, contents);
+
+    // POSIX-only operations must fail loudly on Windows.
+    let err = vm
+        .read_link(&remote_file)
+        .await
+        .expect_err("read_link must be rejected")
+        .to_string();
+    assert!(err.contains("read_link"), "{err}");
+
+    vm.remove_dir_all(root).await?;
+    vm.shutdown().await?;
+    Ok(())
+}

@@ -8,7 +8,7 @@
 
 | 计划 | 主题 | 状态 | 目标分支 | 目标版本 | 最近更新时间 |
 |---|---|---|---|---|---|
-| [`plan-20261104-windows-guest.md`](plan-20261104-windows-guest.md) | Windows 客户机支持 | `in-progress`（R5 环境消歧：`SPK-01`/`SPK-02` 因 DEP-01/02 不可用而 `blocked`；实现卡在临时接受的 ADR 上推进，`OSX-01` 完成、`OSX-02`/`OSX-03`/`TRN-01`/`EXE-01`/`IP-01` 本地验收，`REL-01` 阻塞） | `main` | 0.4.0（minor；公开结构体字面量构造的源码兼容破坏） | 2026-11-12 12:50:00 UTC |
+| [`plan-20261104-windows-guest.md`](plan-20261104-windows-guest.md) | Windows 客户机支持 | `in-progress`（R5 环境消歧：`SPK-01`/`SPK-02` 因 DEP-01/02 不可用而 `blocked`；实现卡在临时接受的 ADR 上推进，`OSX-01` 完成、`OSX-02`/`OSX-03`/`TRN-01`/`EXE-01`/`IP-01`/`FS-01` 本地验收，`REL-01` 阻塞） | `main` | 0.4.0（minor；公开结构体字面量构造的源码兼容破坏） | 2026-11-12 12:50:00 UTC |
 
 ## 任务卡状态
 
@@ -24,7 +24,7 @@
 | TRN-01 | implementation | in-progress | locally-accepted | SPK-01, OSX-03 | 继承 REL-01 / `6711671`（DEFER-04） | 2026-11-12 11:40:00 UTC | TCP 传输 + MAC/lease 地址发现 + host key pinning 已实现；vsock 仅 Linux 需要；`windows_transport`/`windows_pool` 与真实 spawn 重连 `blocked`（DEP-01/02） |
 | EXE-01 | implementation | in-progress | locally-accepted | TRN-01 | 继承 REL-01 / `64b1046`（DEFER-04） | 2026-11-12 12:10:00 UTC | PowerShell 原文 + 退出码契约（`src/exec.rs`）；顺带修正非 0 退出被报为 success 的既有缺陷；真实 `windows_exec` 冒烟 `blocked`（DEP-01/02） |
 | IP-01 | implementation | in-progress | locally-accepted | EXE-01 | 继承 REL-01 / `eb8fd90`（DEFER-04） | 2026-11-12 12:50:00 UTC | 缓存优先 + PowerShell 查询按本 VM MAC 消歧；真实 `windows_get_ip`/双机一致性 `blocked`（DEP-01/02） |
-| FS-01 | implementation | pending | 空 | IP-01 | 继承 REL-01 / — | 2026-11-04 04:10:47 UTC | 文件路径与文件操作语义；序列化于 IP-01 |
+| FS-01 | implementation | in-progress | locally-accepted | IP-01 | 继承 REL-01 / `COMMITHASH`（DEFER-04） | 2026-11-12 13:20:00 UTC | `GuestPath` 唯一转换层 + Windows 文件语义与 unsupported 分支；真实 `windows_files`/Linux 回归 `blocked` |
 | REL-01 | release | pending | 空 | SPK-01, SPK-02, OSX-01, OSX-02, OSX-03, TRN-01, EXE-01, IP-01, FS-01 | 0.4.0 / — | 2026-11-04 04:10:47 UTC | 唯一发布点；已吸收 DOC-01 的收口审计 |
 
 ## 延后项与外部/跨计划依赖

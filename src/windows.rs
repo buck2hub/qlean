@@ -370,6 +370,15 @@ async fn set_owner_only(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Quote a path as a PowerShell single-quoted literal.
+///
+/// Single-quoted literals are the only PowerShell string form with no interpolation, so a
+/// path containing `$`, backticks, spaces or non-ASCII stays exactly as written. A single
+/// quote inside the value is doubled, which is how PowerShell escapes it.
+pub(crate) fn powershell_literal(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,6 +547,21 @@ mod tests {
         assert!(GUEST_IP_QUERY.contains("169.254.*"));
         assert!(GUEST_IP_QUERY.contains("Get-NetIPAddress"));
         assert!(!GUEST_IP_QUERY.contains("hostname -I"));
+    }
+
+    #[test]
+    fn windows_powershell_literal_quotes_paths_without_interpolation() {
+        // Machine::copy passes an already-normalized GuestPath.
+        assert_eq!(powershell_literal("C:/Users/qlean"), "'C:/Users/qlean'");
+        assert_eq!(
+            powershell_literal("C:/Program Files/a$b"),
+            "'C:/Program Files/a$b'"
+        );
+        assert_eq!(powershell_literal("C:/it's/a.txt"), "'C:/it''s/a.txt'");
+        assert_eq!(
+            powershell_literal("C:/döner 报告.txt"),
+            "'C:/döner 报告.txt'"
+        );
     }
 
     #[test]

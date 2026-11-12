@@ -27,6 +27,7 @@ use crate::utils::{ensure_host_prerequisites, ensure_prerequisites};
 
 mod exec;
 mod firmware;
+mod guest_path;
 mod image;
 mod machine;
 mod pool;

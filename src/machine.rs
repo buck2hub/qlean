@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     fs::Permissions,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -21,6 +22,7 @@ use walkdir::WalkDir;
 
 use crate::{
     firmware::{self, Swtpm, VmFirmware},
+    guest_path::{GuestPath, PosixOnlyOperation, ensure_supported},
     image::{GuestArch, GuestOs, Image},
     is_kvm_available,
     qemu::launch_qemu,
@@ -650,49 +652,51 @@ StandardError=journal
     }
 
     /// Upload file or directory to the machine.
+    ///
+    /// Remote paths are always built as [`GuestPath`]s, so a Windows drive path is never
+    /// reinterpreted as a host path. Uploading a tree that contains a symbolic link fails
+    /// instead of silently skipping the link.
     pub async fn upload<P: AsRef<Path>, Q: AsRef<Path>>(
         &mut self,
         local_path: P,
         remote_path: Q,
     ) -> Result<()> {
         let local_path = local_path.as_ref();
-        let remote_path = remote_path.as_ref();
+        let os = self.image.guest_os;
+        let remote_path = guest_path_from(os, remote_path.as_ref())?;
         info!(
-            "📤 Uploading {:?} to {:?} on VM-{}",
-            local_path, remote_path, self.id
+            "📤 Uploading {:?} to {} on VM-{}",
+            local_path,
+            remote_path.as_str(),
+            self.id
         );
         let (ssh, cancel_token) = self.get_ssh()?;
 
-        // Normalize local path type
         let meta = tokio::fs::metadata(local_path).await?;
         if meta.is_file() {
             // Decide final remote target path (dir vs file path)
             let remote_target = {
                 let is_dir = {
                     let sftp = ssh.get_sftp().await?;
-                    (sftp.read_dir(remote_path.to_string_lossy()).await).is_ok()
+                    sftp.read_dir(remote_path.as_str()).await.is_ok()
                 };
                 if is_dir {
-                    remote_path.join(local_path.file_name().expect("local_path has no basename"))
+                    remote_path.join(local_basename(local_path)?)?
                 } else {
-                    remote_path.to_path_buf()
+                    remote_path.clone()
                 }
             };
 
             // Ensure remote parent directory exists
             if let Some(parent) = remote_target.parent() {
-                ssh.create_dir_all(parent).await?;
+                ssh.create_dir_all(&parent).await?;
             }
 
-            // Upload single file
             ssh.upload_file(local_path, &remote_target, cancel_token.clone())
                 .await?;
         } else if meta.is_dir() {
             // For directory: mirror into remote_path/<basename>
-            let base = local_path
-                .file_name()
-                .ok_or_else(|| anyhow::anyhow!("local_path has no basename"))?;
-            let remote_root = remote_path.join(base);
+            let remote_root = remote_path.join(local_basename(local_path)?)?;
             ssh.create_dir_all(&remote_root).await?;
 
             for entry in WalkDir::new(local_path).follow_links(false) {
@@ -704,43 +708,52 @@ StandardError=journal
                     bail!("Upload cancelled");
                 }
 
-                // Relative path under local_path
+                // Relative path under local_path, converted to a guest path
                 let rel = entry
                     .path()
                     .strip_prefix(local_path)
                     .expect("Failed to get relative path");
-                let remote_entry = remote_root.join(rel);
+                let remote_entry = remote_root.join(rel.to_string_lossy())?;
 
                 if ty.is_dir() {
                     ssh.create_dir_all(&remote_entry).await?;
                 } else if ty.is_file() {
                     if let Some(parent) = remote_entry.parent() {
-                        ssh.create_dir_all(parent).await?;
+                        ssh.create_dir_all(&parent).await?;
                     }
                     ssh.upload_file(entry.path(), &remote_entry, cancel_token.clone())
                         .await?;
                 } else if ty.is_symlink() {
-                    // Try to reproduce symlink if possible
-                    match tokio::fs::read_link(entry.path()).await {
-                        Ok(target) => {
-                            // Ensure parent exists
-                            if let Some(parent) = remote_entry.parent() {
-                                ssh.create_dir_all(parent).await?;
-                            }
-                            {
-                                let sftp = ssh.get_sftp().await?;
-                                let _ = sftp
-                                    .symlink(
-                                        remote_entry.to_string_lossy(),
-                                        target.to_string_lossy(),
-                                    )
-                                    .await; // best-effort
-                            }
-                        }
-                        Err(_) => {
-                            // Fallback: ignore or copy as file (we ignore silently)
-                        }
+                    if os == GuestOs::Windows {
+                        bail!(
+                            "symbolic links are not supported when uploading to a Windows guest: {}",
+                            remote_entry.as_str()
+                        );
                     }
+                    // Recreate the link (Linux guests only). A failure here must not be
+                    // reported as a successful upload.
+                    let target = tokio::fs::read_link(entry.path()).await.with_context(|| {
+                        format!("failed to read the link at {:?}", entry.path())
+                    })?;
+                    if let Some(parent) = remote_entry.parent() {
+                        ssh.create_dir_all(&parent).await?;
+                    }
+                    {
+                        let sftp = ssh.get_sftp().await?;
+                        sftp.symlink(remote_entry.as_str(), target.to_string_lossy())
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "failed to recreate the symbolic link {}",
+                                    remote_entry.as_str()
+                                )
+                            })?;
+                    }
+                } else {
+                    bail!(
+                        "unsupported filesystem entry while uploading {:?}: only files, directories and (Linux) symbolic links are supported",
+                        entry.path()
+                    );
                 }
             }
         } else {
@@ -751,35 +764,46 @@ StandardError=journal
     }
 
     /// Download file or directory from the machine.
+    ///
+    /// The remote side is traversed with [`GuestPath`] semantics; entries that cannot be
+    /// represented (for example symbolic links, which SFTP cannot fetch as links) are
+    /// reported as errors instead of being skipped silently.
     pub async fn download<P: AsRef<Path>, Q: AsRef<Path>>(
         &mut self,
         remote_path: P,
         local_path: Q,
     ) -> Result<()> {
-        let remote_path = remote_path.as_ref();
         let local_path = local_path.as_ref();
+        let os = self.image.guest_os;
+        let remote_path = guest_path_from(os, remote_path.as_ref())?;
         info!(
-            "📥 Downloading {:?} from VM-{} to {:?}",
-            remote_path, self.id, local_path
+            "📥 Downloading {} from VM-{} to {:?}",
+            remote_path.as_str(),
+            self.id,
+            local_path
         );
         let (ssh, cancel_token) = self.get_ssh()?;
 
         // Check remote path type
         let remote_meta = {
             let sftp = ssh.get_sftp().await?;
-            sftp.metadata(remote_path.to_string_lossy())
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to stat remote path: {}", e))?
+            sftp.metadata(remote_path.as_str()).await.map_err(|e| {
+                anyhow::anyhow!("Failed to stat remote path {}: {}", remote_path.as_str(), e)
+            })?
         };
 
         if !remote_meta.is_dir() {
             // Decide final local target path (dir vs file path)
             let local_target = match tokio::fs::metadata(local_path).await {
-                Ok(attr) if attr.is_dir() => local_path.join(
-                    remote_path
-                        .file_name()
-                        .ok_or_else(|| anyhow::anyhow!("remote_path has no basename"))?,
-                ),
+                Ok(attr) if attr.is_dir() => {
+                    let name = remote_path.file_name().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "remote path {} has no basename to reuse",
+                            remote_path.as_str()
+                        )
+                    })?;
+                    local_path.join(name)
+                }
                 _ => local_path.to_path_buf(),
             };
 
@@ -790,14 +814,16 @@ StandardError=journal
                 })?;
             }
 
-            // Download single file
-            ssh.download_file(remote_path, &local_target, cancel_token.clone())
+            ssh.download_file(&remote_path, &local_target, cancel_token.clone())
                 .await?;
         } else if remote_meta.is_dir() {
             // For directory: mirror into local_path/<basename>
-            let base = remote_path
-                .file_name()
-                .ok_or_else(|| anyhow::anyhow!("remote_path has no basename"))?;
+            let base = remote_path.file_name().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "remote path {} has no basename to reuse",
+                    remote_path.as_str()
+                )
+            })?;
             let local_root = local_path.join(base);
             tokio::fs::create_dir_all(&local_root).await.map_err(|e| {
                 anyhow::anyhow!("Failed to create local directory {:?}: {}", local_root, e)
@@ -806,7 +832,7 @@ StandardError=journal
             // Use walk_remote_dir for DFS traversal
             let entries = ssh
                 .walk_remote_dir(
-                    remote_path,
+                    &remote_path,
                     /*follow_links=*/ false,
                     cancel_token.clone(),
                 )
@@ -817,12 +843,19 @@ StandardError=journal
                     bail!("Download cancelled");
                 }
 
-                // Compute local path relative to remote root
-                let rel = match e.path().strip_prefix(remote_path) {
-                    Ok(r) => r,
-                    Err(_) => continue,
+                // Compute local path relative to the remote root
+                let rel = e.path().strip_prefix(&remote_path).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "remote entry {} is not under {}",
+                        e.path().as_str(),
+                        remote_path.as_str()
+                    )
+                })?;
+                let local_entry = if rel.is_empty() {
+                    local_root.clone()
+                } else {
+                    local_root.join(rel)
                 };
-                let local_entry = local_root.join(rel);
 
                 if e.file_type().is_dir() {
                     tokio::fs::create_dir_all(&local_entry).await.map_err(|e| {
@@ -837,8 +870,15 @@ StandardError=journal
                     ssh.download_file(e.path(), &local_entry, cancel_token.clone())
                         .await?;
                 } else if e.file_type().is_symlink() {
-                    // Best-effort: current SFTP attrs may not distinguish symlinks.
-                    // Treat as file or skip depending on future capabilities.
+                    bail!(
+                        "cannot download the symbolic link {} as a link; download its target instead",
+                        e.path().as_str()
+                    );
+                } else {
+                    bail!(
+                        "unsupported filesystem entry while downloading {}",
+                        e.path().as_str()
+                    );
                 }
             }
         } else {
@@ -1178,42 +1218,56 @@ StandardError=journal
 }
 
 // Filesystem methods for Machine
+//
+// Every remote path goes through [`GuestPath`] so Windows drive paths keep guest
+// semantics and invalid/unsupported forms are rejected before touching the guest.
 impl Machine {
     /// Copies the contents of one file to another.
-    /// This function will also copy the permission bits of the original file to the destination file.
+    ///
+    /// On Linux guests this uses `cp -p --` inside the guest; on Windows guests it uses
+    /// PowerShell `Copy-Item`, because `cp` does not exist there.
     pub async fn copy<P: AsRef<Path>, Q: AsRef<Path>>(&mut self, from: P, to: Q) -> Result<()> {
-        let from = from.as_ref();
-        let to = to.as_ref();
+        let os = self.image.guest_os;
+        let from = guest_path_from(os, from.as_ref())?;
+        let to = guest_path_from(os, to.as_ref())?;
         let (ssh, cancel_token) = self.get_ssh()?;
 
         // Validate source and destination semantics to mirror std::fs::copy
         {
             let sftp = ssh.get_sftp().await?;
             let src_meta = sftp
-                .metadata(from.to_string_lossy())
+                .metadata(from.as_str())
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to stat source: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("Failed to stat source {}: {e}", from.as_str()))?;
             if src_meta.is_dir() {
-                bail!("Source is a directory: {:?}", from);
+                bail!("Source is a directory: {}", from.as_str());
             }
 
-            if let Ok(dst_meta) = sftp.metadata(to.to_string_lossy()).await
+            if let Ok(dst_meta) = sftp.metadata(to.as_str()).await
                 && dst_meta.is_dir()
             {
-                bail!("Destination is a directory: {:?}", to);
+                bail!("Destination is a directory: {}", to.as_str());
             }
         }
 
-        // Use cp inside the guest to avoid round-tripping data over SFTP.
-        let cmd = format!(
-            "cp -p -- {} {}",
-            escape(from.to_string_lossy()),
-            escape(to.to_string_lossy())
-        );
+        let cmd = match os {
+            GuestOs::Linux => format!(
+                "cp -p -- {} {}",
+                escape(Cow::Borrowed(from.as_str())),
+                escape(Cow::Borrowed(to.as_str()))
+            ),
+            GuestOs::Windows => format!(
+                "powershell -NoProfile -NonInteractive -Command \"Copy-Item -LiteralPath {} -Destination {} -Force\"",
+                windows::powershell_literal(from.as_str()),
+                windows::powershell_literal(to.as_str())
+            ),
+        };
         let (code, _stdout, stderr) = ssh.call_with_output(&cmd, cancel_token).await?;
         if code != 0 {
             bail!(
-                "Failed to copy file (exit code {}): {}",
+                "Failed to copy file {} to {} (exit code {}): {}",
+                from.as_str(),
+                to.as_str(),
                 code,
                 String::from_utf8_lossy(&stderr)
             );
@@ -1224,152 +1278,207 @@ impl Machine {
 
     /// Creates a new, empty directory at the provided path.
     pub async fn create_dir<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
-        let path = path.as_ref();
+        let os = self.image.guest_os;
+        let path = guest_path_from(os, path.as_ref())?;
         let (ssh, _) = self.get_ssh()?;
 
         let sftp = ssh.get_sftp().await?;
-        sftp.create_dir(path.to_string_lossy()).await?;
+        sftp.create_dir(path.as_str()).await?;
 
         Ok(())
     }
 
     /// Recursively create a directory and all of its parent components if they are missing.
     pub async fn create_dir_all<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
-        let path = path.as_ref();
+        let os = self.image.guest_os;
+        let path = guest_path_from(os, path.as_ref())?;
         let (ssh, _) = self.get_ssh()?;
 
-        ssh.create_dir_all(path).await?;
+        ssh.create_dir_all(&path).await?;
 
         Ok(())
     }
 
     /// Returns `Ok(true)` if the path points at an existing entity.
     pub async fn exists<P: AsRef<Path>>(&mut self, path: P) -> Result<bool> {
-        let path = path.as_ref();
+        let os = self.image.guest_os;
+        let path = guest_path_from(os, path.as_ref())?;
         let (ssh, _) = self.get_ssh()?;
 
         let sftp = ssh.get_sftp().await?;
-        Ok(sftp.try_exists(path.to_string_lossy()).await?)
+        Ok(sftp.try_exists(path.as_str()).await?)
     }
 
     /// Creates a new hard link on the filesystem.
+    ///
+    /// Windows guests have no POSIX hard links over SFTP, so this is an explicit error
+    /// rather than a silent no-op.
     pub async fn hard_link<P: AsRef<Path>, Q: AsRef<Path>>(
         &mut self,
         original: P,
         link: Q,
     ) -> Result<()> {
-        let original = original.as_ref();
-        let link = link.as_ref();
+        let os = self.image.guest_os;
+        let original = guest_path_from(os, original.as_ref())?;
+        let link = guest_path_from(os, link.as_ref())?;
+        ensure_supported(os, PosixOnlyOperation::HardLink, &original)?;
         let (ssh, _) = self.get_ssh()?;
 
         let sftp = ssh.get_sftp().await?;
-        sftp.hardlink(original.to_string_lossy(), link.to_string_lossy())
-            .await?;
+        sftp.hardlink(original.as_str(), link.as_str()).await?;
 
         Ok(())
     }
 
     /// Given a path, queries the file system to get information about a file, directory, etc.
     pub async fn metadata<P: AsRef<Path>>(&mut self, path: P) -> Result<Metadata> {
-        let path = path.as_ref();
+        let os = self.image.guest_os;
+        let path = guest_path_from(os, path.as_ref())?;
         let (ssh, _) = self.get_ssh()?;
 
         let sftp = ssh.get_sftp().await?;
-        Ok(sftp.metadata(path.to_string_lossy()).await?)
+        Ok(sftp.metadata(path.as_str()).await?)
     }
 
     /// Reads the entire contents of a file into a bytes vector.
     pub async fn read<P: AsRef<Path>>(&mut self, path: P) -> Result<Vec<u8>> {
-        let path = path.as_ref();
+        let os = self.image.guest_os;
+        let path = guest_path_from(os, path.as_ref())?;
         let (ssh, _) = self.get_ssh()?;
 
         let sftp = ssh.get_sftp().await?;
-        Ok(sftp.read(path.to_string_lossy()).await?)
+        Ok(sftp.read(path.as_str()).await?)
     }
 
     /// Returns an iterator over the entries within a directory.
     pub async fn read_dir<P: AsRef<Path>>(&mut self, path: P) -> Result<ReadDir> {
-        let path = path.as_ref();
+        let os = self.image.guest_os;
+        let path = guest_path_from(os, path.as_ref())?;
         let (ssh, _) = self.get_ssh()?;
 
         let sftp = ssh.get_sftp().await?;
-        Ok(sftp.read_dir(path.to_string_lossy()).await?)
+        Ok(sftp.read_dir(path.as_str()).await?)
     }
 
     /// Reads a symbolic link, returning the file that the link points to.
+    ///
+    /// Windows guests report this as unsupported instead of returning a misleading path.
     pub async fn read_link<P: AsRef<Path>>(&mut self, path: P) -> Result<PathBuf> {
-        let path = path.as_ref();
+        let os = self.image.guest_os;
+        let path = guest_path_from(os, path.as_ref())?;
+        ensure_supported(os, PosixOnlyOperation::ReadLink, &path)?;
         let (ssh, _) = self.get_ssh()?;
 
         let sftp = ssh.get_sftp().await?;
-        Ok(PathBuf::from(sftp.read_link(path.to_string_lossy()).await?))
+        Ok(PathBuf::from(sftp.read_link(path.as_str()).await?))
     }
 
     /// Reads the entire contents of a file into a string.
     pub async fn read_to_string<P: AsRef<Path>>(&mut self, path: P) -> Result<String> {
-        let path = path.as_ref();
+        let os = self.image.guest_os;
+        let path = guest_path_from(os, path.as_ref())?;
         let (ssh, _) = self.get_ssh()?;
 
         let sftp = ssh.get_sftp().await?;
-        let bytes = sftp.read(path.to_string_lossy()).await?;
+        let bytes = sftp.read(path.as_str()).await?;
         Ok(String::from_utf8(bytes)?)
     }
 
     /// Removes a directory at provided path, after removing all its contents.
     pub async fn remove_dir_all<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
-        let path = path.as_ref();
-        let (ssh, _) = self.get_ssh()?;
+        let os = self.image.guest_os;
+        let path = guest_path_from(os, path.as_ref())?;
+        let cancel_token = self
+            .ssh_cancel_token
+            .as_ref()
+            .expect("Machine not initialized or spawned")
+            .clone();
 
-        let sftp = ssh.get_sftp().await?;
-        sftp.remove_dir(path.to_string_lossy()).await?;
+        // Collect the tree first, then delete children before their parents.
+        let entries = {
+            let (ssh, _) = self.get_ssh()?;
+            ssh.walk_remote_dir(&path, /*follow_links=*/ false, cancel_token.clone())
+                .await?
+        };
+
+        for entry in entries.iter().rev() {
+            if cancel_token.is_cancelled() {
+                bail!("remove_dir_all cancelled");
+            }
+            let (ssh, _) = self.get_ssh()?;
+            let sftp = ssh.get_sftp().await?;
+            if entry.file_type().is_dir() {
+                sftp.remove_dir(entry.path().as_str()).await.map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to remove remote directory {}: {}",
+                        entry.path().as_str(),
+                        e
+                    )
+                })?;
+            } else {
+                sftp.remove_file(entry.path().as_str()).await.map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to remove remote file {}: {}",
+                        entry.path().as_str(),
+                        e
+                    )
+                })?;
+            }
+        }
 
         Ok(())
     }
 
     /// Removes a file from the filesystem on VM.
     pub async fn remove_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
-        let path = path.as_ref();
+        let os = self.image.guest_os;
+        let path = guest_path_from(os, path.as_ref())?;
         let (ssh, _) = self.get_ssh()?;
 
         let sftp = ssh.get_sftp().await?;
-        sftp.remove_file(path.to_string_lossy()).await?;
+        sftp.remove_file(path.as_str()).await?;
 
         Ok(())
     }
 
     /// Renames a file or directory to a new name.
     pub async fn rename<P: AsRef<Path>, Q: AsRef<Path>>(&mut self, from: P, to: Q) -> Result<()> {
-        let from = from.as_ref();
-        let to = to.as_ref();
+        let os = self.image.guest_os;
+        let from = guest_path_from(os, from.as_ref())?;
+        let to = guest_path_from(os, to.as_ref())?;
         let (ssh, _) = self.get_ssh()?;
 
         let sftp = ssh.get_sftp().await?;
-        sftp.rename(from.to_string_lossy(), to.to_string_lossy())
-            .await?;
+        sftp.rename(from.as_str(), to.as_str()).await?;
 
         Ok(())
     }
 
     /// Changes the permissions found on a file or a directory.
+    ///
+    /// Windows guests use ACLs, not POSIX mode bits, so this is unsupported rather than a
+    /// change that silently does nothing.
     pub async fn set_permissions<P: AsRef<Path>>(
         &mut self,
         path: P,
         perm: Permissions,
     ) -> Result<()> {
-        let path = path.as_ref();
+        let os = self.image.guest_os;
+        let path = guest_path_from(os, path.as_ref())?;
+        ensure_supported(os, PosixOnlyOperation::SetPermissions, &path)?;
         let (ssh, _) = self.get_ssh()?;
 
         {
             let sftp = ssh.get_sftp().await?;
             let mut meta = sftp
-                .metadata(path.to_string_lossy())
+                .metadata(path.as_str())
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to stat file: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to stat {}: {}", path.as_str(), e))?;
 
             let mode = perm.mode();
             meta.permissions = Some(mode);
 
-            sftp.set_metadata(path.to_string_lossy(), meta).await?;
+            sftp.set_metadata(path.as_str(), meta).await?;
         }
 
         Ok(())
@@ -1383,16 +1492,32 @@ impl Machine {
         path: P,
         contents: C,
     ) -> Result<()> {
-        let path = path.as_ref();
+        let os = self.image.guest_os;
+        let path = guest_path_from(os, path.as_ref())?;
         let contents = contents.as_ref();
         let (ssh, _) = self.get_ssh()?;
 
         let sftp = ssh.get_sftp().await?;
-        let _ = sftp.create(path.to_string_lossy()).await?;
-        sftp.write(path.to_string_lossy(), contents).await?;
+        let _ = sftp.create(path.as_str()).await?;
+        sftp.write(path.as_str(), contents).await?;
 
         Ok(())
     }
+}
+
+/// Convert a caller-supplied path into a validated guest path for `os`.
+fn guest_path_from(os: GuestOs, path: &Path) -> Result<GuestPath> {
+    let text = path.to_str().ok_or_else(|| {
+        anyhow::anyhow!("guest path is not valid UTF-8 and cannot be sent over SFTP: {path:?}")
+    })?;
+    GuestPath::new(os, text)
+}
+
+/// Basename of a local path, as a UTF-8 name that can be joined onto a guest path.
+fn local_basename(path: &Path) -> Result<&str> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("local path {path:?} has no usable basename"))
 }
 
 impl Drop for Machine {

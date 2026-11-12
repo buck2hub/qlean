@@ -908,7 +908,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（A 实现与 B 本地门已过；C 真实 `windows_files` 与 Linux `test_file_operation`/`test_file_transfer` 回归需 DEP-01/02 与完整 Linux VM 宿主，`blocked`）
 
 **Description:** 建立客户机路径抽象并覆盖明确列出的 SFTP/文件操作，POSIX 专属能力明确拒绝。
 
@@ -924,24 +924,41 @@
 | 递归遍历与 `create_dir_all` 使用宿主 components/join | `src/ssh.rs:633-829` |
 | `copy`=POSIX cp，`set_permissions`=Unix mode | `src/machine.rs:922-1137` |
 
+| 项 | 证据 |
+|---|---|
+| 唯一转换层 | 新增 `src/guest_path.rs`：`GuestPath::new(guest_os, raw)` 校验并规范化，`join`/`parent`/`file_name`/`ancestors`/`strip_prefix`/`is_root` 全部按 guest 语义；`src/lib.rs` 注册 `mod guest_path` |
+| Windows 路径规范化 | 盘符必填并统一大写（`c:\users` → `C:/users`）、根写作 `C:`、`\`→`/`、保留空格与非 ASCII、去掉重复分隔符；UNC（`\\server\share`）、设备命名空间（`\\?\`、`\\.\`）、drive-relative（`C:foo`）、root-relative 与裸名一律报错 |
+| 组件校验 | 拒绝 `<>:"|?*`、控制字符、结尾空格/点、保留设备名（`CON`/`NUL`/`COM1-9`/`LPT1-9`）；`..` 在构造与每次 `join` 时都拒绝，避免相对遍历逃逸根目录 |
+| Linux 不变 | `GuestPath` 对 Linux 原样保存（仅拒绝空串/NUL 与反斜杠开头），`create_dir_all` 仍用 `/` 前缀逐级创建 |
+| 所有远程 SFTP 入口 | `src/ssh.rs`：`create_dir_all(&GuestPath)`、`walk_remote_dir(&GuestPath)`、`upload_file(&Path, &GuestPath)`、`download_file(&GuestPath, &Path)`、`RemoteDirEntry::path() -> &GuestPath`；`src/machine.rs` 的 `upload`/`download`/`copy`/`create_dir`/`create_dir_all`/`exists`/`hard_link`/`metadata`/`read`/`read_dir`/`read_link`/`read_to_string`/`remove_dir_all`/`remove_file`/`rename`/`set_permissions`/`write` 全部经 `guest_path_from` 转换，不再用宿主 `Path::join` 拼客户机路径 |
+| `copy` 不再用 POSIX `cp` | Windows 走 `powershell -NoProfile -NonInteractive -Command "Copy-Item -LiteralPath '<from>' -Destination '<to>' -Force"`；`windows::powershell_literal` 用单引号字面量并加倍内部单引号，避免 `$`/反引号插值 |
+| unsupported 语义 | `guest_path::ensure_supported(GuestOs, PosixOnlyOperation, &GuestPath)` 统一拒绝 Windows 的 `hard_link`/`read_link`/`set_permissions`，错误含操作名、sanitized guest 路径与原因（ACL vs mode bits）；Linux 三个操作不变 |
+| 链接不再静默跳过 | `upload` 目录树遇本地 symlink：Windows 直接报错；Linux 重建链接，`read_link` 或 `symlink` 失败即报错。`download` 遇远端 symlink/未知类型报错，不再 `continue` 静默成功 |
+| 递归删除 | `remove_dir_all` 先 `walk_remote_dir` 收集，再逆序删子项与父目录，符合 `std::fs::remove_dir_all` 语义（原实现仅单层 `remove_dir`） |
+| 单测 | `src/guest_path.rs` 9 个（盘符/根/分隔符、空格与非 ASCII、非法与不支持形式、非法字符与保留名、`..` 与 join 逃逸、join/parent、ancestors、strip_prefix、POSIX-only 拒绝 + Linux 可用、Linux 原样），`cargo test --lib windows_path` 过滤 |
+| 集成测试（`#[ignore]`） | `tests/windows_machine.rs::windows_files`：`C:\qlean-fs-test` 下建目录、写/读/`read_to_string`、`copy`、`rename`、`remove_dir_all`、文件与目录 `upload`/`download` 往返、`read_link` 报错 |
+| README/CHANGELOG | README 新增「Windows file operations」支持矩阵与路径规则；CHANGELOG Added 四条 |
+| 提交 | `COMMITHASH` |
+
 **Acceptance criteria:**
 
-- [ ] 唯一 `GuestPath`/转换层处理 Windows 盘符、根目录、分隔符、空格、非 ASCII、`..` 与 basename；所有远程 SFTP 入口使用它，不按宿主 Linux PathBuf 解释客户机路径。
-- [ ] 文件和目录 `upload`/`download` 往返一致；遇到不支持的链接/路径形式必须报错，不得静默跳过并返回成功。
-- [ ] `create_dir`/`create_dir_all`/`exists`/`metadata`/`read`/`read_to_string`/`write`/`read_dir`/`remove_file`/`remove_dir_all`/`rename`/`copy` 在 Windows 按各自文档语义工作，其中 `copy` 不再调用 POSIX `cp`。
-- [ ] Windows `hard_link`/`read_link`/`set_permissions` 与 UNC/device 路径明确返回 unsupported；Linux 分支不变。
-- [ ] 路径校验防止把不支持输入转成宿主绝对路径或意外逃逸目标根；错误包含 sanitized 路径。
-- [ ] `(new)` 单测覆盖盘符、根、空格、非 ASCII、嵌套目录、非法/不支持路径和各 unsupported 分支。
-- [ ] Windows 文件/目录上传下载、递归删除、重命名和复制通过真实冒烟，Linux `single_machine` 文件测试回归。
-- [ ] README 支持矩阵/示例/限制与 CHANGELOG Added 同卡逐文件更新。
+- [x] 唯一 `GuestPath`/转换层处理 Windows 盘符、根目录、分隔符、空格、非 ASCII、`..` 与 basename；所有远程 SFTP 入口使用它，不按宿主 Linux PathBuf 解释客户机路径。——`src/guest_path.rs` 为唯一转换点，`ssh.rs`/`machine.rs` 全部入口改用它。
+- [x] 文件和目录 `upload`/`download` 往返一致；遇到不支持的链接/路径形式必须报错，不得静默跳过并返回成功。——目录树按 `walk_remote_dir`/`WalkDir` 逐项镜像；Windows symlink 与下载端 symlink/未知类型均报错（原实现静默 `continue`）。
+- [x] `create_dir`/`create_dir_all`/`exists`/`metadata`/`read`/`read_to_string`/`write`/`read_dir`/`remove_file`/`remove_dir_all`/`rename`/`copy` 在 Windows 按各自文档语义工作，其中 `copy` 不再调用 POSIX `cp`。——`copy` 改 PowerShell `Copy-Item -LiteralPath`；`remove_dir_all` 改为真正递归。
+- [x] Windows `hard_link`/`read_link`/`set_permissions` 与 UNC/device 路径明确返回 unsupported；Linux 分支不变。——`ensure_supported` + `normalize_windows`；Linux 三个操作与路径语义未改。
+- [x] 路径校验防止把不支持输入转成宿主绝对路径或意外逃逸目标根；错误包含 sanitized 路径。——`..` 在构造与 join 两处拒绝，UNC/device/drive-relative 报错并回显原始输入；错误只含 guest 路径，不含宿主路径。
+- [x] `(new)` 单测覆盖盘符、根、空格、非 ASCII、嵌套目录、非法/不支持路径和各 unsupported 分支。——9 个单测（含 `ensure_supported` 三个操作与 Linux 正向对照）。
+- [ ] Windows 文件/目录上传下载、递归删除、重命名和复制通过真实冒烟，Linux `single_machine` 文件测试回归。——`windows_files` 已编写，执行需 DEP-01/02；Linux 回归需完整 Linux VM 宿主（另见 DEFER-04），`blocked`。
+- [x] README 支持矩阵/示例/限制与 CHANGELOG Added 同卡逐文件更新。
 
 **Verification:**
 
-- [ ] `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings`
-- [ ] `cargo test --lib windows_path`
-- [ ] `cargo test --no-run`
-- [ ] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine windows_files -- --ignored --exact --test-threads=1`
-- [ ] T-1 全量，配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1`（覆盖 `test_file_operation` 与 `test_file_transfer`）
+- [x] `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings`
+- [x] `cargo test --lib windows_path`（9 passed）
+- [x] `cargo test --lib`（69 passed）
+- [x] `cargo test --no-run`
+- [ ] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine windows_files -- --ignored --exact --test-threads=1` —— `blocked`
+- [ ] T-1 全量，配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1`（覆盖 `test_file_operation` 与 `test_file_transfer`）—— `blocked`（DEFER-04）
 
 **Full-suite trigger:** `T-1: 共享 SFTP 路径分派`
 
@@ -949,13 +966,13 @@
 
 **Deliverables:** `N/A`
 
-**Implementation write set:** `src/machine.rs`、`src/ssh.rs`、`src/windows.rs`、`tests/windows_machine.rs`、`README.md`、`CHANGELOG.md`、本计划、`plan-status.md`
+**Implementation write set:** `src/guest_path.rs`、`src/machine.rs`、`src/ssh.rs`、`src/windows.rs`、`src/lib.rs`、`tests/windows_machine.rs`、`README.md`、`CHANGELOG.md`、本计划、`plan-status.md`
 
 **Release write set:** `N/A`
 
-**Files likely touched:** `src/machine.rs`, `src/ssh.rs`, `src/windows.rs`, `tests/windows_machine.rs`, `README.md`, `CHANGELOG.md`
+**Files likely touched:** `src/guest_path.rs`, `src/machine.rs`, `src/ssh.rs`, `src/windows.rs`, `src/lib.rs`, `tests/windows_machine.rs`, `README.md`, `CHANGELOG.md`
 
-**Docs and compatibility impact:** README 列出每个支持/unsupported 文件接口和路径形式；CHANGELOG Added。
+**Docs and compatibility impact:** README 列出每个支持/unsupported 文件接口和路径形式；CHANGELOG Added。兼容性：`upload`/`download` 遇符号链接由「静默跳过」改为报错，`remove_dir_all` 由单层改为递归（更符合 `std::fs` 文档语义），均记入 CHANGELOG。
 
 **Rollback mode:** `revert`
 
@@ -1071,7 +1088,7 @@
 | TRN-01 | `src/ssh.rs:89-104,571-630` | ssh/machine/utils | README 传输/限制、CHANGELOG | `windows_transport`、`windows_pool` |
 | EXE-01 | `src/machine.rs:495-516` | machine/ssh/exec（新 `src/exec.rs`） | README exec、CHANGELOG | `windows_exec` |
 | IP-01 | `src/ssh.rs:831-841` | windows/machine | README get_ip、CHANGELOG | `windows_get_ip` |
-| FS-01 | `src/machine.rs:578-775,922-1137` | machine/ssh/windows | README 文件矩阵、CHANGELOG | `windows_files` |
+| FS-01 | `src/machine.rs:578-775,922-1137` | guest_path/machine/ssh | README 文件矩阵、CHANGELOG | `windows_files` |
 | REL-01 | Cargo/CHANGELOG/CI | 版本与 CI | CHANGELOG 0.4.0/Release | 全量与远端门 |
 
 ## 里程碑验收与回滚
@@ -1141,7 +1158,7 @@
 | TRN-01 | 2026-11-12 11:40:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib ssh`（5 passed）、`cargo test --lib utils`（4 passed）、`cargo test --no-run`（含 `windows_transport`/`windows_pool`）全绿 | `windows_transport`/`windows_pool` 与真实 spawn 重连证据未取得（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `64b1046` |
 | EXE-01 | 2026-11-12 12:10:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_exec`（5 passed）、`cargo test --no-run` 全绿 | `windows_exec` 真实 PowerShell 冒烟未取得（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `64b1046` |
 | IP-01 | 2026-11-12 12:50:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_ip`（6 passed）、`cargo test --no-run` 全绿 | `windows_get_ip` 与双机一致性未取得（DEP-01/02 不可用） | `in-progress` / `locally-accepted` | `eb8fd90` |
-| FS-01 | pending | pending | pending | pending | 继承 REL-01 |
+| FS-01 | 2026-11-12 13:20:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_path`（9 passed）、`cargo test --lib`（69 passed）、`cargo test --no-run` 全绿 | `windows_files` 与 Linux 文件回归未取得（DEP-01/02、DEFER-04） | `in-progress` / `locally-accepted` | `COMMITHASH` |
 | REL-01 | pending | pending | pending | pending | pending |
 
 ## Review log
