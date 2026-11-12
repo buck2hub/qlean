@@ -1,6 +1,6 @@
 use std::{
     io::ErrorKind,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -127,7 +127,7 @@ mod budget_tests {
 const ERR_EACCES: i32 = 13; // Permission denied
 const ERR_ENODEV: i32 = 19; // No such device
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct PersistedSshKeypair {
     pub pubkey_str: String,
     pub _pubkey_path: PathBuf,
@@ -135,40 +135,164 @@ pub(crate) struct PersistedSshKeypair {
     pub privkey_path: PathBuf,
 }
 
+// The derived `Debug` printed the private key material, and this struct is a field of
+// `Machine`: one `{:?}` in a log line or a failed assertion would have published the
+// identity that every deployed guest trusts (the test failures below did exactly that
+// before this was fixed). Redact it and keep the paths, which are what debugging needs.
+impl std::fmt::Debug for PersistedSshKeypair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PersistedSshKeypair")
+            .field("pubkey_str", &self.pubkey_str)
+            .field("pubkey_path", &self._pubkey_path)
+            .field(
+                "privkey_str",
+                &format_args!("<redacted {} bytes>", self.privkey_str.len()),
+            )
+            .field("privkey_path", &self.privkey_path)
+            .finish()
+    }
+}
+
 impl PersistedSshKeypair {
     // Try to load a keypair from `dir`
+    //
+    // Reading the two halves back is not enough to trust them. The private key is the
+    // identity that gets installed into the guest's `authorized_keys`, so it has to
+    // parse, and the stored public half has to be the one that private key derives.
+    // A pair that does not agree is already unusable: handing it to the transport turns
+    // it into "permission denied" much later, after the deployment budget is spent,
+    // and nothing in that error mentions the key files.
     pub(crate) fn from_dir(dir: &Path) -> Result<Self> {
         let privkey_path = dir.join("id_ed25519");
         let pubkey_path = privkey_path.with_extension("pub");
-        let privkey_str = std::fs::read_to_string(&privkey_path)?;
-        let pubkey_str = std::fs::read_to_string(&pubkey_path)?;
+        let hint = "delete both files to generate a fresh identity; every guest deployed \
+                    with the old one will stop accepting this host";
+        let privkey_str = std::fs::read_to_string(&privkey_path).with_context(|| {
+            format!(
+                "failed to read the SSH private key {}: {hint}",
+                privkey_path.display()
+            )
+        })?;
+        let pubkey_str = std::fs::read_to_string(&pubkey_path).with_context(|| {
+            format!(
+                "failed to read the SSH public key {}: {hint}",
+                pubkey_path.display()
+            )
+        })?;
 
-        Ok(Self {
+        let keypair = Self {
             pubkey_str,
             _pubkey_path: pubkey_path,
             privkey_str,
             privkey_path,
-        })
+        };
+        keypair.verify()?;
+        Ok(keypair)
+    }
+
+    /// Reject a private key that does not parse or a public key that does not belong to it.
+    ///
+    /// The message names both files and the one action that fixes it, because the caller
+    /// cannot regenerate a key without invalidating every guest that was deployed with it.
+    fn verify(&self) -> Result<()> {
+        let private = PrivateKey::from_openssh(&self.privkey_str).with_context(|| {
+            format!(
+                "the SSH private key {} does not parse as an OpenSSH key: a truncated or \
+                 half-written file looks like this. Delete it and its `.pub` sibling to \
+                 generate a fresh identity; every guest deployed with the old key will stop \
+                 accepting this host",
+                self.privkey_path.display()
+            )
+        })?;
+        let derived = private.public_key().to_openssh().with_context(|| {
+            format!(
+                "failed to derive the public half of the SSH private key {}",
+                self.privkey_path.display()
+            )
+        })?;
+        anyhow::ensure!(
+            derived.trim() == self.pubkey_str.trim(),
+            "the SSH public key {} does not belong to the private key {}: the two files \
+             were written by different runs, or one of them was replaced. Delete both to \
+             generate a fresh identity; every guest deployed with the old key will stop \
+             accepting this host",
+            self._pubkey_path.display(),
+            self.privkey_path.display()
+        );
+        Ok(())
     }
 }
 
 pub(crate) fn get_ssh_key(dir: &Path) -> Result<PersistedSshKeypair> {
     let privkey_path = dir.join("id_ed25519");
 
-    // First try reading an existing keypair from disk.
-    // If that fails we'll just create a new one.
-    if let Ok(existing_keypair) = PersistedSshKeypair::from_dir(dir) {
-        return Ok(existing_keypair);
+    // A missing keypair is the normal first run. A keypair that exists but cannot be used
+    // is not: regenerating it silently would leave every already-deployed guest holding an
+    // authorized key that no longer exists, and the only symptom would be a login failure
+    // on some later boot.
+    if privkey_path.exists() {
+        let existing = PersistedSshKeypair::from_dir(dir)?;
+        // The identity inside may still be readable by others; the enclosing directory is
+        // owner-only, but a key that was created elsewhere (or before the mode was fixed)
+        // has to be tightened rather than trusted.
+        crate::utils::restrict_file(&existing.privkey_path)?;
+        return Ok(existing);
     }
 
     generate_keypair(&privkey_path)
 }
 
+/// Create `path` with owner-only permission *at creation time*.
+///
+/// `chmod` after the write is a different program: between the two calls the private key
+/// exists on disk with the umask's permissions (0644 under the usual 022), and a crash or a
+/// failed chmod leaves it that way for good. Creating it with `0600` means no umask can
+/// widen it and no window exists.
+fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Write the private key atomically: a crash leaves either the old file or a complete one.
+///
+/// `std::fs::write` truncates the target in place, so a crash mid-write leaves a partial
+/// key that still parses as "some file" and would be used as the identity.
+fn write_private_key(path: &Path, contents: &str) -> Result<()> {
+    let tmp_path = path.with_extension("tmp");
+    let _ = std::fs::remove_file(&tmp_path);
+    let mut tmp = create_private_file(&tmp_path).with_context(|| {
+        format!(
+            "failed to create the temporary SSH private key {} with owner-only permissions",
+            tmp_path.display()
+        )
+    })?;
+    let written = std::io::Write::write_all(&mut tmp, contents.as_bytes())
+        .and_then(|()| std::io::Write::flush(&mut tmp))
+        .with_context(|| format!("failed to write the SSH private key {}", tmp_path.display()));
+    drop(tmp);
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+    std::fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "failed to install the SSH private key {} (the complete key is left at {})",
+            path.display(),
+            tmp_path.display()
+        )
+    })?;
+    Ok(())
+}
+
 /// Generate a fresh ed25519 keypair at `privkey_path` (private key) and
 /// `<privkey_path>.pub` (OpenSSH public key), both owned by the caller.
 ///
-/// The private key is written with `0600` permissions before its content is
-/// flushed to disk, and its material is never logged.
+/// The private key is created with `0600` permissions and appears at its final path only
+/// once it is complete, and its material is never logged. The public half is written after
+/// the private key so the identity always exists before the file that advertises it.
 pub(crate) fn generate_keypair(privkey_path: &Path) -> Result<PersistedSshKeypair> {
     let pubkey_path = privkey_path.with_extension("pub");
 
@@ -180,16 +304,11 @@ pub(crate) fn generate_keypair(privkey_path: &Path) -> Result<PersistedSshKeypai
     let privkey = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
 
     let pubkey_openssh = privkey.public_key().to_openssh()?;
-    debug!("Writing SSH public key to {pubkey_path:?}");
-    std::fs::write(&pubkey_path, &pubkey_openssh)?;
-
     let privkey_openssh = privkey.to_openssh(LineEnding::default())?.to_string();
     debug!("Writing SSH private key to {privkey_path:?}");
-
-    std::fs::write(privkey_path, &privkey_openssh)?;
-    let mut perms = std::fs::metadata(privkey_path)?.permissions();
-    perms.set_mode(0o600);
-    std::fs::set_permissions(privkey_path, perms)?;
+    write_private_key(privkey_path, &privkey_openssh)?;
+    debug!("Writing SSH public key to {pubkey_path:?}");
+    std::fs::write(&pubkey_path, &pubkey_openssh)?;
 
     Ok(PersistedSshKeypair {
         pubkey_str: pubkey_openssh,
@@ -1509,5 +1628,214 @@ mod tests {
         .expect("cancelled connection must fail")
         .to_string();
         assert!(err.contains("cancelled"), "{err}");
+    }
+
+    /// The private half is a credential: it must be owner-only from the moment it exists.
+    #[test]
+    fn test_a_generated_private_key_is_owner_only_and_matches_its_public_half() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let keypair = get_ssh_key(dir.path()).expect("keypair generated");
+
+        let mode = std::fs::metadata(&keypair.privkey_path)
+            .expect("private key stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the private key must be owner-only");
+
+        let private = PrivateKey::from_openssh(&keypair.privkey_str).expect("private key parses");
+        assert_eq!(
+            private
+                .public_key()
+                .to_openssh()
+                .expect("derive public half"),
+            keypair.pubkey_str.trim(),
+            "the stored public half must be the one the private key derives"
+        );
+        // A second call is the normal reuse path and must not regenerate the identity.
+        let again = get_ssh_key(dir.path()).expect("existing keypair reused");
+        assert_eq!(again.privkey_str, keypair.privkey_str);
+    }
+
+    /// The identity has to be readable by the program class that uses it, not just by us.
+    #[test]
+    fn test_the_generated_private_key_is_accepted_by_ssh_keygen() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let keypair = get_ssh_key(dir.path()).expect("keypair generated");
+
+        let Ok(output) = std::process::Command::new("ssh-keygen")
+            .arg("-y")
+            .arg("-f")
+            .arg(&keypair.privkey_path)
+            .output()
+        else {
+            // No `ssh-keygen` on this host: say so loudly instead of pretending the
+            // independence was established.
+            println!("SMOKE-UNAVAILABLE: `ssh-keygen` is not installed, OpenSSH was not consulted");
+            return;
+        };
+        assert!(
+            output.status.success(),
+            "`ssh-keygen -y` rejected the private key: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let derived = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            derived.trim(),
+            keypair.pubkey_str.trim(),
+            "the `.pub` file and the private key must describe the same identity"
+        );
+    }
+
+    /// A half-present keypair is not a first run: say what to do instead of regenerating.
+    #[test]
+    fn test_a_half_present_keypair_is_reported_with_a_way_out() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let keypair = get_ssh_key(dir.path()).expect("keypair generated");
+        std::fs::remove_file(keypair.privkey_path.with_extension("pub"))
+            .expect("drop the public half");
+
+        let error = get_ssh_key(dir.path())
+            .expect_err("a keypair that lost half of itself must not be silently regenerated")
+            .to_string();
+        assert!(error.contains("public key"), "{error}");
+        assert!(error.contains("delete both files"), "{error}");
+        assert!(
+            !keypair.privkey_path.with_extension("pub").exists(),
+            "nothing may be regenerated behind the user's back"
+        );
+    }
+
+    /// `Debug` reaches logs and failed assertions; the private key must not travel with it.
+    #[test]
+    fn test_the_private_key_is_redacted_from_debug_output() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let keypair = get_ssh_key(dir.path()).expect("keypair generated");
+        let printed = format!("{keypair:?}");
+
+        assert!(
+            !printed.contains("PRIVATE KEY"),
+            "the private key material must never appear in Debug output: {printed}"
+        );
+        assert!(
+            !printed.contains(&keypair.privkey_str),
+            "the private key material must never appear in Debug output: {printed}"
+        );
+        assert!(printed.contains("<redacted"), "{printed}");
+        // What debugging actually needs stays.
+        assert!(printed.contains(&keypair.pubkey_str), "{printed}");
+        assert!(printed.contains("id_ed25519"), "{printed}");
+    }
+
+    /// Two files that must agree are never compared by the filesystem.
+    #[test]
+    fn test_a_public_key_from_another_run_is_reported_instead_of_used() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let keypair = get_ssh_key(dir.path()).expect("keypair generated");
+
+        let other = PrivateKey::random(&mut rng(), Algorithm::Ed25519).expect("other key");
+        std::fs::write(
+            keypair.privkey_path.with_extension("pub"),
+            other.public_key().to_openssh().expect("other public half"),
+        )
+        .expect("overwrite the public half");
+
+        let error = get_ssh_key(dir.path())
+            .expect_err("a public key that does not belong to the private key must not be used")
+            .to_string();
+        assert!(error.contains("does not belong"), "{error}");
+        assert!(error.contains("id_ed25519.pub"), "{error}");
+        assert!(error.contains("id_ed25519"), "{error}");
+    }
+
+    /// A half-written private key is what a crash during the old non-atomic write left behind.
+    #[test]
+    fn test_a_truncated_private_key_is_reported_instead_of_reused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let keypair = get_ssh_key(dir.path()).expect("keypair generated");
+        let truncated = &keypair.privkey_str[..keypair.privkey_str.len() / 2];
+        std::fs::write(&keypair.privkey_path, truncated).expect("truncate the private key");
+
+        let error = get_ssh_key(dir.path())
+            .expect_err("a truncated private key must not be handed to the transport")
+            .to_string();
+        assert!(error.contains("does not parse"), "{error}");
+        assert!(error.contains("id_ed25519"), "{error}");
+    }
+
+    /// A key left readable by others must be tightened, not trusted.
+    #[test]
+    fn test_a_loosely_permissioned_private_key_is_tightened_on_reuse() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let keypair = get_ssh_key(dir.path()).expect("keypair generated");
+        std::fs::set_permissions(
+            &keypair.privkey_path,
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .expect("loosen the private key");
+
+        let reused = get_ssh_key(dir.path()).expect("existing keypair reused");
+        let mode = std::fs::metadata(&reused.privkey_path)
+            .expect("private key stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "a reused private key must be owner-only");
+        assert_eq!(reused.privkey_str, keypair.privkey_str);
+    }
+
+    /// `chmod` after the write is a different program: the mode has to come from creation,
+    /// and the write has to be atomic, or a crash leaves a readable or truncated credential.
+    #[test]
+    fn test_the_private_key_is_created_owner_only_and_never_chmoded() {
+        fn region<'a>(source: &'a str, from: &str, to: &str) -> &'a str {
+            let start = source.find(from).expect("region start");
+            let rest = &source[start..];
+            let end = rest.find(to).expect("region end");
+            &rest[..end]
+        }
+
+        let source = include_str!("ssh.rs");
+        let writer = region(
+            source,
+            "fn create_private_file",
+            "/// Generate a fresh ed25519 keypair",
+        );
+        assert!(
+            !writer.contains("set_permissions") && !writer.contains("set_mode"),
+            "the private key mode must come from `OpenOptions::mode`, not from a `chmod` that \
+             leaves a window (and a crash) with the umask's permissions"
+        );
+        assert_eq!(
+            writer.matches("0o600").count(),
+            1,
+            "`0o600` must appear exactly once in the key writer, in the file creation call"
+        );
+        assert!(
+            writer.contains(".mode(0o600)"),
+            "the private key must be created with `OpenOptionsExt::mode(0o600)`"
+        );
+        assert!(
+            writer.contains("std::fs::rename(&tmp_path, path)"),
+            "the private key must be installed by a rename so a crash cannot leave a partial file"
+        );
+
+        let generator = region(
+            source,
+            "pub(crate) fn generate_keypair",
+            "#[derive(Debug, Clone, Default)]",
+        );
+        assert!(
+            !generator.contains("set_permissions") && !generator.contains("set_mode"),
+            "`generate_keypair` must not re-introduce a `chmod` after the write"
+        );
+        assert!(
+            generator.contains("write_private_key(privkey_path"),
+            "`generate_keypair` must write the private key through `write_private_key`"
+        );
     }
 }
