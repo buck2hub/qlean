@@ -36,3 +36,4 @@
 | DEFER-03 | 延后 | plan-20261104-windows-guest.md | Windows TCG 冒烟矩阵（不替代 KVM 核心验收） | open | 出现真实 TCG 需求并有可接受的启动时限 | 2026-11-04 04:10:47 UTC |
 | DEP-01 | incoming | plan-20261104-windows-guest.md | 每个拟声明支持的 Windows 版本的合法 qcow2 + sha256 | open（2026-11-12 审计未提供） | Owner 提供镜像、版本和校验值 | 2026-11-12 07:45:12 UTC |
 | DEP-02 | incoming | plan-20261104-windows-guest.md | Linux KVM Windows 验证宿主机及 QEMU/OVMF/swtpm/libvirt/xorriso/bridge-helper | open（2026-11-12 审计：工具全缺，`sudo` 需密码） | Owner 验证全部前置命令、KVM 与桥接网络可用 | 2026-11-12 07:45:12 UTC |
+| DEP-03 | incoming | plan-20261104-windows-guest.md | 远端推送与 CI 运行核对所需的本机网络与凭据 | open（2026-11-14 复测：`libra push origin main` 仍 `LBR-NET-002`，`ssh -T git@github.com` 被 fake-IP `198.18.0.20` 立即关闭；`gh auth status` 报 keyring token 失效） | 代理节点恢复可用、`gh auth refresh -h github.com` 完成；届时推送 24 个提交并核对四 job（预期 `229 passed / 10 ignored`） | 2026-11-14 03:30:00 UTC |
