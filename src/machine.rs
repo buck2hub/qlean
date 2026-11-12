@@ -718,7 +718,7 @@ StandardError=journal
         })
     }
 
-    /// Initialize the machine (first boot with cloud-init).
+    /// Initialize the machine (first boot: cloud-init on Linux, the per-VM deployment seed on Windows).
     ///
     /// A Windows guest may only be initialized once: its first boot consumes the seed
     /// medium, which is deleted once the deployment marker appears. A second `init`

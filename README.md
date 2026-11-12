@@ -490,7 +490,7 @@ on a real KVM host:
 ### Machine Core Interface
 
 - `Machine::new(image, config)` - Create a new machine instance.
-- `Machine::init()` - Initialize the machine (first boot with cloud-init).
+- `Machine::init()` - Initialize the machine (first boot: cloud-init on Linux, the per-VM deployment seed on Windows).
 - `Machine::spawn()` - Start the machine (normal boot).
 - `Machine::exec(command)` - Execute a command in the VM and return the output.
 - `Machine::shutdown()` - Gracefully shutdown the virtual machine.

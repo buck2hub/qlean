@@ -1988,6 +1988,49 @@ mod plan_doc_tests {
         }
     }
 
+    /// A first boot is one concept with two mechanisms, and both places say so.
+    ///
+    /// The core interface list is the first thing a reader sees, and it used to describe
+    /// `Machine::init` as "first boot with cloud-init" - the rustdoc summary said the same.
+    /// Neither is true for `GuestOs::Windows`, whose first boot is a seed-based deployment
+    /// with no cloud-init anywhere, and the paragraph directly below that rustdoc summary
+    /// describes exactly that. The two summaries are now the same sentence, name both
+    /// mechanisms, and the unqualified wording is rejected.
+    #[test]
+    fn a_first_boot_is_described_the_same_way_in_the_library_and_the_readme() {
+        const README: &str = include_str!("../README.md");
+        let bullet = README
+            .lines()
+            .find(|line| line.starts_with("- `Machine::init()`"))
+            .expect("the README must keep `Machine::init()` in the core interface list");
+        let documented = bullet
+            .split_once(" - ")
+            .map(|(_, rest)| rest.trim())
+            .expect("the core interface list pairs every method with a description");
+
+        let source = include_str!("machine.rs");
+        let summary = source
+            .lines()
+            .find(|line| line.trim_start().starts_with("/// Initialize the machine"))
+            .expect("`Machine::init` must keep a doc summary")
+            .trim()
+            .strip_prefix("///")
+            .expect("a doc summary line starts with `///`")
+            .trim();
+
+        assert_eq!(
+            documented, summary,
+            "the README and the rustdoc describe the first boot differently"
+        );
+        assert!(
+            summary.contains("cloud-init on Linux")
+                && summary.contains("deployment seed on Windows"),
+            "`init` is a different first boot per guest and the summary must say which: {summary}"
+        );
+        // No separate "must not say `cloud-init` alone" assertion: the clause above already
+        // fails on that wording, and a guard whose branch cannot be reached is not a guard.
+    }
+
     /// The image contract requires PowerShell, because `exec` sends the command verbatim.
     ///
     /// `exec` hands the user's string straight to the guest's default shell with no wrapping,
