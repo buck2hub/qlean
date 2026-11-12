@@ -40,6 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The Windows host prerequisite check omitted `xorriso`, so a host without it passed the check and failed later while staging the seed medium
+- Secure Boot paired a `secboot` code image with the plain (empty-key) vars template, which boots in setup mode; the Microsoft-enrolled `.ms`/`.secboot` templates are now preferred
 - Windows guests were launched with `vhost-vsock-pci`, so a Windows VM needed `/dev/vhost-vsock` and the `vhost_vsock` module and failed to start without them; the device is now added only for Linux guests
 - OVMF setup required the code image and vars template to be exactly the same size, which no stock firmware pair satisfies (a ~528 KiB vars template ships next to a multi-megabyte code image); only a vars template larger than the code image is now rejected
 - The `swtpm` control socket was created with default permissions; it is now owner-only (`mode=0600`)
