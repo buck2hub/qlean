@@ -50,12 +50,21 @@ impl MachinePool {
 
     /// Initialize all machines in the pool concurrently.
     ///
+    /// A Windows machine that already completed its one-time deployment is spawned
+    /// instead, because it cannot run `init` again.
+    ///
     /// This is a short-circuiting method: execution returns immediately upon encountering the first machine initialization error, discarding any remaining tasks.
     pub async fn init_all(&mut self) -> Result<()> {
         let tasks = self.pool.values().map(|machine| async {
             let mut m = machine.lock().await;
             if !m.is_running().await? {
-                m.init().await?;
+                // A Windows guest deployed on a previous start must be spawned, not
+                // initialized: it has no deployment seed left and `init` rejects that.
+                if m.wants_init() {
+                    m.init().await?;
+                } else {
+                    m.spawn().await?;
+                }
             }
             Ok::<(), anyhow::Error>(())
         });
@@ -66,12 +75,21 @@ impl MachinePool {
 
     /// Spawn all machines in the pool concurrently.
     ///
+    /// A Windows machine whose one-time deployment has not run yet is initialized instead,
+    /// because spawning it would boot a guest with no installed SSH key.
+    ///
     /// This is a short-circuiting method: execution returns immediately upon encountering the first machine spawn error, discarding any remaining tasks.
     pub async fn spawn_all(&mut self) -> Result<()> {
         let tasks = self.pool.values().map(|machine| async {
             let mut m = machine.lock().await;
             if !m.is_running().await? {
-                m.spawn().await?;
+                // A Windows guest that never deployed has no installed SSH key yet, so a
+                // plain spawn would boot an unreachable guest. Run the deployment instead.
+                if m.needs_first_boot() {
+                    m.init().await?;
+                } else {
+                    m.spawn().await?;
+                }
             }
             Ok::<(), anyhow::Error>(())
         });

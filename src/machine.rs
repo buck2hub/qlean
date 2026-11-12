@@ -549,6 +549,23 @@ StandardError=journal
         Ok(())
     }
 
+    /// Whether starting this machine should run `init` rather than `spawn`.
+    ///
+    /// A Linux guest can be initialized repeatedly (a fresh cloud-init seed each time). A
+    /// Windows guest consumes its deployment seed exactly once, so after the first boot it
+    /// can only be spawned; calling `init` again is rejected by design.
+    pub(crate) fn wants_init(&self) -> bool {
+        self.image.guest_os != GuestOs::Windows || self.needs_first_boot()
+    }
+
+    /// Whether this machine has a Windows deployment that has not run yet.
+    ///
+    /// Starting such a machine with `spawn` would boot a guest whose `sshd` has no
+    /// installed key, so the deployment has to run first.
+    pub(crate) fn needs_first_boot(&self) -> bool {
+        self.image.guest_os == GuestOs::Windows && self.deploy_seed.is_some()
+    }
+
     /// Spawn the machine (normal boot).
     pub async fn spawn(&mut self) -> Result<()> {
         info!("🔥 Spawning VM-{}", self.id);
