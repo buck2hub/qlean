@@ -141,6 +141,30 @@ mod plan_doc_tests {
         ),
     ];
 
+    /// The body of the section whose heading line is exactly `heading`.
+    ///
+    /// Several headings are also quoted inside revision-history rows, so locating a section by
+    /// substring finds the mention instead of the section - line-exact matching is the only way
+    /// to be sure.
+    fn section<'a>(text: &'a str, heading: &str) -> &'a str {
+        let start = text
+            .match_indices(heading)
+            .find(|(at, _)| {
+                let before_ok = *at == 0 || text[..*at].ends_with('\n');
+                let after_ok = text[*at + heading.len()..].starts_with('\n');
+                before_ok && after_ok
+            })
+            .map(|(at, _)| at)
+            .unwrap_or_else(|| panic!("the plan has no `{heading}` heading of its own"));
+        let after = &text[start + heading.len()..];
+        let end = after
+            .match_indices("\n## ")
+            .next()
+            .map(|(at, _)| at)
+            .unwrap_or(after.len());
+        &after[..end]
+    }
+
     /// The lines of the plan's dependency registry.
     fn dependency_registry(plan: &str) -> Vec<&str> {
         let lines: Vec<&str> = plan.lines().collect();
@@ -548,6 +572,105 @@ mod plan_doc_tests {
             "the trace table's 指定测试 column yielded only {checked} labels"
         );
     }
+    /// The status digest mentions every round the review log records.
+    ///
+    /// The status view opens with one long parenthetical listing what each round did, appended by
+    /// hand after every round. The review log is the record; the digest is the summary a reader
+    /// skims. If a round lands in the log and never in the digest, the summary silently stops
+    /// being a summary of the document it summarises. Rounds 1-4 predate the first task card and
+    /// are the one allowed exception; the exception is a whitelist of numbers, not a rule about
+    /// position, so a round that skips the digest still fails.
+    #[test]
+    fn the_status_digest_covers_every_review_round() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        const STATUS: &str = include_str!("../docs/plan/plan-status.md");
+
+        fn rounds(text: &str, pattern: &str) -> Vec<u32> {
+            let mut found = Vec::new();
+            let mut rest = text;
+            while let Some(at) = rest.find(pattern) {
+                rest = &rest[at + pattern.len()..];
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                if let Ok(number) = digits.parse() {
+                    found.push(number);
+                }
+            }
+            found
+        }
+
+        let log = section(PLAN, "## Review log");
+        let logged: Vec<u32> = log
+            .lines()
+            .map(|line| rounds(line, "| R"))
+            .filter_map(|found| found.first().copied())
+            .collect();
+        assert!(
+            logged.windows(2).all(|pair| pair[0] > pair[1]),
+            "the review log is no longer newest-first, so the numbers below cannot be trusted"
+        );
+
+        let digest = STATUS
+            .lines()
+            .find(|line| line.starts_with("| [`plan-20261104-windows-guest.md`]"))
+            .expect("the status view no longer has a row for this plan");
+        let summarised = rounds(digest, "R");
+
+        const PREFACE_ROUNDS: [u32; 4] = [1, 2, 3, 4];
+        for round in &logged {
+            if PREFACE_ROUNDS.contains(round) {
+                continue;
+            }
+            assert!(
+                summarised.contains(round),
+                "review round R{round} is in the log but the status digest never mentions it"
+            );
+        }
+        for round in &summarised {
+            assert!(
+                logged.contains(round),
+                "the status digest mentions R{round}, which no review round records"
+            );
+        }
+    }
+
+    /// The review log reads newest-first, with every round exactly once and none missing.
+    ///
+    /// The log grew in two directions: rounds 1-94 were appended oldest-first, then rounds 95+
+    /// were prepended newest-first *below* them, so the table ran R1..R94 and then R124..R95. A
+    /// reader looking for the latest review found it in the lower half, and nothing said which end
+    /// was newer. The order is now newest-first throughout, matching the revision history, and this
+    /// keeps it that way: strictly descending, contiguous, no round twice.
+    #[test]
+    fn the_review_log_reads_newest_first() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+
+        let logged: Vec<u32> = section(PLAN, "## Review log")
+            .lines()
+            .filter_map(|line| line.strip_prefix("| R"))
+            .filter_map(|rest| {
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                digits.parse().ok()
+            })
+            .collect();
+        assert!(!logged.is_empty(), "the review log has no rows");
+
+        for pair in logged.windows(2) {
+            assert!(
+                pair[0] > pair[1],
+                "the review log runs R{} before R{}: newest-first means the larger number comes first",
+                pair[0],
+                pair[1]
+            );
+        }
+        let newest = logged[0];
+        assert_eq!(
+            logged.len() as u32,
+            newest,
+            "the review log claims to end at R{newest} but holds {} rows, so a round is missing or doubled",
+            logged.len()
+        );
+    }
+
     /// The plan names the CI jobs the workflow actually runs.
     ///
     /// DEP-03's success criterion is that four named jobs are green on the pushed commit. Those
