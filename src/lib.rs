@@ -519,6 +519,75 @@ mod plan_doc_tests {
             "the trace table's 指定测试 column yielded only {checked} labels"
         );
     }
+    /// The README states the version the crate is, not the version it used to be.
+    ///
+    /// The support matrix names a released version so a reader can tell what the claim covers.
+    /// Nothing keeps that number honest: bump `Cargo.toml` and the README goes on describing the
+    /// previous release as current, which is the one line a reader trusts most.
+    #[test]
+    fn the_readme_states_the_version_the_crate_is() {
+        const README: &str = include_str!("../README.md");
+        let version = env!("CARGO_PKG_VERSION");
+
+        let mut stated = Vec::new();
+        let mut rest = README;
+        while let Some(at) = rest.find("released (`") {
+            let after = &rest[at + "released (`".len()..];
+            let end = after.find('`').expect("a released version is not closed");
+            stated.push(&after[..end]);
+            rest = &after[end..];
+        }
+        assert!(
+            !stated.is_empty(),
+            "the README no longer names a released version in its support matrix"
+        );
+        for claim in stated {
+            assert_eq!(
+                claim, version,
+                "the README calls {claim} the released version, but the crate is {version}"
+            );
+        }
+    }
+
+    /// The README does not claim Windows support while the smoke tests that would earn it are
+    /// deferred.
+    ///
+    /// The plan forbids announcing Windows support without recorded evidence from a real KVM host.
+    /// The smoke tests are ignored for exactly that reason, so their `#[ignore]` attributes
+    /// and the README's "Claimed support" column are the same fact written twice. Flipping the
+    /// column to yes is the mistake a release would make; this catches it.
+    #[test]
+    fn the_readme_claims_no_windows_support_while_the_smoke_tests_are_deferred() {
+        const README: &str = include_str!("../README.md");
+        const SMOKE_TESTS: &str = include_str!("../tests/windows_machine.rs");
+
+        // Count attributes, not mentions: the file also says `#[ignore]`d in its own prose.
+        let deferred = SMOKE_TESTS
+            .lines()
+            .filter(|line| line.starts_with("#[ignore"))
+            .count();
+        assert!(
+            deferred > 0,
+            "no Windows smoke test is deferred any more: the README's support claim has to be \
+             re-decided by hand before this guard is relaxed"
+        );
+
+        let row = README
+            .lines()
+            .find(|line| line.starts_with("| Windows 10 / 11"))
+            .expect("the README support matrix has no Windows row");
+        let cells: Vec<&str> = row.split('|').map(str::trim).collect();
+        assert!(
+            cells.len() > 3,
+            "the Windows row of the support matrix lost its columns: {row}"
+        );
+        assert_eq!(
+            cells[3], "**no**",
+            "the README claims Windows support while {deferred} smoke tests are still deferred: \
+             the claim needs recorded KVM evidence, not a table edit"
+        );
+    }
+
     /// The status view names the newest review round, so the two documents agree on where work
     /// stopped.
     ///
