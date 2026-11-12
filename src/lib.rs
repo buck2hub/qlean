@@ -141,6 +141,49 @@ mod plan_doc_tests {
         ),
     ];
 
+    /// Each card's id, lifecycle and acceptance token, in the order the plan declares them.
+    fn card_states(plan: &str) -> Vec<(String, String, String)> {
+        let mut cards: Vec<(String, String, String)> = Vec::new();
+        let mut current: Option<String> = None;
+        for line in plan.lines() {
+            if let Some(rest) = line.strip_prefix("### Task ") {
+                current = Some(rest.split(':').next().unwrap_or(rest).trim().to_string());
+                continue;
+            }
+            if line.starts_with("## ") {
+                current = None;
+                continue;
+            }
+            let Some(rest) = line.strip_prefix("**Lifecycle / Acceptance:**") else {
+                continue;
+            };
+            let id = current
+                .clone()
+                .unwrap_or_else(|| panic!("a lifecycle line sits outside a card: {line}"));
+            let lifecycle = rest
+                .trim_start()
+                .strip_prefix('`')
+                .and_then(|tail| tail.split('`').next())
+                .unwrap_or_else(|| panic!("card {id} states no lifecycle token: {line}"));
+            let acceptance = rest
+                .trim_start()
+                .split_once('/')
+                .map(|(_, tail)| tail)
+                .unwrap_or_else(|| panic!("card {id} states no acceptance token: {line}"))
+                .trim_start()
+                .trim_start_matches('`')
+                .chars()
+                .take_while(|c| !matches!(c, '`' | '（' | '(' | ' '))
+                .collect::<String>();
+            assert!(
+                !acceptance.is_empty(),
+                "card {id} states an empty acceptance token: {line}"
+            );
+            cards.push((id, lifecycle.to_string(), acceptance));
+        }
+        cards
+    }
+
     /// The body of the section whose heading line is exactly `heading`.
     ///
     /// Several headings are also quoted inside revision-history rows, so locating a section by
@@ -994,44 +1037,7 @@ mod plan_doc_tests {
         const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
         const STATUS: &str = include_str!("../docs/plan/plan-status.md");
 
-        let mut cards: Vec<(String, String, String)> = Vec::new();
-        let mut current: Option<String> = None;
-        for line in PLAN.lines() {
-            if let Some(rest) = line.strip_prefix("### Task ") {
-                current = Some(rest.split(':').next().unwrap_or(rest).trim().to_string());
-                continue;
-            }
-            if line.starts_with("## ") {
-                current = None;
-                continue;
-            }
-            let Some(rest) = line.strip_prefix("**Lifecycle / Acceptance:**") else {
-                continue;
-            };
-            let id = current
-                .clone()
-                .unwrap_or_else(|| panic!("a lifecycle line sits outside a card: {line}"));
-            let lifecycle = rest
-                .trim_start()
-                .strip_prefix('`')
-                .and_then(|tail| tail.split('`').next())
-                .unwrap_or_else(|| panic!("card {id} states no lifecycle token: {line}"));
-            let acceptance = rest
-                .trim_start()
-                .split_once('/')
-                .map(|(_, tail)| tail)
-                .unwrap_or_else(|| panic!("card {id} states no acceptance token: {line}"))
-                .trim_start()
-                .trim_start_matches('`')
-                .chars()
-                .take_while(|c| !matches!(c, '`' | '（' | '(' | ' '))
-                .collect::<String>();
-            assert!(
-                !acceptance.is_empty(),
-                "card {id} states an empty acceptance token: {line}"
-            );
-            cards.push((id, lifecycle.to_string(), acceptance));
-        }
+        let cards = card_states(PLAN);
         assert_eq!(cards.len(), 10, "the plan declares {} cards", cards.len());
 
         for (id, lifecycle, acceptance) in &cards {
@@ -1050,6 +1056,48 @@ mod plan_doc_tests {
                 "card {id} declares {lifecycle} / {acceptance} but the status view says {} / {}",
                 cells[3],
                 cells[4]
+            );
+        }
+    }
+
+    /// The evidence summary repeats the lifecycle its card declares, in a third place.
+    ///
+    /// The same two tokens are written three times: in the card, in the status view's table and in
+    /// the evidence summary that records how far the card actually got. The third copy is the one
+    /// a reader consults when asking "is this card done", and it was the only one nothing checked -
+    /// so a card could be `in-progress` everywhere else while the evidence table called it done.
+    #[test]
+    fn the_evidence_summary_repeats_the_lifecycle_each_card_declares() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        let cards = card_states(PLAN);
+        assert_eq!(cards.len(), 10, "the plan declares {} cards", cards.len());
+
+        // `空` is how the tables spell an absent acceptance value.
+        let plain = |token: &str| match token.trim().trim_matches('`') {
+            "空" => String::new(),
+            other => other.to_string(),
+        };
+
+        for (id, lifecycle, acceptance) in &cards {
+            let prefix = format!("| {id} | 20");
+            let row = PLAN
+                .lines()
+                .find(|line| line.starts_with(&prefix))
+                .unwrap_or_else(|| panic!("the evidence summary has no row for {id}"));
+            let cells: Vec<&str> = row.split('|').map(str::trim).collect();
+            assert!(
+                cells.len() > 5,
+                "the evidence row for {id} lost its columns: {row}"
+            );
+            let (lifecycle_there, acceptance_there) = cells[5]
+                .split_once('/')
+                .unwrap_or_else(|| panic!("the evidence row for {id} states no pair: {row}"));
+            assert_eq!(
+                (plain(lifecycle_there), plain(acceptance_there)),
+                (plain(lifecycle), plain(acceptance)),
+                "card {id} declares {lifecycle} / {acceptance} but the evidence summary says {} / {}",
+                plain(lifecycle_there),
+                plain(acceptance_there)
             );
         }
     }
