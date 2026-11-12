@@ -404,7 +404,9 @@ impl Session {
             let sftp = self.open_sftp().await?;
             self.sftp = Some(sftp);
         }
-        Ok(self.sftp.as_mut().expect("SFTP session must exist"))
+        self.sftp.as_mut().ok_or_else(|| {
+            anyhow::anyhow!("the SFTP session could not be opened for this connection")
+        })
     }
 
     /// Call a command via SSH, streaming its output to stdout/stderr.

@@ -832,10 +832,12 @@ StandardError=journal
                 }
 
                 // Relative path under local_path, converted to a guest path
-                let rel = entry
-                    .path()
-                    .strip_prefix(local_path)
-                    .expect("Failed to get relative path");
+                let rel = entry.path().strip_prefix(local_path).with_context(|| {
+                    format!(
+                        "failed to derive the relative path of {:?} under {local_path:?}",
+                        entry.path()
+                    )
+                })?;
                 let remote_entry = remote_root.join(rel.to_string_lossy())?;
 
                 if ty.is_dir() {
@@ -1210,11 +1212,15 @@ StandardError=journal
             kill_if_qemu(pid);
         }
 
-        let cancel_token = self
-            .ssh_cancel_token
-            .as_ref()
-            .expect("Machine not initialized or spawned")
-            .clone();
+        // `launch` is only reached through `init`/`spawn`, which set the token; check
+        // instead of panicking so a future caller cannot turn this into a crash.
+        let Some(cancel_token) = self.ssh_cancel_token.clone() else {
+            bail!(
+                "cannot launch VM-{}: it has no SSH cancellation token because `init` or `spawn` \
+                 was not reached; use those entry points instead of launching directly",
+                self.id
+            );
+        };
         self.qemu_should_exit.store(false, Ordering::SeqCst);
         // Windows guests need OVMF (per-VM vars) and a TPM 2.0 backed by swtpm.
         let mut machine_firmware: Option<VmFirmware> = None;
@@ -1229,12 +1235,14 @@ StandardError=journal
             if self.swtpm.is_none() {
                 self.swtpm = Some(Swtpm::start(&run_dir).await?);
             }
-            let socket = self
-                .swtpm
-                .as_ref()
-                .expect("swtpm was just started")
-                .socket()
-                .to_path_buf();
+            let socket = match self.swtpm.as_ref() {
+                Some(swtpm) => swtpm.socket().to_path_buf(),
+                None => bail!(
+                    "cannot launch VM-{}: the software TPM was not started, so the guest has no \
+                     TPM 2.0 device; re-run `spawn` after `swtpm` is available",
+                    self.id
+                ),
+            };
             machine_firmware = Some(VmFirmware {
                 code: resolved.code,
                 vars,
@@ -1788,9 +1796,22 @@ impl Drop for Machine {
         }
         // Clean up runtime files if configured to do so
         if self.config.clear {
-            let dirs = QleanDirs::new().expect("Failed to get QleanDirs in Drop");
-            let run_dir = dirs.runs.join(&self.id);
-            let _ = std::fs::remove_dir_all(run_dir);
+            // `Drop` must never panic: a panic while unwinding aborts the process.
+            match QleanDirs::new() {
+                Ok(dirs) => {
+                    let run_dir = dirs.runs.join(&self.id);
+                    if let Err(error) = std::fs::remove_dir_all(&run_dir) {
+                        debug!(
+                            "failed to remove the run directory {}: {error}",
+                            run_dir.display()
+                        );
+                    }
+                }
+                Err(error) => warn!(
+                    "cannot remove the run directory of VM-{} on drop: {error}",
+                    self.id
+                ),
+            }
         }
     }
 }

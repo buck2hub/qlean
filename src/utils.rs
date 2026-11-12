@@ -183,7 +183,7 @@ pub(crate) struct QleanDirs {
 
 impl QleanDirs {
     pub(crate) fn new() -> Result<Self> {
-        let project_dir = ProjectDirs::from("", "", "qlean").expect("Couldn't get project dir");
+        let project_dir = project_dir_or_explain(ProjectDirs::from("", "", "qlean"))?;
 
         // Dir containing persistent data (usually ~/.local/share/qlean/)
         let data_dir = project_dir.data_dir().to_path_buf();
@@ -209,10 +209,27 @@ impl QleanDirs {
     }
 }
 
+/// Explain why Qlean has no data directory instead of panicking inside `ProjectDirs`.
+///
+/// `ProjectDirs::from` returns `None` when neither `XDG_DATA_HOME` nor `HOME` is usable
+/// (containers, `env -i`, system services, `sudo` without a preserved environment). Every
+/// public entry point calls [`QleanDirs::new`], and `Drop for Machine` calls it as well, so
+/// a panic here aborts the process instead of reporting the actual problem.
+fn project_dir_or_explain(dirs: Option<ProjectDirs>) -> Result<ProjectDirs> {
+    dirs.ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot determine Qlean's data directory: neither `XDG_DATA_HOME` nor `HOME` is \
+             set to a usable absolute path. Set one of them (for example \
+             `XDG_DATA_HOME=/var/lib/qlean`) and retry"
+        )
+    })
+}
+
 pub(crate) fn create_dir(purpose: &str, path: &Path) -> Result<()> {
     if !path.exists() {
         debug!("{purpose} dir {path:?} doesn't exist yet, creating");
-        std::fs::create_dir_all(path).expect("Failed to create directory");
+        std::fs::create_dir_all(path)
+            .with_context(|| format!("failed to create the {purpose} directory {path:?}"))?;
     }
     // Qlean's directories hold the client private key, per-VM host keys and seed media,
     // so they must not be traversable by other local users even when the umask allows it.
@@ -603,6 +620,44 @@ mod tests {
             ""
         );
         assert_eq!(parse_lease_expiry(""), "");
+    }
+
+    #[test]
+    fn test_project_dir_or_explain_reports_an_unusable_environment() {
+        // Mirrors `ProjectDirs::from("", "", "qlean")` returning `None` when neither
+        // `XDG_DATA_HOME` nor `HOME` is usable.
+        let err = project_dir_or_explain(None)
+            .expect_err("no data directory must be an error, not a panic")
+            .to_string();
+        assert!(
+            err.contains("cannot determine Qlean's data directory"),
+            "{err}"
+        );
+        assert!(
+            err.contains("XDG_DATA_HOME") && err.contains("HOME"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_create_dir_reports_an_uncreatable_path() {
+        // A regular file as the parent makes `create_dir_all` fail with ENOTDIR.
+        let root = std::env::temp_dir().join(format!(
+            "qlean-create-dir-error-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&root, b"not a directory").unwrap();
+        let child = root.join("nested");
+
+        let err = create_dir("test", &child)
+            .expect_err("a directory under a regular file cannot be created")
+            .to_string();
+        assert!(err.contains("failed to create the test directory"), "{err}");
+        std::fs::remove_file(&root).unwrap();
     }
 
     #[test]
