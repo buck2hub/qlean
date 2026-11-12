@@ -49,49 +49,63 @@ pub(crate) struct VmFirmware {
     pub secure_boot: bool,
 }
 
-/// Known (code, vars, secure_boot) layouts, most specific first.
-const OVMF_CANDIDATES: &[(&str, &str, bool)] = &[
+/// Known (code, vars candidates, secure_boot) layouts, most specific first.
+///
+/// Secure Boot only counts as *enabled* when the vars image already carries the
+/// Microsoft KEK/db, so the `.ms`/`.secboot` vars templates are preferred and the
+/// plain template is only a fallback (that combination boots in setup mode, which
+/// Windows 11 rejects).
+const OVMF_CANDIDATES: &[(&str, &[&str], bool)] = &[
     // Arch: edk2-ovmf
     (
         "/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd",
-        "/usr/share/edk2/x64/OVMF_VARS.4m.fd",
+        &[
+            "/usr/share/edk2/x64/OVMF_VARS.4m.ms.fd",
+            "/usr/share/edk2/x64/OVMF_VARS.4m.fd",
+        ],
         true,
     ),
     (
         "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
-        "/usr/share/edk2/x64/OVMF_VARS.4m.fd",
+        &["/usr/share/edk2/x64/OVMF_VARS.4m.fd"],
         false,
     ),
     (
         "/usr/share/edk2/x64/OVMF_CODE.fd",
-        "/usr/share/edk2/x64/OVMF_VARS.fd",
+        &["/usr/share/edk2/x64/OVMF_VARS.fd"],
         false,
     ),
     // Debian/Ubuntu: ovmf
     (
         "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd",
-        "/usr/share/OVMF/OVMF_VARS_4M.fd",
+        &[
+            "/usr/share/OVMF/OVMF_VARS_4M.ms.fd",
+            "/usr/share/OVMF/OVMF_VARS_4M.fd",
+        ],
         true,
     ),
     (
         "/usr/share/OVMF/OVMF_CODE_4M.fd",
-        "/usr/share/OVMF/OVMF_VARS_4M.fd",
+        &["/usr/share/OVMF/OVMF_VARS_4M.fd"],
         false,
     ),
     (
         "/usr/share/OVMF/OVMF_CODE.fd",
-        "/usr/share/OVMF/OVMF_VARS.fd",
+        &["/usr/share/OVMF/OVMF_VARS.fd"],
         false,
     ),
     // Fedora/RHEL: edk2-ovmf
     (
         "/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd",
-        "/usr/share/edk2/ovmf/OVMF_VARS.fd",
+        &[
+            "/usr/share/edk2/ovmf/OVMF_VARS.secboot.fd",
+            "/usr/share/edk2/ovmf/OVMF_VARS.fd",
+        ],
         true,
     ),
     (
         "/usr/share/edk2/ovmf/OVMF_CODE.fd",
-        "/usr/share/edk2/ovmf/OVMF_VARS.fd",
+        &["/usr/share/edk2/ovmf/OVMF_VARS.fd"],
         false,
     ),
 ];
@@ -121,12 +135,17 @@ fn is_secure_boot_name(path: &Path) -> bool {
 fn resolve_ovmf_with(exists: &dyn Fn(&Path) -> bool) -> Option<FirmwarePaths> {
     OVMF_CANDIDATES.iter().find_map(|(code, vars, secure)| {
         let code = Path::new(code);
-        let vars = Path::new(vars);
-        (exists(code) && exists(vars)).then(|| FirmwarePaths {
-            code: code.to_path_buf(),
-            vars_template: vars.to_path_buf(),
-            secure_boot: *secure,
-        })
+        if !exists(code) {
+            return None;
+        }
+        vars.iter()
+            .map(Path::new)
+            .find(|vars| exists(vars))
+            .map(|vars| FirmwarePaths {
+                code: code.to_path_buf(),
+                vars_template: vars.to_path_buf(),
+                secure_boot: *secure,
+            })
     })
 }
 
@@ -429,6 +448,25 @@ mod tests {
         let resolved = resolve_ovmf_with(&probe).expect("candidate matched");
         assert_eq!(resolved.code, plain_code);
         assert!(!resolved.secure_boot);
+    }
+
+    #[test]
+    fn test_secure_boot_prefers_the_microsoft_vars_template() {
+        // Secure Boot is only enabled with the Microsoft KEK/db enrolled; the plain
+        // vars template boots in setup mode, which Windows 11 refuses.
+        let code = Path::new("/usr/share/OVMF/OVMF_CODE_4M.secboot.fd");
+        let ms_vars = Path::new("/usr/share/OVMF/OVMF_VARS_4M.ms.fd");
+        let plain_vars = Path::new("/usr/share/OVMF/OVMF_VARS_4M.fd");
+        let probe = |path: &Path| path == code || path == ms_vars || path == plain_vars;
+        let resolved = resolve_ovmf_with(&probe).expect("secure pair matched");
+        assert_eq!(resolved.vars_template, ms_vars, "the .ms template wins");
+        assert!(resolved.secure_boot);
+
+        // Without the .ms template the plain one is still usable (setup mode).
+        let probe = |path: &Path| path == code || path == plain_vars;
+        let resolved = resolve_ovmf_with(&probe).expect("fallback matched");
+        assert_eq!(resolved.vars_template, plain_vars);
+        assert!(resolved.secure_boot);
     }
 
     #[test]
