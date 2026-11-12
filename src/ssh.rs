@@ -26,6 +26,37 @@ use tracing::{debug, info};
 use crate::guest_path::GuestPath;
 
 #[cfg(test)]
+mod host_key_window_tests {
+    use super::*;
+
+    #[test]
+    fn a_pinned_key_mismatch_is_fatal_only_after_deployment() {
+        assert!(
+            !pinned_key_mismatch_is_fatal(true),
+            "a first boot that has not installed the key yet must keep waiting"
+        );
+        assert!(
+            pinned_key_mismatch_is_fatal(false),
+            "once deployed, a wrong host key must never be retried"
+        );
+    }
+
+    #[test]
+    fn the_pending_key_message_names_the_cause_and_the_contract() {
+        let addr = "192.168.221.42:22".parse().unwrap();
+        let message = host_key_pending_message(addr, Duration::from_secs(900));
+        assert!(message.contains("192.168.221.42:22"), "{message}");
+        assert!(message.contains("900-second"), "{message}");
+        assert!(message.contains("not the one Qlean"), "{message}");
+        assert!(
+            message.contains(crate::windows::SEED_VOLUME_LABEL),
+            "{message}"
+        );
+        assert!(message.contains("Windows image contract"), "{message}");
+    }
+}
+
+#[cfg(test)]
 mod budget_tests {
     use super::*;
 
@@ -248,6 +279,35 @@ fn host_key_rejection_message(transport_name: &str, pinned: bool) -> String {
 ///
 /// Only a rejected pinned host key is fatal here: a refused connection means sshd is not up
 /// yet, while a wrong key means the retry loop can never succeed.
+/// Whether a pinned host key mismatch must end the attempt loop at once.
+///
+/// After deployment the guest's host key is fixed, so a mismatch is a hard error: the
+/// pinned key is the only thing that makes the TCP transport trustworthy, and silently
+/// trusting whatever key the guest presents would throw that away.
+///
+/// While the first boot is still installing Qlean's key, the guest's `sshd` is expected to
+/// be in flux (the task rewrites the host key and restarts the service, and the guest may
+/// reboot more than once). Aborting on the first mismatch there would discard the entire
+/// deployment budget over a state the guest is on its way to leaving, so the mismatch is
+/// retried and reported only once the budget is spent, with a message that names it.
+fn pinned_key_mismatch_is_fatal(deployment_in_progress: bool) -> bool {
+    !deployment_in_progress
+}
+
+/// Message for a guest that never adopted Qlean's host key during its first boot.
+fn host_key_pending_message(addr: std::net::SocketAddr, budget: Duration) -> String {
+    format!(
+        "the Windows guest at {addr} answered SSH with a host key that is not the one Qlean \
+         deployed, for the whole {}-second connection budget.\n\
+         The first-boot task is expected to install Qlean's host key (`ssh_host_ed25519_key` \
+         from the `{}` medium) and restart `sshd`; an `sshd` that starts before that task runs \
+         serves its own key and can never be verified. See the README \"Windows image \
+         contract\", then retry with `spawn` once the guest has finished its first boot",
+        budget.as_secs(),
+        crate::windows::SEED_VOLUME_LABEL
+    )
+}
+
 fn is_fatal_connect_error(error: &anyhow::Error) -> bool {
     error
         .chain()
@@ -906,6 +966,7 @@ pub(crate) async fn connect_ssh_windows(
     keypair: PersistedSshKeypair,
     cancel_token: CancellationToken,
     expected_host_key: String,
+    deployment_in_progress: bool,
 ) -> Result<Session> {
     let privkey = PrivateKey::from_openssh(&keypair.privkey_str)?;
     let pinned = PublicKey::from_openssh(expected_host_key.trim()).with_context(|| {
@@ -914,6 +975,7 @@ pub(crate) async fn connect_ssh_windows(
 
     let deadline = Instant::now() + timeout;
     let mut last_err: Option<anyhow::Error> = None;
+    let mut key_mismatch: Option<anyhow::Error> = None;
 
     while Instant::now() < deadline {
         if cancel_token.is_cancelled() {
@@ -962,7 +1024,13 @@ pub(crate) async fn connect_ssh_windows(
                 );
                 return Ok(session);
             }
-            Err(e) if is_fatal_connect_error(&e) => return Err(e),
+            Err(e) if is_fatal_connect_error(&e) => {
+                if pinned_key_mismatch_is_fatal(deployment_in_progress) {
+                    return Err(e);
+                }
+                key_mismatch = Some(e);
+                sleep(Duration::from_millis(250)).await;
+            }
             Err(e) => {
                 last_err = Some(e);
                 sleep(Duration::from_millis(250)).await;
@@ -970,6 +1038,11 @@ pub(crate) async fn connect_ssh_windows(
         }
     }
 
+    // A mismatch that outlived the whole budget is the real story; report it instead of
+    // the generic "not reachable" message.
+    if let Some(mismatch) = key_mismatch {
+        return Err(mismatch).context(host_key_pending_message(addr, timeout));
+    }
     Err(last_err.unwrap_or_else(|| {
         anyhow::anyhow!(
             "Timeout establishing SSH over tcp to {addr}; pass the Windows guest's reachable \

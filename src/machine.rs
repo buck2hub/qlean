@@ -1409,6 +1409,9 @@ StandardError=journal
                     self.keypair.to_owned(),
                     cancel_token.clone(),
                     host_key.clone(),
+                    // The seed medium is only dropped once the deployment marker was seen,
+                    // so its presence means the guest may still be installing our key.
+                    self.deploy_seed.is_some(),
                 ))
             }
             None => tokio::spawn(connect_ssh(
