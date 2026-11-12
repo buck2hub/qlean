@@ -532,9 +532,24 @@ let image = Image::new(
 );
 ```
 
-`ImageConfig::default()`, the builder methods and the Linux runtime behavior are
-unchanged; the break is source-level only. This release is a `0.x` minor bump
-because the change cannot be expressed as a non-breaking addition.
+`ImageConfig::default()` and the builder methods are unchanged, so the break above is
+source-level only.
+
+Two runtime behaviors did change for Linux guests as well. Both were defects, but code
+that was written around them must be adapted:
+
+- **`Machine::exec` returns the real exit status.** The SSH exit code used to be handed to
+  `ExitStatus::from_raw` as if it were a wait status, so every non-zero exit was reported
+  as `success()` with `code() == Some(0)`. A test that asserted success for a command that
+  actually failed will now fail. Exit codes outside `0..=255` (for example Windows
+  `0xC0000005`) are returned as an error instead of being truncated.
+- **Empty or whitespace-only `exec` commands are rejected** with an actionable error
+  instead of sending an empty shell request, and an absolute path passed as the
+  *destination* of `upload`/`download` is an error instead of being silently treated as a
+  path relative to the destination directory.
+
+This release is a `0.x` minor bump because the `ImageConfig` change cannot be expressed as
+a non-breaking addition.
 
 ## License
 
