@@ -96,7 +96,14 @@ impl std::fmt::Debug for BoundedFailure {
 ///
 /// A budget that does not also end the child process is not a budget: `kill_on_drop`
 /// kills it when the output future is dropped at the deadline, so nothing keeps running
-/// (and writing the file it was told to write) after the caller gave up.
+/// (and writing the file it was told to write) after the caller gave up. A real process
+/// proves that in [`test_run_bounded_kills_the_child_it_gave_up_on`].
+///
+/// The kill reaches the child, not its children: a program that forks and exits leaves the
+/// fork behind. Every program this runs (`virsh`, a `--version` probe, `qemu-img`,
+/// `xorriso` in the tests) answers in its own process, so the group-kill that would be
+/// needed for a forking program is not installed; a caller that ever runs one must say so
+/// here instead of assuming the budget covers it.
 pub(crate) async fn run_bounded(
     mut cmd: tokio::process::Command,
     budget: std::time::Duration,
@@ -1215,6 +1222,58 @@ mod tests {
         assert!(
             !message.contains("install it and try again"),
             "a hung program is already installed: {message}"
+        );
+    }
+
+    /// Whether `pid` is still a live process (a zombie is dead, only not yet reaped).
+    fn still_alive(pid: i32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        // `/proc/<pid>/stat` is `pid (comm) STATE ...`, and `comm` may contain spaces and
+        // parentheses, so the state is the field right after the *last* `)`.
+        let Some(close) = stat.rfind(')') else {
+            return false;
+        };
+        let state = stat[close + 1..].split_whitespace().next();
+        !matches!(state, Some("Z") | Some("X"))
+    }
+
+    #[tokio::test]
+    async fn test_run_bounded_kills_the_child_it_gave_up_on() {
+        // "Killed" is the whole point of the budget: a program that keeps running after the
+        // caller gave up still holds whatever it was writing (a seed ISO, a qcow2 overlay),
+        // and the next run trips over it. Only a real process can prove that, so the child
+        // records its own pid (`exec` keeps that pid the one that runs) and the pid must be
+        // gone afterwards.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let pid_file = tmp.path().join("pid");
+        let mut hung = tokio::process::Command::new("/bin/sh");
+        hung.arg("-c")
+            .arg(format!("echo $$ > {}; exec sleep 30", pid_file.display()));
+        let failure = run_bounded(hung, std::time::Duration::from_millis(150), "probe")
+            .await
+            .expect_err("sleep 30 cannot answer inside 150ms");
+        assert!(
+            matches!(failure, BoundedFailure::Killed { .. }),
+            "expected Killed, got {failure}"
+        );
+
+        let pid = std::fs::read_to_string(&pid_file).expect("the child recorded its own pid");
+        let pid: i32 = pid.trim().parse().expect("a pid");
+        // The kill is a signal and the reap happens in the background, so give it a moment.
+        let mut alive = still_alive(pid);
+        for _ in 0..40 {
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            alive = still_alive(pid);
+        }
+        assert!(
+            !alive,
+            "`{pid}` was still running a second after the budget expired: the message says \
+             the process was killed, so it has to be"
         );
     }
 
