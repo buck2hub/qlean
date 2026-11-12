@@ -40,6 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `with_pool` no longer requires `/dev/vhost-vsock`, and `with_machine` requires it only for `GuestOs::Linux`
 
 ### Fixed
+- Allocating a guest CID panicked in a debug build and wrapped to a reserved value in a
+  release build when a run directory already recorded the highest CID a guest may use: the
+  next machine either crashed the library or was booted with an address the host cannot
+  dial. The allocation now refuses, names the offending run directory and says which
+  directories to remove.
 - A backslash in a guest path was folded into `/` for every guest, so on a Linux guest `a\b` (a legal name) was addressed as `a/b` - a different file - and `a\..\b` made the whole walk fail; a backslash separates only on Windows, and a Linux guest keeps it as an ordinary character in a name
 - Uploading a tree approximated a name that is not valid UTF-8 instead of refusing it: every such byte became `U+FFFD`, so two entries differing only in that byte arrived as one guest name and the second upload silently overwrote the first; an entry whose name has no guest spelling is now refused by name, since a guest path is a UTF-8 string
 - `upload` of a path that is itself a symbolic link followed it: the local path was classified with a following `stat`, so the bytes sent were the target's and, on a Windows guest, the rule that refuses links never ran because that branch was never reached. The root is now classified from the entry's own attributes and both the root link and a link inside a tree go through one shared transfer that refuses it on Windows and recreates it on Linux

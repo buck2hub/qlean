@@ -3405,6 +3405,70 @@ mod plan_doc_tests {
         );
     }
 
+    /// A CID allocation that cannot count past the ceiling is refused, not panicked.
+    ///
+    /// `utils::get_free_cid` reads the highest `cid` under the runs directory and adds one. The
+    /// file is Qlean's own, but the directory is a caller's: it can be copied, restored from a
+    /// backup, or edited. At the ceiling, `+ 1` panics inside the library in a debug build and
+    /// wraps to `0` (a reserved CID the host cannot dial) in a release build - so the two ways of
+    /// failing are "crash the caller" and "boot a guest nothing can reach". The check is one
+    /// `checked_add`, so the guard pins the check, the constant it compares against, the three
+    /// tests that exercise it, and the changelog sentence that tells a reader why the launch
+    /// stopped. Removing the sentence is not compliance: the tests read the real function.
+    #[test]
+    fn the_cid_allocation_refuses_a_value_it_cannot_count_past() {
+        const UTILS: &str = include_str!("../src/utils.rs");
+        const CHANGELOG: &str = include_str!("../CHANGELOG.md");
+
+        assert!(
+            UTILS.contains("const LAST_GUEST_CID: u32 = u32::MAX - 1;"),
+            "the ceiling must stay one below `VMADDR_CID_ANY`"
+        );
+        let alloc_body = UTILS
+            .split("fn get_free_cid(")
+            .nth(1)
+            .and_then(|rest| rest.split("debug!(\"Our new CID").next())
+            .expect("`get_free_cid` or its final trace line is gone");
+        let allocation = alloc_body;
+        assert!(
+            allocation.contains("checked_add(1)") && allocation.contains("<= LAST_GUEST_CID"),
+            "the allocation must refuse a CID it cannot count past"
+        );
+        assert!(
+            !allocation.contains("+ 1"),
+            "the allocation must not add to an untrusted value unchecked"
+        );
+
+        let tests = [
+            "test_a_cid_at_the_ceiling_is_refused_instead_of_overflowing",
+            "test_the_next_cid_follows_the_highest_one_and_starts_above_the_reserved_range",
+            "test_an_unparsable_cid_names_the_file_it_came_from",
+        ];
+        for name in tests {
+            assert!(
+                UTILS.contains(&format!("fn {name}(")),
+                "`{name}` is part of this card's proof and no longer exists"
+            );
+        }
+
+        let unreleased = CHANGELOG
+            .split("## [Unreleased]")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## [").next())
+            .expect("the changelog must still have an [Unreleased] section");
+        let fixed = changelog_sections(unreleased)
+            .into_iter()
+            .find(|(title, _)| title == "Fixed")
+            .expect("the unreleased changelog has no `### Fixed` section")
+            .1;
+        assert!(
+            fixed
+                .iter()
+                .any(|entry| entry.contains("Allocating a guest CID")),
+            "the refusal is user-visible - a launch stops - and the changelog does not say so"
+        );
+    }
+
     /// The traceability table points at names, not at line numbers.
     ///
     /// R127 taught this table's numbers to stay inside their files, which kept them syntactically

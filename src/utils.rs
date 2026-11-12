@@ -580,6 +580,21 @@ pub(crate) fn restrict_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The first CID handed out, when no run directory has claimed one yet.
+const FIRST_GUEST_CID: u32 = 10;
+
+/// The highest CID a guest may be given.
+///
+/// Linux reserves the low values (`0` hypervisor, `1` local, `2` host) and `u32::MAX`
+/// (`VMADDR_CID_ANY`), so the last usable CID is one below the ceiling.
+const LAST_GUEST_CID: u32 = u32::MAX - 1;
+
+/// Hand out a guest CID that no live run directory has claimed.
+///
+/// The allocation is "the highest `cid` under the runs directory, plus one". A `cid` file is
+/// written by Qlean itself, but it lives in a directory a caller can copy, restore or edit, so
+/// the value is untrusted input: at the ceiling, `+ 1` panics in a debug build and wraps to `0`
+/// (a reserved CID the host cannot reach) in a release build. Both are refused here instead.
 pub(crate) fn get_free_cid(runs_dir: &Path, run_dir: &Path) -> Result<u32> {
     let mut cids = vec![];
 
@@ -590,24 +605,38 @@ pub(crate) fn get_free_cid(runs_dir: &Path, run_dir: &Path) -> Result<u32> {
     trace!("Trying to lock {lock_dir:?}");
     let lock = DirLock::new_sync(&lock_dir)?;
 
-    for entry in WalkDir::new(runs_dir) {
+    for entry in WalkDir::new(&runs_dir) {
         let entry = entry?;
         let filename = entry.file_name();
         if filename.to_string_lossy() == "cid" {
             trace!("Found CID file at {:?}", entry.path());
             let cid = std::fs::read_to_string(entry.path())?;
-            cids.push(cid.parse::<u32>()?);
+            cids.push(cid.trim().parse::<u32>().with_context(|| {
+                format!(
+                    "failed to read the guest CID recorded in {}",
+                    entry.path().display()
+                )
+            })?);
         }
     }
 
     // Get the next CID.
     cids.sort();
     let cid = if let Some(last_cid) = cids.iter().next_back() {
-        last_cid + 1
+        last_cid
+            .checked_add(1)
+            .filter(|cid| *cid <= LAST_GUEST_CID)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cannot allocate a guest CID: the run directories under {} already use {last_cid}, \
+                     and a guest may not be given a CID above {LAST_GUEST_CID}. Remove the run \
+                     directories of machines that no longer exist and retry.",
+                    runs_dir.display()
+                )
+            })?
     } else {
-        // We get here if the current list of CIDs is empty. So we'll just start with some
-        // arbitrary CID.
-        10
+        // Nothing has claimed a CID yet, so start at an arbitrary value above the reserved ones.
+        FIRST_GUEST_CID
     };
 
     debug!("Our new CID: {cid}");
@@ -1041,6 +1070,96 @@ mod tests {
  Expiry Time           MAC address         Protocol   IP address           Hostname   Client ID or DUID
 ---------------------------------------------------------------------------------------------------------
 ";
+
+    /// A `cid` file at the ceiling must be refused, not incremented into a reserved value.
+    ///
+    /// `get_free_cid` allocates by reading the highest `cid` under the runs directory and adding
+    /// one, and the file it reads lives in a directory a caller can copy or restore. At the
+    /// ceiling the addition itself is the bug: a debug build panics inside the library, and a
+    /// release build wraps to `0` - a reserved CID - so the guest boots with a number the host
+    /// cannot dial. Nothing here needs a guest, a QEMU or a network, which is why the file-system
+    /// half of the allocation can be tested where every round runs.
+    #[test]
+    fn test_a_cid_at_the_ceiling_is_refused_instead_of_overflowing() {
+        let runs = tempfile::tempdir().expect("temp dir");
+        let run = runs.path().join("run-1");
+        std::fs::create_dir_all(&run).expect("run dir");
+        std::fs::write(run.join("cid"), LAST_GUEST_CID.to_string()).expect("cid file");
+
+        let error = get_free_cid(runs.path(), &run).expect_err("the ceiling has no next CID");
+        let message = error.to_string();
+        assert!(
+            message.contains("cannot allocate a guest CID"),
+            "the refusal must name itself: {message}"
+        );
+        assert!(
+            message.contains("Remove the run directories"),
+            "the refusal must say what to do about it: {message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(run.join("cid")).expect("the cid file"),
+            LAST_GUEST_CID.to_string(),
+            "a refused allocation must not rewrite the `cid` file"
+        );
+
+        // The ceiling itself is also out of range: `u32::MAX` is `VMADDR_CID_ANY`. The addition
+        // would overflow here in a debug build, so this is the case the pre-fix code panicked on.
+        std::fs::write(run.join("cid"), u32::MAX.to_string()).expect("cid file");
+        let error = get_free_cid(runs.path(), &run).expect_err("u32::MAX is not a guest CID");
+        assert!(
+            error.to_string().contains("cannot allocate a guest CID"),
+            "a reserved CID must be refused, not wrapped: {error}"
+        );
+    }
+
+    /// The happy paths of the allocation, so the guard above is not the only thing exercising it.
+    #[test]
+    fn test_the_next_cid_follows_the_highest_one_and_starts_above_the_reserved_range() {
+        let runs = tempfile::tempdir().expect("temp dir");
+        let first = runs.path().join("run-1");
+        std::fs::create_dir_all(&first).expect("run dir");
+
+        let cid = get_free_cid(runs.path(), &first).expect("the first allocation");
+        assert_eq!(cid, FIRST_GUEST_CID, "an empty runs directory starts at 10");
+        assert_eq!(
+            std::fs::read_to_string(first.join("cid")).expect("the cid file"),
+            cid.to_string(),
+            "the allocation is recorded in the run directory"
+        );
+
+        // A second machine, and one whose run directory is nested deeper: the walk is recursive,
+        // so a `cid` file under a nested path still counts as claimed.
+        let second = runs.path().join("run-2");
+        let nested = runs.path().join("run-2").join("seed");
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        std::fs::write(nested.join("cid"), (FIRST_GUEST_CID + 4).to_string()).expect("cid file");
+        let cid = get_free_cid(runs.path(), &second).expect("the second allocation");
+        assert_eq!(
+            cid,
+            FIRST_GUEST_CID + 5,
+            "the highest recorded CID wins, wherever it is nested"
+        );
+    }
+
+    /// A `cid` file nobody can parse is reported with the file it came from.
+    #[test]
+    fn test_an_unparsable_cid_names_the_file_it_came_from() {
+        let runs = tempfile::tempdir().expect("temp dir");
+        let run = runs.path().join("run-1");
+        std::fs::create_dir_all(&run).expect("run dir");
+        std::fs::write(run.join("cid"), "not-a-number").expect("cid file");
+
+        let error = get_free_cid(runs.path(), &run).expect_err("garbage is not a CID");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("failed to read the guest CID recorded in"),
+            "the error must say what it was reading: {message}"
+        );
+        assert!(
+            message.contains("run-1"),
+            "the error must point at the offending run directory: {message}"
+        );
+    }
 
     /// A lease table that no installed program can read must be reported at once.
     ///
