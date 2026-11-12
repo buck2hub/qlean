@@ -114,10 +114,8 @@
 | 2026-11-04 04:19:20 UTC | review R3 | 关闭 R2 全部 P1；结构、依赖、计数、全量门、表格、链接和现有锚点复核通过；无新增 P0/P1，计划文档最终 PASS | N/A（仅评审记录与状态快照） | Review log、plan-status 计划一览 |
 | 2026-11-12 07:20:33 UTC | review R4 | P2 缺口修复：新增 GAP-08（Windows 首启部署超时维度）与 GAP-09（Windows 资源默认值未讨论），`OSX-03`/`OSX-02` 各补一条 AC（两卡均达 8/8 上限）；事实基线、性能摘要、风险表同步；plan-status 同步 | `OSX-02`/`OSX-03` 修订，编号不变 | 事实基线、当前缺口、任务卡、粒度审计表、性能与容量摘要、风险登记、Review log、plan-status |
 | 2026-11-12 07:45:12 UTC | review R5（环境消歧） | `DEP-01`/`DEP-02` 审计为不可用，`SPK-01`/`SPK-02` 置 `blocked`；`ADR-WIN-02`/`ADR-WIN-03` 改为临时接受并写入选定方案；取消 `SPK-02 -> OSX-01` 边，实施顺序改为以 `OSX-01` 为起点的串行链；新增环境消歧结论段落；`REL-01` 明确阻塞 | N/A（无拆合卡；仅依赖边与 ADR 状态） | 实施顺序、依赖登记表、ADR-WIN-02/03、粒度审计表 deps 列、Risk log、实施证据汇总、plan-status |
-
 | 2026-11-12 13:45:00 UTC | review R6（实施后逐卡 review；修订提交 `496b471`） | 逐卡核对 `OSX-01`~`FS-01` 实现与门禁；F1~F4 修复（`Drop`/`swtpm` 顺序、证据表 Review 列语义、`GuestPath::join` 不可达分支、`TRN-01` 提交号更正）；`REL-01` 维持 `blocked` | N/A（无拆合卡、无 AC 变更） | 实施证据汇总、Review log、`src/machine.rs`、`src/firmware.rs`、`src/guest_path.rs`、plan-status |
-
-| 2026-11-12 14:20:00 UTC | review R7（结构复核） | 修复文档结构：恢复丢失的 `OSX-01` 标题与 `Task type` 行；`SPK-01`/`SPK-02` 卡片状态由 `pending` 更正为 `blocked` 并写入阻塞审计证据；删除 `OSX-03` 重复的第二个 `Verification` 块（与首个块矛盾且把已跑通的本地门标为未做）；修复 `Machine::exec` 空命令错误文案的多余空格（`c14b915`），三处状态视图一致 | N/A（无拆合卡、无 AC 变更） | 任务卡、Review log、plan-status |
+| 2026-11-12 14:20:00 UTC | review R7（结构复核） | 修复文档结构：恢复丢失的 `OSX-01` 标题与 `Task type` 行；`SPK-01`/`SPK-02` 卡片状态由 `pending` 更正为 `blocked` 并写入阻塞审计证据；删除 `OSX-03` 重复的第二个 `Verification` 块（与首个块矛盾且把已跑通的本地门标为未做）；补回 `TRN-01`/`EXE-01`/`IP-01`/`FS-01` 卡内 `Implementation evidence` 标签（原为无标题孤表）并消除修订历史表内空行；修复 `Machine::exec` 空命令错误文案的多余空格（`c14b915`），三处状态视图一致 | N/A（无拆合卡、无 AC 变更） | 任务卡、Review log、plan-status |
 
 ## 已决议设计决策
 
@@ -690,6 +688,7 @@
 | 固定 vsock/root/true 与任意 server key | `src/ssh.rs:89-104,571-630` |
 | launch 与第二 interactive 会话 | `src/machine.rs:466-493,812-919` |
 | bridge DHCP 网络 | `src/utils.rs:161-227` |
+**Implementation evidence:**
 
 | 项 | 证据 |
 |---|---|
@@ -773,6 +772,7 @@
 |---|---|
 | `exec` 原样调用 SSH exec channel | `src/machine.rs:495-516`、`src/ssh.rs:324-370` |
 | UNIX escape 属于 `copy`，不是 `exec` | `src/machine.rs:949-955` |
+**Implementation evidence:**
 
 | 项 | 证据 |
 |---|---|
@@ -847,6 +847,7 @@
 | 事实 | 证据 |
 |---|---|
 | Linux 命令与 Machine IP 缓存 | `src/ssh.rs:831-841`、`src/machine.rs:791-800` |
+**Implementation evidence:**
 
 | 项 | 证据 |
 |---|---|
@@ -923,6 +924,7 @@
 | upload/download 使用宿主 PathBuf 拼接远程路径 | `src/machine.rs:578-775` |
 | 递归遍历与 `create_dir_all` 使用宿主 components/join | `src/ssh.rs:633-829` |
 | `copy`=POSIX cp，`set_permissions`=Unix mode | `src/machine.rs:922-1137` |
+**Implementation evidence:**
 
 | 项 | 证据 |
 |---|---|
@@ -1181,7 +1183,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R4 | P2 缺口修订（OSX-02 资源默认值、OSX-03 部署超时） | PASS | 无开放项；GAP-08/09 已修复 | 无 residual risk | 审计表重算：`OSX-02` AC=8/8、VER=5/8；`OSX-03` AC=8/8、VER=7/8（均在上限内）；追溯表补 `windows_deploy_timeout`；风险表新增两行；事实基线/性能摘要同步；plan-status 状态与时间戳同步；新增 AC 不扩大行为轴、不引入新依赖 |
 | R5 | 环境消歧（DEP-01/DEP-02 不可用）与依赖边重排 | PASS | 无开放项；spike 阻塞已登记，ADR 临时接受已写明 revisit 条件 | 残余风险：Windows 实测证据缺失（由 `SPK-01`/`SPK-02` 与 `REL-01` 阻塞承载），具名接受人=计划 Owner | 审计命令输出（`command -v` 全缺、`sudo -n` 需密码、`/dev/kvm` 存在）；依赖图无环复核；`SPK-02 -> OSX-01` 取消理由=OSX-01 无 Phase 0 输入；粒度审计表 deps 列同步 |
 | R6 | 实施后逐卡 review：`OSX-01`~`FS-01` 的实现产物、AC 对照与逐卡门禁 | PASS | 无 P0/P1 开放 | F1~F4 已在本轮修复；残余风险：真实 Windows KVM 证据与独立第二人 review 仍缺（由 `SPK-01`/`SPK-02`/`REL-01` 阻塞承载） | 逐卡门禁重跑：`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、8 个 focused filter 全绿（`image::tests` 18、`qemu` 5、`windows_deploy` 7+2、`ssh::tests` 5、`utils::tests` 4、`windows_exec` 5、`windows_ip` 6、`windows_path` 9）、`cargo test --lib` 69 passed、`cargo test --no-run`；F1~F3 修订见下表 |
-| R7 | 文档结构与状态一致性复核（10 张卡的标题/字段/状态机对齐 `plan-status.md`）+ 实施产物文案复核 | PASS | 无开放项 | 修复 4 处缺陷（`OSX-01` 标题与 `Task type` 行丢失、`SPK-01`/`SPK-02` 卡头仍为 `pending`、`OSX-03` 重复的第二个 `Verification` 块、`Machine::exec` 空命令错误文案多余空格 `c14b915`） | 逐卡字段审计脚本比对 10 张卡：每卡含标题、`Task type`、`Lifecycle / Acceptance` 与全部模板字段且无重复字段；状态与 `plan-status.md`、实施证据汇总三处一致 |
+| R7 | 文档结构与状态一致性复核（10 张卡的标题/字段/状态机对齐 `plan-status.md`）+ 实施产物文案复核 | PASS | 无开放项 | 修复 6 处缺陷（`OSX-01` 标题与 `Task type` 行丢失、`SPK-01`/`SPK-02` 卡头仍为 `pending`、`OSX-03` 重复的第二个 `Verification` 块、`TRN-01`/`EXE-01`/`IP-01`/`FS-01` 缺失的 `Implementation evidence` 标签、修订历史表被空行截断、`Machine::exec` 空命令错误文案多余空格 `c14b915`） | 逐卡字段审计脚本比对 10 张卡：每卡含标题、`Task type`、`Lifecycle / Acceptance` 与全部模板字段且无重复字段；状态与 `plan-status.md`、实施证据汇总三处一致 |
 
 ### R1 findings 与修订对照
 
