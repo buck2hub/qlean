@@ -24,7 +24,6 @@ use tokio_vsock::{VsockAddr, VsockStream};
 use tracing::{debug, info};
 
 use crate::guest_path::GuestPath;
-use crate::image::GuestOs;
 
 const ERR_EACCES: i32 = 13; // Permission denied
 const ERR_ENODEV: i32 = 19; // No such device
@@ -835,8 +834,10 @@ impl Session {
         // Build the path incrementally like mkdir -p, using guest path semantics so a
         // Windows `C:/Users/qlean` never becomes a host-relative `C:/` prefix.
         for cur in path.ancestors() {
-            if cur.is_root() && path.guest_os() == GuestOs::Linux {
-                // "/" always exists.
+            if cur.is_root() {
+                // A POSIX "/" and a Windows drive root (`C:`) always exist, and a
+                // drive-relative SFTP request for `C:` is not guaranteed to resolve to
+                // the drive root, so never try to create (or stat) them.
                 continue;
             }
             // Limit SFTP borrow scope to avoid conflicts with self in recursion
