@@ -2546,6 +2546,71 @@ mod plan_doc_tests {
         }
     }
 
+    /// A path rule the user can observe is written in the README *and* in the changelog.
+    ///
+    /// R149 and R150 each changed what a user sees - a Linux guest keeps a backslash, and an
+    /// entry without a UTF-8 spelling is refused - and each updated the README support matrix.
+    /// Neither added a changelog entry, which is the same gap R140 recorded as F146: a reader of
+    /// the release notes learns nothing about a behaviour that changed under them. The table below
+    /// is deliberately short - it covers the two rules this plan added - and each row is checked
+    /// against the README, the changelog and the code, so a reworded claim cannot pass alone.
+    #[test]
+    fn the_path_rules_a_user_can_observe_are_in_the_readme_and_the_changelog() {
+        use crate::guest_path::GuestPath;
+        use crate::image::GuestOs;
+
+        const README_TEXT: &str = include_str!("../README.md");
+        const CHANGELOG_TEXT: &str = include_str!("../CHANGELOG.md");
+
+        let unreleased = CHANGELOG_TEXT
+            .split("## [Unreleased]")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## [").next())
+            .expect("the changelog must still have an [Unreleased] section");
+        let flat_changelog = unreleased.split_whitespace().collect::<Vec<_>>().join(" ");
+        let flat_readme = README_TEXT.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        // Rule 1: a backslash separates only on Windows.
+        assert_eq!(
+            GuestPath::new(GuestOs::Linux, "/tmp/tree")
+                .expect("a Linux path")
+                .join("a\\b")
+                .expect("a Linux name may contain a backslash")
+                .as_str(),
+            "/tmp/tree/a\\b",
+            "a Linux guest path must keep a backslash as part of the name"
+        );
+        assert!(
+            flat_readme
+                .contains("A Linux guest path keeps `\\` as an ordinary character in a name"),
+            "the README no longer states the Linux backslash rule"
+        );
+        assert!(
+            flat_changelog.contains("a backslash separates only on Windows"),
+            "the changelog no longer records that a backslash separates only on Windows"
+        );
+
+        // Rule 2: a name with no guest spelling is refused.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let unspellable = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(b"tree/f\xff"));
+            assert!(
+                crate::machine::guest_relative_path(&unspellable).is_err(),
+                "a name that is not valid UTF-8 must be refused"
+            );
+        }
+        assert!(
+            flat_readme.contains("an entry whose name is not valid UTF-8 is refused by name"),
+            "the README no longer states the non-UTF-8 refusal"
+        );
+        assert!(
+            flat_changelog
+                .contains("an entry whose name has no guest spelling is now refused by name"),
+            "the changelog no longer records the non-UTF-8 refusal"
+        );
+    }
+
     /// A guest name that cannot be spelled is refused, not approximated.
     ///
     /// `to_string_lossy` is not a converter: it renders every non-UTF-8 byte as `U+FFFD`, so
