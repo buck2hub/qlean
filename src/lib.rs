@@ -3469,6 +3469,90 @@ mod plan_doc_tests {
         );
     }
 
+    /// The budgets the README promises are the ones the code uses.
+    ///
+    /// `README.md` is the only place a reader learns how long a Windows first boot may take: "The
+    /// deployment budget is 900s by default (independent of the Linux SSH connect timeout of
+    /// 180s/300s)". The three numbers are hand-typed, the code keeps them in three unrelated
+    /// places - `windows::DEPLOY_TIMEOUT_SECS` and the two branches of
+    /// `machine::resolve_ssh_timeout` - and nothing compared them, so raising the deployment
+    /// budget would leave the README telling a user to give up at the old number of seconds. The
+    /// CHANGELOG is exempt on purpose: a release note narrates the release it describes, and its
+    /// historical rows quote the budgets as they were.
+    #[test]
+    fn the_budgets_the_readme_promises_are_the_ones_the_code_uses() {
+        const README: &str = include_str!("../README.md");
+        const MACHINE: &str = include_str!("../src/machine.rs");
+
+        let number_after = |text: &'static str, marker: &str| -> u64 {
+            let rest = text
+                .split(marker)
+                .nth(1)
+                .unwrap_or_else(|| panic!("the README no longer states \"{marker}\""));
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            digits.parse().unwrap_or_else(|_| {
+                panic!("`{marker}` is not followed by a number of seconds any more: {rest:.40}")
+            })
+        };
+
+        // The deployment budget: one constant, stated once in prose.
+        assert_eq!(
+            number_after(README, "The deployment budget is "),
+            crate::windows::DEPLOY_TIMEOUT_SECS,
+            "README.md promises a deployment budget the code does not use"
+        );
+
+        // The Linux connect budget: two branches, stated as `180s/300s`.
+        let pair = README
+            .split("Linux SSH connect timeout of ")
+            .nth(1)
+            .expect("the README no longer contrasts the deployment budget with the connect one");
+        let pair = &pair[..pair.find(')').unwrap_or(pair.len())];
+        let stated: Vec<u64> = pair
+            .split('/')
+            .map(|part| {
+                let digits: String = part.chars().filter(|c| c.is_ascii_digit()).collect();
+                digits
+                    .parse()
+                    .unwrap_or_else(|_| panic!("`{pair}` does not pair two budgets"))
+            })
+            .collect();
+        assert_eq!(stated.len(), 2, "the connect budget is a pair: `{pair}`");
+
+        let resolved = MACHINE
+            .split("fn resolve_ssh_timeout(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("`machine::resolve_ssh_timeout` is gone");
+        let literal = |marker: &str| -> u64 {
+            let rest = resolved
+                .split(marker)
+                .nth(1)
+                .unwrap_or_else(|| panic!("`resolve_ssh_timeout` no longer has \"{marker}\""));
+            let after = rest
+                .split("Duration::from_secs(")
+                .nth(1)
+                .unwrap_or_else(|| {
+                    panic!("the branch at \"{marker}\" no longer builds a `Duration` from seconds")
+                });
+            let digits: String = after
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            digits.parse().unwrap_or_else(|_| {
+                panic!("the branch at \"{marker}\" is not a literal number of seconds")
+            })
+        };
+        let kvm = literal("if is_kvm_available() {");
+        let plain = literal("} else {");
+        assert_eq!(
+            stated,
+            vec![kvm, plain],
+            "README.md promises {stated:?} for the Linux connect budget but the code uses {kvm}/{plain}"
+        );
+    }
+
     /// The traceability table points at names, not at line numbers.
     ///
     /// R127 taught this table's numbers to stay inside their files, which kept them syntactically
