@@ -1239,10 +1239,9 @@ StandardError=journal
                 warn!("QEMU pid {pid} is gone; nothing to terminate");
                 return;
             }
-            let _ = std::process::Command::new("kill")
-                .arg("-TERM")
-                .arg(pid.to_string())
-                .output();
+            if let Err(error) = signal_term(pid) {
+                warn!("failed to send SIGTERM to QEMU pid {pid}: {error}");
+            }
 
             // Give it a moment to exit; then SIGKILL.
             let start = std::time::Instant::now();
@@ -1383,7 +1382,7 @@ StandardError=journal
                     if let Some(pid) = self.pid.take() {
                         terminate_qemu(pid).await;
                     }
-                    let _ = qemu_handle.await;
+                    reap_launch_task(qemu_handle, Duration::from_secs(5)).await;
                     if let Some(mut swtpm) = self.swtpm.take() {
                         swtpm.stop().await;
                     }
@@ -1481,7 +1480,7 @@ StandardError=journal
                 if let Some(pid) = self.pid.take() {
                     terminate_qemu(pid).await;
                 }
-                let _ = qemu_handle.await;
+                reap_launch_task(qemu_handle, Duration::from_secs(5)).await;
                 if let Some(mut swtpm) = self.swtpm.take() {
                     swtpm.stop().await;
                 }
@@ -1812,6 +1811,30 @@ fn kill_if_qemu(pid: u32) -> bool {
     }
 }
 
+/// Send SIGTERM through `kill(2)`, reporting a refusal instead of ignoring it.
+fn signal_term(pid: u32) -> std::io::Result<()> {
+    // SAFETY: `kill` with a positive pid only delivers a signal; it does not touch memory.
+    let sent = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    if sent == 0 {
+        return Ok(());
+    }
+    Err(std::io::Error::last_os_error())
+}
+
+/// Wait for a launch task to finish, but never forever.
+///
+/// The failure paths of `launch` must surface the original error: a QEMU that refuses to die
+/// would otherwise leave this await hanging on its pipe readers and the user would see
+/// nothing at all. Returns whether the task had to be aborted.
+async fn reap_launch_task<T>(mut task: tokio::task::JoinHandle<T>, grace: Duration) -> bool {
+    if tokio::time::timeout(grace, &mut task).await.is_ok() {
+        return false;
+    }
+    warn!("QEMU did not exit within {grace:?} after the kill, abandoning the launch task");
+    task.abort();
+    true
+}
+
 /// SIGKILL `pid` through `kill(2)` rather than an external `kill` program.
 fn signal_kill(pid: u32) -> std::io::Result<()> {
     // SAFETY: `kill` with a positive pid only delivers a signal; it does not touch memory.
@@ -2034,6 +2057,26 @@ mod timeout_tests {
             "disarmed guard must not clean up"
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reap_launch_task_returns_for_a_finished_task() {
+        let task = tokio::spawn(async {});
+        assert!(!reap_launch_task(task, std::time::Duration::from_secs(5)).await);
+    }
+
+    #[tokio::test]
+    async fn reap_launch_task_aborts_instead_of_hanging() {
+        // A QEMU that refuses to die must not hide the original launch error.
+        let task = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+        });
+        let started = std::time::Instant::now();
+        assert!(reap_launch_task(task, std::time::Duration::from_millis(50)).await);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the wait must be bounded"
+        );
     }
 
     #[test]
