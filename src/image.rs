@@ -738,6 +738,41 @@ async fn verify_fetched(dest: &Path, expected_hash: &str, computed: &str) -> Res
     )
 }
 
+/// Whether two paths name the same file on disk.
+///
+/// Device and inode decide, not the spelling: `./a`, an absolute path, a hard link and a
+/// symlink all reach the same file, and only the inode knows. A destination that does not
+/// exist yet is a different file by construction.
+fn names_the_same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let (Ok(a), Ok(b)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+        return false;
+    };
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+/// Refuse a copy whose source is the destination.
+///
+/// `copy_with_hash` opens the destination for writing (truncating it) before it reads the
+/// source. When both name one file — the same path, a hard link, a symlink — that truncation
+/// destroys the image it is about to copy: the copy then reads zero bytes, and the digest
+/// check rejects and deletes the emptied file. The user loses their image and the error blames
+/// a hash mismatch. Refusing before anything is opened is the only outcome that keeps the file.
+fn ensure_copy_has_two_files(src: &Path, dest: &Path) -> Result<()> {
+    if !names_the_same_file(src, dest) {
+        return Ok(());
+    }
+    bail!(
+        "the local image source {} and the cache file {} are the same file: copying would \
+         truncate the image before it is read, so nothing was written.\n\
+         Point `source` at the image where it lives instead of inside the image cache \
+         directory, or move the image there under the name Qlean wants to cache it under.",
+        src.display(),
+        dest.display()
+    )
+}
+
 /// Fetch image file from remote source or local path and verify it against the expected hash.
 async fn fetch_from_source(
     source: &ImageSource,
@@ -752,19 +787,39 @@ async fn fetch_from_source(
         }
         ImageSource::LocalPath(src) => {
             anyhow::ensure!(src.exists(), "file does not exist: {}", src.display());
+            ensure_copy_has_two_files(src, dest)?;
             if let Some(parent) = dest.parent() {
                 tokio::fs::create_dir_all(parent)
                     .await
                     .with_context(|| format!("failed to create dir {}", parent.display()))?;
             }
 
-            let src_path = src.clone();
-            let dest_path = dest.clone();
-            let computed = tokio::task::spawn_blocking(move || {
-                copy_with_hash(&src_path, &dest_path, &hash_type)
+            // Install through a `.part` file, exactly like the download path: a copy that dies
+            // half way must not leave a truncated file at the cache path, where the next run
+            // would trust it and `qemu-img` would build an overlay on top of it.
+            let part = dest.with_extension("part");
+            let _ = tokio::fs::remove_file(&part).await;
+            let (src_path, part_path) = (src.clone(), part.clone());
+            let copied = tokio::task::spawn_blocking(move || {
+                copy_with_hash(&src_path, &part_path, &hash_type)
             })
             .await
-            .with_context(|| "copy/hash task failed")??;
+            .with_context(|| "copy/hash task failed")?;
+            let computed = match copied {
+                Ok(computed) => computed,
+                Err(error) => {
+                    let _ = tokio::fs::remove_file(&part).await;
+                    return Err(error);
+                }
+            };
+
+            tokio::fs::rename(&part, dest).await.with_context(|| {
+                format!(
+                    "failed to move the copied image {} -> {}",
+                    part.display(),
+                    dest.display()
+                )
+            })?;
 
             verify_fetched(dest, expected_hash, &computed).await?;
         }
@@ -1398,6 +1453,110 @@ dummy
         tokio::fs::write(&path, b"good").await?;
         verify_fetched(&path, "DEADBEEF", "deadbeef").await?;
         assert!(path.exists(), "case-insensitive match must keep the file");
+        Ok(())
+    }
+
+    /// A local image kept inside the cache directory is the destination of its own copy.
+    ///
+    /// `copy_with_hash` opens the destination for writing before it reads the source, so the
+    /// truncation destroys the very image it is about to copy, the verification then rejects
+    /// the empty result, and the user's file is gone. Nothing may be written at all here.
+    #[tokio::test]
+    async fn test_a_local_copy_refuses_to_truncate_its_own_source() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let image = tmp.path().join("win11.qcow2");
+        let bytes: &[u8] = b"QFI\xfb a real image";
+        tokio::fs::write(&image, bytes).await?;
+        let digest = compute_hash(&image, ShaType::Sha256).await?;
+
+        let error = fetch_from_source(
+            &ImageSource::LocalPath(image.clone()),
+            &image,
+            &digest,
+            ShaType::Sha256,
+        )
+        .await
+        .expect_err("a copy of a file onto itself must be refused, not performed");
+        let message = error.to_string();
+        assert!(message.contains("same file"), "{message}");
+        assert_eq!(
+            tokio::fs::read(&image).await?,
+            bytes,
+            "the source image must survive the refusal"
+        );
+        Ok(())
+    }
+
+    /// The same file reached through a hard link is still one file.
+    #[tokio::test]
+    async fn test_a_local_copy_from_a_link_to_the_destination_is_refused() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let dest = tmp.path().join("cached.qcow2");
+        let bytes: &[u8] = b"linked image bytes";
+        tokio::fs::write(&dest, bytes).await?;
+        let src = tmp.path().join("source.qcow2");
+        std::fs::hard_link(&dest, &src)?;
+        let digest = compute_hash(&dest, ShaType::Sha256).await?;
+
+        let error = fetch_from_source(
+            &ImageSource::LocalPath(src),
+            &dest,
+            &digest,
+            ShaType::Sha256,
+        )
+        .await
+        .expect_err("a hard link to the destination is the same file");
+        assert!(error.to_string().contains("same file"), "{error}");
+        assert_eq!(tokio::fs::read(&dest).await?, bytes);
+        Ok(())
+    }
+
+    /// A local copy is installed the way a download is: through a `.part` file that only
+    /// becomes the cache entry once the whole file arrived.
+    #[tokio::test]
+    async fn test_a_local_copy_is_installed_through_a_part_file() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let src = tmp.path().join("source.qcow2");
+        let bytes: &[u8] = b"a local image that is copied into the cache";
+        tokio::fs::write(&src, bytes).await?;
+        let digest = compute_hash(&src, ShaType::Sha256).await?;
+
+        let cache = tmp.path().join("images");
+        let dest = cache.join("source.qcow2");
+        // A previous copy that was interrupted leaves this behind; it must not survive.
+        tokio::fs::create_dir_all(&cache).await?;
+        tokio::fs::write(dest.with_extension("part"), b"half a previous copy").await?;
+        fetch_from_source(
+            &ImageSource::LocalPath(src.clone()),
+            &dest,
+            &digest,
+            ShaType::Sha256,
+        )
+        .await?;
+        assert_eq!(tokio::fs::read(&dest).await?, bytes);
+        assert!(
+            !dest.with_extension("part").exists(),
+            "a finished copy must not leave its partial file behind"
+        );
+
+        // A rejected copy installs nothing and leaves no partial file either, while the
+        // source stays intact.
+        let rejected = cache.join("rejected.qcow2");
+        let error = fetch_from_source(
+            &ImageSource::LocalPath(src.clone()),
+            &rejected,
+            "deadbeef",
+            ShaType::Sha256,
+        )
+        .await
+        .expect_err("a wrong digest must be rejected");
+        assert!(error.to_string().contains("hash mismatch"), "{error}");
+        assert!(!rejected.exists(), "a rejected image must not appear");
+        assert!(
+            !rejected.with_extension("part").exists(),
+            "a rejected copy must not leave a partial file behind"
+        );
+        assert_eq!(tokio::fs::read(&src).await?, bytes);
         Ok(())
     }
 }
