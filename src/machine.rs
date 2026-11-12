@@ -1286,7 +1286,13 @@ StandardError=journal
 
         let ssh_result = tokio::select! {
             result = &mut ssh_handle => {
-                result.map_err(|e| anyhow::anyhow!("SSH task panicked: {e}"))?
+                // A panicked SSH task is a launch failure like any other: return it as an
+                // error value so the branch below tears QEMU, swtpm and the pid down
+                // instead of propagating and detaching them.
+                match result {
+                    Ok(inner) => inner,
+                    Err(e) => Err(anyhow::anyhow!("SSH task panicked: {e}")),
+                }
             }
             result = &mut qemu_handle => {
                 // QEMU completed or errored, cancel SSH task. Clear the pid and stop swtpm
