@@ -80,6 +80,25 @@ fn pflash_vars_file(arguments: &str) -> Option<String> {
     })
 }
 
+/// The `file=` of the QEMU argument that attaches the seed medium as a CD-ROM.
+fn seed_iso_file(arguments: &str) -> Option<String> {
+    arguments.split(' ').find_map(|argument| {
+        if !argument.contains("media=cdrom") {
+            return None;
+        }
+        argument
+            .split(',')
+            .find_map(|part| part.strip_prefix("file=").map(str::to_owned))
+    })
+}
+
+/// Whether the guest is attached to any CD-ROM at all.
+fn has_cdrom(arguments: &str) -> bool {
+    arguments
+        .split(' ')
+        .any(|part| part.contains("media=cdrom"))
+}
+
 /// The `dir=` of the `swtpm --tpmstate` argument.
 fn tpm_state_dir(arguments: &str) -> Option<String> {
     let mut parts = arguments.split(' ');
@@ -110,6 +129,22 @@ fn the_host_process_helpers_parse_the_paths_the_launch_builds() {
 
     let swtpm = "swtpm socket --tpm2 --tpmstate dir=/run/qlean/VM-1/tpm                  --ctrl type=unixio,path=/run/qlean/VM-1/swtpm.sock,mode=0600";
     assert_eq!(tpm_state_dir(swtpm).as_deref(), Some("/run/qlean/VM-1/tpm"));
+
+    let seeded = "qemu-system-x86_64 -drive file=/run/qlean/VM-1/seed.iso,if=ide,media=cdrom,readonly=on \
+                   -drive file=/run/qlean/VM-1/overlay.img,if=none,id=virtio0";
+    assert_eq!(
+        seed_iso_file(seeded).as_deref(),
+        Some("/run/qlean/VM-1/seed.iso"),
+        "the deployment medium is the CD-ROM, not the disk overlay"
+    );
+    assert!(has_cdrom(seeded));
+    let after_deployment =
+        "qemu-system-x86_64 -drive file=/run/qlean/VM-1/overlay.img,if=none,id=virtio0";
+    assert_eq!(seed_iso_file(after_deployment), None);
+    assert!(
+        !has_cdrom(after_deployment),
+        "a boot without the seed medium must not attach any CD-ROM"
+    );
     assert_eq!(
         tpm_state_dir("swtpm socket --tpm2 --ctrl type=unixio"),
         None
@@ -318,7 +353,25 @@ async fn windows_transport() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Windows guests must expose a per-VM SSH host key"))?
         .to_string();
 
+    let qemu_before = host_processes_matching("qemu-system");
     vm.init().await?;
+    // The seed medium is what makes a first boot a deployment, and it must be gone once the
+    // marker appeared: a deployed guest that keeps a readable seed ISO is a contract leak.
+    let seed = {
+        let qemu = newly_started(&qemu_before, &host_processes_matching("qemu-system"));
+        assert_eq!(
+            qemu.len(),
+            1,
+            "the first boot must start one QEMU: {qemu:#?}"
+        );
+        let (_, arguments) = &qemu[0];
+        seed_iso_file(arguments)
+            .unwrap_or_else(|| panic!("the first boot has no seed CD-ROM: {arguments}"))
+    };
+    assert!(
+        !std::path::Path::new(&seed).exists(),
+        "the seed medium {seed} is still on the host after the deployment marker appeared"
+    );
     // The leased address is discovered from libvirt, never read inside the guest.
     let ip = vm.get_ip().await?;
     assert!(
@@ -338,6 +391,15 @@ async fn windows_transport() -> Result<()> {
 
     // `spawn` reconnects without re-attaching the seed medium.
     vm.spawn().await?;
+    {
+        let qemu = newly_started(&qemu_before, &host_processes_matching("qemu-system"));
+        assert_eq!(qemu.len(), 1, "the restart must start one QEMU: {qemu:#?}");
+        let (_, arguments) = &qemu[0];
+        assert!(
+            !has_cdrom(arguments),
+            "the restarted guest still has a CD-ROM attached: {arguments}"
+        );
+    }
     let out = vm.exec("cmd /c echo spawned").await?;
     assert!(String::from_utf8_lossy(&out.stdout).contains("spawned"));
     // The pinned key survives the reboot because it is the key installed in the image.
