@@ -351,6 +351,17 @@ mod tests {
     }
 
     #[test]
+    fn windows_join_rejects_an_absolute_child_instead_of_silently_nesting() {
+        // `join` must never build `C:/Users/D:/x`: an absolute child would silently
+        // become a nonsense path, so the invalid-colon check rejects it.
+        let err = win(r"C:\Users")
+            .join("D:/data")
+            .expect_err("an absolute child must be rejected")
+            .to_string();
+        assert!(err.contains("does not allow"), "{err}");
+    }
+
+    #[test]
     fn windows_path_rejects_invalid_and_reserved_names() {
         for raw in [
             r"C:\Users\a<b",
