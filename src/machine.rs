@@ -339,6 +339,27 @@ fn spent_first_boot_budget(phase: &str, budget: Duration) -> anyhow::Error {
     )
 }
 
+/// Budget left for `phase` inside a Windows first boot.
+///
+/// A first boot shares one deadline between the DHCP lease, `sshd` and the deployment
+/// marker, so every phase has to ask for what is *left*. An expired deadline means the
+/// documented budget is spent, and handing that phase a fresh timeout would quietly double
+/// it: the guest could take the whole budget to answer SSH and then wait another whole
+/// budget for the marker, which is exactly the "one boot, one budget" rule this code is
+/// supposed to keep. `None` means this is not a first boot, so the plain budget applies.
+fn remaining_first_boot_budget(
+    deadline: Option<std::time::Instant>,
+    budget: Duration,
+    phase: &str,
+) -> Result<Duration> {
+    match deadline {
+        Some(deadline) => {
+            remaining_budget(deadline).ok_or_else(|| spent_first_boot_budget(phase, budget))
+        }
+        None => Ok(budget),
+    }
+}
+
 fn resolve_ssh_timeout(config: &MachineConfig) -> Duration {
     config
         .ssh_timeout
@@ -1181,11 +1202,13 @@ StandardError=journal
         let timeout = windows::deploy_timeout(&self.config);
         let start = std::time::Instant::now();
         // A first boot that is still running shares one deadline with the lease and `sshd`
-        // waits, so the documented budget bounds the whole boot instead of one phase.
-        let remaining = self
-            .first_boot_deadline
-            .and_then(remaining_budget)
-            .unwrap_or(timeout);
+        // waits, so the documented budget bounds the whole boot instead of one phase. An
+        // expired deadline is a failure here, not a fresh budget.
+        let remaining = remaining_first_boot_budget(
+            self.first_boot_deadline,
+            timeout,
+            "the deployment marker appeared",
+        )?;
         // A marker poll that cannot reach the guest says nothing about deployment: the
         // session may have died because the guest rebooted. Retrying that for the whole
         // budget would report "deployment did not finish" 15 minutes later, so give up
@@ -1482,12 +1505,11 @@ StandardError=journal
             // the 900s deployment budget. Race it against QEMU and cancellation so a VM
             // that died right after starting reports why, instead of waiting out the
             // whole budget and blaming the (absent) DHCP lease.
-            let discovery_budget = match self.first_boot_deadline {
-                Some(deadline) => remaining_budget(deadline).ok_or_else(|| {
-                    spent_first_boot_budget("the DHCP lease appeared", ssh_timeout)
-                })?,
-                None => ssh_timeout,
-            };
+            let discovery_budget = remaining_first_boot_budget(
+                self.first_boot_deadline,
+                ssh_timeout,
+                "the DHCP lease appeared",
+            )?;
             let discovery = discover_windows_endpoint(
                 self.mac_address.clone(),
                 self.ssh_host_key.clone(),
@@ -1546,11 +1568,11 @@ StandardError=journal
         let mut ssh_handle = match windows_endpoint {
             Some((addr, host_key)) => {
                 info!("🔎 VM-{} connecting over tcp to {addr}", self.id);
-                let connect_budget = match self.first_boot_deadline {
-                    Some(deadline) => remaining_budget(deadline)
-                        .ok_or_else(|| spent_first_boot_budget("`sshd` answered", ssh_timeout))?,
-                    None => ssh_timeout,
-                };
+                let connect_budget = remaining_first_boot_budget(
+                    self.first_boot_deadline,
+                    ssh_timeout,
+                    "`sshd` answered",
+                )?;
                 tokio::spawn(connect_ssh_windows(
                     addr,
                     connect_budget,
@@ -2241,6 +2263,67 @@ mod timeout_tests {
             "the message must say that later phases get no fresh wait: {message}"
         );
         assert!(message.contains("ssh_timeout"), "{message}");
+    }
+
+    #[test]
+    fn the_first_boot_deadline_is_read_in_exactly_one_place() {
+        // The bug: `confirm_deployment` computed its own remaining budget and fell back to a
+        // *fresh* timeout when the deadline had expired, so a first boot could take twice the
+        // documented budget. `remaining_first_boot_budget` is now the only reader; a new
+        // direct `remaining_budget` call would be the same mistake in another phase.
+        let source: &str = include_str!("machine.rs");
+        // The test module counts itself too, so only the production half is scanned.
+        let production = source.split("#[cfg(test)]").next().expect("module source");
+        assert_eq!(
+            production.matches("remaining_budget(").count(),
+            2,
+            "remaining_budget must only be defined and used by remaining_first_boot_budget"
+        );
+    }
+
+    #[test]
+    fn an_expired_first_boot_budget_does_not_hand_out_a_fresh_one() {
+        // The bug this guards: `confirm_deployment` turned an already-expired deadline into
+        // `unwrap_or(timeout)`, so a guest that spent the whole budget reaching SSH got a
+        // second full budget for the marker and a first boot could last twice as long as
+        // documented.
+        let expired = Some(std::time::Instant::now() - Duration::from_secs(1));
+        let error = remaining_first_boot_budget(
+            expired,
+            Duration::from_secs(900),
+            "the deployment marker appeared",
+        )
+        .expect_err("an expired budget must fail the phase, not restart it");
+        let message = error.to_string();
+        assert!(
+            message.contains("the deployment marker appeared"),
+            "{message}"
+        );
+        assert!(
+            message.contains("not one phase"),
+            "the failure must repeat that later phases get no fresh wait: {message}"
+        );
+    }
+
+    #[test]
+    fn a_running_first_boot_only_lends_the_next_phase_what_is_left() {
+        let deadline = Some(std::time::Instant::now() + Duration::from_secs(5));
+        let remaining =
+            remaining_first_boot_budget(deadline, Duration::from_secs(900), "`sshd` answered")
+                .expect("a future deadline still has budget");
+        assert!(
+            remaining <= Duration::from_secs(5),
+            "a phase must not get more than what the shared deadline leaves: {remaining:?}"
+        );
+    }
+
+    #[test]
+    fn a_boot_that_is_not_a_first_boot_gets_the_plain_budget() {
+        let budget = Duration::from_secs(180);
+        assert_eq!(
+            remaining_first_boot_budget(None, budget, "`sshd` answered").expect("no deadline"),
+            budget
+        );
     }
 
     #[tokio::test]
