@@ -2664,6 +2664,46 @@ mod shutdown_tests {
 }
 
 #[cfg(test)]
+mod blank_command_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_blank_command_is_refused_before_a_session_is_looked_up() {
+        // The refusal is the whole point of the check: an empty line would reach the guest
+        // shell as an empty request, and the user would get a `0` exit code for doing nothing.
+        // It ran only in an `#[ignore]` smoke that needs a real Windows guest (DEP-01/02),
+        // although nothing about it needs a guest at all.
+        for blank in ["", "   ", "\n\t "] {
+            let mut machine = Machine::for_tests_with_pid(None);
+            let error = machine
+                .exec(blank)
+                .await
+                .expect_err("a blank command must be refused");
+            let text = error.to_string();
+            assert!(
+                text.contains("requires a non-empty command"),
+                "a blank command must be refused for being blank, not for any other reason: {text}"
+            );
+            assert!(
+                text.contains("empty shell request"),
+                "the message must say what would have been sent instead: {text}"
+            );
+        }
+        // The control: the same never-started machine gets past the blank check for a real
+        // command, so the error above really was the blank check and not the session lookup.
+        let mut machine = Machine::for_tests_with_pid(None);
+        let error = machine
+            .exec("whoami")
+            .await
+            .expect_err("a machine that never started has no session");
+        assert!(
+            !error.to_string().contains("requires a non-empty command"),
+            "`whoami` must not be refused as blank: {error}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod liveness_tests {
     use super::*;
 

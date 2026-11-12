@@ -2122,6 +2122,44 @@ mod plan_doc_tests {
     }
 
     #[test]
+    fn the_blank_command_refusal_is_tested_where_it_can_run() {
+        const MACHINE: &str = include_str!("../src/machine.rs");
+        const README: &str = include_str!("../README.md");
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        // Two documents promise the refusal; the plan's card used to say the unit tests only
+        // covered exit codes, leaving the refusal to an `#[ignore]` smoke that needs a real
+        // Windows guest for a check that needs no guest at all (R170).
+        assert!(
+            MACHINE.contains("async fn a_blank_command_is_refused_before_a_session_is_looked_up()"),
+            "the unit test for the blank-command refusal is gone"
+        );
+        let exec = function_body(MACHINE, "pub async fn exec<S: AsRef<str>>");
+        assert!(
+            exec.contains("cmd_ref.trim().is_empty()") && exec.contains("bail!("),
+            "`Machine::exec` no longer refuses a blank command before opening a session"
+        );
+        assert!(
+            README.contains(
+                "An empty or whitespace-only command is rejected with an error before any SSH \
+                 request is\n  sent."
+            ) || README.contains(
+                "An empty or whitespace-only command is rejected with an error before any SSH request is"
+            ),
+            "the README no longer states that a blank command is rejected before any SSH request"
+        );
+        // And the card must not claim the refusal is only covered by the ignored smoke.
+        let card = section(PLAN, "### Task EXE-01: PowerShell `exec` 语义");
+        let row = card
+            .lines()
+            .find(|line| line.starts_with("| 单测 |"))
+            .expect("the EXE-01 evidence table lost its unit-test row");
+        assert!(
+            row.contains("a_blank_command_is_refused_before_a_session_is_looked_up"),
+            "the EXE-01 unit-test row does not name the blank-command test: {row}"
+        );
+    }
+
+    #[test]
     fn the_liveness_refusal_is_an_error_in_the_branch_and_in_the_changelog() {
         const MACHINE: &str = include_str!("../src/machine.rs");
         const CHANGELOG: &str = include_str!("../CHANGELOG.md");

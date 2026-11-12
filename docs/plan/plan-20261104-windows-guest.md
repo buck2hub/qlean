@@ -1103,7 +1103,7 @@
 | 空命令 | `Machine::exec` 在建立 SSH 请求前 `bail!` 拒绝空白命令 |
 | 原始字符串 | `exec` 仍把入参原样交给 exec channel，未引入任何 escape/argv 化；Windows 依赖镜像契约把 OpenSSH `DefaultShell` 设为 PowerShell |
 | stdout/stderr | `call_with_output` 分通道返回 `(code, stdout, stderr)`，未合并 |
-| 单测 | `src/exec.rs`：0 success、非 0 failure、2..255 原样、300 拒绝（含可操作文案）、`0xC0000005` 不截断（5 个，`cargo test --lib windows_exec` 可过滤） |
+| 单测 | `src/exec.rs`：0 success、非 0 failure、2..255 原样、300 拒绝（含可操作文案）、`0xC0000005` 不截断（5 个，`cargo test --lib windows_exec` 可过滤）；空命令拒绝在宿主侧单测 `machine::blank_command_tests::a_blank_command_is_refused_before_a_session_is_looked_up`（含「空白命令被拒」与「非空命令不会命中该拒绝」两条断言，R170） |
 | 集成测试（`#[ignore]`） | `tests/windows_machine.rs::windows_exec`：空命令、`whoami`、引号/空格、`cmd /c exit 3`、stdout/stderr 分离、`exit 300` 拒绝 |
 | README/CHANGELOG | README「Windows command execution」+ 镜像契约补 `DefaultShell`；CHANGELOG Added ×3 / Fixed ×1 |
 | 提交 | `64b1046` |
@@ -1113,7 +1113,7 @@
 - [x] Windows 输入原文交给 PowerShell，不调用 UNIX escape；空命令返回明确错误，特殊字符不被二次解释。——`exec` 未改字符串路径，空白命令在发请求前拒绝。
 - [x] `status.success()`、0..=255 的 `status.code()`、超范围错误及 stdout/stderr 分离符合 ADR-WIN-05。——`exec::exit_status_from_code` + 5 个单测；超范围返回可操作错误而非截断。
 - [x] Linux 路径行为不变；若为复用 helper 修正既有退出码问题，先记录兼容说明和对应测试。——复用同一 helper 并修正了非 0 退出被报告为 success 的既有缺陷：CHANGELOG `Fixed` 写明行为变更，`src/exec.rs` 5 个单测覆盖；其余 Linux 路径未改。
-- [ ] `(new)` 单测与 Windows 冒烟覆盖空命令、引号/空格、`whoami`、非零及大退出码。——单测已覆盖退出码维度；`windows_exec` 冒烟已编写但需 DEP-01/02，`blocked`。
+- [ ] `(new)` 单测与 Windows 冒烟覆盖空命令、引号/空格、`whoami`、非零及大退出码。——单测已覆盖退出码维度与**空命令拒绝**（`machine::blank_command_tests::a_blank_command_is_refused_before_a_session_is_looked_up`，R170：此前这条判断只排在需要真机 Windows 的 `#[ignore]` 冒烟里，而它不需要任何 guest）；引号/空格、`whoami` 与真机退出码仍需 `windows_exec` 冒烟（DEP-01/02），`blocked`。
 - [x] README PowerShell 示例/退出码契约与 CHANGELOG Added 同卡更新。
 
 **Verification:**
