@@ -1289,8 +1289,16 @@ StandardError=journal
                 result.map_err(|e| anyhow::anyhow!("SSH task panicked: {e}"))?
             }
             result = &mut qemu_handle => {
-                // QEMU completed or errored, cancel SSH task
+                // QEMU completed or errored, cancel SSH task. Clear the pid and stop swtpm
+                // here: the machine is not running any more, and a leftover handle would
+                // report a live VM and keep the TPM process around until drop.
                 cancel_token.cancel();
+                self.pid = None;
+                // The join handle already resolved in this branch; awaiting it again
+                // would panic on a completed task.
+                if let Some(mut swtpm) = self.swtpm.take() {
+                    swtpm.stop().await;
+                }
                 match result {
                     Ok(Ok(())) => bail!("QEMU exited unexpectedly"),
                     Ok(Err(e)) => bail!(e),
@@ -1333,7 +1341,7 @@ StandardError=journal
             Err(e) => {
                 // SSH failed, QEMU should exit
                 // Here we proactively terminate QEMU process to avoid leaving a zombie process, but we don't set the flag `qemu_should_exit` to true because the failure of SSH is unexpected.
-                if let Some(pid) = self.pid {
+                if let Some(pid) = self.pid.take() {
                     terminate_qemu(pid).await;
                 }
                 let _ = qemu_handle.await;
