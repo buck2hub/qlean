@@ -725,7 +725,9 @@ StandardError=journal
         if self.pid.is_some() {
             let socket_path = qmp::qmp_socket_path(&self.id)?;
             if let Err(e) = qmp::powerdown(&socket_path).await {
-                debug!("QMP system-powerdown failed during teardown: {e}");
+                // The guest will be killed instead of shut down: say why, at a level the
+                // user sees, because the diagnostic below only mentions the timeout.
+                warn!("could not ask the guest to power down, it may be killed instead: {e:#}");
             }
         }
 
@@ -740,23 +742,41 @@ StandardError=journal
             let max_wait_time = Duration::from_secs(30);
             let poll_interval = Duration::from_millis(100);
             let start = std::time::Instant::now();
+            let mut kill_sent = false;
 
             loop {
-                if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
-                    debug!("QEMU process {} has exited", pid);
-                    break;
+                let alive = std::path::Path::new(&format!("/proc/{pid}")).exists();
+                match teardown_step(alive, start.elapsed(), max_wait_time, kill_sent) {
+                    TeardownStep::StillGone => {
+                        debug!("QEMU process {} has exited", pid);
+                        break;
+                    }
+                    TeardownStep::KeepWaiting => {
+                        tokio::time::sleep(poll_interval).await;
+                    }
+                    TeardownStep::ForceKill => {
+                        info!(
+                            "QEMU process {} did not exit within timeout, force killing",
+                            pid
+                        );
+                        if kill_if_qemu(pid) {
+                            kill_sent = true;
+                        } else {
+                            // The pid no longer belongs to our QEMU, so there is nothing left
+                            // for teardown to wait for.
+                            break;
+                        }
+                        tokio::time::sleep(poll_interval).await;
+                    }
+                    TeardownStep::Unkillable => {
+                        // Leave `self.pid` set: the process is still running, so reporting a
+                        // clean shutdown would let the next start rebuild the overlay of a
+                        // live guest.
+                        bail!(
+                            "QEMU process {pid} is still running after SIGKILL: the machine was not shut down.                              Kill pid {pid} manually before starting it again"
+                        );
+                    }
                 }
-
-                if start.elapsed() > max_wait_time {
-                    info!(
-                        "QEMU process {} did not exit within timeout, force killing",
-                        pid
-                    );
-                    kill_if_qemu(pid);
-                    break;
-                }
-
-                tokio::time::sleep(poll_interval).await;
             }
         }
 
@@ -1773,8 +1793,9 @@ fn process_is_qemu(pid: u32) -> bool {
 
 /// SIGKILL a pid only when it is still QEMU.
 ///
-/// Returns whether the signal was sent, so callers can report the pid reuse instead of
-/// leaving a misleading "killed" impression.
+/// Returns whether the signal was delivered, so callers can report pid reuse or a refused
+/// signal instead of leaving a misleading "killed" impression. A process that is already
+/// gone counts as delivered: that is the state the caller wanted.
 fn kill_if_qemu(pid: u32) -> bool {
     if !process_is_qemu(pid) {
         warn!(
@@ -1782,11 +1803,51 @@ fn kill_if_qemu(pid: u32) -> bool {
         );
         return false;
     }
-    let _ = std::process::Command::new("kill")
-        .arg("-9")
-        .arg(pid.to_string())
-        .output();
-    true
+    match signal_kill(pid) {
+        Ok(()) => true,
+        Err(error) => {
+            warn!("failed to send SIGKILL to pid {pid}: {error}");
+            false
+        }
+    }
+}
+
+/// SIGKILL `pid` through `kill(2)` rather than an external `kill` program.
+fn signal_kill(pid: u32) -> std::io::Result<()> {
+    // SAFETY: `kill` with a positive pid only delivers a signal; it does not touch memory.
+    let sent = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    if sent == 0 {
+        return Ok(());
+    }
+    Err(std::io::Error::last_os_error())
+}
+
+/// What a teardown poll should do next, given the QEMU process and the elapsed grace.
+///
+/// Pure so the three ways out of the wait loop are testable without a live QEMU:
+/// `StillGone` (the usual case), `KeepWaiting` (guest is powering down), `ForceKill` (grace
+/// expired, no signal sent yet) and `Unkillable` (SIGKILL was sent and the process is still
+/// there, which must not be reported as a clean shutdown).
+#[derive(Debug, PartialEq, Eq)]
+enum TeardownStep {
+    StillGone,
+    KeepWaiting,
+    ForceKill,
+    Unkillable,
+}
+
+fn teardown_step(
+    alive: bool,
+    elapsed: std::time::Duration,
+    grace: std::time::Duration,
+    kill_sent: bool,
+) -> TeardownStep {
+    match (alive, elapsed > grace, kill_sent) {
+        (false, ..) => TeardownStep::StillGone,
+        (true, false, _) => TeardownStep::KeepWaiting,
+        (true, true, false) => TeardownStep::ForceKill,
+        (true, true, true) => TeardownStep::Unkillable,
+    }
 }
 
 /// Convert a caller-supplied path into a validated guest path for `os`.
@@ -1973,6 +2034,55 @@ mod timeout_tests {
             "disarmed guard must not clean up"
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn teardown_step_keeps_waiting_while_the_guest_shuts_down() {
+        use std::time::Duration;
+        let grace = Duration::from_secs(30);
+        assert_eq!(
+            teardown_step(true, Duration::from_secs(1), grace, false),
+            TeardownStep::KeepWaiting
+        );
+        // Even after a kill was sent, a live process within the grace period is merely
+        // taking its time.
+        assert_eq!(
+            teardown_step(true, Duration::from_secs(1), grace, true),
+            TeardownStep::KeepWaiting
+        );
+        assert_eq!(
+            teardown_step(false, Duration::from_secs(1), grace, false),
+            TeardownStep::StillGone
+        );
+    }
+
+    #[test]
+    fn teardown_step_forces_a_kill_only_after_the_grace_period() {
+        use std::time::Duration;
+        let grace = Duration::from_secs(30);
+        assert_eq!(
+            teardown_step(true, grace, grace, false),
+            TeardownStep::KeepWaiting
+        );
+        assert_eq!(
+            teardown_step(true, grace + Duration::from_millis(1), grace, false),
+            TeardownStep::ForceKill
+        );
+        // A process that disappeared during the grace period needs no signal at all.
+        assert_eq!(
+            teardown_step(false, grace + Duration::from_secs(1), grace, false),
+            TeardownStep::StillGone
+        );
+    }
+
+    #[test]
+    fn teardown_step_reports_a_qemu_that_survived_the_kill() {
+        use std::time::Duration;
+        let grace = Duration::from_secs(30);
+        assert_eq!(
+            teardown_step(true, grace + Duration::from_secs(1), grace, true),
+            TeardownStep::Unkillable
+        );
     }
 
     #[test]
