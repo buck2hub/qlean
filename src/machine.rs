@@ -482,7 +482,18 @@ StandardError=journal
     }
 
     /// Initialize the machine (first boot with cloud-init).
+    ///
+    /// A Windows guest may only be initialized once: its first boot consumes the seed
+    /// medium, which is deleted once the deployment marker appears. A second `init`
+    /// would boot without a seed (and without the host key the guest installed), so it
+    /// is rejected here instead of failing later inside QEMU or at the host-key check.
     pub async fn init(&mut self) -> Result<()> {
+        if self.image.guest_os == GuestOs::Windows && self.deploy_seed.is_none() {
+            bail!(
+                "VM-{} already completed its Windows first-boot deployment; use `spawn` to start it again",
+                self.id
+            );
+        }
         info!("🚀 Initializing VM-{}", self.id);
 
         // Resize image if needed
