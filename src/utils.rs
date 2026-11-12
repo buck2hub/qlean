@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use dir_lock::DirLock;
 use directories::ProjectDirs;
 use rand::RngExt;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 use walkdir::WalkDir;
 
 pub(crate) static HEX_ALPHABET: [char; 16] = [
@@ -515,6 +515,24 @@ async fn ensure_network() -> Result<()> {
     let active_networks = stdout.lines().map(str::to_owned).collect::<HashSet<_>>();
     let net_active = active_networks.contains("qlean");
 
+    // QEMU is always launched with `br={QLEAN_BRIDGE_NAME}`, so a `qlean` network that
+    // exists but hands out a different bridge cannot work: QEMU would fail to attach the
+    // NIC and the guest would never get a lease. Fail here, where the mismatch is
+    // visible, instead of deep inside a QEMU error message.
+    if net_exists {
+        let bridge = existing_network_bridge().await?;
+        match bridge.as_deref() {
+            Some(name) if name != QLEAN_BRIDGE_NAME => {
+                bail!("{}", bridge_mismatch_message(name));
+            }
+            Some(_) => {}
+            None => warn!(
+                "could not read the bridge name of the existing `qlean` network; assuming it is                  {QLEAN_BRIDGE_NAME}. If guest networking fails, recreate the network with \
+                 `virsh -c {VIRSH_CONNECTION_URI} net-undefine qlean`"
+            ),
+        }
+    }
+
     if !net_exists {
         debug!("Creating qlean network");
         let xml = r#"
@@ -575,6 +593,62 @@ async fn ensure_network() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Bridge name of the existing `qlean` libvirt network.
+async fn existing_network_bridge() -> Result<Option<String>> {
+    let output = tokio::process::Command::new("virsh")
+        .arg("-c")
+        .arg(VIRSH_CONNECTION_URI)
+        .arg("net-dumpxml")
+        .arg("qlean")
+        .output()
+        .await
+        .context("failed to read the qlean network definition")?;
+    if !output.status.success() {
+        bail!(
+            "`virsh net-dumpxml qlean` failed ({}); cannot verify that the network provides \
+             the {QLEAN_BRIDGE_NAME} bridge",
+            output.status
+        );
+    }
+    Ok(network_bridge_name(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// Extract the bridge name from `virsh net-dumpxml` output.
+///
+/// Tolerant on purpose: the attribute may use single or double quotes, and other elements
+/// (`<name>`, `<uuid>`) carry attributes that must not be mistaken for the bridge. Only the
+/// `<bridge .../>` element is inspected, and a missing bridge element yields `None` rather
+/// than a guess.
+pub(crate) fn network_bridge_name(xml: &str) -> Option<String> {
+    let start = xml.find("<bridge")?;
+    let rest = &xml[start + "<bridge".len()..];
+    let end = rest.find("/>").or_else(|| rest.find('>'))?;
+    let element = &rest[..end];
+    let name_at = element.find("name")?;
+    let after = &element[name_at + "name".len()..];
+    let value = after.get(after.find('=')? + 1..)?.trim_start();
+    let quote = value.chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let rest = &value[1..];
+    Some(rest[..rest.find(quote)?].to_string())
+}
+
+/// Actionable message for a `qlean` network that does not provide Qlean's bridge.
+fn bridge_mismatch_message(found: &str) -> String {
+    format!(
+        "the existing libvirt network `qlean` uses bridge `{found}`, but Qlean attaches every \
+         guest to `{QLEAN_BRIDGE_NAME}`; the guest would never receive a DHCP lease.\n\
+         Recreate the network so Qlean owns it:\n  \
+         virsh -c {VIRSH_CONNECTION_URI} net-destroy qlean\n  \
+         virsh -c {VIRSH_CONNECTION_URI} net-undefine qlean\n\
+         then run the command again."
+    )
 }
 
 pub(crate) fn gen_random_mac() -> String {
@@ -873,5 +947,44 @@ mod tests {
         let leases = parse_dhcp_leases(&output);
         assert_eq!(leases.len(), 1);
         assert_eq!(leases[0].ip.to_string(), "fd00::42");
+    }
+
+    const QLEAN_NET_XML: &str = "\
+<network connections='1'>
+  <name>qlean</name>
+  <uuid>8b2f1c26-0a5f-4a4f-9a1f-0b8f0a1f6d3c</uuid>
+  <bridge name='qlbr0' stp='on' delay='0'/>
+  <forward mode='nat'/>
+  <ip address='192.168.221.1' netmask='255.255.255.0'>
+    <dhcp>
+      <range start='192.168.221.2' end='192.168.221.254'/>
+    </dhcp>
+  </ip>
+</network>
+";
+
+    #[test]
+    fn existing_qlean_network_bridge_is_read_from_the_definition() {
+        assert_eq!(network_bridge_name(QLEAN_NET_XML).as_deref(), Some("qlbr0"));
+        assert_eq!(
+            network_bridge_name("<network><bridge name=\"virbr7\"/></network>").as_deref(),
+            Some("virbr7")
+        );
+    }
+
+    #[test]
+    fn a_network_without_a_bridge_element_is_not_guessed() {
+        // `<name>` and `<uuid>` come first and must not be mistaken for the bridge.
+        let xml = "<network><name>qlean</name><forward mode='nat'/></network>";
+        assert_eq!(network_bridge_name(xml), None);
+        assert_eq!(network_bridge_name("garbage"), None);
+    }
+
+    #[test]
+    fn bridge_mismatch_names_both_bridges_and_the_recovery() {
+        let message = bridge_mismatch_message("virbr0");
+        assert!(message.contains("`virbr0`"), "{message}");
+        assert!(message.contains(QLEAN_BRIDGE_NAME), "{message}");
+        assert!(message.contains("net-undefine qlean"), "{message}");
     }
 }
