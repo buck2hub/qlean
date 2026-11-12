@@ -1316,6 +1316,104 @@ mod plan_doc_tests {
         );
     }
 
+    /// No document dates an observation later than the clock, not just the plan.
+    ///
+    /// The plan's dates are checked; the status view was not, and it carried seven timestamps two
+    /// days ahead - six card rows and one deferred item whose "last updated" moment had not
+    /// arrived. A note at the top of the file declared them estimates, which is honest about the
+    /// problem and still leaves a reader who opens one row with a date that means nothing.
+    #[test]
+    fn the_status_view_states_no_date_that_has_not_happened_yet() {
+        const STATUS: &str = include_str!("../docs/plan/plan-status.md");
+        let today = today_utc();
+        let mut checked = 0;
+        for line in STATUS.lines() {
+            // The note that explains the old estimates quotes the dates it is talking about, and a
+            // quoted date is a mention rather than a claim. Everything else in it is a claim.
+            let note: String;
+            let line = if line.trim_start().starts_with('>') {
+                note = line
+                    .split('`')
+                    .enumerate()
+                    .filter(|(index, _)| index % 2 == 0)
+                    .map(|(_, text)| text)
+                    .collect();
+                note.as_str()
+            } else {
+                line
+            };
+            let bytes = line.as_bytes();
+            for at in 0..bytes.len().saturating_sub(9) {
+                let window = &bytes[at..at + 10];
+                let shaped = window[..4].iter().all(u8::is_ascii_digit)
+                    && window[4] == b'-'
+                    && window[5..7].iter().all(u8::is_ascii_digit)
+                    && window[7] == b'-'
+                    && window[8..10].iter().all(u8::is_ascii_digit);
+                if !shaped {
+                    continue;
+                }
+                let date = std::str::from_utf8(window).expect("a date is not ascii");
+                checked += 1;
+                assert!(
+                    date <= today.as_str(),
+                    "the status view records {date}, but the clock says {today}: that row claims \
+                     an update that has not happened"
+                );
+            }
+        }
+        assert!(
+            checked >= 10,
+            "the status view yielded only {checked} dates: the scan is not looking at them"
+        );
+    }
+
+    /// Every dependency the documents cite has a row, in the registry that defines it.
+    ///
+    /// `DEFER-05` was cited by the plan and registered in the status view but never entered the
+    /// plan's own deferred table, so the instruction "registered as DEFER-05" pointed at nothing
+    /// in the document it named.
+    #[test]
+    fn every_deferral_the_documents_cite_is_registered_in_the_plan() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        const STATUS: &str = include_str!("../docs/plan/plan-status.md");
+
+        let section_start = PLAN
+            .lines()
+            .position(|line| line.trim_end() == "## 非目标与延后项")
+            .expect("the plan has no deferred-items section");
+        let rows: Vec<String> = PLAN
+            .lines()
+            .skip(section_start + 1)
+            .take_while(|line| !line.starts_with("## "))
+            .filter_map(|line| line.split('|').nth(1).map(|id| id.trim().to_owned()))
+            .filter(|id| id.starts_with("DEFER-"))
+            .collect();
+        assert!(
+            rows.len() >= 4,
+            "the deferred table lists {} rows: the parse is not reading it",
+            rows.len()
+        );
+
+        let mut cited = 0;
+        for (who, document) in [("the plan", PLAN), ("the status view", STATUS)] {
+            for word in document.split(|c: char| !c.is_alphanumeric() && c != '-') {
+                let Some(id) = word.strip_prefix("DEFER-") else {
+                    continue;
+                };
+                if id.len() != 2 || !id.chars().all(|c| c.is_ascii_digit()) {
+                    continue;
+                }
+                cited += 1;
+                assert!(
+                    rows.iter().any(|row| row == word),
+                    "{who} cites {word}, but the plan's deferred table has no row for it"
+                );
+            }
+        }
+        assert!(cited >= 8, "only {cited} deferrals were cited anywhere");
+    }
+
     /// Every `src/file.rs::symbol` the plan points at names something that is there.
     ///
     /// The write-set rows exist so a reader can go and look at the implementation. Three of them

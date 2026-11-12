@@ -1719,6 +1719,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | DEFER-02 | Windows on ARM | 尚无真实需求，固件/驱动未验证 | 真实需求 + 新可行性验证 | 新计划 |
 | DEFER-03 | Windows TCG 冒烟矩阵 | 核心目标是 KVM，TCG 启动成本未验证 | 真实 TCG 需求 + 可接受时限 | 新测试计划；不得替代本计划 KVM 门 |
 | DEFER-04 | Linux VM 全量门 `cargo test -- --test-threads=1` 的本地执行 | 当前实现宿主无 QEMU/libvirt/xorriso/qemu-bridge-helper（DEP-02 不可用），VM 集成测试无法运行 | 配置齐全的 Linux KVM 宿主机可用时（与 DEP-02 解除同步） | 本计划 / `REL-01` 收口门；不得替代任何 Windows KVM 核心验收 |
+| DEFER-05 | Linux 侧的镜像格式假设：overlay 恒用 `-F qcow2`，raw Linux 源同样会在 `qemu-img create` 处失败（R106 只对 Windows guest 加了 preflight） | Linux 侧问题，按「只修 Windows 卡相关缺陷」的纪律登记不改 | 出现 raw Linux 源的真实报告时，把 `ensure_windows_image_is_qcow2` 的 guest 闸门提升到 `ImageConfig` 层对全部 guest 生效 | 本计划（登记项，R136 补登：此前只在 `plan-status.md` 有行，计划文档的延后表缺失，读者按「登记为 DEFER-05」去找会落空）；R106 实测 raw 作 backing → `Image is not in qcow2 format`，exit 1 |
 
 ## 完成判据
 
