@@ -402,6 +402,34 @@ mod plan_doc_tests {
         None
     }
 
+    /// The bullets of every `### <heading>` section inside the changelog's `[Unreleased]` block.
+    ///
+    /// Returned in document order as `(heading, bullets)`. A wrapped entry is flattened onto one
+    /// line, because the sentence - not the line - is what gets classified: `... was parsed as`
+    /// can straddle a wrap and a line-only reader would then see nothing wrong.
+    fn changelog_sections(unreleased: &str) -> Vec<(String, Vec<String>)> {
+        let mut sections: Vec<(String, Vec<String>)> = Vec::new();
+        for line in unreleased.lines() {
+            if let Some(heading) = line.strip_prefix("### ") {
+                sections.push((heading.trim().to_string(), Vec::new()));
+                continue;
+            }
+            let Some((_, bullets)) = sections.last_mut() else {
+                continue;
+            };
+            if let Some(bullet) = line.strip_prefix("- ") {
+                bullets.push(bullet.trim().to_string());
+            } else if line.starts_with(' ')
+                && !line.trim().is_empty()
+                && let Some(last) = bullets.last_mut()
+            {
+                last.push(' ');
+                last.push_str(line.trim());
+            }
+        }
+        sections
+    }
+
     /// The tests declared in `sources`, as full paths such as `image::tests::test_the_guard`.
     ///
     /// A test is a `fn`/`async fn` whose four preceding lines hold `#[test]`, `#[tokio::test…]`
@@ -3276,6 +3304,107 @@ mod plan_doc_tests {
         assert!(seen >= 40, "only {seen} line citations were checked");
     }
 
+    /// A document in the plan is cited by a heading, not by a line number.
+    ///
+    /// R127 taught the `src/<file>.rs:<a>-<b>` citations to stay inside their files; the same
+    /// hand-typed form was used four times for documents, and every one of them had rotted by
+    /// R172: the network row pointed at host-key pinning, the "0.3.0 dropped the TCP fallback"
+    /// row at `0.2.3`, the migration row at the interactive shell, and the changelog row at
+    /// whatever followed `[Unreleased]` that week. A source file only moves when someone edits
+    /// it; a changelog or a README gains lines every round. The rule is now mechanical: a `.md`
+    /// mention may not carry a line number, and a cell that names a heading must name one that
+    /// the document still has.
+    #[test]
+    fn a_document_in_the_plan_is_cited_by_a_heading_not_by_a_line_number() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+
+        for line in PLAN.lines() {
+            let mut rest = line;
+            while let Some(at) = rest.find(".md:") {
+                let after = &rest[at + 4..];
+                if after.starts_with(|c: char| c.is_ascii_digit()) {
+                    panic!(
+                        "the plan cites a markdown line range, which rots as the file grows: {line}"
+                    );
+                }
+                rest = after;
+            }
+        }
+
+        let document = |name: &str| -> Option<&'static str> {
+            if name.ends_with("CHANGELOG.md") {
+                Some(include_str!("../CHANGELOG.md"))
+            } else if name.ends_with("README.md") {
+                Some(include_str!("../README.md"))
+            } else if name.ends_with("plan-template.md") {
+                Some(include_str!("../docs/plan/plan-template.md"))
+            } else if name.ends_with("plan-status.md") {
+                Some(include_str!("../docs/plan/plan-status.md"))
+            } else {
+                None
+            }
+        };
+
+        let mut checked = 0_usize;
+        for line in PLAN.lines() {
+            let mut rest = line;
+            while let Some(at) = rest.find(".md`") {
+                let name = rest[..at + 3]
+                    .rsplit_once(['`', ' ', '/'])
+                    .map(|(_, name)| name)
+                    .unwrap_or(&rest[..at + 3]);
+                let tail = &rest[at + 4..];
+                let cell = &tail[..tail.find('|').unwrap_or(tail.len())];
+                rest = &rest[at + 4..];
+
+                // A heading is attributed to a document only when it follows the name
+                // directly (`\`README.md\` 的 \`## Network Configuration\``, or a second
+                // heading joined by `与`). A `## ...` heading mentioned elsewhere in the same
+                // cell belongs to whatever that sentence is about.
+                let mut after = cell.trim_start();
+                while let Some(connector) = after
+                    .strip_prefix('的')
+                    .or_else(|| after.strip_prefix('与'))
+                {
+                    let Some(quoted) = connector.trim_start().strip_prefix('`') else {
+                        break;
+                    };
+                    let Some((token, remainder)) = quoted.split_once('`') else {
+                        break;
+                    };
+                    // Historical rows name a section in prose
+                    // (`\`CHANGELOG.md\` 的 \`[Unreleased]\``) rather than citing a heading;
+                    // only a `#`-prefixed token is a citation this guard can resolve.
+                    if !(token.starts_with("## ") || token.starts_with("### ")) {
+                        break;
+                    }
+                    let body = document(name).unwrap_or_else(|| {
+                        panic!("`{name}` is cited with a heading but is not a registered document")
+                    });
+                    // A heading may carry a release date after its name, so the citation
+                    // has to be a prefix that ends at a word boundary.
+                    let found = body.lines().any(|line| {
+                        let line = line.trim_end();
+                        line == token
+                            || line
+                                .strip_prefix(token)
+                                .is_some_and(|rest| rest.starts_with(' '))
+                    });
+                    assert!(
+                        found,
+                        "the plan points `{name}` at `{token}`, which that document no longer has"
+                    );
+                    checked += 1;
+                    after = remainder.trim_start();
+                }
+            }
+        }
+        assert!(
+            checked >= 4,
+            "only {checked} heading citations were checked, so the scan is not reading the plan"
+        );
+    }
+
     /// The traceability table points at names, not at line numbers.
     ///
     /// R127 taught this table's numbers to stay inside their files, which kept them syntactically
@@ -3544,6 +3673,101 @@ mod plan_doc_tests {
                  does for each guest"
             );
         }
+    }
+
+    /// A changelog entry is filed under the heading its own sentence describes.
+    ///
+    /// `### Added` is where a reader looks for a capability they did not have before; someone who
+    /// upgrades and wants to know whether the hang they hit is gone reads `### Fixed`. Until R172
+    /// nothing compared the two, and nine `[Unreleased]` bullets that narrate an old defect ("ran
+    /// `xorriso` without a deadline", "was parsed as \"no expiry\"", "is now capped ...", "no longer
+    /// requires ...") sat in the feature list. The rule here is mechanical - an `### Added` bullet
+    /// may not narrate the past or the change - and two of the re-filed entries are read back from
+    /// the code they describe, so deleting the sentence is not a way to comply.
+    #[test]
+    fn the_unreleased_changelog_files_each_entry_under_the_change_it_describes() {
+        const CHANGELOG_TEXT: &str = include_str!("../CHANGELOG.md");
+        let unreleased = CHANGELOG_TEXT
+            .split("## [Unreleased]")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## [").next())
+            .expect("the changelog must still have an [Unreleased] section");
+        let sections = changelog_sections(unreleased);
+        let bullets_under = |wanted: &str| -> Vec<String> {
+            sections
+                .iter()
+                .find(|(heading, _)| heading == wanted)
+                .map(|(_, bullets)| bullets.clone())
+                .unwrap_or_else(|| panic!("[Unreleased] has no `### {wanted}` section"))
+        };
+
+        let added = bullets_under("Added");
+        assert!(
+            added.len() >= 15,
+            "the Added list shrank to {} entries, which is not this plan's feature set: {added:#?}",
+            added.len()
+        );
+        for bullet in &added {
+            let flat = format!(
+                " {} ",
+                bullet.split_whitespace().collect::<Vec<_>>().join(" ")
+            );
+            for marker in [
+                " was ",
+                " were ",
+                " ran ",
+                " carried ",
+                " logged ",
+                " no longer ",
+                " is now ",
+                " are now ",
+                " silently ",
+            ] {
+                assert!(
+                    !flat.contains(marker),
+                    "an entry filed under `### Added` narrates a past defect or a change \
+                     ({marker:?}), which belongs under `### Changed` or `### Fixed`: {bullet}"
+                );
+            }
+        }
+
+        // The re-filed entries are still stated, and still stated as fixes.
+        let fixed = bullets_under("Fixed");
+        let fixed_text = fixed
+            .iter()
+            .map(|bullet| bullet.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for claim in [
+            "without a deadline",
+            "A lease that never expires",
+            "30-space hole",
+            "Symbolic links are no longer skipped silently",
+        ] {
+            assert!(
+                fixed_text.contains(claim),
+                "`### Fixed` no longer records `{claim}`, which R172 moved there from `### Added`"
+            );
+        }
+
+        // Two of those sentences name code; the code has to still do what they say.
+        assert!(
+            crate::windows::SEED_BUILD_BUDGET > std::time::Duration::ZERO,
+            "the seed ISO build still runs `xorriso` without a deadline"
+        );
+        let leases = crate::utils::parse_dhcp_leases(
+            "infinite   52:54:00:aa:bb:cc   ipv4   192.168.221.42/24",
+        );
+        assert_eq!(
+            leases.len(),
+            1,
+            "the lease row must still parse: {leases:#?}"
+        );
+        assert_eq!(
+            leases[0].expiry, "infinite",
+            "a lease that never expires is no longer read as `infinite`, so the entry under \
+             `### Fixed` describes behaviour that does not exist"
+        );
     }
 
     /// A path rule the user can observe is written in the README *and* in the changelog.
