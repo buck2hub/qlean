@@ -819,45 +819,30 @@ mod plan_doc_tests {
         }
     }
 
-    /// A count written either as digits or as a Chinese numeral, right after `marker`.
+    /// The number that follows `label` inside the round's tally sentence.
     ///
-    /// The plan's rows and the status view's digest describe the same round in different prose
-    /// ("变异实测（三条被抓）" vs "变异三条被抓"), so a guard that compares them has to read
-    /// both spellings instead of assuming one.
-    /// Prose is allowed to quote the marker itself (a row that explains the guard does), so
-    /// every occurrence is tried and the first one that carries a number wins.
-    fn spelled_count(text: &str, marker: &str) -> Option<usize> {
+    /// The sentence is introduced by `本轮计数：` so that prose which quotes an older or stale
+    /// claim - the very thing these rows are about - cannot be mistaken for the tally.
+    fn tally(text: &str, label: &str) -> Option<usize> {
+        // A row may quote the sentence's shape (`本轮计数：变异 <n> 条…`) while explaining the
+        // guard, so every occurrence is tried and the last one that carries a number wins.
         let mut search = 0;
-        while let Some(found) = text[search..].find(marker) {
-            let at = search + found + marker.len();
+        let mut found = None;
+        while let Some(found_at) = text[search..].find("本轮计数：") {
+            let at = search + found_at + "本轮计数：".len();
             search = at;
-            if let Some(count) = count_at(&text[at..]) {
-                return Some(count);
+            let Some(label_at) = text[at..].find(label) else {
+                continue;
+            };
+            let digits: String = text[at + label_at + label.len()..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            if let Ok(count) = digits.parse() {
+                found = Some(count);
             }
         }
-        None
-    }
-
-    fn count_at(rest: &str) -> Option<usize> {
-        let rest = rest.trim_start();
-        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-        if !digits.is_empty() {
-            return digits.parse().ok();
-        }
-        let spelled = rest.chars().next()?;
-        match spelled {
-            '一' => Some(1),
-            '两' | '二' => Some(2),
-            '三' => Some(3),
-            '四' => Some(4),
-            '五' => Some(5),
-            '六' => Some(6),
-            '七' => Some(7),
-            '八' => Some(8),
-            '九' => Some(9),
-            '十' => Some(10),
-            _ => None,
-        }
+        found
     }
 
     /// The review log reads newest-first, with every round exactly once and none missing.
@@ -2560,13 +2545,16 @@ mod plan_doc_tests {
         // number belongs to that round.
         let sentence = &digest[start..];
 
-        for (marker_plan, marker_status, what) in [
-            ("变异实测（", "变异", "mutations caught"),
-            ("负结果（", "负结果", "negative results"),
+        // Both documents state the round's tally in one fixed sentence, so the guard reads a
+        // number instead of guessing which mention of "变异" is the count and which one is the
+        // stale claim being quoted.
+        for (label, what) in [
+            ("变异 ", "mutations caught"),
+            ("负结果 ", "negative results"),
         ] {
-            let planned = spelled_count(row, marker_plan)
+            let planned = tally(row, label)
                 .unwrap_or_else(|| panic!("the plan's R{newest} row states no {what}"));
-            let reported = spelled_count(sentence, marker_status)
+            let reported = tally(sentence, label)
                 .unwrap_or_else(|| panic!("the status digest states no {what} for R{newest}"));
             assert_eq!(
                 planned, reported,
