@@ -169,6 +169,7 @@
 | 2026-11-13 01:35:00 UTC | review R57（非 UTF-8 镜像名不再共用一个缓存槽） | F62：`image::cache_name_from_source` 对**非 UTF-8** 的本地文件名回退成字面量 `custom-image`，于是**所有**这类镜像共用一个缓存文件。两个不同的 Windows qcow2（数 GB）会互相顶掉：`Image::load` 命中后重算哈希发现不符，转而重新下载，**每次在两者之间切换都要重下一遍**。调试时表现为「明明缓存过，怎么又在下」，几乎不可能指向真正原因（文件名编码）。修：新增 `local_cache_stem`——文件名是合法 UTF-8 时行为不变（仍取 stem），否则回退名带上**原始字节的 FNV-1a 哈希**（`custom-image-<16 hex>`），稳定且互不相同；URL 分支不动。新增 2 个单测（两个不同非 UTF-8 名必须得到不同缓存名且可重复、UTF-8 名保持原 stem）。`cargo test --lib` 154 → 156 | N/A（`IP-01`/镜像缓存既有契约：不同来源不得共享缓存；无卡拆合） | `IP-01` 实现证据、Review log、`src/image.rs`、CHANGELOG、plan-status |
 | 2026-11-13 02:05:00 UTC | review R58（标记探测要加引号；测试目录的“唯一”后缀并不唯一） | F63 两项，都是「守卫看着在守、其实没守」：① 部署标记探测拼成 `cmd /c if exist {marker} echo deployed`，**路径没有引号**——`cmd` 按空格切分，一旦标记路径带空格（或未来改成 `%ProgramData%` 展开出空格），探测就永远「文件不存在」，于是**部署已完成的 guest 会被判成没完成**，用户白等满整个预算才知道是探测写错了；② `firmware::tests::temp_dir` 的「唯一」后缀用 `Instant::now().elapsed().as_nanos()`——从紧邻创建的那一刻算起，永远是几个纳秒，**等于常量**：同 tag 的两次调用会拿到同一目录，上一轮遗留的只读 vars 模板会让「复制一次」「只读也能用」这些断言变得毫无意义。修：① 新增 `marker_probe_command()` + `MARKER_PRESENT_TOKEN`，路径加引号，`machine::deploy_marker_present` 改用它们（匹配词也走常量，避免命令文本与判据漂移）；② `temp_dir` 改用进程内 `AtomicU64` 计数器。新增 3 个单测（引号形态、只有 echo 词跟在路径之后、同 tag 两次调用必不冲突）。`cargo test --lib` 156 → 159 | N/A（`EXE-01` 既有 AC：部署完成判定必须可信；无卡拆合） | `EXE-01` 实现证据、Review log、`src/windows.rs`、`src/machine.rs`、`src/firmware.rs`、CHANGELOG、plan-status |
 | 2026-11-13 02:35:00 UTC | review R59（闭包自己的失败不能被收尾失败顶掉） | F64：`with_machine` 是 `let result = f(&mut machine).await; machine.shutdown().await?; result`——**收尾失败会用 `?` 提前返回，把闭包里真正的原因丢掉**。对一个测试库来说这是最坏的失效方向：用例失败时读者看到的只有「cleanup failed」，于是去查错误的地方；Windows guest 恰恰让收尾更容易失败（忽略 ACPI 电源键、seed 介质仍被占用、QMP 不再应答）。`with_pool` 同样。修：抽出纯函数 `combine_outcome(outcome, shutdown)`——闭包的错误保持为主错误、收尾错误以 context 形式挂在它下面；只有闭包成功时收尾错误才独立成错（没能停掉的 VM 仍是资源泄漏，必须报）；两条入口都改走它。新增 3 个单测（双失败保住主因、成功+收尾失败仍报错、干净收尾原样返回）。`cargo test --lib` 159 → 162 | N/A（`OSX-02`/`OSX-03` 既有 AC：失败必须给出真实原因、VM 不得泄漏；无卡拆合） | `OSX-03` 实现证据、Review log、`src/lib.rs`、CHANGELOG、plan-status |
+| 2026-11-13 03:10:00 UTC | review R60（自己的探测不该依赖 guest 的 registry 设置） | F65：`query_windows_ip` 与 `copy_file` 把 PowerShell 脚本**裸发**给 SSH——它们能跑的前提是镜像把 OpenSSH 的 `DefaultShell` 改成了 PowerShell。官方 MSI 装出来的 Windows 默认是 `cmd.exe`，于是 `Get-NetAdapter`/`Copy-Item` 只会得到 cmd 的 `'...' is not recognized`，**报错位置离真正原因（一条 registry 值）极远**；而 Qlean 自己的控制面探测本不该依赖镜像配置。原测试还写死了「不许嵌套 PowerShell，因为 `-Command` 会把路径里的 `$b` 提前展开」——结论只对 `-Command` 成立。修：新增 `powershell_command(script)`，用 `powershell -NoProfile -NonInteractive -EncodedCommand <base64 UTF-16LE>`——**payload 是 base64**，因此既不受两端默认 shell 影响，也不存在任何引号/`$`/反引号插值；`GUEST_IP_QUERY` 与 `Copy-Item` 两条都走它（`guest_ip_query_command()`/`copy_file_script`+`copy_file_command`）。用户 `exec` 仍在镜像默认 shell 里跑，README 镜像契约保留 PowerShell 要求。新增 4 个单测（base64/UTF-16LE 已知向量、copy 命令必须走编码包装且不得出现 `$b`、copy 脚本字面量不变、IP 探测必须自足）。`cargo test --lib` 162 → 165。同时按用户决定改 ER-13/14：**CI 不跑 Windows 虚拟机测试**，核心冒烟只在本地 KVM 宿主机跑 | N/A（`EXE-01`/`IP-01`/`FS-01` 既有 AC：控制面命令必须自足、失败必须可归因；无卡拆合） | `EXE-01`/`IP-01` 实现证据、ER-13/14、Review log、`src/windows.rs`、`src/machine.rs`、README、CHANGELOG、plan-status |
 
 ## 已决议设计决策
 
@@ -235,7 +236,7 @@
 
 - **ER-04 状态闭环：** family/no-release 卡完成自身 A/B + review 后即可 `complete`；继承发布点的 C/D 只表示覆盖归属，不构成子卡完成前的循环等待。`REL-01` 独自等待家族 C/D。
 - **ER-06 同卡文档：** 包括 `IP-01` 在内的公开行为变化都必须同卡更新 README 和 CHANGELOG；不再由独立补文档卡代做。
-- **ER-13/14 Windows 门：** CI 只编译 Windows test target。每个声称支持的版本必须在 Linux KVM 验证宿主机运行核心 Windows 冒烟；缺镜像/宿主时相关任务或发布为 `blocked`。只有 Linux VM 环境缺口或额外 TCG 矩阵可按模板登记 `DEFER-*`，核心 Windows 验收不可延后。
+- **ER-13/14 Windows 门：** CI 只编译 Windows test target，**不在 GitHub Actions 里跑 Windows 虚拟机测试**（托管 runner 没有 `/dev/kvm`，也不该为跑虚拟机放宽权限模型）；核心 Windows 冒烟一律在**本地 Linux KVM 验证宿主机**执行 `cargo test --test windows_machine -- --ignored --test-threads=1`。每个声称支持的版本都必须拿到这份本地证据；缺镜像/宿主时相关任务或发布为 `blocked`。只有 Linux VM 环境缺口或额外 TCG 矩阵可按模板登记 `DEFER-*`，核心 Windows 验收不可延后。
 - **VCS 兼容：** Git checkout 使用模板中的 Git 命令；当前 Libra checkout 使用等价的 `libra status/add/commit/push`，证据记录实际命令。不得在两种元数据之间转换或清理用户已有脏状态。
 
 ## 实施顺序
@@ -771,6 +772,7 @@
 | 集成测试（`#[ignore]`） | `tests/windows_machine.rs`：`windows_transport`（地址、pin、unsupported、shutdown→spawn 重连）、`windows_pool`（双机地址/host key/会话隔离） |
 | README/CHANGELOG | README「Windows transport and security」；CHANGELOG Added ×4 / Changed ×1 |
 | 地址发现与 QEMU 退出 race | `launch` 把 DHCP lease 轮询与 `qemu_handle`、cancel token 一起 `select!`，QEMU 启动即退出时立即返回其真实错误并停 `swtpm`（R12，`src/machine.rs`） |
+| 控制面自足 | Qlean 自己的 guest 命令不依赖镜像默认 shell（R60，`af4a7ba`） |
 | 失败原因优先 | 闭包/用例自身的失败是主错误，收尾错误只作 context（R59，`36f4d2b`） |
 | 探测命令可信 | 标记路径加引号，判据词走常量，探测文本与匹配不漂移（R58，`6d1bbd7`） |
 | 缓存名唯一 | 不同来源不得映射到同一缓存槽，含非 UTF-8 文件名（R57，`c942947`） |
@@ -1349,6 +1351,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R57 | 非 UTF-8 镜像名各有缓存槽 | PASS | 无开放项 | F62：非 UTF-8 本地文件名统一回退 `custom-image`，不同镜像共用缓存、切换即重下 | `local_cache_stem` 对原始字节取 FNV-1a 作回退名（`c942947`）；新增 2 个单测；`cargo test --lib` 156 passed |
 | R58 | 标记探测加引号、测试目录真唯一 | PASS | 无开放项 | F63：标记路径未加引号会让已完成的部署被判成未完成；测试目录的唯一后缀恒为常量，遗留文件可污染断言 | `marker_probe_command()`/`MARKER_PRESENT_TOKEN` + 引号（`6d1bbd7`）；`temp_dir` 改 `AtomicU64`；新增 3 个单测；`cargo test --lib` 159 passed |
 | R59 | 闭包失败保持主因 | PASS | 无开放项 | F64：`with_machine`/`with_pool` 用 `shutdown().await?` 提前返回，收尾失败吞掉闭包的真实失败原因 | `combine_outcome` 纯函数 + 两条入口改走（`36f4d2b`）；新增 3 个单测；`cargo test --lib` 162 passed |
+| R60 | 探测不依赖 guest 默认 shell | PASS | 无开放项 | F65：地址查询与文件复制裸发 PowerShell，镜像默认 shell 是 `cmd` 时报错离原因极远；原测试还误以为只能用裸命令 | `powershell_command()` 走 `-EncodedCommand`（`af4a7ba`）；4 个单测；`cargo test --lib` 165 passed |
 
 ### R1 findings 与修订对照
 
