@@ -468,7 +468,7 @@
 | 缓存隔离 | `image_cache_name` 按 `guest_os` 命名，Windows 使用 `windows-` 前缀；`ensure_cached_guest_os` 拒绝 OS 不匹配条目（旧 JSON 默认 Linux） |
 | 单一事实源 | `Image::guest_os` 随元数据持久化；`MachineImage::guest_os` 由 `image.guest_os()` 填充；公开 `Machine::guest_os()` 供后续卡分派 |
 | 迁移 | 仓库内 `ImageConfig` 字面量改为 `..ImageConfig::default()`；README 新增 Guest OS 小节与 Migration；CHANGELOG `[Unreleased]` Added/Changed/Migration |
-| 提交 | `34c6eb9` |
+| 提交 | `50c8cff` |
 
 **Dependencies:** 无（R5 取消 `SPK-02 -> OSX-01` 边：本卡不消费任何 Phase 0 产物；串行写集起点）
 
@@ -547,7 +547,7 @@
 | 生命周期 | `src/machine.rs`：`launch` 前准备固件与 `swtpm`，`shutdown`、`launch` 失败路径与 `Drop` 均停止 `swtpm`；`swtpm` 状态在 `machine.swtpm` 唯一持有 |
 | 集成测试 | `tests/windows_machine.rs::windows_firmware_lifecycle`（`#[ignore]`，需要 `QLEAN_WINDOWS_IMAGE`/`QLEAN_WINDOWS_DIGEST`，缺省时返回可操作错误） |
 | 资源默认值 | README Windows 表格：最低=默认 `core:2`/`mem:4096`，推荐 `core:4`/`mem:8192`，磁盘 ≥64GB |
-| 提交 | `e1e880a` |
+| 提交 | `f2fc277` |
 
 **Full-suite trigger:** `T-1: 共享 QEMU 启动路径`
 
@@ -603,7 +603,7 @@
 
 - [x] Windows 分支严格实现 ADR-WIN-03 选定方案（pre-generalized 镜像 + 每 VM seed 介质，不写 autounattend、不重建已安装镜像）；Linux cloud-init `user-data`/`meta-data`/seed ISO 字节语义不变（`Machine::new` 早返回于 Windows 分支，Linux 路径未改动）。
 - [x] 客户端公钥以 `qlean/authorized_keys` 注入 seed；README 契约要求镜像首启任务将其安装为 `C:\ProgramData\ssh\administrators_authorized_keys`（管理员）或用户级 `authorized_keys`，ACL 仅授权 `Administrators`/`SYSTEM`，并关闭 `PasswordAuthentication`；Qlean 从不生成、不传递静态管理密码。
-- [ ] sshd 默认 shell/SFTP 与用户名单一事实源：`windows::GUEST_USERNAME` 常量已建立并写入 `deploy.json`，README 契约已写明 `PubkeyAuthentication`/`sftp`；传输层消费该常量在 `TRN-01` 落地，故本项未勾选。
+- [x] sshd 默认 shell/SFTP 与用户名单一事实源：`windows::GUEST_USERNAME` 常量已建立并写入 `deploy.json`，README 契约已写明 `PubkeyAuthentication`/`sftp`；`TRN-01` 的 `connect_ssh_windows` 已消费该常量作为唯一用户名来源。
 - [x] 每 VM 用 `windows::generate_host_key` 生成独立 ed25519 host key（私钥落 seed，公钥经 `Machine::ssh_host_key()` 交给上层用于 pinning）；seed 文件权限 `0600`，seed ISO 仅在 `init`（`is_init`）附加，部署成功后 `confirm_deployment` 删除 ISO 与暂存目录；`spawn` 复用同一 overlay/vars/TPM，不再附加 seed。
 - [ ] `init` 首启部署与后续 `spawn` 可用 + test-only 连接助手取得真实首启证据：`init`/`spawn` 的启动路径已可用，部署确认挂在首个会话上（`confirm_deployment`），真实证据需 `TRN-01` 传输与 DEP-01/02，`blocked`。
 - [x] `(new)` 单测覆盖：seed 三件套内容与 `deploy.json` 契约、seed 文件 `0600`、每 VM host key 互不相同、`Debug` 不泄漏密钥材料、清理删除 ISO+目录、部署超时默认值与可操作错误文案。
@@ -629,7 +629,7 @@
 | 密钥来源 | `src/ssh.rs` 抽出 `generate_keypair(&Path)`，客户端与 per-VM host key 共用同一实现（权限 `0600`） |
 | 日志安全 | seed 只记录目录路径与文件名清单，不记录密钥内容；`DeploySeed` 自定义 `Debug` |
 | README | “Windows image contract”：virtio 驱动、OpenSSH Server、`sysprep /generalize`、`qlean` 账号、ACL 规则、首启任务步骤、seed 生命周期、900s 预算 |
-| 提交 | `0a745a5` |
+| 提交 | `8812fb4` |
 
 **Verification:**
 
@@ -702,7 +702,7 @@
 | 单测 | `src/ssh.rs`：pin 匹配/不匹配、未 pin TOFU、OpenSSH 往返、取消即失败（5 个）；`src/utils.rs`：lease 解析 MAC 映射/大小写/表头空行/IPv6（4 个） |
 | 集成测试（`#[ignore]`） | `tests/windows_machine.rs`：`windows_transport`（地址、pin、unsupported、shutdown→spawn 重连）、`windows_pool`（双机地址/host key/会话隔离） |
 | README/CHANGELOG | README「Windows transport and security」；CHANGELOG Added ×4 / Changed ×1 |
-| 提交 | `COMMITHASH` |
+| 提交 | `6711671` |
 
 **Acceptance criteria:**
 
@@ -1112,10 +1112,10 @@
 |---|---|---|---|---|---|
 | SPK-01 | 2026-11-12 07:45:12 UTC | 宿主机审计：Linux x86_64、`/dev/kvm` 存在；`qemu-system-x86_64`/`qemu-img`/`swtpm`/`xorriso`/`virsh`/`qemu-bridge-helper`/OVMF 均缺失；`sudo -n` 需密码；无 Windows qcow2（DEP-01/02 均不可用） | 未执行：无可用 Windows VM，无法取得连接/鉴权/SFTP 证据 | `blocked`（DEP-01/DEP-02） | N/A |
 | SPK-02 | 2026-11-12 07:45:12 UTC | 同上（无 QEMU/OVMF/swtpm，无 Windows 镜像） | 未执行：无可用 Windows VM，无法取得首启/重启证据 | `blocked`（DEP-01/DEP-02） | N/A |
-| OSX-01 | 2026-11-12 08:40:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib image::tests`（18 passed）、`cargo test --no-run` 全绿 | T-1 全量门未执行（无 QEMU/libvirt，`DEFER-04`） | `done` / `complete` | `34c6eb9` |
-| OSX-02 | 2026-11-12 09:35:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib qemu`（5 passed）、`cargo test --no-run`（含 `tests/windows_machine.rs`）全绿 | `windows_firmware_lifecycle` 未执行（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `e1e880a` |
-| OSX-03 | 2026-11-12 10:20:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_deploy`（7 passed）、`cargo test --lib windows_deploy_timeout`（2 passed）、`cargo test --no-run` 全绿 | `windows_first_boot` 与首启/重启 seed 清理证据未取得（需 `TRN-01` + DEP-01/02），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `0a745a5` |
-| TRN-01 | 2026-11-12 11:10:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib ssh`（5 passed）、`cargo test --lib utils`（4 passed）、`cargo test --no-run`（含 `windows_transport`/`windows_pool`）全绿 | `windows_transport`/`windows_pool` 与真实 spawn 重连证据未取得（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `COMMITHASH` |
+| OSX-01 | 2026-11-12 08:40:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib image::tests`（18 passed）、`cargo test --no-run` 全绿 | T-1 全量门未执行（无 QEMU/libvirt，`DEFER-04`） | `done` / `complete` | `50c8cff` |
+| OSX-02 | 2026-11-12 09:35:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib qemu`（5 passed）、`cargo test --no-run`（含 `tests/windows_machine.rs`）全绿 | `windows_firmware_lifecycle` 未执行（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `f2fc277` |
+| OSX-03 | 2026-11-12 10:20:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_deploy`（7 passed）、`cargo test --lib windows_deploy_timeout`（2 passed）、`cargo test --no-run` 全绿 | `windows_first_boot` 与首启/重启 seed 清理证据未取得（需 `TRN-01` + DEP-01/02），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `8812fb4` |
+| TRN-01 | 2026-11-12 11:40:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib ssh`（5 passed）、`cargo test --lib utils`（4 passed）、`cargo test --no-run`（含 `windows_transport`/`windows_pool`）全绿 | `windows_transport`/`windows_pool` 与真实 spawn 重连证据未取得（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `COMMITHASH` |
 | EXE-01 | pending | pending | pending | pending | 继承 REL-01 |
 | IP-01 | pending | pending | pending | pending | 继承 REL-01 |
 | FS-01 | pending | pending | pending | pending | 继承 REL-01 |
