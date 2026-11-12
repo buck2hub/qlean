@@ -264,6 +264,21 @@ pub(crate) async fn find_lease_address(
     mac: &str,
     timeout: std::time::Duration,
 ) -> Result<std::net::IpAddr> {
+    find_lease_address_with(mac, timeout, VIRSH_PROGRAM).await
+}
+
+/// Program name used to read the lease table.
+const VIRSH_PROGRAM: &str = "virsh";
+
+/// [`find_lease_address`] with an explicit lease-table program.
+///
+/// Exists so a test can point the lookup at a program that is not installed without
+/// rewriting the process environment, which other tests in the same binary share.
+async fn find_lease_address_with(
+    mac: &str,
+    timeout: std::time::Duration,
+    program: &str,
+) -> Result<std::net::IpAddr> {
     let mac = mac.to_ascii_lowercase();
     let deadline = tokio::time::Instant::now() + timeout;
     let mut last_seen = Vec::new();
@@ -274,7 +289,7 @@ pub(crate) async fn find_lease_address(
     let mut last_error: Option<String> = None;
 
     loop {
-        let mut cmd = tokio::process::Command::new("virsh");
+        let mut cmd = tokio::process::Command::new(program);
         cmd.arg("-c")
             .arg(VIRSH_CONNECTION_URI)
             .arg("net-dhcp-leases")
@@ -284,7 +299,7 @@ pub(crate) async fn find_lease_address(
         // left of the budget (at least a millisecond, so the loop always makes progress).
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let budget = remaining.max(std::time::Duration::from_millis(1));
-        match bounded_output(cmd, budget, "read the DHCP lease table").await {
+        match run_bounded(cmd, budget, "read the DHCP lease table").await {
             Ok(output) if output.status.success() => {
                 saw_a_listing = true;
                 last_seen = parse_dhcp_leases(&String::from_utf8_lossy(&output.stdout));
@@ -297,6 +312,18 @@ pub(crate) async fn find_lease_address(
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
                 debug!("virsh net-dhcp-leases failed: {stderr}");
                 last_error = Some(stderr);
+            }
+            Err(BoundedFailure::NotRun(error)) => {
+                // Waiting cannot install a program. On a Windows first boot this lookup runs
+                // under the whole deployment budget, so polling a missing `virsh` would spend
+                // 900s to discover a fact that was knowable before the guest started — and
+                // then blame libvirt access or the guest's DHCP.
+                bail!(
+                    "no DHCP lease table can be read: `{program}` is not available ({error:#}).\n\
+                     Windows guests discover their address through `{program} net-dhcp-leases`, \
+                     so install the `libvirt` package (and its `{program}` client) before \
+                     starting a Windows guest"
+                );
             }
             Err(error) => {
                 // The call itself was abandoned; that is a libvirt finding, not a guest one.
@@ -935,6 +962,35 @@ mod tests {
  Expiry Time           MAC address         Protocol   IP address           Hostname   Client ID or DUID
 ---------------------------------------------------------------------------------------------------------
 ";
+
+    /// A lease table that no installed program can read must be reported at once.
+    ///
+    /// Windows guests learn their address only through `virsh net-dhcp-leases`, and on a
+    /// first boot this lookup runs under the whole deployment budget. Polling a program that
+    /// is not installed turns "install libvirt" into a spent 900s wait whose message points
+    /// at libvirt access or at the guest's DHCP — the same finding, reported 15 minutes late
+    /// and aimed at the wrong machine.
+    #[tokio::test]
+    async fn test_a_missing_lease_tool_fails_at_once_instead_of_polling() {
+        let start = std::time::Instant::now();
+        let error = find_lease_address_with(
+            "52:54:00:aa:bb:cc",
+            std::time::Duration::from_secs(30),
+            "/nonexistent/virsh",
+        )
+        .await
+        .expect_err("a program that does not exist cannot answer");
+        let elapsed = start.elapsed();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("/nonexistent/virsh"), "{message}");
+        assert!(message.contains("libvirt"), "{message}");
+        // The whole 30s budget must not be spent on a fact already known at the first poll.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "waited {elapsed:?} for a program that is not installed"
+        );
+    }
 
     #[test]
     fn test_parse_dhcp_leases_maps_mac_to_address() {

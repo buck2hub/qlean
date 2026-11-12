@@ -340,6 +340,9 @@ pub(crate) fn resolve_ovmf() -> Result<FirmwarePaths> {
 /// Program that builds the Windows seed ISO medium.
 pub(crate) const SEED_ISO_BUILDER: &str = "xorriso";
 
+/// Program that answers "which address does this MAC have on Qlean's network?".
+const LEASE_TOOL: &str = "virsh";
+
 /// Program used to run the software TPM.
 fn swtpm_program() -> PathBuf {
     env_nonempty(ENV_SWTPM)
@@ -371,6 +374,7 @@ fn host_support_problems(
     swtpm: &Path,
     swtpm_available: bool,
     seed_iso_builder_available: bool,
+    virsh_available: bool,
 ) -> Vec<String> {
     let mut problems: Vec<String> = Vec::new();
 
@@ -394,6 +398,12 @@ fn host_support_problems(
             "`{SEED_ISO_BUILDER}` was not found: it builds the Windows seed medium, so install the `{SEED_ISO_BUILDER}` package"
         ));
     }
+    if !virsh_available {
+        problems.push(format!(
+            "`{LEASE_TOOL}` was not found: a Windows guest's address comes from \
+             `{LEASE_TOOL} net-dhcp-leases`, so install the `libvirt` package before starting one"
+        ));
+    }
 
     problems
 }
@@ -407,6 +417,7 @@ pub(crate) fn ensure_host_support() -> Result<()> {
         &swtpm,
         command_available(&swtpm),
         command_available(Path::new(SEED_ISO_BUILDER)),
+        command_available(Path::new(LEASE_TOOL)),
     );
 
     anyhow::ensure!(
@@ -1238,27 +1249,42 @@ mod tests {
             Path::new("swtpm"),
             false,
             false,
+            false,
         );
 
-        assert_eq!(problems.len(), 4, "gaps: {problems:?}");
+        assert_eq!(problems.len(), 5, "gaps: {problems:?}");
         assert!(problems[0].contains("never fall back to TCG"));
         assert!(problems[1].contains("no OVMF firmware found"));
         assert!(problems[2].contains("install the `swtpm` package"));
         assert!(problems[2].contains(ENV_SWTPM));
         assert!(problems[3].contains("install the `xorriso` package"));
+        assert!(
+            problems[4].contains("install the `libvirt` package"),
+            "{problems:?}"
+        );
+        assert!(
+            problems[4].contains("net-dhcp-leases"),
+            "the virsh gap must say what the tool is for: {problems:?}"
+        );
 
-        // The aggregated error keeps every line, so one run lists all four gaps.
+        // The aggregated error keeps every line, so one run lists all five gaps.
         let message = format!(
             "Windows guest prerequisites are missing:\n- {}",
             problems.join("\n- ")
         );
-        assert_eq!(message.lines().count(), 5, "{message}");
+        assert_eq!(message.lines().count(), 6, "{message}");
     }
 
     #[test]
     fn test_host_support_is_quiet_when_everything_is_present() {
-        let problems =
-            host_support_problems(true, Ok(firmware_fixture()), Path::new("swtpm"), true, true);
+        let problems = host_support_problems(
+            true,
+            Ok(firmware_fixture()),
+            Path::new("swtpm"),
+            true,
+            true,
+            true,
+        );
 
         assert!(problems.is_empty(), "unexpected gaps: {problems:?}");
     }
@@ -1271,6 +1297,7 @@ mod tests {
             Path::new("/opt/swtpm"),
             true,
             false,
+            true,
         );
 
         assert_eq!(problems.len(), 1, "gaps: {problems:?}");
@@ -1285,9 +1312,24 @@ mod tests {
             Path::new("/opt/swtpm"),
             false,
             true,
+            true,
         );
         assert_eq!(problems.len(), 1, "gaps: {problems:?}");
         assert!(problems[0].contains("/opt/swtpm"), "{problems:?}");
+
+        let problems = host_support_problems(
+            true,
+            Ok(firmware_fixture()),
+            Path::new("/opt/swtpm"),
+            true,
+            true,
+            false,
+        );
+        assert_eq!(problems.len(), 1, "gaps: {problems:?}");
+        assert!(
+            problems[0].contains("`virsh` was not found"),
+            "{problems:?}"
+        );
         assert!(INSTALL_HINT.contains("edk2-ovmf"));
         assert!(INSTALL_HINT.contains("QLEAN_OVMF_CODE"));
     }
