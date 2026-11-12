@@ -115,6 +115,8 @@
 | 2026-11-12 07:20:33 UTC | review R4 | P2 缺口修复：新增 GAP-08（Windows 首启部署超时维度）与 GAP-09（Windows 资源默认值未讨论），`OSX-03`/`OSX-02` 各补一条 AC（两卡均达 8/8 上限）；事实基线、性能摘要、风险表同步；plan-status 同步 | `OSX-02`/`OSX-03` 修订，编号不变 | 事实基线、当前缺口、任务卡、粒度审计表、性能与容量摘要、风险登记、Review log、plan-status |
 | 2026-11-12 07:45:12 UTC | review R5（环境消歧） | `DEP-01`/`DEP-02` 审计为不可用，`SPK-01`/`SPK-02` 置 `blocked`；`ADR-WIN-02`/`ADR-WIN-03` 改为临时接受并写入选定方案；取消 `SPK-02 -> OSX-01` 边，实施顺序改为以 `OSX-01` 为起点的串行链；新增环境消歧结论段落；`REL-01` 明确阻塞 | N/A（无拆合卡；仅依赖边与 ADR 状态） | 实施顺序、依赖登记表、ADR-WIN-02/03、粒度审计表 deps 列、Risk log、实施证据汇总、plan-status |
 
+| 2026-11-12 13:45:00 UTC | review R6（实施后逐卡 review；修订提交 `496b471`） | 逐卡核对 `OSX-01`~`FS-01` 实现与门禁；F1~F4 修复（`Drop`/`swtpm` 顺序、证据表 Review 列语义、`GuestPath::join` 不可达分支、`TRN-01` 提交号更正）；`REL-01` 维持 `blocked` | N/A（无拆合卡、无 AC 变更） | 实施证据汇总、Review log、`src/machine.rs`、`src/firmware.rs`、`src/guest_path.rs`、plan-status |
+
 ## 已决议设计决策
 
 实现时若需偏离本节，必须先修改计划、状态视图与受影响任务卡并重新 review，不得在代码中静默改语义。
@@ -1156,18 +1158,18 @@
 
 每张卡都必须在 Review 列记录其代码或产物 review 的 round、PASS 与问题关闭情况，然后才能按 ER-04 进入 `complete`。下方 Review log 是计划文档评审，不能替代实现后的逐卡 review。
 
-| 任务 | UTC 时间 | 环境与 sanitized 输入 | 命令/检查与结果 | Review | 发布/远端证据 |
-|---|---|---|---|---|---|
-| SPK-01 | 2026-11-12 07:45:12 UTC | 宿主机审计：Linux x86_64、`/dev/kvm` 存在；`qemu-system-x86_64`/`qemu-img`/`swtpm`/`xorriso`/`virsh`/`qemu-bridge-helper`/OVMF 均缺失；`sudo -n` 需密码；无 Windows qcow2（DEP-01/02 均不可用） | 未执行：无可用 Windows VM，无法取得连接/鉴权/SFTP 证据 | `blocked`（DEP-01/DEP-02） | N/A |
-| SPK-02 | 2026-11-12 07:45:12 UTC | 同上（无 QEMU/OVMF/swtpm，无 Windows 镜像） | 未执行：无可用 Windows VM，无法取得首启/重启证据 | `blocked`（DEP-01/DEP-02） | N/A |
-| OSX-01 | 2026-11-12 08:40:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib image::tests`（18 passed）、`cargo test --no-run` 全绿 | T-1 全量门未执行（无 QEMU/libvirt，`DEFER-04`） | `done` / `complete` | `50c8cff` |
-| OSX-02 | 2026-11-12 09:35:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib qemu`（5 passed）、`cargo test --no-run`（含 `tests/windows_machine.rs`）全绿 | `windows_firmware_lifecycle` 未执行（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `f2fc277` |
-| OSX-03 | 2026-11-12 10:20:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_deploy`（7 passed）、`cargo test --lib windows_deploy_timeout`（2 passed）、`cargo test --no-run` 全绿 | `windows_first_boot` 与首启/重启 seed 清理证据未取得（需 `TRN-01` + DEP-01/02），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `8812fb4` |
-| TRN-01 | 2026-11-12 11:40:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib ssh`（5 passed）、`cargo test --lib utils`（4 passed）、`cargo test --no-run`（含 `windows_transport`/`windows_pool`）全绿 | `windows_transport`/`windows_pool` 与真实 spawn 重连证据未取得（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `64b1046` |
-| EXE-01 | 2026-11-12 12:10:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_exec`（5 passed）、`cargo test --no-run` 全绿 | `windows_exec` 真实 PowerShell 冒烟未取得（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `64b1046` |
-| IP-01 | 2026-11-12 12:50:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_ip`（6 passed）、`cargo test --no-run` 全绿 | `windows_get_ip` 与双机一致性未取得（DEP-01/02 不可用） | `in-progress` / `locally-accepted` | `eb8fd90` |
-| FS-01 | 2026-11-12 13:20:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_path`（9 passed）、`cargo test --lib`（69 passed）、`cargo test --no-run` 全绿 | `windows_files` 与 Linux 文件回归未取得（DEP-01/02、DEFER-04） | `in-progress` / `locally-accepted` | `443ec5d` |
-| REL-01 | 2026-11-12 13:30:00 UTC | 未执行发布动作 | `SPK-01`/`SPK-02` 与全部真实 Windows KVM 冒烟 `blocked`（DEP-01/02）；Linux 全量门 `blocked`（DEFER-04） | `blocked` / 空 | — |
+| 任务 | UTC 时间 | 环境与 sanitized 输入 | 命令/检查与结果 | Lifecycle / Acceptance | Review | 发布/远端证据 |
+|---|---|---|---|---|---|---|
+| SPK-01 | 2026-11-12 07:45:12 UTC | 宿主机审计：Linux x86_64、`/dev/kvm` 存在；`qemu-system-x86_64`/`qemu-img`/`swtpm`/`xorriso`/`virsh`/`qemu-bridge-helper`/OVMF 均缺失；`sudo -n` 需密码；无 Windows qcow2（DEP-01/02 均不可用） | 未执行：无可用 Windows VM，无法取得连接/鉴权/SFTP 证据 | `blocked` / 空 | N/A（无实现产物可 review） | N/A |
+| SPK-02 | 2026-11-12 07:45:12 UTC | 同上（无 QEMU/OVMF/swtpm，无 Windows 镜像） | 未执行：无可用 Windows VM，无法取得首启/重启证据 | `blocked` / 空 | N/A（无实现产物可 review） | N/A |
+| OSX-01 | 2026-11-12 08:40:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib image::tests`（18 passed）、`cargo test --no-run` 全绿 | T-1 全量门未执行（无 QEMU/libvirt，`DEFER-04`） | `done` / `complete` | R6 PASS：逐条核对 8 条 AC；`ensure_cached_guest_os` 覆盖旧 JSON 默认 `Linux` 与 `windows-` 命名空间；`GuestOs`/校验/README API+Migration/CHANGELOG 一致，无遗留问题 | `50c8cff` |
+| OSX-02 | 2026-11-12 09:35:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib qemu`（5 passed）、`cargo test --no-run`（含 `tests/windows_machine.rs`）全绿 | `windows_firmware_lifecycle` 未执行（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | R6 PASS：核对 `windows_firmware_args`、`select_accel`（Windows 不回退 TCG）、`prepare_vars` 复用与 `swtpm` 生命周期；F1（`Drop` 与 `swtpm` 关闭顺序）本轮修复 | `f2fc277` |
+| OSX-03 | 2026-11-12 10:20:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_deploy`（7 passed）、`cargo test --lib windows_deploy_timeout`（2 passed）、`cargo test --no-run` 全绿 | `windows_first_boot` 与首启/重启 seed 清理证据未取得（需 `TRN-01` + DEP-01/02），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | R6 PASS：核对 seed 0600/目录权限、每 VM host key、`confirm_deployment` 后删 ISO/目录、超时错误可操作；无遗留问题 | `8812fb4` |
+| TRN-01 | 2026-11-12 11:40:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib ssh`（5 passed）、`cargo test --lib utils`（4 passed）、`cargo test --no-run`（含 `windows_transport`/`windows_pool`）全绿 | `windows_transport`/`windows_pool` 与真实 spawn 重连证据未取得（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | R6 PASS：核对 `connect_over`/`ConnectParams` 与 vsock 语义、`check_server_key` 拒绝错配与证书、lease 按 MAC 检索并缓存、vsock 仅 Linux 必需；无遗留问题 | `6711671` |
+| EXE-01 | 2026-11-12 12:10:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_exec`（5 passed）、`cargo test --no-run` 全绿 | `windows_exec` 真实 PowerShell 冒烟未取得（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | R6 PASS：核对 `exit_status_from_code` 高位映射、`0..=255` 外拒绝、空命令拒绝、README 契约与 CHANGELOG `Fixed`；无遗留问题 | `64b1046` |
+| IP-01 | 2026-11-12 12:50:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_ip`（6 passed）、`cargo test --no-run` 全绿 | `windows_get_ip` 与双机一致性未取得（DEP-01/02 不可用） | `in-progress` / `locally-accepted` | R6 PASS：核对缓存优先、按本 VM MAC 精确选择、0/多结果报错不回落到他机 lease；无遗留问题 | `eb8fd90` |
+| FS-01 | 2026-11-12 13:20:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_path`（9 passed）、`cargo test --lib`（69 passed）、`cargo test --no-run` 全绿 | `windows_files` 与 Linux 文件回归未取得（DEP-01/02、DEFER-04） | `in-progress` / `locally-accepted` | R6 PASS：核对 `GuestPath` 校验/规范化/`join`/`ancestors`/`strip_prefix`、所有 SFTP 入口改造、`copy` 去 POSIX `cp`、unsupported 分支；F2（Review 列语义）与 F3（`join` 不可达分支）本轮修复 | `443ec5d` |
+| REL-01 | 2026-11-12 13:30:00 UTC | 未执行发布动作 | `SPK-01`/`SPK-02` 与全部真实 Windows KVM 冒烟 `blocked`（DEP-01/02）；Linux 全量门 `blocked`（DEFER-04） | `blocked` / 空 | blocked（未进入发布 review） | — |
 
 ## Review log
 
@@ -1180,6 +1182,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R3 | 三份文件最终一致性复审 | PASS | 无开放项；P1-01~P1-14 全部关闭 | 无 residual risk | 自动校验 PASS：10 任务/10 状态行、依赖无环、AC/VER 与审计一致、T-1/T-2 全量门齐全、表格/链接/现有锚点有效；人工语义复核通过 |
 | R4 | P2 缺口修订（OSX-02 资源默认值、OSX-03 部署超时） | PASS | 无开放项；GAP-08/09 已修复 | 无 residual risk | 审计表重算：`OSX-02` AC=8/8、VER=5/8；`OSX-03` AC=8/8、VER=7/8（均在上限内）；追溯表补 `windows_deploy_timeout`；风险表新增两行；事实基线/性能摘要同步；plan-status 状态与时间戳同步；新增 AC 不扩大行为轴、不引入新依赖 |
 | R5 | 环境消歧（DEP-01/DEP-02 不可用）与依赖边重排 | PASS | 无开放项；spike 阻塞已登记，ADR 临时接受已写明 revisit 条件 | 残余风险：Windows 实测证据缺失（由 `SPK-01`/`SPK-02` 与 `REL-01` 阻塞承载），具名接受人=计划 Owner | 审计命令输出（`command -v` 全缺、`sudo -n` 需密码、`/dev/kvm` 存在）；依赖图无环复核；`SPK-02 -> OSX-01` 取消理由=OSX-01 无 Phase 0 输入；粒度审计表 deps 列同步 |
+| R6 | 实施后逐卡 review：`OSX-01`~`FS-01` 的实现产物、AC 对照与逐卡门禁 | PASS | 无 P0/P1 开放 | F1~F4 已在本轮修复；残余风险：真实 Windows KVM 证据与独立第二人 review 仍缺（由 `SPK-01`/`SPK-02`/`REL-01` 阻塞承载） | 逐卡门禁重跑：`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、8 个 focused filter 全绿（`image::tests` 18、`qemu` 5、`windows_deploy` 7+2、`ssh::tests` 5、`utils::tests` 4、`windows_exec` 5、`windows_ip` 6、`windows_path` 9）、`cargo test --lib` 69 passed、`cargo test --no-run`；F1~F3 修订见下表 |
 
 ### R1 findings 与修订对照
 
@@ -1204,6 +1207,15 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | P1-12 | “私钥不进 seed”与可 pinning 的 host key provisioning 冲突 | 仅禁止客户端私钥进 seed；每 VM host 私钥若注入则随机、0600、首启专用并清理，公钥交 Machine |
 | P1-13 | 计划文档 Review log 不能证明每张实现卡完成代码 review | 实施证据表新增逐卡 Review 列，无逐卡 PASS 不得 complete |
 | P1-14 | Windows 10/11 的发布范围可被误读为只测一个也宣称两个；模板完成门缺状态同步项 | 至少一个明确版本全验收，未测版本不得声明；模板完成判据补 plan-status 同步 |
+
+### R6 findings 与修订对照
+
+| ID | 问题 | 修订 |
+|---|---|---|
+| F1 | `Machine::Drop` 先删 run dir 再依赖字段 drop 顺序停止 `swtpm`，控制 socket 可能被先行删除 | `Drop` 内显式 `swtpm.take()` 并 `stop_now()`；`Swtpm::stop_now` 为同步停止入口，注释说明无法 await |
+| F2 | 实施证据表的 `Review` 列被用于承载 Lifecycle/Acceptance，缺少 P1-13 要求的逐卡 review round/PASS | 表新增 `Lifecycle / Acceptance` 列；`Review` 列逐卡写 `R6 PASS` 与核对范围（spike 与 `REL-01` 记 N/A/blocked） |
+| F3 | `GuestPath::join` 中“Windows 根回退”分支不可达（Windows 根写作 `C:`，`trim_end_matches('/')` 不会为空） | 删除该分支并注释说明只有 POSIX 根会 trim 成空串；`windows_path_*` 9 个单测保持全绿 |
+| F4 | 证据表 `TRN-01` 行的提交号误写为 `64b1046`（实为 `EXE-01`） | 更正为 `6711671`（`feat(ssh): connect to Windows guests over TCP with a pinned host key`） |
 
 ## 非目标与延后项
 
