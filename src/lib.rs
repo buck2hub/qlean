@@ -222,6 +222,41 @@ mod plan_doc_tests {
         counts
     }
 
+    /// Every `- [x]`/`- [ ]` bullet in each card's `**Verification:**` block.
+    fn verification_bullets(plan: &str) -> Vec<(String, String)> {
+        let mut bullets: Vec<(String, String)> = Vec::new();
+        let mut current: Option<String> = None;
+        let mut reading = false;
+        for line in plan.lines() {
+            if let Some(rest) = line.strip_prefix("### Task ") {
+                current = Some(rest.split(':').next().unwrap_or(rest).trim().to_string());
+                reading = false;
+                continue;
+            }
+            if line.starts_with("## ") {
+                current = None;
+                reading = false;
+                continue;
+            }
+            if line.starts_with("**Verification:**") {
+                reading = true;
+                continue;
+            }
+            if line.starts_with("**") {
+                reading = false;
+                continue;
+            }
+            let bullet = line.starts_with("- [x] ") || line.starts_with("- [ ] ");
+            if reading && bullet {
+                let id = current
+                    .clone()
+                    .unwrap_or_else(|| panic!("a verification bullet sits outside a card: {line}"));
+                bullets.push((id, line.to_string()));
+            }
+        }
+        bullets
+    }
+
     /// The body of the section whose heading line is exactly `heading`.
     ///
     /// Several headings are also quoted inside revision-history rows, so locating a section by
@@ -1136,6 +1171,46 @@ mod plan_doc_tests {
                 claimed.parse::<usize>().ok(),
                 Some(*declared),
                 "card {id} declares {declared} acceptance criteria but its evidence row claims {claimed}"
+            );
+        }
+    }
+
+    /// A card past the local gate records the documentation gate the plan requires of every card.
+    ///
+    /// The per-card gate names five commands, and one of them is
+    /// `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`. That gate has bitten before - a public
+    /// doc comment linking a private type fails it - yet no card recorded running it, so the one
+    /// required command with a failure history was the one with no evidence in the document.
+    #[test]
+    fn the_done_cards_record_the_documentation_gate_the_plan_requires() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        const GATE: &str = "RUSTDOCFLAGS=\"-D warnings\" cargo doc --no-deps";
+
+        // A card with an acceptance value is a card that has been through the local gate, whatever
+        // its lifecycle says about the Windows-hosted criteria still waiting on DEP-01/02.
+        let accepted: Vec<String> = card_states(PLAN)
+            .into_iter()
+            .filter(|(_, _, acceptance)| acceptance != "空")
+            .map(|(id, _, _)| id)
+            .collect();
+        assert_eq!(
+            accepted.len(),
+            7,
+            "the plan declares {} cards past the local gate",
+            accepted.len()
+        );
+
+        let bullets = verification_bullets(PLAN);
+        for id in &accepted {
+            let lines: Vec<&str> = bullets
+                .iter()
+                .filter(|(card, _)| card == id)
+                .map(|(_, line)| line.as_str())
+                .collect();
+            assert!(!lines.is_empty(), "card {id} records no verification");
+            assert!(
+                lines.iter().any(|line| line.contains(GATE)),
+                "card {id} is past the local gate but records no {GATE} result"
             );
         }
     }

@@ -595,6 +595,7 @@
 - [x] `cargo test --lib guest_os`：3 passed（默认值/builder/缓存 OS 不匹配；旧 JSON 兼容是同一条默认值用例里的断言，不是独立用例——R115 更正：原先写「4 passed」，这个过滤串从来没有选中过 4 个测试）
 - [x] `cargo test --lib image::tests`：18 passed, 0 failed
 - [x] `cargo test --no-run`：全部 test target 编译通过
+- [x] `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 通过（R129 补记：原验收轮只在本地跑过、卡内未记录该门；本轮对当前树复跑，0 warning）
 - [ ] T-1 全量，配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1` —— 本机无 QEMU/libvirt/xorriso（DEP-02 不可用），登记为 `DEFER-04`；卡内已用 `cargo test --lib` + `cargo test --no-run` 覆盖 ER-14 的替代门。
 
 **Implementation evidence:**
@@ -685,6 +686,7 @@
 - [x] QMP 控制通道（真 QEMU，无需固件/磁盘）：`cargo test --lib -- --ignored qmp_control_channel` —— 同一条 `qmp_chardev_args` 路径上 `query_running` 返回 `true`、`powerdown` 被接受、QEMU 消失后残留 socket 返回错误；`mode=control`→`mode=readline` 即失败（R83，`1af3a77`）
 - [x] 宿主参数契约（真 QEMU + 真 `swtpm`，`-S` 不跑 guest，不需要 Windows 镜像与 KVM）：`cargo test --lib -- --ignored firmware_arguments_are_accepted_by_real_qemu` —— QMP 问候到达、`query-tpm` 返回 `model=tpm-tis`/`chardev=chrtpm`、进程存活、stderr 无 `tpm-emulator`；Arch 容器 QEMU 11.1.3 + swtpm 0.10.2 通过，删一行 `-device` 即失败（R82，`b2a2199`）
 - [x] 宿主固件解析（真实 `edk2-ovmf`，不依赖 Windows 镜像）：`cargo test --lib -- --ignored firmware_resolve` —— 真实 Arch 布局只解析到 `OVMF_CODE.4m.fd` + `OVMF_VARS.4m.fd`（`secure_boot=false`），`skipped` 恰为「secboot 对缺 Microsoft 密钥」，且「非 Secure Boot 回退 ⇔ 有通知」成立（R81，`9ab1f4b`）
+- [x] `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 通过（R129 补记：原验收轮只在本地跑过、卡内未记录该门；本轮对当前树复跑，0 warning）
 - [ ] T-1 全量，配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1` —— 环境缺口 `DEFER-04`
 - [ ] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=... QLEAN_WINDOWS_DIGEST=... cargo test --test windows_machine windows_firmware_lifecycle -- --ignored --exact --test-threads=1` —— `blocked`（无 QEMU/OVMF/swtpm 宿主与 Windows 镜像）
 
@@ -790,6 +792,7 @@
 - [x] `cargo test --lib timeout_tests`：3 passed（Windows `init` 用部署预算、Windows `spawn` 与 Linux 保持连接预算；R8 回归门）
 - [x] `cargo test --no-run`：含 `tests/windows_machine.rs::windows_first_boot` 在内全部 target 编译通过
 - [x] seed 介质契约（真实 `xorriso`，不依赖 Windows 镜像）：`cargo test --lib -- --ignored windows_seed_medium` —— 卷标 `QLEANSEED`、Joliet 视图下 `qlean/{authorized_keys,deploy.json,ssh_host_ed25519_key}` 齐全、解包后三份文件字节与暂存内容一致、ISO 权限 `0600`（R80，`f708b36`；`xorriso` 不是 CI 依赖，故标 `#[ignore]`）
+- [x] `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 通过（R129 补记：原验收轮只在本地跑过、卡内未记录该门；本轮对当前树复跑，0 warning）
 - [ ] T-1 全量，配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1` —— 环境缺口 `DEFER-04`
 - [ ] 满足 DEP-01/02 且 `TRN-01` 已落地：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine windows_first_boot -- --ignored --exact --test-threads=1` —— `blocked`
 - [ ] 首启后关机、`spawn` 与 host-key seed 清理的 sanitized 证据 —— `blocked`（无 Windows 镜像与 KVM 宿主）
@@ -989,6 +992,7 @@
 - [x] `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings`
 - [x] `cargo test --lib ssh`（5 passed：pin 匹配/不匹配/TOFU/往返/取消）
 - [x] `cargo test --no-run`
+- [x] `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 通过（R129 补记：原验收轮只在本地跑过、卡内未记录该门；本轮对当前树复跑，0 warning）
 - [ ] T-1 全量，配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1` —— `DEFER-04`（本机无 Linux guest 全量环境）
 - [ ] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine windows_transport -- --ignored --exact --test-threads=1` —— `blocked`
 - [ ] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine windows_pool -- --ignored --exact --test-threads=1` —— `blocked`
@@ -1069,6 +1073,7 @@
 - [x] `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings`
 - [x] `cargo test --lib windows_exec`（5 passed）
 - [x] `cargo test --no-run`
+- [x] `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 通过（R129 补记：原验收轮只在本地跑过、卡内未记录该门；本轮对当前树复跑，0 warning）
 - [ ] T-1 全量，配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1` —— `DEFER-04`
 - [ ] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine windows_exec -- --ignored --exact --test-threads=1` —— `blocked`
 
@@ -1142,6 +1147,7 @@
 - [x] `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings`
 - [x] `cargo test --lib windows_ip`（6 passed）
 - [x] `cargo test --no-run`
+- [x] `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 通过（R129 补记：原验收轮只在本地跑过、卡内未记录该门；本轮对当前树复跑，0 warning）
 - [ ] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine windows_get_ip -- --ignored --exact --test-threads=1` —— `blocked`
 - [ ] 双机地址一致性结果写入「实施证据汇总」。——`blocked`
 
@@ -1232,6 +1238,7 @@
 - [x] `cargo test --lib windows_path`（11 passed；R26 增补组合式不变量与拒绝原因分类两组）
 - [x] `cargo test --lib`（69 passed）
 - [x] `cargo test --no-run`
+- [x] `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 通过（R129 补记：原验收轮只在本地跑过、卡内未记录该门；本轮对当前树复跑，0 warning）
 - [ ] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine windows_files -- --ignored --exact --test-threads=1` —— `blocked`
 - [ ] T-1 全量，配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1`（覆盖 `test_file_operation` 与 `test_file_transfer`）—— `blocked`（DEFER-04）
 
