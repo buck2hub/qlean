@@ -349,13 +349,29 @@ async fn windows_files() -> Result<()> {
     assert!(downloaded.is_file());
     assert_eq!(std::fs::read(&downloaded)?, contents);
 
-    // POSIX-only operations must fail loudly on Windows.
+    // Every POSIX-only operation must fail loudly on Windows, so one hardware run
+    // proves all three entry points rather than only the symbolic-link reader.
     let err = vm
         .read_link(&remote_file)
         .await
         .expect_err("read_link must be rejected")
         .to_string();
     assert!(err.contains("read_link"), "{err}");
+
+    let err = vm
+        .hard_link(&remote_file, root.join("hard link.txt"))
+        .await
+        .expect_err("hard_link must be rejected")
+        .to_string();
+    assert!(err.contains("hard_link"), "{err}");
+
+    let perms = std::fs::metadata(&host_file)?.permissions();
+    let err = vm
+        .set_permissions(&remote_file, perms)
+        .await
+        .expect_err("set_permissions must be rejected")
+        .to_string();
+    assert!(err.contains("set_permissions"), "{err}");
 
     vm.remove_dir_all(root).await?;
     vm.shutdown().await?;
