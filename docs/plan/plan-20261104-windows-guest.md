@@ -130,6 +130,7 @@
 | 2026-11-12 20:50:00 UTC | review R18（CI 覆盖面审计，findings-only） | 无代码缺陷；记录一条需要 `REL-01` 修的执行缺口：`.github/workflows/check-and-test.yml` 的 test job 只有 `cargo test --no-run`（只编译不运行），而唯一能在任意宿主运行的验证面（85 个 `cargo test --lib` 单测）因此从未在 CI 上被检查；同时 CI 的 clippy 为 `cargo clippy -- -D warnings`，未带 `--all-targets --all-features`，测试与 bench 代码不被 lint。两处修复均属 `REL-01` 的 write set（该卡 AC 已写明对齐 clippy 命令），故只登记不改动 | N/A（不新增卡；缺口归属 `REL-01` AC-04） | `REL-01` Current evidence、Review log、`.github/workflows/check-and-test.yml` |
 | 2026-11-12 21:20:00 UTC | review R19（验收项到断言的追溯） | F25：`windows_files` 只断言 `read_link` 报错，而 FS-01 的 AC 要求 `hard_link`/`read_link`/`set_permissions` 三个 POSIX-only 入口都明确报错；单测覆盖了 `ensure_supported` 层，但一次昂贵的硬件冒烟跑完仍不能证明后两个入口的接线正确。补两条断言（`daa6f19`） | N/A（不新增卡；补齐 `FS-01` 既有 AC 的硬件证据面） | `FS-01` 实现证据、Review log、`tests/windows_machine.rs` |
 | 2026-11-12 21:45:00 UTC | review R20（一次性部署的可观测性） | F26：`windows_transport` 只断言 `spawn` 后能执行命令，未验证「部署后 seed 介质已删除」「host key 跨重启不变」「二次 `init` 被拒绝」这三条 OSX-03 AC；其中「seed 已删除」此前只有宿主私有路径可查、无公开可观测面。利用 `init` 对已部署 Windows 的拒绝（`deploy_seed.is_none()` 即 seed 已被 take+remove）作为公开观测量，补 3 条断言（`aa7fc0e`） | N/A（不新增卡、不加公开 API） | `OSX-03`/`TRN-01` 实现证据、Review log、`tests/windows_machine.rs` |
+| 2026-11-12 22:15:00 UTC | review R21（迁移说明与 CHANGELOG 一致性） | F27：README「0.3.x → 0.4.0」写着「Linux runtime behavior are unchanged」，但 CHANGELOG `Fixed` 已记录两处 Linux 运行时行为变化（`exec` 退出码换算修复、空命令拒绝），迁移说明与事实矛盾。改为「破坏仅源码级」并新增「两处 Linux 运行时行为变化」小节，写明需要调用方适配的内容（`943daa0`）；随后自查发现初稿多写了一条第 `upload`/`download` 绝对目的地的断言，但该路径走 `guest_path_from` 而非 `join`，不是错误，已撤回该句（`8365972`） | N/A（不新增卡） | `REL-01` Current evidence、Review log、`README.md`、`CHANGELOG.md` |
 
 ## 已决议设计决策
 
@@ -1044,6 +1045,7 @@
 | 当前版本 0.3.1 | `Cargo.toml:1-4` |
 | CI 仅 pull_request，clippy 命令与模板不一致 | `.github/workflows/check-and-test.yml:1-7,76-100` |
 | CHANGELOG Unreleased/0.3.1 | `CHANGELOG.md:8-24` |
+| README 迁移节已按 CHANGELOG 校正（源码级破坏 + 两处 Linux 运行时变化，R21） | `README.md:503-536` |
 | CI `test` job 只编译（`cargo test --no-run`），从不运行单测；clippy 未带 `--all-targets --all-features`（R18） | `.github/workflows/check-and-test.yml:76-100,70-77` |
 
 | 发布前阻塞项（2026-11-12） | 状态 |
@@ -1236,6 +1238,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R18 | CI 覆盖面审计 | PASS（findings-only，无代码改动） | 缺口转 `REL-01` AC-04 | CI 的 `test` job 是 `cargo test --no-run`：只编译、不执行，因此本计划新增的 85 个单测（唯一不依赖 KVM/镜像的验证面）在 CI 上从未运行；clippy job 用 `cargo clippy -- -D warnings`，不含 `--all-targets --all-features`，测试与 benches 不被 lint | 不改 workflow：`.github/workflows/check-and-test.yml` 属 `REL-01` write set，且该卡 AC-04 已要求「CI 对 push 与 PR 均触发 format/clippy/test」并把 clippy 对齐到 `--all-targets --all-features`；本地门禁已按更严口径执行（fmt/clippy --all-targets/rustdoc -D warnings/`cargo test --lib`/`--no-run --all-targets`），故登记为发布前必须关闭的执行缺口 |
 | R19 | 验收项到断言的追溯 | PASS | 无开放项 | 逐条比对 7 个 `windows_*` 冒烟的断言与卡片 AC：`windows_files` 只验证 `read_link`，缺 `hard_link`/`set_permissions` 两处接线证明；其余 6 个测试的断言与 AC 一一对应（固件生命周期、首启 marker 与 authorized_keys、pinned host key 与 PTY 拒绝、池内地址/host key 互异、PowerShell 引号/流分离/退出码、`get_ip` 缓存与双机互异） | 补两条断言，复用宿主临时文件的 `Permissions` 避免引入 unix-only 依赖（`daa6f19`）；`cargo fmt --check`、clippy `-D warnings`、`cargo test --lib` 85 passed、`cargo test --no-run --all-targets` 全绿，`--ignored` 仍为 7 failed（DEP-01 门未绕过） |
 | R20 | 一次性部署的可观测性 | PASS | 无开放项 | `windows_transport` 的 `spawn` 段只证明「能连上并执行」，而 OSX-03 还要求部署后 seed 清理、host key 跨重启保持、二次 `init` 拒绝；seed 删除本身没有公开访问器，直接查宿主 run 目录会侵入私有实现 | 用公开行为观测：`spawn` 后 `ssh_host_key()` 仍等于首次 pin 的 key；随后 `init()` 必须报 `already completed its Windows first-boot deployment`（该错误仅在 `deploy_seed` 被 take+remove 后出现，且 `init` 在改动任何状态前返回）（`aa7fc0e`）；门禁 fmt/clippy/`cargo test --lib` 85 passed/`--no-run --all-targets` 全绿 |
+| R21 | 迁移说明与 CHANGELOG 一致性 | PASS | 无开放项 | README 迁移节声称 Linux 运行时行为未变，与 CHANGELOG `Fixed` 的两条（`Machine::exec` 退出码换算、空命令拒绝）直接矛盾；首次修订又多写了「绝对 `upload`/`download` 目的地报错」，该路径实际走 `guest_path_from`，`GuestPath::join` 的绝对子路径修复只影响内部调用（`local_basename`/`rel` 永远相对），故用户可见影响为零 | README 改写为「源码级破坏 + 两处运行时行为变化」并列出适配动作（`943daa0`），撤回不准确的第三条（`8365972`）；核对后 CHANGELOG `Added`/`Changed`/`Fixed` 三类 40+ 条与本轮实现一一对应，无失实条目 |
 
 ### R1 findings 与修订对照
 
