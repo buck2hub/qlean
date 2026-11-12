@@ -65,6 +65,47 @@ pub struct Machine {
     ssh_host_key: Option<String>,
 }
 
+/// Removes a half-built run directory unless construction completed.
+///
+/// [`Machine::new`] creates the run directory, the disk overlay, the SSH host key and (for
+/// Windows) the seed medium before it can return. If any of those steps fails the caller
+/// gets an error and no `Machine`, so `Drop` would never clean up: without this guard a
+/// failed construction leaves a directory, an overlay and seed material behind in `runs/`
+/// that nothing ever removes.
+struct RunDirGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl RunDirGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    /// Keep the directory: construction finished and the `Machine` owns it now.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RunDirGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        warn!(
+            "removing the partially built run directory {} after a failed construction",
+            self.path.display()
+        );
+        if let Err(error) = std::fs::remove_dir_all(&self.path) {
+            warn!(
+                "failed to remove the partially built run directory {}: {error}",
+                self.path.display()
+            );
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct MachineImage {
     pub overlay: PathBuf,
@@ -238,6 +279,9 @@ impl Machine {
         // The run directory holds the per-VM host private key, the seed medium and the
         // disk overlay: keep it owner-only regardless of the host umask.
         crate::utils::restrict_dir(&run_dir)?;
+        // Everything below writes into `run_dir`; if it fails, the directory must not
+        // outlive the failed construction.
+        let run_dir_guard = RunDirGuard::new(run_dir.clone());
 
         // Create overlay image
         let mut qemu_img_command = tokio::process::Command::new("qemu-img");
@@ -272,6 +316,9 @@ impl Machine {
         // Windows guests follow ADR-WIN-03: a pre-generalized image plus a per-VM
         // seed medium, instead of cloud-init NoCloud user-data.
         if image.guest_os() == GuestOs::Windows {
+            // Fail before generating keys or building the seed medium: a host that cannot
+            // run the guest must not leave seed material or an ISO behind.
+            firmware::ensure_host_support()?;
             let host_key = windows::generate_host_key(&run_dir)?;
             let seed =
                 DeploySeed::stage(&run_dir, ssh_keypair.pubkey_str.trim(), &host_key).await?;
@@ -285,6 +332,7 @@ impl Machine {
                 seed: seed_iso_path,
             };
 
+            run_dir_guard.disarm();
             return Ok(Self {
                 id: machine_id,
                 image: machine_image,
@@ -487,6 +535,7 @@ StandardError=journal
             seed: seed_iso_path,
         };
 
+        run_dir_guard.disarm();
         Ok(Self {
             id: machine_id,
             image: machine_image,
@@ -1788,6 +1837,48 @@ mod timeout_tests {
             ssh_timeout,
             ..MachineConfig::default()
         }
+    }
+
+    #[test]
+    fn run_dir_guard_removes_a_partially_built_run_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "qlean-run-dir-guard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // Mimic a construction that already wrote an overlay and a seed directory.
+        std::fs::create_dir_all(root.join("seed")).unwrap();
+        std::fs::write(root.join("overlay.img"), b"overlay").unwrap();
+
+        drop(RunDirGuard::new(root.clone()));
+        assert!(
+            !root.exists(),
+            "a failed construction must not leave the run directory behind"
+        );
+    }
+
+    #[test]
+    fn run_dir_guard_keeps_the_directory_after_a_successful_construction() {
+        let root = std::env::temp_dir().join(format!(
+            "qlean-run-dir-guard-keep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("overlay.img"), b"overlay").unwrap();
+
+        RunDirGuard::new(root.clone()).disarm();
+        assert!(
+            root.join("overlay.img").is_file(),
+            "disarmed guard must not clean up"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
