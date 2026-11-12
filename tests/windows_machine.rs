@@ -557,8 +557,9 @@ async fn windows_exec() -> Result<()> {
     Ok(())
 }
 
-/// `get_ip` for Windows guests: the transport's address is cached, and a fresh query must
-/// match this VM's own MAC rather than another pool member's lease.
+/// `get_ip` for Windows guests: the first query resolves this VM's lease, the next call is
+/// served from the cache, and after a restart - with another pool member's lease in the same
+/// table - the fresh query still answers with this VM's own address.
 #[tokio::test]
 #[ignore = "needs a licensed Windows image (DEP-01) and a Windows KVM host (DEP-02)"]
 #[serial]
@@ -582,6 +583,17 @@ async fn windows_get_ip() -> Result<()> {
     other.init().await?;
     let other_ip = other.get_ip().await?;
     assert_ne!(ip, other_ip, "pool members share an address");
+
+    // A restart drops the cached address, so the next call has to query the guest again. The
+    // table now holds another VM's lease as well, which is what makes this a test of the MAC
+    // filter rather than of the cache: losing it would surface as `other_ip` here.
+    vm.shutdown().await?;
+    vm.spawn().await?;
+    assert_eq!(
+        vm.get_ip().await?,
+        ip,
+        "the fresh query after a restart lost this VM's own lease"
+    );
 
     vm.shutdown().await?;
     other.shutdown().await?;

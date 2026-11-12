@@ -2041,6 +2041,87 @@ mod plan_doc_tests {
     /// describes exactly that. The two summaries are now the same sentence, name both
     /// mechanisms, and the unqualified wording is rejected.
     #[test]
+    fn the_ip_smoke_re_queries_after_a_restart() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        // The card promised a smoke test for "the cache and a fresh query" while the test only
+        // called `get_ip` twice on one running machine - the second call is the cache, so the
+        // fresh query the comment, the card bullet and the evidence row all describe was never
+        // exercised (F172). The three facts now have to be three assertions.
+        let source = CRATE_SOURCES
+            .iter()
+            .find(|(path, _)| *path == "tests/windows_machine.rs")
+            .map(|(_, source)| *source)
+            .expect("tests/windows_machine.rs is not in CRATE_SOURCES");
+        let body = body_of(source, "async fn windows_get_ip(");
+        let queries = body.matches(".get_ip().await").count();
+        assert!(
+            queries >= 3,
+            "the IP smoke makes {queries} `get_ip` calls: the first query, the cache hit and the \
+             query after the restart are three"
+        );
+        let spawn = body
+            .find("vm.spawn().await?")
+            .expect("the IP smoke no longer restarts the machine before its fresh query");
+        let other = body
+            .find("let other_ip = other.get_ip().await?")
+            .expect("the IP smoke no longer starts a second machine");
+        assert!(
+            spawn > other,
+            "the restart has to happen after the second machine has a lease, otherwise the \
+             fresh query proves nothing about the MAC filter"
+        );
+        assert!(
+            body[spawn..].contains("assert_eq!(\n        vm.get_ip().await?,\n        ip,"),
+            "the query after the restart is not compared with the address of the same VM"
+        );
+
+        // The card and the test have to describe the same three facts; a card that promises a
+        // re-query over a test that has none is the defect this round fixed.
+        let lines: Vec<&str> = PLAN.lines().collect();
+        let start = lines
+            .iter()
+            .position(|line| line.starts_with("### Task IP-01"))
+            .expect("the plan has no IP-01 card")
+            + 1;
+        let end = lines[start..]
+            .iter()
+            .position(|line| line.starts_with("### Task ") || line.starts_with("## "))
+            .map(|offset| start + offset)
+            .expect("the IP-01 card runs to the end of the document");
+        let card = lines[start..end]
+            .iter()
+            .find(|line| line.starts_with("| 集成测试（`#[ignore]`） |"))
+            .expect("the IP card no longer lists its integration test");
+        for phrase in ["首查", "缓存复读", "双机地址互异", "重启后重查"] {
+            assert!(
+                card.contains(phrase),
+                "the IP card's integration-test row no longer mentions `{phrase}`: {card}"
+            );
+        }
+        // The comment above the test is what a reader believes; the assertion message inside it
+        // mentions a restart too, so checking the body would pass on the message alone.
+        let signature = source
+            .find("async fn windows_get_ip(")
+            .expect("the IP smoke no longer exists");
+        let doc: Vec<&str> = source[..signature]
+            .lines()
+            .rev()
+            .skip_while(|line| line.trim_end().is_empty())
+            // Attributes sit between the comment and the signature; a scan that stops at the
+            // first non-`///` line stops before it has read anything at all.
+            .take_while(|line| {
+                let line = line.trim_start();
+                line.starts_with("///") || line.starts_with("#[")
+            })
+            .filter(|line| line.trim_start().starts_with("///"))
+            .collect();
+        assert!(
+            doc.iter().any(|line| line.contains("restart")),
+            "the IP smoke's own comment no longer says what the restart is for"
+        );
+    }
+
+    #[test]
     fn the_plan_and_the_code_agree_on_how_many_failures_end_the_marker_wait() {
         const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
         // The failure-recovery matrix and the test matrix both promise a number ("three
