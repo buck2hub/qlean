@@ -269,6 +269,27 @@ pub(crate) fn prepare_vars(run_dir: &Path, firmware: &FirmwarePaths) -> Result<P
     Ok(dest)
 }
 
+/// Arguments for the per-VM `swtpm` TPM 2.0 emulator.
+///
+/// `--ctrl` carries the socket QEMU's TPM chardev connects to, so it is created
+/// owner-only even when the run directory itself is world-readable. `startup-clear`
+/// matches a physical TPM, which also discards volatile state on every power cycle,
+/// while sealed and NV data persist in the state directory.
+fn swtpm_args(state_dir: &Path, socket: &Path, log: &Path) -> Vec<String> {
+    vec![
+        "socket".to_string(),
+        "--tpm2".to_string(),
+        "--tpmstate".to_string(),
+        format!("dir={}", state_dir.to_string_lossy()),
+        "--ctrl".to_string(),
+        format!("type=unixio,path={},mode=0600", socket.to_string_lossy()),
+        "--flags".to_string(),
+        "not-need-init,startup-clear".to_string(),
+        "--log".to_string(),
+        format!("file={},level=1", log.to_string_lossy()),
+    ]
+}
+
 /// A running `swtpm` process backing one VM's TPM 2.0 device.
 pub(crate) struct Swtpm {
     child: tokio::process::Child,
@@ -303,16 +324,7 @@ impl Swtpm {
 
         let program = swtpm_program();
         let mut cmd = tokio::process::Command::new(&program);
-        cmd.arg("socket")
-            .arg("--tpm2")
-            .arg("--tpmstate")
-            .arg(format!("dir={}", state_dir.to_string_lossy()))
-            .arg("--ctrl")
-            .arg(format!("type=unixio,path={}", socket.to_string_lossy()))
-            .arg("--flags")
-            .arg("not-need-init,startup-clear")
-            .arg("--log")
-            .arg(format!("file={},level=1", log.to_string_lossy()))
+        cmd.args(swtpm_args(&state_dir, &socket, &log))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -461,6 +473,30 @@ mod tests {
         assert_eq!(std::fs::read(&again).unwrap(), vec![1u8; 64]);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_swtpm_args_keep_the_control_socket_owner_only() {
+        let args = swtpm_args(
+            Path::new("/run/qlean/abc/tpm"),
+            Path::new("/run/qlean/abc/swtpm.sock"),
+            Path::new("/run/qlean/abc/swtpm.log"),
+        );
+        assert_eq!(args[0], "socket");
+        assert!(args.contains(&"--tpm2".to_string()), "{args:?}");
+        assert!(
+            args.iter()
+                .any(|a| a == "type=unixio,path=/run/qlean/abc/swtpm.sock,mode=0600"),
+            "{args:?}"
+        );
+        assert!(
+            args.contains(&"not-need-init,startup-clear".to_string()),
+            "{args:?}"
+        );
+        assert!(
+            args.contains(&"dir=/run/qlean/abc/tpm".to_string()),
+            "{args:?}"
+        );
     }
 
     #[test]
