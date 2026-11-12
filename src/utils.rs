@@ -29,10 +29,14 @@ pub(crate) struct DhcpLease {
     pub mac: String,
     /// Address handed to that MAC.
     pub ip: std::net::IpAddr,
-    /// Expiry exactly as libvirt printed it (`YYYY-MM-DD HH:MM:SS`), empty if absent.
+    /// Expiry exactly as libvirt printed it (`YYYY-MM-DD HH:MM:SS`), `infinite` for a
+    /// lease that never expires, and empty if the row carried no recognizable expiry.
     ///
     /// The table can hold several rows for one MAC (an expiring lease next to the one
     /// renewed after it), so rows are compared by this field to pick the current address.
+    /// The three spellings are ordered on purpose: a real timestamp sorts below the word
+    /// `infinite`, and an unrecognized expiry sorts below both, so the most durable claim
+    /// on the MAC wins and an unreadable row can never outrank a readable one.
     pub expiry: String,
 }
 
@@ -110,7 +114,7 @@ fn parse_lease_expiry(line: &str) -> String {
     }
 
     let tokens = line.split_whitespace().collect::<Vec<_>>();
-    match tokens.as_slice() {
+    let parsed = match tokens.as_slice() {
         [date, time, ..]
             if looks_like_date(date)
                 && time.len() == 8
@@ -122,10 +126,24 @@ fn parse_lease_expiry(line: &str) -> String {
                     }
                 }) =>
         {
-            format!("{date} {time}")
+            Some(format!("{date} {time}"))
         }
-        _ => String::new(),
+        _ => None,
+    };
+    if let Some(expiry) = parsed {
+        return expiry;
     }
+    // `virsh` prints `infinite` for a lease that never expires (a static host entry or a
+    // reservation). It has to outrank every real timestamp when rows are compared, because
+    // the address that never expires is the one the guest keeps; ranking it lowest would
+    // hand back an abandoned dynamic address instead.
+    if tokens
+        .iter()
+        .any(|token| token.eq_ignore_ascii_case("infinite"))
+    {
+        return "infinite".to_string();
+    }
+    String::new()
 }
 
 /// Leased IPv4 address of `mac`, if the lease table has one.
@@ -865,6 +883,35 @@ mod tests {
             ""
         );
         assert_eq!(parse_lease_expiry(""), "");
+    }
+
+    #[test]
+    fn test_parse_lease_expiry_recognizes_a_lease_that_never_expires() {
+        // `virsh` prints `infinite` for a static host entry. It is still a lease row, so it
+        // must not be read as "no expiry at all".
+        assert_eq!(
+            parse_lease_expiry("infinite   52:54:00:aa:bb:cc   ipv4   192.168.221.42/24"),
+            "infinite"
+        );
+        assert_eq!(parse_lease_expiry("Infinite"), "infinite");
+    }
+
+    #[test]
+    fn test_lease_address_for_prefers_a_lease_that_never_expires() {
+        // A reservation that never expires is the address the guest keeps; the expiring row
+        // next to it is the one it abandoned. Ranking `infinite` as an empty string would
+        // pick the abandoned address.
+        let output = format!(
+            "{LEASES_HEADER} 2026-11-12 09:35:00   52:54:00:aa:bb:cc   ipv4       192.168.221.42/24    *  -\n\
+             infinite              52:54:00:aa:bb:cc   ipv4       192.168.221.77/24    *  -\n"
+        );
+        let leases = parse_dhcp_leases(&output);
+        assert_eq!(leases.len(), 2);
+        assert_eq!(leases[1].expiry, "infinite");
+        assert_eq!(
+            lease_address_for(&leases, "52:54:00:aa:bb:cc").map(|ip| ip.to_string()),
+            Some("192.168.221.77".to_string())
+        );
     }
 
     #[test]

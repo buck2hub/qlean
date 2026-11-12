@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Symbolic links are no longer skipped silently during `upload`/`download`: recreating a link that fails, or meeting a link that cannot be transferred, is now an error
 - `Machine::get_ip` returns the transport address for Windows guests and, when it must be re-queried, runs PowerShell inside the guest and keeps only the address whose MAC matches that VM, erroring on a missing or ambiguous result instead of returning another VM's address
 - Building the Windows seed ISO ran `xorriso` without a deadline, so a stuck build (an unreachable network mount under the staging directory, a hung FUSE mount) blocked `Machine::init` forever before the first-boot deadline had even started; the build now has a 120s budget and the child process is killed at the deadline with an error that names `xorriso` and the staging directory assumption
+- A lease that never expires (`infinite`) was parsed as "no expiry", so it ranked below every expiring row and the lookup could return an address the guest had already abandoned; it now outranks real timestamps, while a row with an unrecognizable expiry still ranks lowest
 
 ### Changed
 
