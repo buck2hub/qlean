@@ -8,7 +8,7 @@
 
 | 计划 | 主题 | 状态 | 目标分支 | 目标版本 | 最近更新时间 |
 |---|---|---|---|---|---|
-| [`plan-20261104-windows-guest.md`](plan-20261104-windows-guest.md) | Windows 客户机支持 | `in-progress`（R5 环境消歧：`SPK-01`/`SPK-02` 因 DEP-01/02 不可用而 `blocked`；实现卡在临时接受的 ADR 上推进，`OSX-01` 完成、`OSX-02`/`OSX-03`/`TRN-01`/`EXE-01`/`IP-01`/`FS-01` 本地验收，`REL-01` 阻塞；R6 实施后逐卡 review PASS；R7 结构/状态一致性复核 PASS；R8 修复首启连接预算与首启失败清理；R9 修复 vsock 设备分派/OVMF 配对规则/swtpm socket 权限/Secure Boot vars 模板/xorriso 前置；R10 修复 `copy` 的 PowerShell 二次解析；R11 修复失败启动无法重试；R12 让 lease 发现与 QEMU 退出 race、跳过盘根创建） | `main` | 0.4.0（minor；公开结构体字面量构造的源码兼容破坏） | 2026-11-12 17:00:00 UTC |
+| [`plan-20261104-windows-guest.md`](plan-20261104-windows-guest.md) | Windows 客户机支持 | `in-progress`（R5 环境消歧：`SPK-01`/`SPK-02` 因 DEP-01/02 不可用而 `blocked`；实现卡在临时接受的 ADR 上推进，`OSX-01` 完成、`OSX-02`/`OSX-03`/`TRN-01`/`EXE-01`/`IP-01`/`FS-01` 本地验收，`REL-01` 阻塞；R6 实施后逐卡 review PASS；R7 结构/状态一致性复核 PASS；R8 修复首启连接预算与首启失败清理；R9 修复 vsock 设备分派/OVMF 配对规则/swtpm socket 权限/Secure Boot vars 模板/xorriso 前置；R10 修复 `copy` 的 PowerShell 二次解析；R11 修复失败启动无法重试；R12 让 lease 发现与 QEMU 退出 race、跳过盘根创建；R13 仅接受 IPv4 lease、拒绝绝对子路径） | `main` | 0.4.0（minor；公开结构体字面量构造的源码兼容破坏） | 2026-11-12 17:40:00 UTC |
 
 ## 任务卡状态
 

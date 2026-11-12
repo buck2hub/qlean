@@ -122,6 +122,7 @@
 | 2026-11-12 16:10:00 UTC | review R10（Windows 命令构造） | F14 修复：`Machine::copy` 的 Windows 分支改为直接执行 `Copy-Item`（`windows::copy_file_command`），不再套 `powershell -Command "..."`，避免外层 PowerShell 二次解析把路径中的 `$` 展开成空 | N/A（`FS-01` 既有 AC「Windows 文件语义」，无卡拆合） | `FS-01` 实现证据、Review log、`src/windows.rs`、`src/machine.rs`、CHANGELOG |
 | 2026-11-12 16:30:00 UTC | review R11（失败启动的可恢复性） | F15 修复：`init`/`spawn` 把 cancel token 当「已启动」标记，启动失败后 token 残留，之后每次尝试都报 `Machine already initialized`/`already spawned`，且残留的连接任务不会被取消；现在只在机器确实在运行时拒绝重复启动，失败时取消并清除 token（`bf0710c`） | N/A（`OSX-03`/`TRN-01` 既有「有界重试后清理」AC 与故障恢复矩阵，无卡拆合） | `OSX-03` 实现证据、故障恢复矩阵、Review log、`src/machine.rs`、README（Windows 状态说明改为「已实现但未发布/未支持」）、CHANGELOG |
 | 2026-11-12 17:00:00 UTC | review R12（首启地址发现与目录创建） | F16 修复：Windows 首启的 DHCP lease 轮询在 `select!` 之前执行且不可取消，QEMU 启动即死时要等满 900s 并误报「无 lease」（`d2a85ab`）；F17 修复：`create_dir_all` 会尝试 mkdir/stat Windows 盘根 `C:`（drive-relative，部分服务器会失败），改为对两种 OS 的根一律跳过（`1e1af91`） | N/A（`TRN-01`/`FS-01` 既有 AC：有界重试后清理、Windows 目录创建，无卡拆合） | `TRN-01`/`FS-01` 实现证据、故障恢复矩阵、Review log、`src/machine.rs`、`src/ssh.rs`、CHANGELOG |
+| 2026-11-12 17:40:00 UTC | review R13（地址选择与路径拼接） | F18 修复：lease 查找取首个匹配行，双栈网络下可能选中链路本地 IPv6（无 scope id，必然连不上），且解析成功导致不再重试，现仅接受 IPv4 并在超时错误中说明（`ed09b5b`）；F19 修复：`GuestPath::join` 会静默吞掉前导分隔符（Linux 上把 `/etc/passwd` 变成相对路径），现显式拒绝绝对子路径；`\\?\C:` 设备路径此前被误报为 UNC（`33567ed`） | N/A（`TRN-01`/`FS-01` 既有 AC：按本 VM MAC 解析且不回退到别机、路径校验，无卡拆合） | `TRN-01`/`FS-01` 实现证据、Review log、`src/utils.rs`、`src/guest_path.rs`、CHANGELOG |
 
 ## 已决议设计决策
 
@@ -718,6 +719,7 @@
 | 集成测试（`#[ignore]`） | `tests/windows_machine.rs`：`windows_transport`（地址、pin、unsupported、shutdown→spawn 重连）、`windows_pool`（双机地址/host key/会话隔离） |
 | README/CHANGELOG | README「Windows transport and security」；CHANGELOG Added ×4 / Changed ×1 |
 | 地址发现与 QEMU 退出 race | `launch` 把 DHCP lease 轮询与 `qemu_handle`、cancel token 一起 `select!`，QEMU 启动即退出时立即返回其真实错误并停 `swtpm`（R12，`src/machine.rs`） |
+| 仅接受 IPv4 lease | `lease_address_for` 跳过双栈下的 IPv6 行：链路本地地址无 scope id 不可达，误选后连接循环不会重试（R13，`src/utils.rs`） |
 | 提交 | `6711671` |
 
 **Acceptance criteria:**
@@ -959,6 +961,7 @@
 | README/CHANGELOG | README 新增「Windows file operations」支持矩阵与路径规则；CHANGELOG Added 四条 |
 | Windows `copy` | `Machine::copy` 的 Windows 分支由 `windows::copy_file_command` 生成，直接执行 `Copy-Item -LiteralPath … -Destination … -Force`（单引号字面量，`$`/反引号/空格/非 ASCII 原样保留），不再套一层 `powershell -Command "..."`（R10，`src/windows.rs`、`src/machine.rs`） |
 | 目录创建根跳过 | `create_dir_all` 对 POSIX `/` 与 Windows 盘根 `C:` 一律跳过，避免 drive-relative 的 `stat('C:')` 让递归创建失败（R12，`src/ssh.rs`） |
+| 绝对子路径拒绝 | `GuestPath::join` 显式拒绝前导分隔符，不再静默变成相对路径；设备路径先于 UNC 判定（R13，`src/guest_path.rs`） |
 | 提交 | `443ec5d` |
 
 **Acceptance criteria:**
@@ -1210,6 +1213,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R10 | Windows 命令构造复核（`Machine::copy` 的 PowerShell 调用） | PASS | 无开放项 | F14：`copy` 把 cmdlet 包在 `powershell -Command "..."` 里，而 guest 默认 shell 已是 PowerShell，外层会再解析一次双引号字符串并展开 `$`，复制 `C:/Program Files/a$b.txt` 这类路径会静默指向别的文件 | F14 抽出 `windows::copy_file_command` 直接发射 cmdlet（单引号字面量，仅一层解析）+ 单测断言不含 `-Command`/`"`（`ec6a9a1`）；门禁 `cargo fmt --check`、clippy `-D warnings`、`cargo test --lib` 79 passed、`cargo test --no-run` 全绿 |
 | R11 | 失败启动的可恢复性复核（`init`/`spawn` 状态标记） | PASS | 无开放项 | F15：`ssh_cancel_token` 同时充当「已启动」标记，`launch` 失败（含 Windows 首启超时拆除、`read_pid` 失败）后 token 残留，同一 `Machine` 上无法重试且报错文案误导；残留连接任务也未被取消 | F15 `init`/`spawn` 仅在 `pid`/`ssh` 存在时拒绝重复启动，失败路径新增 `abandon_launch()` 取消并清除 token，顺带修掉 `warn!` 里的多余空格（`bf0710c`）；门禁 `cargo fmt --check`、clippy `-D warnings`、`cargo test --lib` 79 passed、`cargo test --no-run` 全绿 |
 | R12 | 首启地址发现与 Windows 目录创建复核 | PASS | 无开放项 | F16：`find_lease_address` 在 `launch` 的 `select!` 之前串行执行且不响应取消，Windows 首启时最长 900s 内即使 QEMU 已退出也不会报真正原因；F17：`create_dir_all` 对 Windows 盘根 `C:` 仍执行 mkdir/stat，drive-relative 请求不保证解析到盘根，严格服务器会让整条递归创建失败 | F16 将地址发现与 `qemu_handle`/cancel token 一起 race，端点解析改为 owned 参数以解除 `self` 借用（`d2a85ab`）；F17 两种 OS 的根一律跳过（`1e1af91`）；门禁 `cargo fmt --check`、clippy `-D warnings`、`cargo test --lib` 79 passed、`cargo test --no-run` 全绿 |
+| R13 | 地址选择与路径拼接复核 | PASS | 无开放项 | F18：`find_lease_address` 返回首个 MAC 匹配的 lease，双栈网络下 `fe80::/10` 行会排在前面，`SocketAddr::new(link_local, 22)` 不可达却已算成功，连接循环不再重试；F19：`normalize_relative` 用 `trim_matches('/')`，`join("/etc/passwd")` 在 Linux 上静默变成 `etc/passwd`，与 `Path::join` 语义相反；`normalize_windows` 先判 UNC，导致 `\\?\C:` 报 UNC 而非设备路径 | F18 新增 `lease_address_for`（仅 IPv4，含双栈/仅 IPv6/别机 MAC 三个用例）并在超时文案注明（`ed09b5b`）；F19 拒绝前导分隔符、设备路径先于 UNC 判定，补 Linux/Windows 用例（`33567ed`）；门禁 `cargo fmt --check`、clippy `-D warnings`、`cargo test --lib` 83 passed、`cargo test --no-run` 全绿 |
 
 ### R1 findings 与修订对照
 

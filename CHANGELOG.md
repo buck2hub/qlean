@@ -40,6 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Windows DHCP lookup returned the first lease for a MAC, so a dual-stack network could hand a link-local IPv6 address that cannot be dialled
+- `GuestPath::join` accepted an absolute child and silently made it relative on Linux, and reported `\\?\` device paths as UNC
 - Windows first-boot address discovery ran before the QEMU liveness check, so a VM that died right after starting waited out the whole deployment budget and blamed a missing DHCP lease
 - Recursive directory creation tried to create (and stat) a Windows drive root such as `C:`, which is drive-relative and can fail
 - A failed `init`/`spawn` left the cancel token behind, so retrying on the same `Machine` reported "already initialized"/"already spawned" for a VM that never started
