@@ -125,6 +125,23 @@ already be generalized and ship a first-boot task that consumes Qlean's seed med
 4. Leave the image shut down and unconfigured; Qlean creates a per-VM overlay, a per-VM
    `ovmf_vars.fd`, a per-VM TPM 2.0 state and a per-VM seed medium on every `init`.
 
+The seed also carries `qlean/deploy.json`, the machine-readable half of this contract. Read
+the account and the marker from it instead of hard-coding them, and refuse a `version` you
+do not know:
+
+```json
+{
+  "version": 1,
+  "username": "qlean",
+  "marker": "C:\\ProgramData\\qlean\\deployed"
+}
+```
+
+`version` is the layout version Qlean writes today; `username` is the account that must
+receive `qlean/authorized_keys`; `marker` is the file the task has to create at the end.
+The example above is parsed into Qlean's own contract type by a test, so a field rename
+that would silently break every conforming image fails the build instead.
+
 The seed medium is appended only on the first boot and is deleted as soon as the guest
 reports `C:\ProgramData\qlean\deployed`. It contains the client's *public* key, the
 per-VM host *private* key and `qlean/deploy.json`; the client private key stays in the

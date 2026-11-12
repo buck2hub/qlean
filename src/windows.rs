@@ -486,6 +486,43 @@ pub(crate) fn copy_file_command(from: &str, to: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The `deploy.json` schema is the only machine-readable part of the image contract.
+    ///
+    /// An image author reads `username` and `marker` out of that file, so a field rename
+    /// (or a changed default) breaks every conforming image silently: the guest task would
+    /// install the key for nobody and Qlean would spend the whole 900s deployment budget
+    /// reporting "the deployment marker was never observed". The README example is therefore
+    /// parsed with the real type and compared to the real contract, so documentation and
+    /// code can only change together.
+    #[test]
+    fn test_the_readme_deploy_json_example_is_the_contract_the_guest_receives() {
+        let readme = include_str!("../README.md");
+        let section = readme
+            .split("#### Windows image contract")
+            .nth(1)
+            .expect("the README must document the Windows image contract");
+        let json = section
+            .split("```json")
+            .nth(1)
+            .and_then(|rest| rest.split("```").next())
+            .expect("the image contract must show the deploy.json example in a json block");
+
+        // Parsing with `DeployContract` is what makes the keys part of the contract: an
+        // unknown or missing field is an error here, not a surprise on a Windows host.
+        let documented: DeployContract = serde_json::from_str(json).unwrap_or_else(|error| {
+            panic!("the README deploy.json example is not the contract: {error}")
+        });
+        assert_eq!(documented, DeployContract::current());
+
+        // The guest sees exactly what `to_vec_pretty` writes; the example must therefore
+        // survive the same round trip the deployed file does.
+        let serialized = serde_json::to_string_pretty(&DeployContract::current())
+            .expect("the contract must serialize");
+        let written: DeployContract = serde_json::from_str(&serialized)
+            .expect("the deployed deploy.json must parse back into the contract");
+        assert_eq!(documented, written);
+    }
+
     #[test]
     fn test_marker_probe_quotes_the_marker_path() {
         let command = marker_probe_command();
