@@ -254,6 +254,36 @@ fn no_usable_firmware_message(resolved: &ResolvedFirmware) -> String {
     message
 }
 
+/// Notice to emit when resolution had to fall back to a non-Secure-Boot pair.
+///
+/// [`resolve_ovmf_with`] skipping a `secboot` pair whose vars template carries no
+/// Microsoft keys is the right call: booting it would land the guest in setup mode.
+/// What is *not* right is doing it silently. The most common layout on a rolling
+/// distro is exactly that pair plus a usable plain one, so the guest then boots with
+/// Secure Boot disabled, and a Windows 11 image refuses to install with an
+/// unsupported-configuration error that says nothing about the firmware. The reason is
+/// already known here, so it has to reach the user.
+fn secure_boot_skipped_notice(skipped: &[String]) -> Option<String> {
+    if skipped.is_empty() {
+        return None;
+    }
+    let mut notice = String::from(
+        "Secure Boot is disabled for this Windows guest: the host has no OVMF pair with \
+         Microsoft's Secure Boot keys enrolled, so Qlean fell back to a code image without \
+         Secure Boot. Windows 11 requires Secure Boot and refuses to install without it.",
+    );
+    for reason in skipped {
+        notice.push_str("\n- ");
+        notice.push_str(reason);
+    }
+    notice.push_str(&format!(
+        "\nInstall the enrolled vars template that ships with the same package (for example \
+         OVMF_VARS.4m.ms.fd next to OVMF_CODE.secboot.4m.fd) and set {ENV_OVMF_VARS} to it if \
+         this guest is Windows 11."
+    ));
+    Some(notice)
+}
+
 /// Resolve the host OVMF firmware pair, honoring the environment overrides.
 pub(crate) fn resolve_ovmf() -> Result<FirmwarePaths> {
     let env_code = env_nonempty(ENV_OVMF_CODE);
@@ -292,6 +322,13 @@ pub(crate) fn resolve_ovmf() -> Result<FirmwarePaths> {
                     // Re-check through the shared entry point: it also reports a template
                     // that cannot be read, which the probe above turned into "skipped".
                     ensure_secure_boot_pair(&paths.code, &paths.vars_template, paths.secure_boot)?;
+                    // Falling back to a non-Secure-Boot pair is legitimate, but it changes
+                    // what the guest sees, so it is never silent.
+                    if !paths.secure_boot
+                        && let Some(notice) = secure_boot_skipped_notice(&resolved.skipped)
+                    {
+                        warn!("{notice}");
+                    }
                     Ok(paths)
                 }
                 None => Err(anyhow::anyhow!(no_usable_firmware_message(&resolved))),
@@ -825,6 +862,125 @@ mod tests {
             resolved.skipped[0].contains("permission denied"),
             "{:?}",
             resolved.skipped
+        );
+    }
+
+    #[test]
+    fn test_falling_back_to_a_plain_pair_is_never_silent() {
+        // The Arch layout: a `secboot` code image with no enrolled vars template next to a
+        // usable plain pair. The fallback itself is correct, but a Windows 11 image will
+        // refuse to install, so the user has to be told why Secure Boot is off.
+        let secboot_code = Path::new("/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd");
+        let plain_vars = Path::new("/usr/share/edk2/x64/OVMF_VARS.4m.fd");
+        let plain_code = Path::new("/usr/share/edk2/x64/OVMF_CODE.4m.fd");
+        let probe = |path: &Path| path == secboot_code || path == plain_vars || path == plain_code;
+
+        let resolved = resolve_ovmf_with(&probe, &ms_only);
+        let paths = resolved.paths.expect("the plain candidate is usable");
+        assert!(!paths.secure_boot);
+
+        let notice = secure_boot_skipped_notice(&resolved.skipped)
+            .expect("a skipped Secure Boot pair must produce a notice");
+        assert!(notice.contains("Secure Boot is disabled"), "{notice}");
+        assert!(
+            notice.contains("Windows 11 requires Secure Boot"),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("no Microsoft Secure Boot keys"),
+            "the reason must be carried, not just the verdict: {notice}"
+        );
+        assert!(notice.contains(ENV_OVMF_VARS), "{notice}");
+    }
+
+    #[test]
+    fn test_a_secure_boot_pair_produces_no_fallback_notice() {
+        // The `.ms` template is enrolled, so the first candidate wins and nothing was
+        // skipped: warning about Secure Boot here would be a false alarm.
+        let code = Path::new("/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd");
+        let ms_vars = Path::new("/usr/share/edk2/x64/OVMF_VARS.4m.ms.fd");
+        let probe = |path: &Path| path == code || path == ms_vars;
+
+        let resolved = resolve_ovmf_with(&probe, &ms_only);
+        assert!(resolved.paths.expect("the pair is usable").secure_boot);
+        assert!(resolved.skipped.is_empty(), "{:?}", resolved.skipped);
+        assert_eq!(secure_boot_skipped_notice(&resolved.skipped), None);
+    }
+
+    #[test]
+    fn test_the_fallback_notice_names_every_skipped_pair() {
+        let skipped = vec![
+            "skipped A: the vars template carries no Microsoft Secure Boot keys".to_string(),
+            "skipped B: the vars template could not be read (permission denied)".to_string(),
+        ];
+        let notice = secure_boot_skipped_notice(&skipped).expect("two reasons are worth saying");
+        for reason in &skipped {
+            assert!(notice.contains(reason), "{notice}");
+        }
+        assert_eq!(secure_boot_skipped_notice(&[]), None);
+    }
+
+    /// Check the resolver against the OVMF package really installed on this host.
+    ///
+    /// Every other firmware test injects probes, so nothing proved that the candidate
+    /// paths match what a distribution actually ships. Ignored because a host without
+    /// `edk2-ovmf`/`ovmf` has nothing to resolve; run it where the package is installed:
+    ///
+    /// ```text
+    /// cargo test --lib -- --ignored firmware_resolve
+    /// ```
+    #[test]
+    #[ignore = "needs the distro OVMF package installed; run with --ignored"]
+    fn test_firmware_resolve_accepts_the_host_package_layout() {
+        let paths = resolve_ovmf().expect("this host has a usable OVMF pair installed");
+        assert!(paths.code.is_file(), "{}", paths.code.display());
+        assert!(
+            paths.vars_template.is_file(),
+            "{}",
+            paths.vars_template.display()
+        );
+        assert_eq!(
+            paths.secure_boot,
+            is_secure_boot_name(&paths.code),
+            "the Secure Boot flag must follow the code image name"
+        );
+        let code_len = std::fs::metadata(&paths.code)
+            .expect("code is readable")
+            .len();
+        let vars_len = std::fs::metadata(&paths.vars_template)
+            .expect("vars is readable")
+            .len();
+        assert!(
+            vars_len <= code_len,
+            "the vars template must not be larger than the code image: {vars_len} > {code_len}"
+        );
+        if paths.secure_boot {
+            assert!(
+                vars_template_enrolls_microsoft_keys(&paths.vars_template)
+                    .expect("the vars template is readable"),
+                "a Secure Boot pair must come from an enrolled template"
+            );
+        }
+        // Same probes `resolve_ovmf` uses, so this records the *real* decision including
+        // the reasons it skipped a Secure Boot pair: on the Arch layout the skipped list is
+        // what feeds the "Secure Boot is disabled" warning.
+        let probed = resolve_ovmf_with(&|path| path.is_file(), &|path| {
+            vars_template_enrolls_microsoft_keys(path)
+        });
+        let probed_paths = probed.paths.as_ref().expect("the same pair resolves");
+        assert_eq!(probed_paths.code, paths.code, "both paths must agree");
+        assert_eq!(
+            secure_boot_skipped_notice(&probed.skipped).is_some(),
+            !paths.secure_boot,
+            "a non-Secure-Boot fallback must always carry a notice: skipped={:?}",
+            probed.skipped
+        );
+        println!(
+            "resolved OVMF: code={} vars={} secure_boot={} skipped={:?}",
+            paths.code.display(),
+            paths.vars_template.display(),
+            paths.secure_boot,
+            probed.skipped
         );
     }
 

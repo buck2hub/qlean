@@ -72,10 +72,13 @@ the TPM binary with `QLEAN_SWTPM`. Secure Boot is used only when the resolved co
 an OVMF `secboot` build; otherwise the firmware is reported as Secure Boot disabled — Qlean
 never silently swaps in a different firmware. For a `secboot` code image Qlean prefers the
 Microsoft-enrolled vars template (`OVMF_VARS_4M.ms.fd`, `OVMF_VARS.4m.ms.fd`,
-`OVMF_VARS.secboot.fd`). If the template it would pair with carries no Microsoft keys, Qlean
-refuses to start instead of booting in Secure Boot *setup mode*, which Windows 11 rejects;
-point `QLEAN_OVMF_VARS` at the enrolled template (or pair a code image without `secboot` and
-run without Secure Boot) if your distribution names the files differently.
+`OVMF_VARS.secboot.fd`). If that template carries no Microsoft keys, Qlean does not pair it
+with the `secboot` code image — booting that pair lands the guest in Secure Boot *setup
+mode* — and falls back to a plain code image without Secure Boot when the host has one. The
+fallback is reported as a warning naming the skipped pair, because Windows 11 requires Secure
+Boot and refuses to install without it; point `QLEAN_OVMF_VARS` at the enrolled template if
+your distribution names the file differently. When no usable pair remains, Qlean refuses to
+start and lists why every present pair was rejected.
 
 | Guest | Minimum (Qlean defaults) | Recommended |
 |---|---|---|

@@ -48,6 +48,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `is_running` no longer reports a live QEMU as stopped just because its control socket is missing: a live process without a socket is an error, so a second QEMU cannot be started on the same disk
 
 ### Fixed
+- Windows guests no longer lose the reason Secure Boot was skipped: when the host
+  has a `secboot` OVMF code image but no Microsoft-enrolled vars template, Qlean falls
+  back to a plain code image and now warns with the skipped pair and the Windows 11
+  Secure Boot requirement instead of staying silent. The README no longer claims that
+  such a pair makes Qlean refuse to start.
 
 - DHCP lease lookup took the first row matching the MAC, so after a renewal it dialled the address the guest had already abandoned; the row with the newest expiry now wins, and the timeout error shows each lease's expiry
 - Waiting for the Windows deployment marker treated a dropped session as "not deployed yet" and burned the whole 900s budget
