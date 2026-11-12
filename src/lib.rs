@@ -1215,6 +1215,54 @@ mod plan_doc_tests {
 
     /// The seven ignored Windows smoke tests all stop at the precondition the plan describes.
     ///
+    /// The plan quotes the prerequisite error the Windows gate prints, word for word.
+    ///
+    /// The plan tells a reader what happens once the image variables are set: the gate hands
+    /// over to the host check, which names the missing program. A quote that drifts from the
+    /// code sends someone looking for a message that no longer exists - and the ladder's last
+    /// step is the one nobody can reach on this host, so the quote is all the reader has.
+    #[test]
+    fn the_plan_quotes_the_prerequisite_error_the_windows_gate_prints() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        const FIRMWARE: &str = include_str!("../src/firmware.rs");
+        const PROBE: &str = "was not found: a Windows guest's address comes from";
+
+        assert_eq!(
+            FIRMWARE.matches(PROBE).count(),
+            1,
+            "the lease-tool prerequisite message is not stated exactly once in firmware.rs"
+        );
+        // The template spans a continuation line, so the source text is unescaped and re-wrapped
+        // before it is compared with the plan, which wraps nothing.
+        let at = FIRMWARE.find(PROBE).expect("the probe is right above");
+        let start = FIRMWARE[..at]
+            .rfind("format!(")
+            .expect("the message is not built by format!");
+        let end = at
+            + FIRMWARE[at..]
+                .find("))")
+                .expect("the message is not closed");
+        let template = &FIRMWARE[start..end];
+        let quoted = &template[template.find('"').expect("no quote") + 1
+            ..template.rfind('"').expect("no closing quote")];
+        let rendered = quoted
+            .replace("\\\n", " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .replace("{LEASE_TOOL}", "virsh");
+        let flat = PLAN.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains(&rendered),
+            "the plan does not quote the prerequisite error the gate prints; the gate says \
+             {rendered}"
+        );
+        assert!(
+            rendered.contains("virsh net-dhcp-leases"),
+            "the lease tool is no longer looked up through net-dhcp-leases"
+        );
+    }
+
     /// No date in the plan lies in the future.
     ///
     /// R111 found a third of the revision history stamped with times that had not happened yet,
