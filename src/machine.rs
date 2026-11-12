@@ -1178,7 +1178,8 @@ StandardError=journal
             RunningCheck::NoControlSocket => Ok(false),
             RunningCheck::AskQmp => qmp::query_running(&socket_path).await.with_context(|| {
                 format!(
-                    "VM-{} has a QEMU pid and a QMP socket at {} but the control socket did not                      answer; check whether the process is still alive before starting it again",
+                    "VM-{} has a QEMU pid and a QMP socket at {} but the control socket did not \
+                     answer; check whether the process is still alive before starting it again",
                     self.id,
                     socket_path.display()
                 )
@@ -1867,7 +1868,8 @@ fn spawn_guard(needs_first_boot: bool, machine_id: &str) -> Result<()> {
         return Ok(());
     }
     bail!(
-        "VM-{machine_id} has a Windows deployment that has not run yet, and `spawn` boots          without the deployment medium; use `init` for the first boot and `spawn` afterwards"
+        "VM-{machine_id} has a Windows deployment that has not run yet, and `spawn` boots \
+         without the deployment medium; use `init` for the first boot and `spawn` afterwards"
     )
 }
 
@@ -2003,6 +2005,24 @@ mod timeout_tests {
         // recycled pid never gets SIGKILLed.
         assert!(!process_is_qemu(std::process::id()));
         assert!(!process_is_qemu(u32::MAX));
+    }
+
+    #[test]
+    fn user_facing_messages_have_no_runs_of_spaces() {
+        // A lost `\` continuation leaves a run of spaces in the middle of a sentence, which
+        // reads like a formatting bug to the user. This is a regression guard for that.
+        let messages = [
+            spawn_guard(true, "abc123").unwrap_err().to_string(),
+            not_running_error("upload files", "abc123").to_string(),
+        ];
+        for message in messages {
+            for line in message.lines() {
+                assert!(
+                    !line.contains("  "),
+                    "message line has a run of spaces: {line:?}"
+                );
+            }
+        }
     }
 
     #[test]

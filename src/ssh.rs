@@ -154,17 +154,37 @@ impl russh::client::Handler for SshClient {
 /// A pinned key that does not match is a security decision, not a transient failure, so
 /// the message must say which endpoint answered, why the key is pinned, and what makes
 /// the two disagree — never just `UnknownKey`.
+/// Phrase every pinned-key rejection contains.
+///
+/// The retry loops in [`connect_ssh`] and [`connect_ssh_windows`] must not retry a rejected
+/// host key: it is a security decision, not a transient failure, and retrying only replaces
+/// the real reason with "still not reachable" after the whole budget is spent. Detection and
+/// construction therefore share this one string instead of matching on prose twice.
+const PINNED_KEY_REJECTED: &str = "presented an SSH host key that is not the one deployed";
+
 fn host_key_rejection_message(transport_name: &str, pinned: bool) -> String {
     if pinned {
         format!(
-            "The {transport_name} endpoint presented an SSH host key that is not the one deployed for this VM.\n             Qlean pins the per-VM Windows host key created during deployment, so either a different \
-             guest answers on this address (for example after a DHCP lease moved) or the VM was \
-             re-deployed and now has a new key.\n             Check that `get_ip` returns this VM's own address; a VM deployed by a different host \
-             cannot be reached from here."
+            "The {transport_name} endpoint {PINNED_KEY_REJECTED} for this VM.\n\
+             Qlean pins the per-VM Windows host key created during deployment, so either a \
+             different guest answers on this address (for example after a DHCP lease moved) or \
+             the VM was re-deployed and now has a new key.\n\
+             Check that `get_ip` returns this VM's own address; a VM deployed by a different \
+             host cannot be reached from here."
         )
     } else {
         format!("The {transport_name} endpoint presented an unexpected SSH host key.")
     }
+}
+
+/// Whether a failed connect attempt must not be retried.
+///
+/// Only a rejected pinned host key is fatal here: a refused connection means sshd is not up
+/// yet, while a wrong key means the retry loop can never succeed.
+fn is_fatal_connect_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains(PINNED_KEY_REJECTED))
 }
 
 /// Everything a single SSH connection attempt needs besides the transport itself.
@@ -766,6 +786,7 @@ pub(crate) async fn connect_ssh(
                 debug!("SSH command channel is ready");
                 return Ok(session);
             }
+            Err(e) if is_fatal_connect_error(&e) => return Err(e),
             Err(e) => {
                 last_err = Some(e);
                 sleep(Duration::from_millis(250)).await;
@@ -843,6 +864,7 @@ pub(crate) async fn connect_ssh_windows(
                 );
                 return Ok(session);
             }
+            Err(e) if is_fatal_connect_error(&e) => return Err(e),
             Err(e) => {
                 last_err = Some(e);
                 sleep(Duration::from_millis(250)).await;
@@ -852,7 +874,8 @@ pub(crate) async fn connect_ssh_windows(
 
     Err(last_err.unwrap_or_else(|| {
         anyhow::anyhow!(
-            "Timeout establishing SSH over tcp to {addr}; pass the Windows guest's              reachable address and check that sshd accepts the deployed client key"
+            "Timeout establishing SSH over tcp to {addr}; pass the Windows guest's reachable \
+             address and check that sshd accepts the deployed client key"
         )
     }))
 }
@@ -1148,6 +1171,45 @@ mod tests {
         let unpinned = host_key_rejection_message("vsock", false);
         assert!(unpinned.contains("unexpected SSH host key"), "{unpinned}");
         assert!(!unpinned.contains("pins the per-VM"), "{unpinned}");
+    }
+
+    #[test]
+    fn test_a_rejected_pinned_key_is_not_retried() {
+        // Retrying a security decision would spend the whole connect budget and then report
+        // "still not reachable", so the loops must classify it as fatal.
+        let rejected = anyhow::anyhow!(host_key_rejection_message("tcp", true));
+        assert!(is_fatal_connect_error(&rejected));
+
+        // It also has to be detected through a context layer, because the loops wrap errors.
+        let wrapped = rejected.context("SSH client error");
+        assert!(is_fatal_connect_error(&wrapped));
+
+        // A guest whose sshd is not up yet is the transient case and must still be retried.
+        assert!(!is_fatal_connect_error(&anyhow::anyhow!(
+            "Connection refused (os error 111)"
+        )));
+        assert!(!is_fatal_connect_error(&anyhow::anyhow!(
+            host_key_rejection_message("vsock", false)
+        )));
+    }
+
+    #[test]
+    fn test_user_facing_messages_have_no_runs_of_spaces() {
+        // Messages are written across several source lines; a lost continuation leaves a run
+        // of spaces in the middle of a sentence. Check every Windows-facing message.
+        let messages = [
+            host_key_rejection_message("tcp", true),
+            host_key_rejection_message("vsock", false),
+            crate::windows::deploy_timeout_message(std::time::Duration::from_secs(900)),
+        ];
+        for message in messages {
+            for line in message.lines() {
+                assert!(
+                    !line.contains("  "),
+                    "message line has a run of spaces: {line:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
