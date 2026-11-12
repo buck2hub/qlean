@@ -74,10 +74,10 @@ where
 
     let mut machine = Machine::new(image, config).await?;
     machine.init().await?;
-    let result = f(&mut machine).await;
-    machine.shutdown().await?;
+    let outcome = f(&mut machine).await;
+    let shutdown = machine.shutdown().await;
 
-    result
+    combine_outcome(outcome, shutdown)
 }
 
 /// Execute a closure with a virtual machine pool.
@@ -95,8 +95,56 @@ where
     ensure_host_prerequisites().await?;
 
     let mut pool = MachinePool::new();
-    let result = f(&mut pool).await;
-    pool.shutdown_all().await?;
+    let outcome = f(&mut pool).await;
+    let shutdown = pool.shutdown_all().await;
 
-    result
+    combine_outcome(outcome, shutdown)
+}
+
+/// Report the closure's outcome, keeping a teardown failure as context on it.
+///
+/// A teardown failure used to replace the closure's error outright: a test that failed for
+/// its own reason reported only "cleanup failed", which hides the actual defect and sends
+/// the reader after the wrong problem. The closure's error stays the primary one and the
+/// teardown error is attached to it; a teardown failure on its own is still an error
+/// because a VM that could not be stopped leaks resources.
+fn combine_outcome<T>(outcome: Result<T>, shutdown: Result<()>) -> Result<T> {
+    match (outcome, shutdown) {
+        (Err(error), Err(teardown)) => {
+            Err(error.context(format!("teardown also failed: {teardown:#}")))
+        }
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(teardown)) => Err(teardown),
+        (Ok(value), Ok(())) => Ok(value),
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::combine_outcome;
+
+    #[test]
+    fn a_closure_failure_keeps_its_own_cause_when_teardown_fails_too() {
+        let error = combine_outcome::<()>(
+            Err(anyhow::anyhow!("the guest command failed")),
+            Err(anyhow::anyhow!("QEMU did not stop")),
+        )
+        .expect_err("a failed closure stays a failure");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("the guest command failed"), "{rendered}");
+        assert!(rendered.contains("QEMU did not stop"), "{rendered}");
+    }
+
+    #[test]
+    fn a_successful_closure_does_not_hide_a_teardown_failure() {
+        let error = combine_outcome(Ok(7u8), Err(anyhow::anyhow!("seed medium stayed mounted")))
+            .expect_err("a VM that could not be stopped is an error");
+        assert!(error.to_string().contains("seed medium stayed mounted"));
+    }
+
+    #[test]
+    fn a_clean_teardown_returns_the_closure_value() {
+        assert_eq!(combine_outcome(Ok(7u8), Ok(())).unwrap(), 7);
+        assert!(combine_outcome::<u8>(Err(anyhow::anyhow!("boom")), Ok(())).is_err());
+    }
 }
