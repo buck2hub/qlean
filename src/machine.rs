@@ -725,12 +725,10 @@ StandardError=journal
     /// would boot without a seed (and without the host key the guest installed), so it
     /// is rejected here instead of failing later inside QEMU or at the host-key check.
     pub async fn init(&mut self) -> Result<()> {
-        if self.image.guest_os == GuestOs::Windows && self.deploy_seed.is_none() {
-            bail!(
-                "VM-{} already completed its Windows first-boot deployment; use `spawn` to start it again",
-                self.id
-            );
-        }
+        init_guard(
+            start_actions(self.image.guest_os, self.deploy_seed.is_some()),
+            &self.id,
+        )?;
         info!("🚀 Initializing VM-{}", self.id);
 
         // Resize image if needed
@@ -773,12 +771,8 @@ StandardError=journal
     }
 
     /// Whether starting this machine should run `init` rather than `spawn`.
-    ///
-    /// A Linux guest can be initialized repeatedly (a fresh cloud-init seed each time). A
-    /// Windows guest consumes its deployment seed exactly once, so after the first boot it
-    /// can only be spawned; calling `init` again is rejected by design.
     pub(crate) fn wants_init(&self) -> bool {
-        self.image.guest_os != GuestOs::Windows || self.needs_first_boot()
+        start_actions(self.image.guest_os, self.deploy_seed.is_some()).init_all == Start::Init
     }
 
     /// Whether this machine has a Windows deployment that has not run yet.
@@ -786,7 +780,7 @@ StandardError=journal
     /// Starting such a machine with `spawn` would boot a guest whose `sshd` has no
     /// installed key, so the deployment has to run first.
     pub(crate) fn needs_first_boot(&self) -> bool {
-        self.image.guest_os == GuestOs::Windows && self.deploy_seed.is_some()
+        start_actions(self.image.guest_os, self.deploy_seed.is_some()).spawn_all == Start::Init
     }
 
     /// Spawn the machine (normal boot).
@@ -2385,6 +2379,65 @@ fn running_check(pid_present: bool, socket_present: bool, qemu_alive: bool) -> R
     }
 }
 
+/// What `MachinePool::init_all` and `MachinePool::spawn_all` must do for one machine.
+///
+/// Both pool entry points ask the same two questions - is this a Windows guest, and is its
+/// one-time deployment still pending - and they answer them in opposite directions: a Linux
+/// guest is initialized by both (`init` is its deployment path and can repeat), a Windows
+/// guest is initialized only while its seed is pending, and spawned afterwards because the
+/// seed is consumed exactly once. Written as two negations in two predicates, the four cases
+/// were untested and one flipped `is_some` would send a deployed guest back to `init` (where
+/// it is rejected) or spawn a guest whose `sshd` has no installed key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StartActions {
+    pub(crate) init_all: Start,
+    pub(crate) spawn_all: Start,
+}
+
+/// The start one pool entry point performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Start {
+    Init,
+    Spawn,
+}
+
+/// Route a start request for one machine. The only place that decides it.
+pub(crate) fn start_actions(guest_os: GuestOs, deployment_pending: bool) -> StartActions {
+    match (guest_os, deployment_pending) {
+        // Linux has no one-time medium: `init` lays down a fresh cloud-init seed every time.
+        (GuestOs::Linux, _) => StartActions {
+            init_all: Start::Init,
+            spawn_all: Start::Spawn,
+        },
+        // A pending Windows deployment can only be run by `init`; once it has run, `init`
+        // is refused by design, so both entry points must spawn.
+        (GuestOs::Windows, true) => StartActions {
+            init_all: Start::Init,
+            spawn_all: Start::Init,
+        },
+        (GuestOs::Windows, false) => StartActions {
+            init_all: Start::Spawn,
+            spawn_all: Start::Spawn,
+        },
+    }
+}
+
+/// Refuse to `init` a machine whose route is not `init`.
+///
+/// The pool decides a start with [`start_actions`]; the public entry point has to answer the
+/// same question, or a caller reaches QEMU with a guest whose medium was already consumed and
+/// learns it from a boot that hangs. The message names the way forward, because "already
+/// completed" alone leaves the caller with a refused call and no next step.
+fn init_guard(actions: StartActions, machine_id: &str) -> Result<()> {
+    if actions.init_all == Start::Init {
+        return Ok(());
+    }
+    bail!(
+        "VM-{machine_id} already completed its Windows first-boot deployment; \
+         use `spawn` to start it again"
+    )
+}
+
 /// Refuse to `spawn` a Windows guest whose deployment never ran.
 ///
 /// `spawn` boots without the seed medium, so the guest never installs the SSH key and the
@@ -3172,6 +3225,45 @@ mod timeout_tests {
                     "message line has a run of spaces: {line:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn every_pool_start_routes_a_pending_windows_deployment_through_init() {
+        // The failure-recovery matrix promises that `init_all` spawns an already-deployed
+        // Windows guest and that `spawn_all` deploys a pending one. Both are this table.
+        let rows = [
+            (GuestOs::Linux, false, Start::Init, Start::Spawn),
+            (GuestOs::Linux, true, Start::Init, Start::Spawn),
+            (GuestOs::Windows, true, Start::Init, Start::Init),
+            (GuestOs::Windows, false, Start::Spawn, Start::Spawn),
+        ];
+        for (guest_os, pending, init_all, spawn_all) in rows {
+            let actions = start_actions(guest_os, pending);
+            assert_eq!(
+                (actions.init_all, actions.spawn_all),
+                (init_all, spawn_all),
+                "init_all/spawn_all for a {guest_os:?} guest with deployment_pending={pending}"
+            );
+        }
+    }
+
+    #[test]
+    fn init_is_refused_once_the_windows_deployment_has_run() {
+        let refused = init_guard(start_actions(GuestOs::Windows, false), "abc123")
+            .expect_err("a deployed guest must not be initialized again")
+            .to_string();
+        assert!(refused.contains("VM-abc123"), "{refused}");
+        assert!(refused.contains("`spawn`"), "{refused}");
+        for actions in [
+            start_actions(GuestOs::Windows, true),
+            start_actions(GuestOs::Linux, false),
+            start_actions(GuestOs::Linux, true),
+        ] {
+            assert!(
+                init_guard(actions, "abc123").is_ok(),
+                "{actions:?} must still be initializable"
+            );
         }
     }
 

@@ -319,6 +319,38 @@ mod tests {
         );
     }
 
+    /// Each pool entry point asks its own question, and asking the other one is the bug.
+    ///
+    /// `init_all` must use `wants_init` (a deployed Windows guest is spawned) and `spawn_all`
+    /// must use `needs_first_boot` (a pending one is deployed). The two predicates differ by
+    /// one call and both live on `Machine`, so a copy-paste between the two branches would
+    /// read as correct while sending one of the two cases down the wrong path.
+    #[test]
+    fn each_pool_entry_point_asks_its_own_question() {
+        let source = include_str!("pool.rs");
+        let body_of = |name: &str| -> &str {
+            let start = source
+                .find(&format!("pub async fn {name}"))
+                .unwrap_or_else(|| panic!("`{name}` is gone from the pool"));
+            let rest = &source[start..];
+            let end = rest
+                .find("\n    }\n")
+                .unwrap_or_else(|| panic!("`{name}` has no closing brace"));
+            &rest[..end]
+        };
+
+        let init_all = body_of("init_all");
+        let spawn_all = body_of("spawn_all");
+        assert!(
+            init_all.contains(".wants_init()") && !init_all.contains(".needs_first_boot()"),
+            "`init_all` must route through `wants_init`"
+        );
+        assert!(
+            spawn_all.contains(".needs_first_boot()") && !spawn_all.contains(".wants_init()"),
+            "`spawn_all` must route through `needs_first_boot`"
+        );
+    }
+
     #[tokio::test]
     async fn test_a_pool_of_machines_that_never_started_shuts_down_cleanly() {
         // A launch that died before its QMP socket appeared leaves exactly this: a machine
