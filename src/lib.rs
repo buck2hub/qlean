@@ -819,6 +819,47 @@ mod plan_doc_tests {
         }
     }
 
+    /// A count written either as digits or as a Chinese numeral, right after `marker`.
+    ///
+    /// The plan's rows and the status view's digest describe the same round in different prose
+    /// ("变异实测（三条被抓）" vs "变异三条被抓"), so a guard that compares them has to read
+    /// both spellings instead of assuming one.
+    /// Prose is allowed to quote the marker itself (a row that explains the guard does), so
+    /// every occurrence is tried and the first one that carries a number wins.
+    fn spelled_count(text: &str, marker: &str) -> Option<usize> {
+        let mut search = 0;
+        while let Some(found) = text[search..].find(marker) {
+            let at = search + found + marker.len();
+            search = at;
+            if let Some(count) = count_at(&text[at..]) {
+                return Some(count);
+            }
+        }
+        None
+    }
+
+    fn count_at(rest: &str) -> Option<usize> {
+        let rest = rest.trim_start();
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if !digits.is_empty() {
+            return digits.parse().ok();
+        }
+        let spelled = rest.chars().next()?;
+        match spelled {
+            '一' => Some(1),
+            '两' | '二' => Some(2),
+            '三' => Some(3),
+            '四' => Some(4),
+            '五' => Some(5),
+            '六' => Some(6),
+            '七' => Some(7),
+            '八' => Some(8),
+            '九' => Some(9),
+            '十' => Some(10),
+            _ => None,
+        }
+    }
+
     /// The review log reads newest-first, with every round exactly once and none missing.
     ///
     /// The log grew in two directions: rounds 1-94 were appended oldest-first, then rounds 95+
@@ -2467,6 +2508,72 @@ mod plan_doc_tests {
             "the plan's newest round is R{planned} but the status view stops at R{reported}: \
              a reader would take the stale round for the current one"
         );
+    }
+
+    /// The newest round's evidence reads the same in the plan and in the status view.
+    ///
+    /// Each round's summary is written twice - once in the revision history, once in the status
+    /// view's digest - and R148 exists because the two drifted: the plan's R147 row lost its
+    /// negative results to a stray `cp` restore, the digest kept the shorter claim, and the
+    /// commit message described evidence that was no longer in the tree. Counting the mutations
+    /// and the negative results in both places is cheap and catches exactly that drift.
+    #[test]
+    fn the_newest_round_states_the_same_counts_in_both_documents() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        const STATUS: &str = include_str!("../docs/plan/plan-status.md");
+
+        let newest = PLAN
+            .lines()
+            .skip_while(|line| line.trim_end() != "## Review log")
+            .filter_map(|line| line.strip_prefix("| R"))
+            .map(|rest| {
+                rest.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+            })
+            .filter(|digits| !digits.is_empty())
+            .filter_map(|digits| digits.parse::<u32>().ok())
+            .next()
+            .expect("the review log has no rounds");
+        assert!(
+            newest >= 140,
+            "the newest round is R{newest}: the scan is not reading the log"
+        );
+
+        // The revision history carries the round's own tally; the review log's row is a
+        // verdict, not a count.
+        let row = PLAN
+            .lines()
+            .find(|line| line.contains(&format!("review R{newest}（")))
+            .expect("the newest round has no revision-history row of its own");
+
+        // The digest is one table cell of the plan's row; the round's sentence ends where the
+        // next round's number begins.
+        let digest = STATUS
+            .lines()
+            .find(|line| line.starts_with("| [`plan-20261104-windows-guest.md`]"))
+            .expect("the status view no longer has a row for this plan");
+        let start = digest
+            .rfind(&format!("R{newest} "))
+            .unwrap_or_else(|| panic!("the status digest never mentions R{newest}"));
+        // The digest lists its rounds oldest-first, so everything after the newest round's
+        // number belongs to that round.
+        let sentence = &digest[start..];
+
+        for (marker_plan, marker_status, what) in [
+            ("变异实测（", "变异", "mutations caught"),
+            ("负结果（", "负结果", "negative results"),
+        ] {
+            let planned = spelled_count(row, marker_plan)
+                .unwrap_or_else(|| panic!("the plan's R{newest} row states no {what}"));
+            let reported = spelled_count(sentence, marker_status)
+                .unwrap_or_else(|| panic!("the status digest states no {what} for R{newest}"));
+            assert_eq!(
+                planned, reported,
+                "the plan's R{newest} row says {planned} {what} and the status view says \
+                 {reported}: the same round cannot have two tallies"
+            );
+        }
     }
 
     /// Every round in the review log that can name its commit does name one.
