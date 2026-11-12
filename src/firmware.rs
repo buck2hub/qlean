@@ -208,32 +208,54 @@ fn command_available(program: &Path) -> bool {
     })
 }
 
-/// Check every host prerequisite for a Windows guest, reporting all gaps at once.
-pub(crate) fn ensure_host_support() -> Result<()> {
+/// Collect every missing Windows host prerequisite, in one pass.
+///
+/// Taking the probe results as arguments keeps the aggregation testable: a user whose
+/// host lacks several pieces must learn about all of them from one run instead of
+/// reinstalling one package per attempt.
+fn host_support_problems(
+    kvm_available: bool,
+    ovmf: Result<FirmwarePaths>,
+    swtpm: &Path,
+    swtpm_available: bool,
+    seed_iso_builder_available: bool,
+) -> Vec<String> {
     let mut problems: Vec<String> = Vec::new();
 
-    if !is_kvm_available() {
+    if !kvm_available {
         problems.push(
             "KVM acceleration is unavailable: Windows guests require KVM and never fall back to TCG"
                 .to_string(),
         );
     }
-    if let Err(err) = resolve_ovmf() {
+    if let Err(err) = ovmf {
         problems.push(err.to_string());
     }
-    let swtpm = swtpm_program();
-    if !command_available(&swtpm) {
+    if !swtpm_available {
         problems.push(format!(
             "`{}` was not found: install the `swtpm` package or set {ENV_SWTPM}",
             swtpm.display()
         ));
     }
-    let iso_builder = Path::new(SEED_ISO_BUILDER);
-    if !command_available(iso_builder) {
+    if !seed_iso_builder_available {
         problems.push(format!(
             "`{SEED_ISO_BUILDER}` was not found: it builds the Windows seed medium, so install the `{SEED_ISO_BUILDER}` package"
         ));
     }
+
+    problems
+}
+
+/// Check every host prerequisite for a Windows guest, reporting all gaps at once.
+pub(crate) fn ensure_host_support() -> Result<()> {
+    let swtpm = swtpm_program();
+    let problems = host_support_problems(
+        is_kvm_available(),
+        resolve_ovmf(),
+        &swtpm,
+        command_available(&swtpm),
+        command_available(Path::new(SEED_ISO_BUILDER)),
+    );
 
     anyhow::ensure!(
         problems.is_empty(),
@@ -424,6 +446,7 @@ impl Drop for Swtpm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -591,25 +614,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    fn firmware_fixture() -> FirmwarePaths {
+        FirmwarePaths {
+            code: PathBuf::from("/usr/share/OVMF/OVMF_CODE_4M.secboot.fd"),
+            vars_template: PathBuf::from("/usr/share/OVMF/OVMF_VARS_4M.ms.fd"),
+            secure_boot: true,
+        }
+    }
+
     #[test]
-    fn test_explicit_gaps_error_is_actionable() {
-        let swtpm_gap =
-            format!("`swtpm` was not found: install the `swtpm` package or set {ENV_SWTPM}");
-        let xorriso_gap = format!(
-            "`{SEED_ISO_BUILDER}` was not found: it builds the Windows seed medium, so install the `{SEED_ISO_BUILDER}` package"
+    fn test_host_support_reports_every_gap_at_once() {
+        let problems = host_support_problems(
+            false,
+            Err(anyhow::anyhow!("no OVMF firmware found")),
+            Path::new("swtpm"),
+            false,
+            false,
         );
-        let gaps = [
-            "KVM acceleration is unavailable: Windows guests require KVM and never fall back to TCG",
-            swtpm_gap.as_str(),
-            xorriso_gap.as_str(),
-        ];
+
+        assert_eq!(problems.len(), 4, "gaps: {problems:?}");
+        assert!(problems[0].contains("never fall back to TCG"));
+        assert!(problems[1].contains("no OVMF firmware found"));
+        assert!(problems[2].contains("install the `swtpm` package"));
+        assert!(problems[2].contains(ENV_SWTPM));
+        assert!(problems[3].contains("install the `xorriso` package"));
+
+        // The aggregated error keeps every line, so one run lists all four gaps.
         let message = format!(
             "Windows guest prerequisites are missing:\n- {}",
-            gaps.join("\n- ")
+            problems.join("\n- ")
         );
-        assert!(message.contains("never fall back to TCG"));
-        assert!(message.contains("install the `swtpm` package"));
-        assert!(message.contains("install the `xorriso` package"));
+        assert_eq!(message.lines().count(), 5, "{message}");
+    }
+
+    #[test]
+    fn test_host_support_is_quiet_when_everything_is_present() {
+        let problems =
+            host_support_problems(true, Ok(firmware_fixture()), Path::new("swtpm"), true, true);
+
+        assert!(problems.is_empty(), "unexpected gaps: {problems:?}");
+    }
+
+    #[test]
+    fn test_host_support_reports_only_the_missing_piece() {
+        let problems = host_support_problems(
+            true,
+            Ok(firmware_fixture()),
+            Path::new("/opt/swtpm"),
+            true,
+            false,
+        );
+
+        assert_eq!(problems.len(), 1, "gaps: {problems:?}");
+        assert!(
+            problems[0].contains("`xorriso` was not found"),
+            "{problems:?}"
+        );
+
+        let problems = host_support_problems(
+            true,
+            Ok(firmware_fixture()),
+            Path::new("/opt/swtpm"),
+            false,
+            true,
+        );
+        assert_eq!(problems.len(), 1, "gaps: {problems:?}");
+        assert!(problems[0].contains("/opt/swtpm"), "{problems:?}");
         assert!(INSTALL_HINT.contains("edk2-ovmf"));
         assert!(INSTALL_HINT.contains("QLEAN_OVMF_CODE"));
     }
