@@ -40,6 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Windows guests were launched with `vhost-vsock-pci`, so a Windows VM needed `/dev/vhost-vsock` and the `vhost_vsock` module and failed to start without them; the device is now added only for Linux guests
+- OVMF setup required the code image and vars template to be exactly the same size, which no stock firmware pair satisfies (a ~528 KiB vars template ships next to a multi-megabyte code image); only a vars template larger than the code image is now rejected
+- The `swtpm` control socket was created with default permissions; it is now owner-only (`mode=0600`)
 - A failed Windows first-boot deployment left the VM running with the seed medium (client public key and per-VM host private key) still attached; the launch path now closes the session, terminates QEMU, stops `swtpm` and clears the endpoint state
 - A launch whose QEMU pid file could never be read now stops `swtpm` and waits a bounded time instead of returning while the TPM and a half-started VM remain
 - A second `init` on an already-deployed Windows machine is rejected with an actionable error (use `spawn`), instead of booting without the consumed seed medium

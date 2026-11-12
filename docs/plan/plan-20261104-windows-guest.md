@@ -117,6 +117,7 @@
 | 2026-11-12 13:45:00 UTC | review R6（实施后逐卡 review；修订提交 `496b471`） | 逐卡核对 `OSX-01`~`FS-01` 实现与门禁；F1~F4 修复（`Drop`/`swtpm` 顺序、证据表 Review 列语义、`GuestPath::join` 不可达分支、`TRN-01` 提交号更正）；`REL-01` 维持 `blocked` | N/A（无拆合卡、无 AC 变更） | 实施证据汇总、Review log、`src/machine.rs`、`src/firmware.rs`、`src/guest_path.rs`、plan-status |
 | 2026-11-12 14:20:00 UTC | review R7（结构复核） | 修复文档结构：恢复丢失的 `OSX-01` 标题与 `Task type` 行；`SPK-01`/`SPK-02` 卡片状态由 `pending` 更正为 `blocked` 并写入阻塞审计证据；删除 `OSX-03` 重复的第二个 `Verification` 块（与首个块矛盾且把已跑通的本地门标为未做）；补回 `TRN-01`/`EXE-01`/`IP-01`/`FS-01` 卡内 `Implementation evidence` 标签（原为无标题孤表）并消除修订历史表内空行；修复 `Machine::exec` 空命令错误文案的多余空格（`c14b915`），三处状态视图一致 | N/A（无拆合卡、无 AC 变更） | 任务卡、Review log、plan-status |
 | 2026-11-12 14:55:00 UTC | review R8（首启生命周期） | F5~F8 修复：`init` 用部署预算等待 `sshd`（`0e72b45`）；部署确认失败即拆除 VM 并清理 seed（`f9cc1ee`）；`read_pid` 失败路径有界等待并停 `swtpm`（`83a8b0c`）；已部署机器再次 `init` 明确拒绝（`178ac03`）；README/CHANGELOG 同步 | N/A（均为让实现符合 `OSX-03` 既有 AC 与故障恢复矩阵，无卡拆合） | `OSX-03` 实现证据、Verification、实施证据汇总、Review log、故障恢复矩阵、README、CHANGELOG |
+| 2026-11-12 15:20:00 UTC | review R9（硬件对接面） | F9~F11 修复：vsock 设备仅为 Linux 添加（`f42a942`）；OVMF code/vars 等长校验改为「vars 不得大于 code」（`8ae13ec`）；swtpm 控制 socket 改 `mode=0600`（`3e7ebd0`） | N/A（`OSX-01`/`OSX-02` 既有 AC，无卡拆合） | `OSX-01`/`OSX-02` 实现证据、Review log、`src/qemu.rs`、`src/firmware.rs`、CHANGELOG |
 
 ## 已决议设计决策
 
@@ -477,6 +478,7 @@
 | 缓存隔离 | `image_cache_name` 按 `guest_os` 命名，Windows 使用 `windows-` 前缀；`ensure_cached_guest_os` 拒绝 OS 不匹配条目（旧 JSON 默认 Linux） |
 | 单一事实源 | `Image::guest_os` 随元数据持久化；`MachineImage::guest_os` 由 `image.guest_os()` 填充；公开 `Machine::guest_os()` 供后续卡分派 |
 | 迁移 | 仓库内 `ImageConfig` 字面量改为 `..ImageConfig::default()`；README 新增 Guest OS 小节与 Migration；CHANGELOG `[Unreleased]` Added/Changed/Migration |
+| 传输设备按 guest OS 分派 | `src/qemu.rs::vsock_args`：`vhost-vsock-pci` 仅对 Linux 追加；Windows 不再附带该设备（否则宿主缺 `/dev/vhost-vsock` 时 QEMU 直接启动失败），2 个单测覆盖两条分支（R9，`f42a942`） |
 | 提交 | `50c8cff` |
 
 **Dependencies:** 无（R5 取消 `SPK-02 -> OSX-01` 边：本卡不消费任何 Phase 0 产物；串行写集起点）
@@ -550,12 +552,14 @@
 
 | 项 | 证据 |
 |---|---|
-| 新模块 | `src/firmware.rs`：OVMF 候选探测、`QLEAN_OVMF_CODE`/`QLEAN_OVMF_VARS`/`QLEAN_SWTPM` 覆盖、`prepare_vars`（首启复制、重启复用、代码/vars 尺寸配对校验）、`Swtpm`（前台进程 + 控制 socket 等待 + `stop`/`Drop` 双保险） |
+| 新模块 | `src/firmware.rs`：OVMF 候选探测、`QLEAN_OVMF_CODE`/`QLEAN_OVMF_VARS`/`QLEAN_SWTPM` 覆盖、`prepare_vars`（首启复制、重启复用、拒绝 vars 模板大于 code 镜像的配对）、`Swtpm`（前台进程 + 控制 socket 等待 + `stop`/`Drop` 双保险） |
 | QEMU 参数 | `src/qemu.rs::windows_firmware_args`：`q35,hpet=off[,smm=on]`、可选 `cfi.pflash01 secure`、`if=pflash unit=0 readonly` code、`unit=1` per-VM vars、`chrtpm`/`tpm-tis` |
 | 加速门 | `src/qemu.rs::select_accel`：Windows 无 KVM 或架构不匹配时 `bail!`，Linux 保持 KVM/TCG 回退 |
 | 生命周期 | `src/machine.rs`：`launch` 前准备固件与 `swtpm`，`shutdown`、`launch` 失败路径与 `Drop` 均停止 `swtpm`；`swtpm` 状态在 `machine.swtpm` 唯一持有 |
 | 集成测试 | `tests/windows_machine.rs::windows_firmware_lifecycle`（`#[ignore]`，需要 `QLEAN_WINDOWS_IMAGE`/`QLEAN_WINDOWS_DIGEST`，缺省时返回可操作错误） |
 | 资源默认值 | README Windows 表格：最低=默认 `core:2`/`mem:4096`，推荐 `core:4`/`mem:8192`，磁盘 ≥64GB |
+| 固件配对规则 | `prepare_vars` 只拒绝「vars 模板大于 code 镜像」的错配，并记录尺寸差异：stock 固件（Debian/Ubuntu/Fedora/Arch）的 vars 模板约 528 KiB、code 镜像数 MiB，等长要求会拒绝所有真实宿主（R9，`8ae13ec`） |
+| TPM socket 权限 | `swtpm_args` 以 `mode=0600` 创建控制 socket（run dir 可读时也不会暴露 TPM），参数构造为纯函数并被单测覆盖（R9，`3e7ebd0`） |
 | 提交 | `f2fc277` |
 
 **Full-suite trigger:** `T-1: 共享 QEMU 启动路径`
@@ -1190,6 +1194,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R6 | 实施后逐卡 review：`OSX-01`~`FS-01` 的实现产物、AC 对照与逐卡门禁 | PASS | 无 P0/P1 开放 | F1~F4 已在本轮修复；残余风险：真实 Windows KVM 证据与独立第二人 review 仍缺（由 `SPK-01`/`SPK-02`/`REL-01` 阻塞承载） | 逐卡门禁重跑：`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、8 个 focused filter 全绿（`image::tests` 18、`qemu` 5、`windows_deploy` 7+2、`ssh::tests` 5、`utils::tests` 4、`windows_exec` 5、`windows_ip` 6、`windows_path` 9）、`cargo test --lib` 69 passed、`cargo test --no-run`；F1~F3 修订见下表 |
 | R7 | 文档结构与状态一致性复核（10 张卡的标题/字段/状态机对齐 `plan-status.md`）+ 实施产物文案复核 | PASS | 无开放项 | 修复 6 处缺陷（`OSX-01` 标题与 `Task type` 行丢失、`SPK-01`/`SPK-02` 卡头仍为 `pending`、`OSX-03` 重复的第二个 `Verification` 块、`TRN-01`/`EXE-01`/`IP-01`/`FS-01` 缺失的 `Implementation evidence` 标签、修订历史表被空行截断、`Machine::exec` 空命令错误文案多余空格 `c14b915`） | 逐卡字段审计脚本比对 10 张卡：每卡含标题、`Task type`、`Lifecycle / Acceptance` 与全部模板字段且无重复字段；状态与 `plan-status.md`、实施证据汇总三处一致 |
 | R8 | 首启生命周期复核（连接预算/失败清理/重复 init） | PASS | 无开放项 | F5：Windows `init` 仍用 180s/300s 连接预算等待 `sshd`，900s 部署预算永远不可达；F6：`confirm_deployment` 失败经 `?` 透传，留下运行中的 QEMU、`swtpm` 与仍挂载的 seed（含客户端公钥与每 VM host 私钥）；F7：`read_pid` 失败直接透传，跳过 `swtpm` 停止；F8：已部署的 Windows 机器可再次 `init`，此时 seed ISO 已删除 | F5 修复 `resolve_connect_timeout` + 3 个单测（`0e72b45`）；F6 失败即关会话/杀 QEMU/停 swtpm/清端点（`f9cc1ee`）；F7 有界等待并停 swtpm（`83a8b0c`）；F8 `init` 前置拒绝并提示 `spawn`（`178ac03`）；门禁 `cargo fmt --check`、clippy `-D warnings`、`cargo test --lib` 72 passed、`cargo test --no-run` 全绿 |
+| R9 | 硬件对接面复核（QEMU 设备/OVMF 配对/swtpm 权限） | PASS | 无开放项 | F9：所有 guest 都被追加 `vhost-vsock-pci`，Windows 因此依赖 `/dev/vhost-vsock`；F10：`prepare_vars` 要求 code 与 vars 等长，而所有 stock 固件的 vars 远小于 code，真实宿主上必然失败；F11：swtpm 控制 socket 用默认权限创建 | F9 `vsock_args` 分派 + 2 单测（`f42a942`）；F10 规则修正 + 2 单测（`8ae13ec`）；F11 `mode=0600` + `swtpm_args` 单测（`3e7ebd0`）；门禁 `cargo fmt --check`、clippy `-D warnings`、`cargo test --lib` 76 passed、`cargo test --no-run` 全绿 |
 
 ### R1 findings 与修订对照
 
