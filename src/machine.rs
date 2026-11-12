@@ -629,6 +629,7 @@ StandardError=journal
         if self.ssh_cancel_token.is_some() && (self.pid.is_some() || self.ssh.is_some()) {
             bail!("Machine already spawned");
         }
+        spawn_guard(self.needs_first_boot(), &self.id)?;
         self.ssh_cancel_token = Some(CancellationToken::new());
 
         if let Err(err) = self.launch(false).await {
@@ -1856,6 +1857,20 @@ fn running_check(pid_present: bool, socket_present: bool) -> RunningCheck {
     }
 }
 
+/// Refuse to `spawn` a Windows guest whose deployment never ran.
+///
+/// `spawn` boots without the seed medium, so the guest never installs the SSH key and the
+/// only symptom is a deployment wait that times out fifteen minutes later. The pool already
+/// routed this case to `init`; the public entry point must not accept it either.
+fn spawn_guard(needs_first_boot: bool, machine_id: &str) -> Result<()> {
+    if !needs_first_boot {
+        return Ok(());
+    }
+    bail!(
+        "VM-{machine_id} has a Windows deployment that has not run yet, and `spawn` boots          without the deployment medium; use `init` for the first boot and `spawn` afterwards"
+    )
+}
+
 /// Refuse to probe the deployment marker without a session.
 ///
 /// A missing session is not evidence that the deployment has not finished: reporting
@@ -1988,6 +2003,18 @@ mod timeout_tests {
         // recycled pid never gets SIGKILLed.
         assert!(!process_is_qemu(std::process::id()));
         assert!(!process_is_qemu(u32::MAX));
+    }
+
+    #[test]
+    fn spawn_is_refused_while_the_windows_deployment_has_not_run() {
+        // `spawn` boots without the seed medium, so the guest can never install the key; the
+        // caller must be told now instead of after a 15-minute deployment timeout.
+        let error = spawn_guard(true, "abc123")
+            .expect_err("a pending deployment must be refused")
+            .to_string();
+        assert!(error.contains("VM-abc123"), "{error}");
+        assert!(error.contains("init"), "{error}");
+        assert!(spawn_guard(false, "abc123").is_ok());
     }
 
     #[test]
