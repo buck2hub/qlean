@@ -564,7 +564,7 @@ StandardError=journal
         let cmd_ref = cmd.as_ref();
         if cmd_ref.trim().is_empty() {
             bail!(
-                "`exec` requires a non-empty command; an empty string would be sent as an                  empty shell request with no defined result"
+                "`exec` requires a non-empty command; an empty string would be sent as an empty shell request with no defined result"
             );
         }
         info!("🧬 Executing command `{}` on VM-{}", cmd_ref, self.id);
