@@ -660,14 +660,36 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// Per-call counter for [`temp_dir`].
+    ///
+    /// The old name used `Instant::now().elapsed().as_nanos()`, which is measured from an
+    /// instant created immediately before it and is therefore always a few nanoseconds:
+    /// the "unique" suffix was effectively a constant, so two tests that asked for the
+    /// same tag could hand each other stale files (a leftover read-only vars template,
+    /// for example, makes the copy assertions meaningless). A counter is actually unique.
+    static TEMP_DIR_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "qlean-firmware-{tag}-{}-{}",
             std::process::id(),
-            Instant::now().elapsed().as_nanos()
+            TEMP_DIR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn test_temp_dir_names_are_unique_within_a_run() {
+        let first = temp_dir("uniqueness");
+        let second = temp_dir("uniqueness");
+        assert_ne!(
+            first, second,
+            "two test directories with the same tag must not collide"
+        );
+        assert!(first.is_dir() && second.is_dir());
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
     }
 
     fn write_file(path: &Path, len: usize) {

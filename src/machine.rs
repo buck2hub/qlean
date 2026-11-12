@@ -1165,10 +1165,7 @@ StandardError=journal
                 self.id
             );
         };
-        let cmd = format!(
-            "cmd /c if exist {} echo deployed",
-            windows::GUEST_DEPLOY_MARKER
-        );
+        let cmd = windows::marker_probe_command();
         let (code, stdout, stderr) = ssh.call_probe(&cmd, cancel_token).await?;
         if code != 0 {
             bail!(
@@ -1176,7 +1173,7 @@ StandardError=journal
                 String::from_utf8_lossy(&stderr).trim()
             );
         }
-        Ok(String::from_utf8_lossy(&stdout).contains("deployed"))
+        Ok(String::from_utf8_lossy(&stdout).contains(windows::MARKER_PRESENT_TOKEN))
     }
 
     /// Guest operating system family of this machine's image.

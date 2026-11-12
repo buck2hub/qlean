@@ -48,6 +48,19 @@ pub(crate) const GUEST_USERNAME: &str = "qlean";
 /// Marker file written by the image's first-boot task once the deployment is done.
 pub(crate) const GUEST_DEPLOY_MARKER: &str = r"C:\ProgramData\qlean\deployed";
 
+/// Command that reports whether the deployment marker exists.
+///
+/// The marker path is quoted: `cmd` splits an unquoted path on spaces, so a future marker
+/// location (or a `%ProgramData%` rendered with a space) would silently turn the probe
+/// into "file not found" and make a finished deployment look unfinished for the whole
+/// budget. The probe is read-only and always exits 0, so only its stdout decides.
+pub(crate) fn marker_probe_command() -> String {
+    format!(r#"cmd /c if exist "{GUEST_DEPLOY_MARKER}" echo deployed"#)
+}
+
+/// Word the marker probe prints when the marker exists; also the token it is matched on.
+pub(crate) const MARKER_PRESENT_TOKEN: &str = "deployed";
+
 /// TCP port Windows guests expose their OpenSSH server on.
 pub(crate) const SSH_PORT: u16 = 22;
 
@@ -413,6 +426,35 @@ pub(crate) fn copy_file_command(from: &str, to: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_marker_probe_quotes_the_marker_path() {
+        let command = marker_probe_command();
+        assert!(
+            command.contains(r#""C:\ProgramData\qlean\deployed""#),
+            "the marker path must be quoted for cmd: {command}"
+        );
+        assert_eq!(
+            command,
+            r#"cmd /c if exist "C:\ProgramData\qlean\deployed" echo deployed"#
+        );
+    }
+
+    #[test]
+    fn test_marker_probe_token_is_not_part_of_the_path() {
+        // The stdout check must not be satisfiable by the path itself: the token is a
+        // separate word after the quoted path, so only a real marker prints it.
+        let command = marker_probe_command();
+        let after_path = command
+            .split('"')
+            .nth(2)
+            .expect("the quoted path must close");
+        assert_eq!(
+            after_path.trim(),
+            format!("echo {}", MARKER_PRESENT_TOKEN),
+            "only the echo word may follow the quoted path: {command}"
+        );
+    }
 
     const CLIENT_PUBKEY: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICLIENTPUBKEYCLIENTPUBKEYCLIENTPUBKEY qlean-test";
