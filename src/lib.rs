@@ -190,6 +190,119 @@ mod plan_doc_tests {
             "the review numbers in the table are not strictly descending: {seen:?}"
         );
     }
+
+    /// The revision history is one table, not a table with prose wedged into the middle of it.
+    ///
+    /// Markdown ends a table at the first line that is not a table row, so a paragraph inserted
+    /// between two rows silently cuts the table in half: the rows below it stop being rows for
+    /// every reader that renders markdown, and a reader of the raw file cannot tell whether the
+    /// paragraph belongs to the section or to a row. Prose about the table belongs after it.
+    #[test]
+    fn the_plan_revision_history_table_is_not_split_by_prose() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        const HEADING: &str = "### 修订历史";
+
+        let lines: Vec<&str> = PLAN.lines().collect();
+        let heading = lines
+            .iter()
+            .position(|line| line.trim_end() == HEADING)
+            .expect("the plan has no 修订历史 section");
+        let header = lines[heading..]
+            .iter()
+            .position(|line| line.starts_with("| 时间 |"))
+            .map(|offset| heading + offset)
+            .expect("the 修订历史 section has no table header");
+
+        let mut ended = false;
+        for (offset, line) in lines[header + 2..].iter().enumerate() {
+            let is_row = line.starts_with('|');
+            if ended && is_row {
+                panic!(
+                    "the revision history table ends and starts again at line {}: \
+                     markdown ends a table at the first non-row line, so every row after that \
+                     break is invisible as a table row: {line}",
+                    header + 3 + offset
+                );
+            }
+            if !is_row {
+                ended = true;
+                // The section is over: a later table belongs to another section.
+                if line.starts_with("## ") || line.starts_with("### ") {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Every Windows smoke test the code defers is named in the plan, and every smoke test the
+    /// plan names exists.
+    ///
+    /// The plan is the only place that says which acceptance criteria are still blocked on real
+    /// Windows hardware, and it names them by test function. A hand-copied list of names drifts:
+    /// rename the test and the plan keeps promising a name that no longer exists, and a reader
+    /// greps for it, finds nothing, and cannot tell "deferred" from "already deleted".
+    #[test]
+    fn the_plan_names_exactly_the_deferred_windows_smoke_tests() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        const SMOKE_TESTS: &str = include_str!("../tests/windows_machine.rs");
+
+        let mut deferred: Vec<String> = Vec::new();
+        let mut lines = SMOKE_TESTS.lines().map(str::trim).peekable();
+        while let Some(line) = lines.next() {
+            if !line.starts_with("#[ignore") {
+                continue;
+            }
+            // `#[ignore = "..."]` may wrap; the attribute is followed by the test signature.
+            let mut rest = lines.clone();
+            let mut name = None;
+            for _ in 0..4 {
+                let next = rest.next().unwrap_or_default();
+                if let Some(after) = next.split("fn ").nth(1) {
+                    name = Some(
+                        after
+                            .split('(')
+                            .next()
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string(),
+                    );
+                    break;
+                }
+            }
+            if let Some(name) = name {
+                assert!(
+                    !name.is_empty(),
+                    "an `#[ignore]` test has no parseable name"
+                );
+                deferred.push(name);
+            }
+        }
+        assert!(
+            !deferred.is_empty(),
+            "tests/windows_machine.rs has no `#[ignore]` tests: the deferred smoke matrix is gone"
+        );
+
+        for name in &deferred {
+            // Whole-name match: `windows_get_ip` is not mentioned by a plan that only contains
+            // `windows_get_ip_renamed`.
+            let mentioned = PLAN.match_indices(name.as_str()).any(|(index, _)| {
+                PLAN[index + name.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|next| !(next.is_alphanumeric() || next == '_'))
+            });
+            assert!(
+                mentioned,
+                "the plan never names the deferred smoke test `{name}`: a reader cannot tell \
+                 what is still blocked on real Windows hardware"
+            );
+        }
+        assert!(
+            deferred.len() >= 7,
+            "the plan defers 7 Windows smoke tests but the code defers {}: {deferred:?}",
+            deferred.len()
+        );
+    }
 }
 
 #[cfg(test)]
