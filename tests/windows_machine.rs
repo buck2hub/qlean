@@ -22,6 +22,111 @@ use serial_test::serial;
 mod utils;
 use utils::tracing_subscriber_init;
 
+/// Command lines of the live host processes whose argv contains `needle`.
+///
+/// The Windows smoke tests are the only evidence this project will ever have for a guest it
+/// cannot inspect, so "the TPM state was reused" and "no `swtpm` was left behind" have to be
+/// observable facts, not comments. Both are visible without the guest: the `swtpm` and QEMU
+/// command lines carry the per-VM paths. `/proc` is the cheapest way to read them and this test
+/// only ever runs on Linux KVM hosts.
+fn host_processes_matching(needle: &str) -> Vec<(u32, String)> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        if raw.is_empty() {
+            continue;
+        }
+        let argv: Vec<String> = raw
+            .split(|byte| *byte == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect();
+        let line = argv.join(" ");
+        if line.contains(needle) {
+            found.push((pid, line));
+        }
+    }
+    found.sort_by_key(|(pid, _)| *pid);
+    found
+}
+
+/// Processes that `after` has and `before` does not, by pid.
+fn newly_started(before: &[(u32, String)], after: &[(u32, String)]) -> Vec<(u32, String)> {
+    after
+        .iter()
+        .filter(|(pid, _)| !before.iter().any(|(seen, _)| seen == pid))
+        .cloned()
+        .collect()
+}
+
+/// The `file=` of the QEMU argument that attaches the per-VM OVMF vars pflash unit.
+fn pflash_vars_file(arguments: &str) -> Option<String> {
+    arguments.split(' ').find_map(|argument| {
+        if !argument.starts_with("if=pflash") || !argument.contains("unit=1") {
+            return None;
+        }
+        argument
+            .split(',')
+            .find_map(|part| part.strip_prefix("file=").map(str::to_owned))
+    })
+}
+
+/// The `dir=` of the `swtpm --tpmstate` argument.
+fn tpm_state_dir(arguments: &str) -> Option<String> {
+    let mut parts = arguments.split(' ');
+    while let Some(part) = parts.next() {
+        if part == "--tpmstate"
+            && let Some(value) = parts.next()
+        {
+            return value.strip_prefix("dir=").map(str::to_owned);
+        }
+    }
+    None
+}
+
+/// The host-process helpers are the eyes of the firmware lifecycle test.
+///
+/// They run on every CI host (no Windows image needed) because a helper that silently returns
+/// `None` would turn "the restart reused the same vars" into a panic on the one host that has a
+/// licensed image, after a 15 minute boot. Parsing is checked here against the exact argument
+/// shapes `src/qemu.rs` and `src/firmware.rs` produce.
+#[test]
+fn the_host_process_helpers_parse_the_paths_the_launch_builds() {
+    let arguments = "qemu-system-x86_64 -drive if=pflash,format=raw,readonly=on,unit=0,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd                      -drive if=pflash,format=raw,unit=1,file=/run/qlean/VM-1/ovmf_vars.fd";
+    assert_eq!(
+        pflash_vars_file(arguments).as_deref(),
+        Some("/run/qlean/VM-1/ovmf_vars.fd"),
+        "the per-VM vars are the pflash unit=1, not the read-only code image"
+    );
+
+    let swtpm = "swtpm socket --tpm2 --tpmstate dir=/run/qlean/VM-1/tpm                  --ctrl type=unixio,path=/run/qlean/VM-1/swtpm.sock,mode=0600";
+    assert_eq!(tpm_state_dir(swtpm).as_deref(), Some("/run/qlean/VM-1/tpm"));
+    assert_eq!(
+        tpm_state_dir("swtpm socket --tpm2 --ctrl type=unixio"),
+        None
+    );
+
+    let before = vec![(10, "a".to_string())];
+    let after = vec![(10, "a".to_string()), (11, "b".to_string())];
+    assert_eq!(newly_started(&before, &after), vec![(11, "b".to_string())]);
+
+    // A needle that no process can carry must find nothing: the scan reads argv, not the name of
+    // any particular binary.
+    assert!(
+        host_processes_matching("qlean-this-needle-cannot-exist-4f2a").is_empty(),
+        "the /proc scan matched a process for an impossible needle"
+    );
+}
+
 /// Build a Windows `ImageConfig` from the test environment.
 fn windows_image_config() -> Result<ImageConfig> {
     let path = std::env::var("QLEAN_WINDOWS_IMAGE").map_err(|_| {
@@ -73,18 +178,89 @@ async fn windows_firmware_lifecycle() -> Result<()> {
     let mut vm = Machine::new(&image, &config).await?;
     assert_eq!(vm.guest_os(), GuestOs::Windows);
 
-    // First boot lays down per-VM OVMF vars and TPM state.
+    // First boot lays down per-VM OVMF vars and TPM state. `is_running` only speaks for QEMU,
+    // so the firmware and the TPM are checked on the host: their processes and the per-VM paths
+    // on their command lines are the only observation a Windows guest allows.
+    let swtpm_before = host_processes_matching("swtpm socket");
+    let qemu_before = host_processes_matching("qemu-system");
     vm.init().await?;
     assert!(vm.is_running().await?);
+
+    let swtpm_now = newly_started(&swtpm_before, &host_processes_matching("swtpm socket"));
+    assert_eq!(
+        swtpm_now.len(),
+        1,
+        "the first boot must start exactly one swtpm: {swtpm_now:#?}"
+    );
+    let vars = {
+        let qemu = newly_started(&qemu_before, &host_processes_matching("qemu-system"));
+        assert_eq!(
+            qemu.len(),
+            1,
+            "the first boot must start one QEMU: {qemu:#?}"
+        );
+        let (_, arguments) = &qemu[0];
+        let vars = pflash_vars_file(arguments)
+            .unwrap_or_else(|| panic!("QEMU has no per-VM vars pflash: {arguments}"));
+        assert!(
+            std::path::Path::new(&vars).is_file(),
+            "OVMF vars {vars} must exist on the host after the first boot"
+        );
+        vars
+    };
+    let tpm_dir = tpm_state_dir(&swtpm_now[0].1)
+        .unwrap_or_else(|| panic!("swtpm has no --tpmstate dir: {}", swtpm_now[0].1));
+    assert!(
+        std::path::Path::new(&tpm_dir).is_dir(),
+        "TPM state {tpm_dir} must be a directory during the first boot"
+    );
 
     // QMP/ACPI shutdown must stop the guest and the swtpm process.
     vm.shutdown().await?;
     assert!(!vm.is_running().await?);
+    let leaked = host_processes_matching(&tpm_dir);
+    assert!(
+        leaked.is_empty(),
+        "shutdown left a process holding TPM state {tpm_dir}: {leaked:#?}"
+    );
 
-    // Restart reuses the same overlay, OVMF vars and TPM state.
+    // Restart reuses the same overlay, OVMF vars and TPM state: same files, and a TPM state that
+    // was written during the first boot instead of a fresh one.
+    assert!(
+        std::fs::read_dir(&tpm_dir)
+            .map(|entries| entries
+                .flatten()
+                .any(|entry| entry.metadata().map(|meta| meta.len() > 0).unwrap_or(false)))
+            .unwrap_or(false),
+        "the TPM state directory {tpm_dir} is empty: nothing was persisted to reuse"
+    );
     vm.spawn().await?;
     assert!(vm.is_running().await?);
+    let vars_again = {
+        let qemu = newly_started(&qemu_before, &host_processes_matching("qemu-system"));
+        assert_eq!(qemu.len(), 1, "the restart must start one QEMU: {qemu:#?}");
+        let (_, arguments) = &qemu[0];
+        pflash_vars_file(arguments)
+            .unwrap_or_else(|| panic!("QEMU has no per-VM vars pflash: {arguments}"))
+    };
+    assert_eq!(
+        vars_again, vars,
+        "the restart booted with different OVMF vars, so the first boot's NVRAM was dropped"
+    );
+    let tpm_dir_again =
+        tpm_state_dir(&newly_started(&swtpm_before, &host_processes_matching("swtpm socket"))[0].1)
+            .expect("the restarted swtpm has no --tpmstate dir");
+    assert_eq!(
+        tpm_dir_again, tpm_dir,
+        "the restart used a different TPM state directory, so the vTPM started over"
+    );
     vm.shutdown().await?;
+    assert!(!vm.is_running().await?);
+    let leaked = host_processes_matching(&tpm_dir);
+    assert!(
+        leaked.is_empty(),
+        "the second shutdown left a process holding TPM state {tpm_dir}: {leaked:#?}"
+    );
 
     Ok(())
 }
