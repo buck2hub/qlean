@@ -1,4 +1,5 @@
 use std::{
+    os::unix::process::ExitStatusExt,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -372,19 +373,58 @@ fn map_qemu_exit_status(
     pid: u32,
     expected_to_exit: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
+    let expected = expected_to_exit.load(Ordering::SeqCst);
+    let detail = describe_exit(&status);
+
     if status.success() {
-        if expected_to_exit.load(Ordering::SeqCst) {
+        if expected {
             info!("⏏️  Process {} exited as expected", pid);
-            Ok(())
-        } else {
-            error!("Process {} exited unexpectedly", pid);
-            Err(anyhow::anyhow!("QEMU exited unexpectedly"))
+            return Ok(());
         }
-    } else {
-        Err(anyhow::anyhow!(
-            "QEMU exited with error code: {:?}",
-            status.code()
-        ))
+        error!("Process {} exited unexpectedly", pid);
+        return Err(anyhow::anyhow!("QEMU exited unexpectedly"));
+    }
+
+    // A shutdown was requested: teardown sends SIGTERM and then SIGKILL, so a signal
+    // death is the normal outcome of stopping a guest that ignores ACPI powerdown.
+    // Reporting it as a launch failure would blame the caller for its own teardown.
+    if expected {
+        warn!("Process {pid} {detail} while stopping the guest");
+        return Ok(());
+    }
+
+    Err(anyhow::anyhow!(
+        "QEMU {detail} before the VM was asked to stop; check its log for the reason"
+    ))
+}
+
+/// Describe how a process died, including the signal name.
+///
+/// `ExitStatus::code()` is `None` for a signal death, so formatting the code alone
+/// produced messages such as "exited with error code: None" that tell the user nothing.
+fn describe_exit(status: &std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("exited with status {code}");
+    }
+    match status.signal() {
+        Some(signal) => format!("was killed by signal {signal} ({})", signal_name(signal)),
+        None => "exited with an unreportable status".to_string(),
+    }
+}
+
+fn signal_name(signal: i32) -> &'static str {
+    match signal {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        4 => "SIGILL",
+        6 => "SIGABRT",
+        7 => "SIGBUS",
+        8 => "SIGFPE",
+        9 => "SIGKILL",
+        11 => "SIGSEGV",
+        13 => "SIGPIPE",
+        15 => "SIGTERM",
+        _ => "unrecognized signal",
     }
 }
 
@@ -399,6 +439,60 @@ mod tests {
             vars: PathBuf::from("/run/qlean/abc/ovmf_vars.fd"),
             secure_boot,
         }
+    }
+
+    fn exiting(flag: bool) -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(flag))
+    }
+
+    fn exit_code(code: i32) -> std::process::ExitStatus {
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    fn killed_by(signal: i32) -> std::process::ExitStatus {
+        std::process::ExitStatus::from_raw(signal)
+    }
+
+    #[test]
+    fn test_a_killed_guest_is_not_a_launch_failure_during_teardown() {
+        // Tearing a Windows guest down escalates to SIGTERM/SIGKILL when the guest ignores
+        // ACPI powerdown, so this must not be reported as "QEMU exited with error code".
+        assert!(
+            map_qemu_exit_status(killed_by(15), 42, &exiting(true)).is_ok(),
+            "SIGTERM during the requested shutdown is the normal outcome"
+        );
+        assert!(map_qemu_exit_status(killed_by(9), 42, &exiting(true)).is_ok());
+        assert!(map_qemu_exit_status(exit_code(1), 42, &exiting(true)).is_ok());
+    }
+
+    #[test]
+    fn test_an_unexpected_death_reports_the_signal_instead_of_none() {
+        let error = map_qemu_exit_status(killed_by(9), 42, &exiting(false))
+            .expect_err("a guest that was never asked to stop must not die silently")
+            .to_string();
+        assert!(error.contains("signal 9"), "{error}");
+        assert!(error.contains("SIGKILL"), "{error}");
+        // `ExitStatus::code()` is None for a signal death; the old message said "None".
+        assert!(!error.contains("None"), "{error}");
+    }
+
+    #[test]
+    fn test_an_unexpected_exit_status_is_named() {
+        let clean = map_qemu_exit_status(exit_code(0), 42, &exiting(false))
+            .expect_err("exit without a request is still a failure")
+            .to_string();
+        assert!(clean.contains("exited unexpectedly"), "{clean}");
+
+        let failed = map_qemu_exit_status(exit_code(3), 42, &exiting(false))
+            .expect_err("a non-zero status is a failure")
+            .to_string();
+        assert!(failed.contains("status 3"), "{failed}");
+        assert!(!failed.contains("None"), "{failed}");
+    }
+
+    #[test]
+    fn test_an_expected_exit_is_not_an_error() {
+        assert!(map_qemu_exit_status(exit_code(0), 42, &exiting(true)).is_ok());
     }
 
     #[test]
