@@ -519,6 +519,77 @@ mod plan_doc_tests {
             "the trace table's 指定测试 column yielded only {checked} labels"
         );
     }
+    /// The status view repeats the lifecycle each card declares, not one of its own.
+    ///
+    /// A card states its state in two places: its own `Lifecycle / Acceptance` line, which the
+    /// plan calls authoritative, and the summary table in `plan-status.md`. Two hand-kept copies of
+    /// the same token drift the moment one is updated alone, and the resolution rule in the status
+    /// view only says which one wins - it does not notice that they disagreed.
+    #[test]
+    fn the_status_view_repeats_the_lifecycle_each_card_declares() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        const STATUS: &str = include_str!("../docs/plan/plan-status.md");
+
+        let mut cards: Vec<(String, String, String)> = Vec::new();
+        let mut current: Option<String> = None;
+        for line in PLAN.lines() {
+            if let Some(rest) = line.strip_prefix("### Task ") {
+                current = Some(rest.split(':').next().unwrap_or(rest).trim().to_string());
+                continue;
+            }
+            if line.starts_with("## ") {
+                current = None;
+                continue;
+            }
+            let Some(rest) = line.strip_prefix("**Lifecycle / Acceptance:**") else {
+                continue;
+            };
+            let id = current
+                .clone()
+                .unwrap_or_else(|| panic!("a lifecycle line sits outside a card: {line}"));
+            let lifecycle = rest
+                .trim_start()
+                .strip_prefix('`')
+                .and_then(|tail| tail.split('`').next())
+                .unwrap_or_else(|| panic!("card {id} states no lifecycle token: {line}"));
+            let acceptance = rest
+                .trim_start()
+                .split_once('/')
+                .map(|(_, tail)| tail)
+                .unwrap_or_else(|| panic!("card {id} states no acceptance token: {line}"))
+                .trim_start()
+                .trim_start_matches('`')
+                .chars()
+                .take_while(|c| !matches!(c, '`' | '（' | '(' | ' '))
+                .collect::<String>();
+            assert!(
+                !acceptance.is_empty(),
+                "card {id} states an empty acceptance token: {line}"
+            );
+            cards.push((id, lifecycle.to_string(), acceptance));
+        }
+        assert_eq!(cards.len(), 10, "the plan declares {} cards", cards.len());
+
+        for (id, lifecycle, acceptance) in &cards {
+            let row = STATUS
+                .lines()
+                .find(|line| line.starts_with(&format!("| {id} |")))
+                .unwrap_or_else(|| panic!("the status view has no row for {id}"));
+            let cells: Vec<&str> = row.split('|').map(str::trim).collect();
+            assert!(
+                cells.len() > 4,
+                "the status row for {id} lost its columns: {row}"
+            );
+            assert_eq!(
+                (cells[3], cells[4]),
+                (lifecycle.as_str(), acceptance.as_str()),
+                "card {id} declares {lifecycle} / {acceptance} but the status view says {} / {}",
+                cells[3],
+                cells[4]
+            );
+        }
+    }
+
     /// The README states the version the crate is, not the version it used to be.
     ///
     /// The support matrix names a released version so a reader can tell what the claim covers.
