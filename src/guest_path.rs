@@ -209,7 +209,13 @@ impl GuestPath {
 
     fn normalize_relative(&self, child: &str) -> Result<String> {
         let child = child.replace('\\', "/");
-        let child = child.trim_matches('/').to_owned();
+        if child.starts_with('/') {
+            // `Path::join` replaces the base for an absolute argument, so accepting one
+            // here would either silently escape the base or silently nest a nonsense
+            // path. Neither is what a caller means.
+            bail!("cannot join an absolute path onto a guest path: `{child}`");
+        }
+        let child = child.trim_end_matches('/').to_owned();
         if child.is_empty() {
             return Ok(String::new());
         }
@@ -236,13 +242,15 @@ fn is_root_spelling(name: &str) -> bool {
 
 /// Normalize a Windows path: drive-absolute, `/` separated, with each component validated.
 fn normalize_windows(raw: &str) -> Result<String> {
+    // Device paths are checked first: they also start with `\\`, so the UNC branch would
+    // otherwise report them as UNC and send the caller looking for a share name.
+    if raw.starts_with("\\\\?\\") || raw.starts_with("\\\\.\\") {
+        bail!("Windows device paths are not supported: `{raw}`");
+    }
     if raw.starts_with("\\\\") || raw.starts_with("//") {
         bail!(
             "UNC paths are not supported for Windows guests: `{raw}`; pass a drive path such as C:/Users/qlean"
         );
-    }
-    if raw.starts_with("\\\\?\\") || raw.starts_with("\\\\.\\") {
-        bail!("Windows device paths are not supported: `{raw}`");
     }
 
     let unified = raw.replace('\\', "/");
@@ -348,6 +356,31 @@ mod tests {
                 "`{raw}` must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn linux_join_rejects_an_absolute_child() {
+        let err = posix("/srv/data")
+            .join("/etc/passwd")
+            .expect_err("an absolute child must be rejected")
+            .to_string();
+        assert!(err.contains("absolute"), "{err}");
+        // A trailing separator is still just a nested name.
+        assert_eq!(
+            posix("/srv")
+                .join("data/")
+                .expect("relative child")
+                .as_str(),
+            "/srv/data"
+        );
+    }
+
+    #[test]
+    fn windows_device_paths_are_reported_as_device_paths() {
+        let err = GuestPath::new(GuestOs::Windows, r"\\?\C:\Users")
+            .expect_err("device paths must be rejected")
+            .to_string();
+        assert!(err.contains("device paths"), "{err}");
     }
 
     #[test]
