@@ -734,7 +734,7 @@ StandardError=journal
 
     /// Upload file or directory to the machine.
     ///
-    /// Remote paths are always built as [`GuestPath`]s, so a Windows drive path is never
+    /// Remote paths are always built as `GuestPath` values, so a Windows drive path is never
     /// reinterpreted as a host path. Uploading a tree that contains a symbolic link fails
     /// instead of silently skipping the link.
     pub async fn upload<P: AsRef<Path>, Q: AsRef<Path>>(
@@ -846,7 +846,7 @@ StandardError=journal
 
     /// Download file or directory from the machine.
     ///
-    /// The remote side is traversed with [`GuestPath`] semantics; entries that cannot be
+    /// The remote side is traversed with `GuestPath` semantics; entries that cannot be
     /// represented (for example symbolic links, which SFTP cannot fetch as links) are
     /// reported as errors instead of being skipped silently.
     pub async fn download<P: AsRef<Path>, Q: AsRef<Path>>(
@@ -1402,7 +1402,7 @@ StandardError=journal
 
 // Filesystem methods for Machine
 //
-// Every remote path goes through [`GuestPath`] so Windows drive paths keep guest
+// Every remote path goes through `GuestPath` so Windows drive paths keep guest
 // semantics and invalid/unsupported forms are rejected before touching the guest.
 impl Machine {
     /// Copies the contents of one file to another.
