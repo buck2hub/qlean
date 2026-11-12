@@ -184,6 +184,44 @@ mod plan_doc_tests {
         cards
     }
 
+    /// How many acceptance criteria each card declares, keyed by card id.
+    fn acceptance_counts(plan: &str) -> Vec<(String, usize)> {
+        let mut counts: Vec<(String, usize)> = Vec::new();
+        let mut current: Option<String> = None;
+        let mut counting = false;
+        for line in plan.lines() {
+            if let Some(rest) = line.strip_prefix("### Task ") {
+                current = Some(rest.split(':').next().unwrap_or(rest).trim().to_string());
+                counting = false;
+                continue;
+            }
+            if line.starts_with("## ") {
+                current = None;
+                counting = false;
+                continue;
+            }
+            if line.starts_with("**Acceptance criteria:**") {
+                counting = true;
+                let id = current
+                    .clone()
+                    .unwrap_or_else(|| panic!("an acceptance block sits outside a card: {line}"));
+                counts.push((id, 0));
+                continue;
+            }
+            if line.starts_with("**") {
+                counting = false;
+                continue;
+            }
+            if counting
+                && (line.starts_with("- [x] ") || line.starts_with("- [ ] "))
+                && let Some((_, count)) = counts.last_mut()
+            {
+                *count += 1;
+            }
+        }
+        counts
+    }
+
     /// The body of the section whose heading line is exactly `heading`.
     ///
     /// Several headings are also quoted inside revision-history rows, so locating a section by
@@ -1056,6 +1094,48 @@ mod plan_doc_tests {
                 "card {id} declares {lifecycle} / {acceptance} but the status view says {} / {}",
                 cells[3],
                 cells[4]
+            );
+        }
+    }
+
+    /// The evidence summary counts the acceptance criteria its card actually declares.
+    ///
+    /// The evidence row records the review as "逐条核对 N 条 AC". N is a hand-typed count of
+    /// bullets that live in a different part of the same document, and it is the number a reader
+    /// uses to decide whether the review covered everything. The template also caps a card at
+    /// eight criteria, so a ninth bullet would be a rule violation rather than a detail.
+    #[test]
+    fn the_evidence_summary_counts_the_acceptance_criteria_each_card_declares() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        let counts = acceptance_counts(PLAN);
+        assert_eq!(counts.len(), 10, "the plan declares {} cards", counts.len());
+
+        for (id, declared) in &counts {
+            assert!(
+                (1..=8).contains(declared),
+                "card {id} declares {declared} acceptance criteria; the template caps a card at 8"
+            );
+            let prefix = format!("| {id} | 20");
+            let row = PLAN
+                .lines()
+                .find(|line| line.starts_with(&prefix))
+                .unwrap_or_else(|| panic!("the evidence summary has no row for {id}"));
+            let Some(at) = row.find("条 AC") else {
+                continue;
+            };
+            let claimed: String = row[..at]
+                .trim_end()
+                .chars()
+                .rev()
+                .take_while(char::is_ascii_digit)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            assert_eq!(
+                claimed.parse::<usize>().ok(),
+                Some(*declared),
+                "card {id} declares {declared} acceptance criteria but its evidence row claims {claimed}"
             );
         }
     }
