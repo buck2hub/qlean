@@ -283,6 +283,9 @@ fn validate_windows_components(path: &str) -> Result<String> {
         if component.is_empty() || component == "." {
             continue;
         }
+        if component == ".." {
+            bail!("`..` is not allowed in a Windows guest path");
+        }
         if component.contains(WINDOWS_INVALID_CHARS) {
             bail!("`{component}` contains a character Windows does not allow in file names");
         }
@@ -417,7 +420,10 @@ mod tests {
         let err = GuestPath::new(GuestOs::Windows, r"C:\Users\..\Windows")
             .expect_err("`..` must be rejected")
             .to_string();
-        assert!(err.contains(".."), "{err}");
+        assert!(err.contains("`..` is not allowed"), "{err}");
+        // The diagnostic must not be the trailing-dot rule: Windows strips the dot,
+        // it does not treat `..` as a name.
+        assert!(!err.contains("ends with a space or dot"), "{err}");
 
         let base = win(r"C:\Users");
         let err = base
@@ -518,5 +524,110 @@ mod tests {
             .map(|p| p.as_str().to_owned())
             .collect::<Vec<_>>();
         assert_eq!(ancestors, ["/", "/a", "/a/b"]);
+    }
+
+    #[test]
+    fn windows_paths_hold_structural_invariants_across_spellings() {
+        // Every accepted spelling must land on one canonical form and keep the
+        // structural helpers consistent with it; the hand-written cases above only
+        // cover a few shapes, so this walks the spelling cross-product.
+        let components = ["Users", "Program Files", "数据", "a.b", "x-y", "qlean"];
+        for drive in ["C", "c", "Z"] {
+            for separator in ['/', '\\'] {
+                for first in components {
+                    for second in components {
+                        for third in components {
+                            for trailing in [false, true] {
+                                let mut raw = format!("{drive}:{separator}{first}");
+                                raw.push_str(&format!("{separator}{second}{separator}{third}"));
+                                if trailing {
+                                    raw.push(separator);
+                                }
+                                let expected_drive = drive.to_ascii_uppercase();
+                                let path = GuestPath::new(GuestOs::Windows, &raw)
+                                    .unwrap_or_else(|error| panic!("{raw}: {error}"));
+                                let text = path.as_str();
+                                assert!(
+                                    text.starts_with(&format!("{expected_drive}:/")),
+                                    "{raw} -> {text}"
+                                );
+                                assert!(!text.contains('\\'), "{raw} -> {text}");
+                                assert!(!text.contains("//"), "{raw} -> {text}");
+                                assert!(!text.ends_with('/'), "{raw} -> {text}");
+                                // Re-parsing the canonical form is a no-op.
+                                assert_eq!(
+                                    GuestPath::new(GuestOs::Windows, text).unwrap().as_str(),
+                                    text
+                                );
+                                assert_eq!(path.file_name(), Some(third));
+                                let ancestors = path.ancestors();
+                                assert_eq!(
+                                    ancestors.first().unwrap().as_str(),
+                                    format!("{expected_drive}:")
+                                );
+                                assert_eq!(ancestors.last().unwrap().as_str(), text);
+                                let parent = path.parent().unwrap();
+                                assert_eq!(parent.join(third).unwrap().as_str(), text);
+                                for ancestor in ancestors {
+                                    assert_eq!(
+                                        GuestPath::new(GuestOs::Windows, ancestor.as_str())
+                                            .unwrap()
+                                            .as_str(),
+                                        ancestor.as_str()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn windows_path_rejects_unsupported_shapes_exhaustively() {
+        // Each shape must be refused by the check that actually applies to it, so a
+        // regression cannot make a case "pass" by failing for an unrelated reason.
+        let rejected = [
+            ("\\\\server\\share", "UNC paths are not supported"),
+            ("//server/share", "UNC paths are not supported"),
+            ("\\\\?\\C:\\Users", "device paths are not supported"),
+            ("\\\\.\\C:\\Users", "device paths are not supported"),
+            ("C:foo", "drive-relative Windows paths are not supported"),
+            ("C", "must start with a drive letter"),
+            ("", "must not be empty"),
+            ("/root", "must start with a drive letter"),
+            ("root", "must start with a drive letter"),
+            ("C:/Users/..", "`..` is not allowed"),
+            ("C:/Users/../../etc", "`..` is not allowed"),
+            ("C:/Users\\..\\x", "`..` is not allowed"),
+            ("C:/Users/qlean\u{0}", "NUL bytes"),
+            ("C:/Users/qlean\u{7}", "control character"),
+            ("C:/Users/na<me", "character Windows does not allow"),
+            ("C:/Users/na>me", "character Windows does not allow"),
+            ("C:/Users/na:me", "character Windows does not allow"),
+            ("C:/Users/na\"me", "character Windows does not allow"),
+            ("C:/Users/na|me", "character Windows does not allow"),
+            ("C:/Users/na?me", "character Windows does not allow"),
+            ("C:/Users/na*me", "character Windows does not allow"),
+            ("C:/Users/trailing ", "ends with a space or dot"),
+            ("C:/Users/trailing.", "ends with a space or dot"),
+            ("C:/CON", "reserved Windows device name"),
+            ("C:/con.txt", "reserved Windows device name"),
+            ("C:/Users/NUL", "reserved Windows device name"),
+            ("C:/Users/COM1.log", "reserved Windows device name"),
+            ("C:/Users/LPT9", "reserved Windows device name"),
+            ("C:/Users/prn.tar.gz", "reserved Windows device name"),
+        ];
+        for (raw, expected) in rejected {
+            let message = GuestPath::new(GuestOs::Windows, raw)
+                .err()
+                .unwrap_or_else(|| panic!("`{raw}` should be rejected"))
+                .to_string();
+            assert!(
+                message.contains(expected),
+                "`{raw}` was rejected with `{message}`, expected `{expected}`"
+            );
+        }
     }
 }
