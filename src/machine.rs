@@ -178,6 +178,20 @@ impl Default for MachineConfig {
     }
 }
 
+/// Connection budget for `Machine::launch`.
+///
+/// A Windows guest's first boot must also finish its deployment before `sshd`
+/// answers, and that work is budgeted by `windows::deploy_timeout` (900s by
+/// default). Using the plain connect budget there would abort a working first
+/// boot at 180s, leaving the deployment budget unreachable. Later boots and
+/// Linux guests keep the historical connect budget.
+fn resolve_connect_timeout(config: &MachineConfig, guest_os: GuestOs, is_init: bool) -> Duration {
+    if guest_os == GuestOs::Windows && is_init {
+        return windows::deploy_timeout(config);
+    }
+    resolve_ssh_timeout(config)
+}
+
 fn resolve_ssh_timeout(config: &MachineConfig) -> Duration {
     config
         .ssh_timeout
@@ -1040,7 +1054,7 @@ StandardError=journal
             self.cid, self.keypair.privkey_path,
         );
 
-        let ssh_timeout = resolve_ssh_timeout(&self.config);
+        let ssh_timeout = resolve_connect_timeout(&self.config, self.image.guest_os, is_init);
 
         // Helper: read pid written by launch_qemu.
         async fn read_pid(vmid: &str) -> Result<u32> {
@@ -1541,5 +1555,57 @@ impl Drop for Machine {
             let run_dir = dirs.runs.join(&self.id);
             let _ = std::fs::remove_dir_all(run_dir);
         }
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    fn config(ssh_timeout: Option<u64>) -> MachineConfig {
+        MachineConfig {
+            ssh_timeout,
+            ..MachineConfig::default()
+        }
+    }
+
+    #[test]
+    fn windows_first_boot_uses_the_deployment_budget() {
+        // 900s, not the 180s/300s Linux connect budget: the guest still has to
+        // install the seed key and enable sshd before it answers.
+        assert_eq!(
+            resolve_connect_timeout(&config(None), GuestOs::Windows, true),
+            windows::deploy_timeout(&config(None))
+        );
+        assert_eq!(
+            resolve_connect_timeout(&config(None), GuestOs::Windows, true),
+            Duration::from_secs(windows::DEPLOY_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn windows_restart_keeps_the_connect_budget() {
+        // No deployment happens on spawn, so the override is the plain connect budget.
+        assert_eq!(
+            resolve_connect_timeout(&config(Some(45)), GuestOs::Windows, false),
+            Duration::from_secs(45)
+        );
+        assert_eq!(
+            resolve_connect_timeout(&config(Some(45)), GuestOs::Windows, true),
+            Duration::from_secs(45)
+        );
+    }
+
+    #[test]
+    fn linux_first_boot_keeps_the_connect_budget() {
+        let conf = config(None);
+        assert_eq!(
+            resolve_connect_timeout(&conf, GuestOs::Linux, true),
+            resolve_ssh_timeout(&conf)
+        );
+        assert_eq!(
+            resolve_connect_timeout(&config(Some(45)), GuestOs::Linux, true),
+            Duration::from_secs(45)
+        );
     }
 }

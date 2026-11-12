@@ -114,9 +114,11 @@ The seed medium is appended only on the first boot and is deleted as soon as the
 reports `C:\ProgramData\qlean\deployed`. It contains the client's *public* key, the
 per-VM host *private* key and `qlean/deploy.json`; the client private key stays in the
 host secrets directory. The deployment budget is 900s by default (independent of the
-Linux SSH connect timeout of 180s/300s) and can be tuned with `MachineConfig::ssh_timeout`;
-on timeout Qlean keeps the seed medium and returns an error naming the expected marker
-file and this section.
+Linux SSH connect timeout of 180s/300s) and can be tuned with `MachineConfig::ssh_timeout`.
+It bounds both halves of the first boot: waiting for `sshd` to answer and waiting for the
+deploy marker, since a guest that is still deploying does not accept connections yet.
+Later boots use the plain connect budget again. On timeout Qlean keeps the seed medium and
+returns an error naming the expected marker file and this section.
 
 #### Windows transport and security
 
