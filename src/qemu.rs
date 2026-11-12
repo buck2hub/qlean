@@ -110,7 +110,10 @@ fn select_accel(
 /// Windows boots only on UEFI. Secure Boot additionally needs SMM and the secure
 /// pflash property; the resolution step reports which OVMF build was found instead
 /// of silently downgrading the firmware.
-fn windows_firmware_args(firmware: &VmFirmware, tpm_socket: Option<&Path>) -> Vec<String> {
+fn windows_firmware_args(
+    firmware: &VmFirmware,
+    tpm_socket: Option<&Path>,
+) -> anyhow::Result<Vec<String>> {
     let mut args = vec![
         "-machine".to_string(),
         if firmware.secure_boot {
@@ -126,25 +129,49 @@ fn windows_firmware_args(firmware: &VmFirmware, tpm_socket: Option<&Path>) -> Ve
     args.push("-drive".to_string());
     args.push(format!(
         "if=pflash,format=raw,unit=0,readonly=on,file={}",
-        firmware.code.to_string_lossy()
+        qemu_option_path("OVMF code image", &firmware.code)?
     ));
     args.push("-drive".to_string());
     args.push(format!(
         "if=pflash,format=raw,unit=1,file={}",
-        firmware.vars.to_string_lossy()
+        qemu_option_path("OVMF vars image", &firmware.vars)?
     ));
     if let Some(socket) = tpm_socket {
         args.push("-chardev".to_string());
         args.push(format!(
             "socket,id=chrtpm,path={}",
-            socket.to_string_lossy()
+            qemu_option_path("swtpm control socket", socket)?
         ));
         args.push("-tpmdev".to_string());
         args.push("emulator,id=tpm0,chardev=chrtpm".to_string());
         args.push("-device".to_string());
         args.push("tpm-tis,tpmdev=tpm0".to_string());
     }
-    args
+    Ok(args)
+}
+
+/// Render a host path for a comma-separated QEMU option value.
+///
+/// QEMU splits `-drive`/`-chardev` values on commas, so a path containing one would be
+/// read as extra key=value pairs instead of a file name — QEMU would then either refuse
+/// to start with a confusing message, or honour an injected property such as
+/// `cache=unsafe`. Spaces are fine (the value is a single argv element), so only the
+/// separators and control characters that break the encoding are rejected.
+fn qemu_option_path(kind: &str, path: &Path) -> anyhow::Result<String> {
+    let text = path.to_string_lossy().into_owned();
+    if text.is_empty() {
+        anyhow::bail!("{kind} path is empty");
+    }
+    if text.contains(',') {
+        anyhow::bail!(
+            "{kind} path `{text}` contains a comma, which QEMU would read as an option separator; \
+             move it to a path without commas"
+        );
+    }
+    if text.chars().any(|c| c.is_control()) {
+        anyhow::bail!("{kind} path `{text}` contains a control character");
+    }
+    Ok(text)
 }
 
 /// QEMU arguments for the guest transport.
@@ -175,7 +202,7 @@ pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> 
         qemu_cmd.args(windows_firmware_args(
             firmware,
             params.tpm_socket.as_deref(),
-        ));
+        )?);
     } else if params.image.arch == GuestArch::Amd64 {
         // Decrease idle CPU usage on x86_64.
         qemu_cmd.args(["-machine", "hpet=off"]);
@@ -190,25 +217,24 @@ pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> 
         let _ = std::fs::remove_file(&qmp_socket);
     }
 
+    let qmp_chardev = format!(
+        "socket,path={},server=on,wait=off,id=qmp0",
+        qemu_option_path("QMP socket", &qmp_socket)?
+    );
     qemu_cmd.args([
         "-chardev",
-        &format!(
-            "socket,path={},server=on,wait=off,id=qmp0",
-            qmp_socket.to_string_lossy()
-        ),
+        &qmp_chardev,
         "-mon",
         "chardev=qmp0,mode=control",
     ]);
 
+    let disk_drive = format!(
+        "file={},if=virtio,cache=writeback",
+        qemu_option_path("guest disk overlay", &params.image.overlay)?
+    );
     qemu_cmd
         // Disk
-        .args([
-            "-drive",
-            &format!(
-                "file={},if=virtio,cache=writeback",
-                params.image.overlay.to_str().unwrap()
-            ),
-        ])
+        .args(["-drive", &disk_drive])
         // No GUI
         .arg("-nographic");
 
@@ -230,28 +256,24 @@ pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> 
     // Output redirection
     // We multiplex QEMU monitor + guest serial onto stdio AND tee it into a file under the run dir.
     let serial_log = run_dir.join("serial.log");
+    let serial_chardev = format!(
+        "stdio,id=char0,mux=on,signal=off,logfile={},logappend=on",
+        qemu_option_path("serial log", &serial_log)?
+    );
     qemu_cmd
-        .args([
-            "-chardev",
-            &format!(
-                "stdio,id=char0,mux=on,signal=off,logfile={},logappend=on",
-                serial_log.to_string_lossy()
-            ),
-        ])
+        .args(["-chardev", &serial_chardev])
         .args(["-serial", "chardev:char0"])
         .args(["-mon", "chardev=char0,mode=readline"]);
 
     // Seed ISO is only used for initial boot with cloud-init.
     if params.is_init {
-        qemu_cmd.args([
-            "-drive",
-            &format!(
-                // Use an emulated CD-ROM device for maximum compatibility with NoCloud on Fedora/Arch.
-                // Some images do not reliably scan virtio-cdrom paths during early boot.
-                "file={},if=ide,media=cdrom,readonly=on",
-                params.image.seed.to_str().unwrap()
-            ),
-        ]);
+        let seed_drive = format!(
+            // Use an emulated CD-ROM device for maximum compatibility with NoCloud on Fedora/Arch.
+            // Some images do not reliably scan virtio-cdrom paths during early boot.
+            "file={},if=ide,media=cdrom,readonly=on",
+            qemu_option_path("seed ISO", &params.image.seed)?
+        );
+        qemu_cmd.args(["-drive", &seed_drive]);
     }
 
     match select_accel(
@@ -384,7 +406,8 @@ mod tests {
         let args = windows_firmware_args(
             &firmware(true),
             Some(Path::new("/run/qlean/abc/swtpm.sock")),
-        );
+        )
+        .unwrap();
         let joined = args.join(" ");
         assert!(joined.contains("-machine q35,hpet=off,smm=on"), "{joined}");
         assert!(
@@ -411,6 +434,42 @@ mod tests {
     }
 
     #[test]
+    fn test_windows_firmware_args_reject_paths_that_break_the_option_encoding() {
+        // A comma in the file name would be parsed as another key=value pair, so the
+        // value must be rejected before QEMU ever sees it.
+        let mut comma_code = firmware(true);
+        comma_code.code = PathBuf::from("/run/qlean,a/OVMF_CODE.fd");
+        let error = windows_firmware_args(&comma_code, None)
+            .expect_err("a comma in the OVMF code path must be refused")
+            .to_string();
+        assert!(error.contains("OVMF code image"), "{error}");
+        assert!(error.contains("comma"), "{error}");
+
+        let mut comma_vars = firmware(true);
+        comma_vars.vars = PathBuf::from("/run/qlean/abc,unsafe/ovmf_vars.fd");
+        let error = windows_firmware_args(&comma_vars, None)
+            .expect_err("a comma in the OVMF vars path must be refused")
+            .to_string();
+        assert!(error.contains("OVMF vars image"), "{error}");
+
+        let error =
+            windows_firmware_args(&firmware(true), Some(Path::new("/run/q,lean/swtpm.sock")))
+                .expect_err("a comma in the swtpm socket path must be refused")
+                .to_string();
+        assert!(error.contains("swtpm control socket"), "{error}");
+
+        // Spaces are legitimate: the value travels as one argv element.
+        let mut spaced = firmware(true);
+        spaced.code = PathBuf::from("/run/qlean dir/OVMF_CODE.fd");
+        let args = windows_firmware_args(&spaced, None).unwrap();
+        assert!(
+            args.iter()
+                .any(|a| a.ends_with("file=/run/qlean dir/OVMF_CODE.fd")),
+            "{args:?}"
+        );
+    }
+
+    #[test]
     fn test_windows_guest_gets_no_vsock_device() {
         assert!(
             vsock_args(GuestOs::Windows, 42).is_empty(),
@@ -430,7 +489,7 @@ mod tests {
 
     #[test]
     fn test_windows_firmware_args_without_secure_boot() {
-        let args = windows_firmware_args(&firmware(false), None);
+        let args = windows_firmware_args(&firmware(false), None).unwrap();
         let joined = args.join(" ");
         assert!(joined.contains("-machine q35,hpet=off"), "{joined}");
         assert!(!joined.contains("smm=on"), "{joined}");
