@@ -397,6 +397,16 @@ fn resolve_ssh_timeout(config: &MachineConfig) -> Duration {
         })
 }
 
+/// Whether this machine can still hold resources that need tearing down.
+///
+/// A QEMU pid or a live SSH session is proof that something started; the run directory alone
+/// is not, because it exists from `Machine::new` onwards. The single implementation is shared
+/// by `shutdown` (which refuses a machine that was never started) and by
+/// `shutdown_if_started` (which uses it when the liveness probe could not answer).
+fn started(pid_is_some: bool, ssh_is_some: bool) -> bool {
+    pid_is_some || ssh_is_some
+}
+
 // Core methods for Machine
 impl Machine {
     /// Create a new Machine instance with specified image and configuration.
@@ -872,9 +882,66 @@ StandardError=journal
         })
     }
 
+    /// A machine that was constructed but never started: no QEMU pid, no SSH session.
+    ///
+    /// This is the state a pool sees after a launch whose QMP socket never came up, and it is
+    /// one of the states in which `is_running` fails instead of answering.
+    #[cfg(test)]
+    pub(crate) fn never_started_for_tests() -> Self {
+        Self::for_tests_with_pid(None)
+    }
+
+    /// A machine fixture that claims `pid` as its QEMU process.
+    ///
+    /// Used by the teardown tests that hand it a real, live QEMU pid.
+    #[cfg(test)]
+    pub(crate) fn for_tests_with_pid(pid: Option<u32>) -> Self {
+        Machine {
+            id: "never-started".to_string(),
+            image: MachineImage {
+                overlay: PathBuf::from("/nonexistent/overlay.qcow2"),
+                arch: GuestArch::Amd64,
+                guest_os: GuestOs::Linux,
+                seed: PathBuf::from("/nonexistent/seed.iso"),
+            },
+            config: MachineConfig::default(),
+            keypair: PersistedSshKeypair {
+                pubkey_str: String::new(),
+                _pubkey_path: PathBuf::from("/nonexistent/id_ed25519.pub"),
+                privkey_str: String::new(),
+                privkey_path: PathBuf::from("/nonexistent/id_ed25519"),
+            },
+            ssh: None,
+            cid: 3,
+            pid,
+            qemu_should_exit: Arc::new(AtomicBool::new(false)),
+            ssh_cancel_token: None,
+            mac_address: "52:54:00:00:00:01".to_string(),
+            ip: None,
+            swtpm: None,
+            deploy_seed: None,
+            ssh_host_key: None,
+            first_boot_deadline: None,
+        }
+    }
+
+    /// Shut down a machine whose liveness could not be probed.
+    ///
+    /// [`Machine::is_running`] answers "did a QMP session reply", and a hung or unreadable
+    /// socket makes it fail even while QEMU is still running. Callers that would otherwise
+    /// skip the shutdown (see `MachinePool::shutdown_all`) use this instead: a machine that
+    /// never started has nothing to shut down, and one that did is asked to power down with
+    /// the same budget and escalation as [`Machine::shutdown`].
+    pub(crate) async fn shutdown_if_started(&mut self) -> Result<()> {
+        if !started(self.pid.is_some(), self.ssh.is_some()) {
+            return Ok(());
+        }
+        self.shutdown().await
+    }
+
     /// Shutdown the machine.
     pub async fn shutdown(&mut self) -> Result<()> {
-        if self.pid.is_none() && self.ssh.is_none() {
+        if !started(self.pid.is_some(), self.ssh.is_some()) {
             bail!("Machine is not running");
         }
 
@@ -2261,8 +2328,53 @@ fn session_or_operation_error<'a>(
 }
 
 #[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shutting_down_a_machine_that_never_started_is_not_an_error() {
+        // `shutdown_all` reaches this path when the liveness probe failed, which includes
+        // "this machine never came up". Reporting that as a failure would make a pool with a
+        // single failed launch look like it also failed to shut down.
+        Machine::never_started_for_tests()
+            .shutdown_if_started()
+            .await
+            .expect("a machine that never started has nothing to shut down");
+
+        // The strict path keeps refusing it, so a caller that does expect a running guest is
+        // still told the truth.
+        let error = Machine::never_started_for_tests()
+            .shutdown()
+            .await
+            .expect_err("must refuse");
+        assert!(error.to_string().contains("not running"), "{error}");
+    }
+}
+
+#[cfg(test)]
 mod timeout_tests {
     use super::*;
+
+    #[test]
+    fn a_machine_counts_as_started_when_qemu_or_ssh_is_present() {
+        // `shutdown` refuses a machine that never started, and `shutdown_if_started` uses the
+        // same predicate when the liveness probe could not answer. Both are decided from
+        // `pid`/`ssh`; getting this table wrong either leaks a running guest or reports a
+        // spurious "not running" for a machine that was never started.
+        assert!(started(true, true), "QEMU and SSH are both up");
+        assert!(
+            started(true, false),
+            "a QEMU pid is enough proof of a start"
+        );
+        assert!(
+            started(false, true),
+            "a live SSH session is enough proof of a start"
+        );
+        assert!(
+            !started(false, false),
+            "nothing started means there is nothing to shut down"
+        );
+    }
 
     #[test]
     fn a_shared_deadline_has_no_budget_once_it_passed() {

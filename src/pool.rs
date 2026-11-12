@@ -8,6 +8,36 @@ use crate::{Image, Machine, MachineConfig};
 /// A pool operation that has already captured the machine it works on.
 type PoolTask<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
 
+/// What `shutdown_all` should do with one machine.
+///
+/// Separated from the pool loop so the decision can be tested: the interesting case is a
+/// probe that *failed*, which used to abort that machine's task before any shutdown was
+/// attempted.
+#[derive(Debug, PartialEq, Eq)]
+enum ShutdownStep {
+    /// The machine is up: ask the guest to power down.
+    ShutDown,
+    /// The machine is already down: nothing to do.
+    Skip,
+    /// Liveness could not be determined (hung or unreadable QMP socket): shut down anyway.
+    ShutDownWithoutLiveness { reason: String },
+}
+
+/// Decide the shutdown step from the machine's liveness probe.
+///
+/// "Unknown" is not "stopped": a QMP socket that does not answer is what a *hung* QEMU
+/// looks like, and that is exactly the machine that must still be shut down (or killed)
+/// instead of being left running to be SIGKILLed when the pool is dropped.
+fn shutdown_step(probe: Result<bool>) -> ShutdownStep {
+    match probe {
+        Ok(true) => ShutdownStep::ShutDown,
+        Ok(false) => ShutdownStep::Skip,
+        Err(error) => ShutdownStep::ShutDownWithoutLiveness {
+            reason: format!("{error:#}"),
+        },
+    }
+}
+
 /// Run every pool operation to completion and report each failure by machine name.
 ///
 /// The operations are deliberately not cancelled when one machine fails: dropping a start
@@ -140,15 +170,30 @@ impl MachinePool {
     /// Shutdown all machines in the pool concurrently.
     ///
     /// This method collects errors from all shutdown attempts and returns them together.
+    /// A machine whose liveness cannot be probed is still shut down: hibernating or hung
+    /// guests are the ones that most need the graceful path, and skipping them leaves QEMU to
+    /// be SIGKILLed on drop.
     pub async fn shutdown_all(&mut self) -> Result<()> {
         let tasks = self.pool.iter().map(|(name, machine)| {
             let name = name.clone();
             let task: PoolTask<'_> = Box::pin(async move {
                 let mut m = machine.lock().await;
-                if m.is_running().await? {
-                    m.shutdown().await?;
+                match shutdown_step(m.is_running().await) {
+                    ShutdownStep::Skip => Ok(()),
+                    ShutdownStep::ShutDown => m.shutdown().await,
+                    ShutdownStep::ShutDownWithoutLiveness { reason } => {
+                        tracing::warn!(
+                            "shutting down anyway: whether this machine is running could not be \
+                             determined ({reason})"
+                        );
+                        m.shutdown_if_started().await.map_err(|error| {
+                            anyhow::anyhow!(
+                                "liveness could not be determined ({reason}) and the shutdown \
+                                 that was attempted anyway failed: {error}"
+                            )
+                        })
+                    }
                 }
-                Ok(())
             });
             (name, task)
         });
@@ -215,5 +260,78 @@ mod tests {
         ];
         assert!(run_all(tasks.into_iter()).await.is_err());
         assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_a_failed_liveness_probe_still_shuts_the_machine_down() {
+        // The machine answered: power it down.
+        assert_eq!(shutdown_step(Ok(true)), ShutdownStep::ShutDown);
+        // The machine is already down: nothing to do.
+        assert_eq!(shutdown_step(Ok(false)), ShutdownStep::Skip);
+
+        // The probe failed: a hung or unreadable QMP socket is what a *live* QEMU looks like
+        // from here, so "unknown" must not become "stopped". Reporting the error instead of
+        // shutting down left a running guest to be SIGKILLed when the pool was dropped.
+        let step = shutdown_step(Err(anyhow::anyhow!(
+            "failed to connect to QMP socket /run/qlean/vm/qmp.sock: connection refused"
+        )));
+        match step {
+            ShutdownStep::ShutDownWithoutLiveness { reason } => {
+                assert!(reason.contains("connection refused"), "{reason}");
+                assert!(reason.contains("QMP"), "{reason}");
+            }
+            other => panic!("a failed probe must still lead to a shutdown, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a real qemu-system-x86_64 on PATH (DEP-02); run in the qlean-smoke container"]
+    #[serial_test::serial]
+    async fn test_a_live_qemu_without_a_control_socket_is_still_shut_down() {
+        // The state a hung or half-torn-down launch leaves behind: QEMU is alive, the QMP
+        // socket is gone. `is_running` refuses to answer there (starting a second QEMU would
+        // fight this one for the disk), so the pre-fix `shutdown_all` returned that error and
+        // left the process running until `Drop` SIGKILLed whatever was left.
+        let mut child = std::process::Command::new("qemu-system-x86_64")
+            .args(["-machine", "none", "-display", "none", "-nodefaults"])
+            .spawn()
+            .expect("qemu-system-x86_64 must be on PATH for this test");
+        let pid = child.id();
+
+        let mut pool = MachinePool::new();
+        pool.pool.insert(
+            "hung".to_string(),
+            Mutex::new(Machine::for_tests_with_pid(Some(pid))),
+        );
+
+        let outcome = pool.shutdown_all().await;
+        let exited = matches!(child.try_wait(), Ok(Some(_)));
+        if !exited {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+
+        outcome
+            .expect("a machine that is still running must be shut down, not reported as unknown");
+        assert!(
+            exited,
+            "the live QEMU process {pid} was left running instead of being shut down"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_pool_of_machines_that_never_started_shuts_down_cleanly() {
+        // A launch that died before its QMP socket appeared leaves exactly this: a machine
+        // with nothing running. Its liveness probe fails, and folding that failure into
+        // "shutdown failed" reported an error for a pool that was already fully down.
+        let mut pool = MachinePool::new();
+        pool.pool.insert(
+            "ghost".to_string(),
+            Mutex::new(Machine::never_started_for_tests()),
+        );
+
+        pool.shutdown_all()
+            .await
+            .expect("nothing is running, so no shutdown can fail");
     }
 }
