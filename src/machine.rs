@@ -1128,14 +1128,18 @@ StandardError=journal
                     }
                     {
                         let sftp = ssh.get_sftp().await?;
-                        sftp.symlink(remote_entry.as_str(), target.to_string_lossy())
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "failed to recreate the symbolic link {}",
-                                    remote_entry.as_str()
-                                )
-                            })?;
+                        crate::ssh::create_symlink(
+                            sftp,
+                            remote_entry.as_str(),
+                            &target.to_string_lossy(),
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to recreate the symbolic link {}",
+                                remote_entry.as_str()
+                            )
+                        })?;
                     }
                 } else {
                     bail!(

@@ -359,6 +359,43 @@ async fn bounded<T>(
     }
 }
 
+/// Argument pair for `SFTP symlink`, in the order OpenSSH reads them.
+///
+/// `SSH_FXP_SYMLINK` carries two strings and the two plausible orders are both in the
+/// wild: the version-3 draft names them `linkpath` then `targetpath`, while OpenSSH's
+/// `sftp-server` reads the *first* string as the link's target and the second as the path
+/// of the link to create (its own client sends them in that order too). `russh-sftp`
+/// follows the draft: [`russh_sftp::client::SftpSession::symlink`] writes its first
+/// argument into `linkpath`, so passing the link path first makes OpenSSH create the link
+/// at the *target* path - silently, when that path is writable, and reported as a copy
+/// failure only when it is not.
+///
+/// Both halves were measured, not assumed: `russh-sftp` 3.0.0 serializes
+/// `Symlink { linkpath: "LINKNAME", targetpath: "TARGET" }` as `id, "LINKNAME", "TARGET"`,
+/// and OpenSSH 10.6p1's `sftp-server` creates `LINKNAME -> REALFILE` from the pair
+/// (`REALFILE`, `LINKNAME`) and answers `SSH_FX_FAILURE` for (`LINKNAME`, `REALFILE`).
+///
+/// So the pair handed to the client is `(link_target, link_path)`, in that order.
+pub(crate) fn symlink_arguments(link_path: &str, link_target: &str) -> (String, String) {
+    (link_target.to_string(), link_path.to_string())
+}
+
+/// Create a symbolic link in the guest, addressing the request the way OpenSSH reads it.
+///
+/// Callers name the link and its target, in that order, and never touch the wire order:
+/// the swap lives in [`symlink_arguments`], so there is no second place to get it wrong.
+pub(crate) async fn create_symlink(
+    sftp: &russh_sftp::client::SftpSession,
+    link_path: &str,
+    link_target: &str,
+) -> Result<()> {
+    let (first, second) = symlink_arguments(link_path, link_target);
+    sftp.symlink(first, second)
+        .await
+        .map(|_| ())
+        .map_err(Into::into)
+}
+
 fn host_key_rejection_message(transport_name: &str, pinned: bool) -> String {
     if pinned {
         format!(
@@ -1455,6 +1492,42 @@ impl RemoteDirEntry {
 
 #[cfg(test)]
 mod tests {
+    /// The symlink request must put the link's target first, because OpenSSH reads it that way.
+    ///
+    /// The client serializes its first argument into the draft's `linkpath` field, so the
+    /// pair has to be handed over already swapped. This test does not trust the helper: it
+    /// builds the same `Symlink` request the client builds and reads the wire bytes back,
+    /// which is the only place the order is observable. Getting it wrong creates the link at
+    /// the target's path instead of the link's own path - a silent wrong result when that
+    /// path is writable, and a misleading "failed to recreate the symbolic link" otherwise
+    /// (measured against OpenSSH 10.6p1's `sftp-server`).
+    #[test]
+    fn the_symlink_request_sends_the_link_target_before_the_link_path() {
+        let (first, second) = symlink_arguments("/home/qlean/app/bin/tool", "../lib/tool");
+        let request = russh_sftp::protocol::Symlink {
+            id: 1,
+            linkpath: first,
+            targetpath: second,
+        };
+        let bytes = russh_sftp::ser::to_bytes(&request).expect("a symlink request serializes");
+
+        // Payload: request id, then the two strings, each length-prefixed.
+        let mut at = 4;
+        let take_string = |at: &mut usize| {
+            let len = u32::from_be_bytes(bytes[*at..*at + 4].try_into().unwrap()) as usize;
+            let value = String::from_utf8(bytes[*at + 4..*at + 4 + len].to_vec()).unwrap();
+            *at += 4 + len;
+            value
+        };
+        let first_on_the_wire = take_string(&mut at);
+        let second_on_the_wire = take_string(&mut at);
+        assert_eq!(
+            (first_on_the_wire.as_str(), second_on_the_wire.as_str()),
+            ("../lib/tool", "/home/qlean/app/bin/tool"),
+            "OpenSSH creates the link named by the second string, so the target must come first"
+        );
+    }
+
     use super::*;
     use rand::rng;
     use russh::client::Handler;
