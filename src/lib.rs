@@ -519,6 +519,68 @@ mod plan_doc_tests {
             "the trace table's 指定测试 column yielded only {checked} labels"
         );
     }
+    /// The changelog's newest release is the version the crate is, dated, and in order.
+    ///
+    /// A version lives in three places: `Cargo.toml`, the README's support matrix and the
+    /// changelog. Bumping one and not the others is how a release ends up announcing a version
+    /// whose notes are still under `Unreleased`. The date and the ordering are here because a
+    /// release heading that is undated, or a list that runs backwards, is the same kind of drift
+    /// in the same file.
+    #[test]
+    fn the_changelog_releases_the_version_the_crate_is() {
+        const CHANGELOG: &str = include_str!("../CHANGELOG.md");
+        let version = env!("CARGO_PKG_VERSION");
+
+        let mut releases: Vec<(u64, u64, u64, String)> = Vec::new();
+        for line in CHANGELOG.lines() {
+            let Some(rest) = line.strip_prefix("## [") else {
+                continue;
+            };
+            let (name, tail) = rest
+                .split_once(']')
+                .unwrap_or_else(|| panic!("a changelog heading has no closing bracket: {line}"));
+            if name == "Unreleased" {
+                continue;
+            }
+            let parts: Vec<u64> = name
+                .split('.')
+                .map(|part| {
+                    part.parse()
+                        .unwrap_or_else(|_| panic!("a changelog version is not numeric: {line}"))
+                })
+                .collect();
+            assert_eq!(parts.len(), 3, "a changelog version is not x.y.z: {line}");
+            let date = tail
+                .trim()
+                .strip_prefix("- ")
+                .unwrap_or_else(|| panic!("a changelog release is undated: {line}"));
+            assert!(
+                date.len() == 10 && date.as_bytes()[4] == b'-' && date.as_bytes()[7] == b'-',
+                "a changelog release carries a date that is not YYYY-MM-DD: {line}"
+            );
+            releases.push((parts[0], parts[1], parts[2], name.to_string()));
+        }
+        assert!(
+            releases.len() >= 5,
+            "the changelog lists only {} releases",
+            releases.len()
+        );
+        assert_eq!(
+            releases[0].3, version,
+            "the changelog's newest release is {}, but the crate is {version}: bumping one without \
+             the other announces a version whose notes are still unreleased",
+            releases[0].3
+        );
+        for window in releases.windows(2) {
+            assert!(
+                (window[0].0, window[0].1, window[0].2) > (window[1].0, window[1].1, window[1].2),
+                "the changelog lists {} above {}, so it reads backwards",
+                window[0].3,
+                window[1].3
+            );
+        }
+    }
+
     /// Every `QLEAN_*` override the crate reads is named in the README.
     ///
     /// The overrides are the only way to point the crate at a different OVMF, swtpm or timeout
