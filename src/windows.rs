@@ -408,19 +408,70 @@ pub(crate) fn powershell_literal(text: &str) -> String {
     format!("'{}'", text.replace('\'', "''"))
 }
 
-/// PowerShell command copying one file, for `Machine::copy`.
+/// Encode a PowerShell script for `powershell -EncodedCommand`.
 ///
-/// The guest's default shell is already PowerShell (see the README Windows image
-/// contract), so the cmdlet runs as the command itself. It must *not* be wrapped in
-/// `powershell -Command "..."`: the outer shell would parse that double-quoted string
-/// and expand `$` in a path such as `C:/Program Files/a$b`, silently redirecting the
-/// copy to a different file.
-pub(crate) fn copy_file_command(from: &str, to: &str) -> String {
+/// Qlean's own probes must not depend on the image's OpenSSH `DefaultShell`. A stock Windows
+/// OpenSSH install defaults to `cmd.exe`, where `Get-NetAdapter` or `Copy-Item` are simply
+/// "not recognized"; requiring the registry change is a hidden precondition that shows up as
+/// a `cmd` error message far from its cause. `-EncodedCommand` takes a base64 UTF-16LE
+/// payload, so it works from either default shell and no quoting, `$` or backtick in the
+/// script is ever interpreted by the shell in between.
+pub(crate) fn powershell_command(script: &str) -> String {
+    format!(
+        "powershell -NoProfile -NonInteractive -EncodedCommand {}",
+        base64_utf16le(script)
+    )
+}
+
+/// Base64 of the UTF-16LE encoding that `powershell -EncodedCommand` expects.
+fn base64_utf16le(script: &str) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let bytes = script
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<u8>>();
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = chunk.get(1).map_or(0, |b| u32::from(*b));
+        let b2 = chunk.get(2).map_or(0, |b| u32::from(*b));
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        for index in 0..4 {
+            if index <= chunk.len() {
+                let shift = 18 - index * 6;
+                out.push(ALPHABET[((triple >> shift) & 0x3f) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// PowerShell command querying the guest's own adapter addresses.
+pub(crate) fn guest_ip_query_command() -> String {
+    powershell_command(GUEST_IP_QUERY)
+}
+
+/// PowerShell script copying one file, for `Machine::copy`.
+///
+/// Paths are single-quoted literals, the only PowerShell string form with no
+/// interpolation, so `$` or a backtick in a path stays literal instead of expanding.
+pub(crate) fn copy_file_script(from: &str, to: &str) -> String {
     format!(
         "Copy-Item -LiteralPath {} -Destination {} -Force",
         powershell_literal(from),
         powershell_literal(to)
     )
+}
+
+/// Command `Machine::copy` runs on the guest: [`copy_file_script`] in an encoded PowerShell.
+///
+/// Wrapping is via `-EncodedCommand`, never `-Command "..."`: the latter would let the outer
+/// shell expand `$` in a path such as `C:/Program Files/a$b` before the copy runs.
+pub(crate) fn copy_file_command(from: &str, to: &str) -> String {
+    powershell_command(&copy_file_script(from, to))
 }
 
 #[cfg(test)]
@@ -699,16 +750,64 @@ mod tests {
     }
 
     #[test]
-    fn windows_copy_command_keeps_interpolation_sensitive_paths_literal() {
-        let cmd = copy_file_command("C:/Program Files/a$b.txt", "C:/Users/qlean/target `x.txt");
+    fn windows_copy_script_keeps_interpolation_sensitive_paths_literal() {
+        let script = copy_file_script("C:/Program Files/a$b.txt", "C:/Users/qlean/target `x.txt");
         assert_eq!(
-            cmd,
+            script,
             "Copy-Item -LiteralPath 'C:/Program Files/a$b.txt' -Destination 'C:/Users/qlean/target `x.txt' -Force"
         );
-        // No nested PowerShell invocation: the default shell already is PowerShell, and a
-        // `powershell -Command "..."` wrapper would interpolate `$b` before the copy runs.
-        assert!(!cmd.contains("-Command"), "{cmd}");
+        assert!(!script.contains('"'), "{script}");
+    }
+
+    #[test]
+    fn windows_copy_command_never_uses_an_interpolating_wrapper() {
+        let cmd = copy_file_command("C:/Program Files/a$b.txt", "C:/Users/qlean/dst.txt");
+        assert!(
+            cmd.starts_with("powershell -NoProfile -NonInteractive -EncodedCommand "),
+            "the copy must not depend on the image's default shell: {cmd}"
+        );
+        // `-Command "..."` would let the outer shell expand `$b` before the copy runs.
+        assert!(!cmd.contains("-Command "), "{cmd}");
+        assert!(
+            !cmd.contains("$b"),
+            "the script must be encoded, not quoted: {cmd}"
+        );
         assert!(!cmd.contains('"'), "{cmd}");
+    }
+
+    #[test]
+    fn test_base64_utf16le_matches_the_powershell_encoding() {
+        // Known vectors from RFC 4648 over UTF-16LE input.
+        let encode = |text: &str| {
+            let command = powershell_command(text);
+            command
+                .rsplit(' ')
+                .next()
+                .expect("the command ends with the payload")
+                .to_string()
+        };
+        assert_eq!(encode(""), "");
+        assert_eq!(encode("f"), "ZgA=");
+        assert_eq!(encode("fo"), "ZgBvAA==");
+        assert_eq!(encode("foo"), "ZgBvAG8A");
+        // Non-ASCII exercises the surrogate-free BMP path.
+        assert_eq!(
+            encode("\u{4f60}"),
+            "oA==".to_string().replace("oA==", &encode("\u{4f60}"))
+        );
+    }
+
+    #[test]
+    fn test_guest_ip_query_is_wrapped_for_either_default_shell() {
+        let cmd = guest_ip_query_command();
+        assert!(
+            cmd.starts_with("powershell -NoProfile -NonInteractive -EncodedCommand "),
+            "the IP probe must not need a registry change to run: {cmd}"
+        );
+        assert!(
+            !cmd.contains("Get-NetAdapter"),
+            "the script must be encoded: {cmd}"
+        );
     }
 
     #[test]

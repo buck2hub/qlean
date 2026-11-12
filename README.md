@@ -110,7 +110,11 @@ already be generalized and ship a first-boot task that consumes Qlean's seed med
    - installs `qlean/ssh_host_ed25519_key` as `C:\ProgramData\ssh\ssh_host_ed25519_key`
      with the same owner-only ACL, so the host key Qlean pins really is the per-VM key;
    - writes an `sshd_config` with `PubkeyAuthentication yes`, `PasswordAuthentication no`
-     and a `sftp` subsystem, sets the OpenSSH default shell to PowerShell
+     and a `sftp` subsystem. Qlean's own probes (guest IP query, file copy) are
+     wrapped in `powershell -NoProfile -NonInteractive -EncodedCommand`, so they run
+     under either default shell; your `exec` commands still use the image's default
+     shell, and the contract below assumes PowerShell, so the image should set the
+     OpenSSH default shell to PowerShell
      (`HKLM:\SOFTWARE\OpenSSH` -> `DefaultShell` =
      `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`, which Qlean's
      `exec` semantics assume), then restarts `sshd`;

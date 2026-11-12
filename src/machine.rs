@@ -1207,7 +1207,7 @@ StandardError=journal
     async fn query_windows_ip(&mut self) -> Result<String> {
         let (ssh, cancel_token) = self.get_ssh("query the guest address")?;
         let (code, stdout, stderr) = ssh
-            .call_probe(windows::GUEST_IP_QUERY, cancel_token)
+            .call_probe(&windows::guest_ip_query_command(), cancel_token)
             .await?;
         if code != 0 {
             bail!(
