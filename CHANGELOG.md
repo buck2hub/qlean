@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Teardown's "still running after SIGKILL" error carried a 30-space hole where a line continuation was intended, and the guard that rejects padded user-facing messages did not cover it; the message is now one sentence and is part of that guard
 - A DHCP lease lookup where `virsh net-dhcp-leases` never succeeded was reported as "the guest may still be booting", so an unreachable or unreadable libvirt sent the reader to the wrong machine after the full budget; the timeout now says the lease table could not be read, keeps `virsh`'s own message, and only speculates about the guest when a listing actually succeeded
 - Each `virsh net-dhcp-leases` call in the lease poll is now capped by what is left of the lookup budget, so a wedged libvirtd can no longer outlive the deadline by hanging inside one call; the bounded-run helper is shared with the seed ISO build instead of existing twice
+- Every external command on the launch, network and prerequisite paths (`qemu-img`, `xorriso`, all `virsh` calls, `--version` probes) is now bounded and killed at its budget, so a wedged host tool fails the launch instead of hanging it; a source guard keeps new unbounded `.output().await` calls out
 
 ### Changed
 

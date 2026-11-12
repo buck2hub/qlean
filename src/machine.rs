@@ -302,6 +302,15 @@ fn resolve_connect_timeout(config: &MachineConfig, guest_os: GuestOs, is_init: b
 /// instead of failing it.
 const SSH_CLOSE_BUDGET: Duration = Duration::from_secs(5);
 
+/// How long a local host tool on the launch path may take.
+///
+/// `qemu-img` creates only COW metadata and `xorriso` packs two small files, so both finish in
+/// milliseconds on a healthy host. They read and write the run directory, though, and a run
+/// directory on an unreachable mount (NFS, a hung FUSE mount) turns the call into an
+/// unbounded wait *before* the first-boot budget even starts. The same budget the Windows seed
+/// build uses keeps the launch path bounded end to end.
+const LOCAL_TOOL_BUDGET: Duration = Duration::from_secs(120);
+
 /// Await `future` for at most `budget`, returning `None` when the budget was spent.
 ///
 /// Used by teardown paths where a stuck step must not prevent the next (stronger) step from
@@ -379,7 +388,12 @@ impl Machine {
             "Creating overlay image with command:\n{:?}",
             qemu_img_command.to_string()
         );
-        let output = qemu_img_command.output().await?;
+        let output = crate::utils::bounded_output(
+            qemu_img_command,
+            LOCAL_TOOL_BUDGET,
+            "create the disk overlay from the cached image",
+        )
+        .await?;
         if !output.status.success() {
             bail!(
                 "Failed to create overlay image: {}",
@@ -602,7 +616,12 @@ StandardError=journal
             "Creating seed ISO with command:\n{:?}",
             xorriso_command.to_string()
         );
-        let output = xorriso_command.output().await?;
+        let output = crate::utils::bounded_output(
+            xorriso_command,
+            LOCAL_TOOL_BUDGET,
+            "build the cloud-init seed ISO",
+        )
+        .await?;
         if !output.status.success() {
             bail!(
                 "Failed to create seed ISO: {}",
@@ -663,7 +682,12 @@ StandardError=journal
                 "Resizing overlay image with command:\n{:?}",
                 qemu_img_command.to_string()
             );
-            let output = qemu_img_command.output().await?;
+            let output = crate::utils::bounded_output(
+                qemu_img_command,
+                LOCAL_TOOL_BUDGET,
+                "resize the disk overlay",
+            )
+            .await?;
             if !output.status.success() {
                 bail!(
                     "Failed to resize image: {}",

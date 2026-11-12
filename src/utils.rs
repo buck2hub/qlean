@@ -40,6 +40,16 @@ pub(crate) struct DhcpLease {
     pub expiry: String,
 }
 
+/// How long one `virsh` call may take.
+///
+/// These are local RPCs against `libvirtd`; on a healthy host each finishes in milliseconds.
+/// The budget exists for the unhealthy case: a wedged `libvirtd` (or a socket that never
+/// answers) must fail the launch with a message instead of hanging it.
+const VIRSH_CALL_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a prerequisite probe (`<program> --version`) may take.
+const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Run `cmd` and collect its output, but never wait longer than `budget`.
 ///
 /// A budget that does not also end the child process is not a budget: `kill_on_drop`
@@ -585,11 +595,9 @@ fn program_problems(probes: &[(&str, ProgramProbe)]) -> Vec<String> {
 async fn check_commands_available(programs: &[&'static str]) -> Vec<String> {
     let mut probes = Vec::with_capacity(programs.len());
     for program in programs {
-        let probe = match tokio::process::Command::new(program)
-            .arg("--version")
-            .output()
-            .await
-        {
+        let mut probe_command = tokio::process::Command::new(program);
+        probe_command.arg("--version");
+        let probe = match bounded_output(probe_command, PROBE_BUDGET, "probe the program").await {
             Ok(output) if output.status.success() => ProgramProbe::Available,
             // A program that cannot run `--version` is not usable, even if it exists.
             Ok(output) => ProgramProbe::Broken(output.status.to_string()),
@@ -611,26 +619,32 @@ fn ensure_vsock() -> Result<()> {
 }
 
 async fn ensure_network() -> Result<()> {
-    let output = tokio::process::Command::new("virsh")
+    let mut command = tokio::process::Command::new("virsh");
+    command
         .arg("-c")
         .arg(VIRSH_CONNECTION_URI)
         .arg("net-list")
         .arg("--name")
-        .arg("--all")
-        .output()
+        .arg("--all");
+    let output = bounded_output(command, VIRSH_CALL_BUDGET, "list every libvirt network")
         .await
         .context("failed to execute virsh to check qlean network")?;
     let all_networks = listed_networks(&output, "net-list --all")?;
     let net_exists = all_networks.contains("qlean");
 
-    let output = tokio::process::Command::new("virsh")
+    let mut command = tokio::process::Command::new("virsh");
+    command
         .arg("-c")
         .arg(VIRSH_CONNECTION_URI)
         .arg("net-list")
-        .arg("--name")
-        .output()
-        .await
-        .context("failed to execute virsh to check qlean network")?;
+        .arg("--name");
+    let output = bounded_output(
+        command,
+        VIRSH_CALL_BUDGET,
+        "list the active libvirt networks",
+    )
+    .await
+    .context("failed to execute virsh to check qlean network")?;
     let active_networks = listed_networks(&output, "net-list")?;
     let net_active = active_networks.contains("qlean");
 
@@ -669,12 +683,13 @@ async fn ensure_network() -> Result<()> {
             .await
             .context("failed to write qlean network xml file")?;
 
-        let output = tokio::process::Command::new("virsh")
+        let mut command = tokio::process::Command::new("virsh");
+        command
             .arg("-c")
             .arg(VIRSH_CONNECTION_URI)
             .arg("net-define")
-            .arg(&xml_path)
-            .output()
+            .arg(&xml_path);
+        let output = bounded_output(command, VIRSH_CALL_BUDGET, "define the qlean network")
             .await
             .context("failed to execute virsh to define qlean network")?;
         if !output.status.success() {
@@ -687,14 +702,19 @@ async fn ensure_network() -> Result<()> {
 
     if !net_exists || !net_active {
         debug!("Starting qlean network");
-        let output = tokio::process::Command::new("virsh")
+        let mut command = tokio::process::Command::new("virsh");
+        command
             .arg("-c")
             .arg(VIRSH_CONNECTION_URI)
             .arg("net-autostart")
-            .arg("qlean")
-            .output()
-            .await
-            .context("failed to execute virsh to autostart qlean network")?;
+            .arg("qlean");
+        let output = bounded_output(
+            command,
+            VIRSH_CALL_BUDGET,
+            "mark the qlean network autostart",
+        )
+        .await
+        .context("failed to execute virsh to autostart qlean network")?;
         if !output.status.success() {
             bail!(
                 "failed to autostart the qlean network: {}",
@@ -702,12 +722,13 @@ async fn ensure_network() -> Result<()> {
             );
         }
 
-        let output = tokio::process::Command::new("virsh")
+        let mut command = tokio::process::Command::new("virsh");
+        command
             .arg("-c")
             .arg(VIRSH_CONNECTION_URI)
             .arg("net-start")
-            .arg("qlean")
-            .output()
+            .arg("qlean");
+        let output = bounded_output(command, VIRSH_CALL_BUDGET, "start the qlean network")
             .await
             .context("failed to execute virsh to start qlean network")?;
         if !output.status.success() {
@@ -762,14 +783,19 @@ fn bridge_assumed_message() -> String {
 
 /// Bridge name of the existing `qlean` libvirt network.
 async fn existing_network_bridge() -> Result<Option<String>> {
-    let output = tokio::process::Command::new("virsh")
+    let mut command = tokio::process::Command::new("virsh");
+    command
         .arg("-c")
         .arg(VIRSH_CONNECTION_URI)
         .arg("net-dumpxml")
-        .arg("qlean")
-        .output()
-        .await
-        .context("failed to read the qlean network definition")?;
+        .arg("qlean");
+    let output = bounded_output(
+        command,
+        VIRSH_CALL_BUDGET,
+        "read the qlean network definition",
+    )
+    .await
+    .context("failed to read the qlean network definition")?;
     if !output.status.success() {
         bail!(
             "`virsh net-dumpxml qlean` failed ({}); cannot verify that the network provides \
@@ -946,6 +972,31 @@ mod tests {
             lease_address_for(&leases, "52:54:00:aa:bb:cc").map(|ip| ip.to_string()),
             Some("192.168.221.77".to_string())
         );
+    }
+
+    #[test]
+    fn test_production_code_never_awaits_a_command_without_a_budget() {
+        // Every external command on the launch, teardown and network paths goes through
+        // `bounded_output`, so a wedged child cannot outlive its budget. Written as a source
+        // guard because the failing form compiles and looks innocuous in review.
+        let sources = [
+            ("machine.rs", include_str!("machine.rs")),
+            ("utils.rs", include_str!("utils.rs")),
+            ("windows.rs", include_str!("windows.rs")),
+            ("qemu.rs", include_str!("qemu.rs")),
+            ("firmware.rs", include_str!("firmware.rs")),
+            ("qmp.rs", include_str!("qmp.rs")),
+            ("ssh.rs", include_str!("ssh.rs")),
+            ("pool.rs", include_str!("pool.rs")),
+        ];
+        // Split so this guard does not match itself.
+        let unbounded = concat!(".output()", ".await");
+        for (name, source) in sources {
+            assert!(
+                !source.contains(unbounded),
+                "src/{name} awaits a child process without a budget; use `bounded_output`"
+            );
+        }
     }
 
     #[tokio::test]
