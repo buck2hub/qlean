@@ -1439,15 +1439,15 @@
 
 | 任务 | 来源/证据 | 代码落点 | 文档/CHANGELOG 动作 | 指定测试 `(new)` |
 |---|---|---|---|---|
-| SPK-01 | `src/ssh.rs:89-104,571-630` | 无生产代码 | ADR-WIN-02 | 手工连接/SFTP 证据 |
-| SPK-02 | `src/qemu.rs:74-169` | 无生产代码 | ADR-WIN-03 | 手工首启/重启证据 |
-| OSX-01 | `src/image.rs:68-81,645-717` | image/lib/machine | README API/Migration、CHANGELOG | `guest_os_default`、`guest_os_defaults_to_linux`（旧 JSON 用例在该测试内部）、`guest_os_mismatch` |
-| OSX-02 | `src/qemu.rs:74-169`、`src/machine.rs:63-68,156-157` | qemu/machine/utils/firmware | README Host Setup（含 Windows 最低/推荐资源）、CHANGELOG | `windows_firmware_lifecycle`、`firmware_resolve`、`firmware_arguments_are_accepted_by_real_qemu`、`qmp_control_channel` |
-| OSX-03 | `src/machine.rs:181-464` | machine/windows | README 部署、CHANGELOG | `windows_first_boot`、`windows_deploy_timeout`、`windows_seed_medium` |
-| TRN-01 | `src/ssh.rs:89-104,571-630` | ssh/machine/utils | README 传输/限制、CHANGELOG | `windows_transport`、`windows_pool` |
-| EXE-01 | `src/machine.rs:495-516` | machine/ssh/exec（新 `src/exec.rs`） | README exec、CHANGELOG | `windows_exec` |
-| IP-01 | `src/ssh.rs:831-841` | windows/machine | README get_ip、CHANGELOG | `windows_get_ip` |
-| FS-01 | `src/machine.rs:578-775,922-1137` | guest_path/machine/ssh | README 文件矩阵、CHANGELOG | `windows_files` |
+| SPK-01 | `src/ssh.rs::connect_ssh`、`src/ssh.rs::connect_ssh_windows` | 无生产代码 | ADR-WIN-02 | 手工连接/SFTP 证据 |
+| SPK-02 | `src/qemu.rs::windows_firmware_args`、`src/firmware.rs::prepare_vars` | 无生产代码 | ADR-WIN-03 | 手工首启/重启证据 |
+| OSX-01 | `src/image.rs::ensure_windows_image_is_qcow2`、`src/image.rs::ensure_cached_guest_os` | image/lib/machine | README API/Migration、CHANGELOG | `guest_os_default`、`guest_os_defaults_to_linux`（旧 JSON 用例在该测试内部）、`guest_os_mismatch` |
+| OSX-02 | `src/qemu.rs::windows_firmware_args`、`src/qemu.rs::select_accel`、`src/firmware.rs::swtpm_args`、`src/machine.rs::MachineConfig` | qemu/machine/utils/firmware | README Host Setup（含 Windows 最低/推荐资源）、CHANGELOG | `windows_firmware_lifecycle`、`firmware_resolve`、`firmware_arguments_are_accepted_by_real_qemu`、`qmp_control_channel` |
+| OSX-03 | `src/machine.rs::discover_windows_endpoint`、`src/machine.rs::confirm_deployment` | machine/windows | README 部署、CHANGELOG | `windows_first_boot`、`windows_deploy_timeout`、`windows_seed_medium` |
+| TRN-01 | `src/ssh.rs::connect_ssh_windows`、`src/utils.rs::parse_dhcp_leases` | ssh/machine/utils | README 传输/限制、CHANGELOG | `windows_transport`、`windows_pool` |
+| EXE-01 | `src/machine.rs::exec`、`src/exec.rs::exit_status_from_code` | machine/ssh/exec（新 `src/exec.rs`） | README exec、CHANGELOG | `windows_exec` |
+| IP-01 | `src/windows.rs::guest_ip_query_command`、`src/machine.rs::query_windows_ip` | windows/machine | README get_ip、CHANGELOG | `windows_get_ip` |
+| FS-01 | `src/guest_path.rs::GuestPath`、`src/ssh.rs::walk_remote_dir`、`src/windows.rs::copy_file_command` | guest_path/machine/ssh | README 文件矩阵、CHANGELOG | `windows_files` |
 | REL-01 | Cargo/CHANGELOG/CI | 版本与 CI | CHANGELOG 0.4.0/Release | 全量与远端门 |
 
 ## 里程碑验收与回滚

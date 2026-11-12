@@ -2545,6 +2545,64 @@ mod plan_doc_tests {
         assert!(seen >= 40, "only {seen} line citations were checked");
     }
 
+    /// The traceability table points at names, not at line numbers.
+    ///
+    /// R127 taught this table's numbers to stay inside their files, which kept them syntactically
+    /// valid and let them rot semantically: after ten implementation cards, the row that used to
+    /// point at `Machine::exec` pointed at a `let` binding in a test, and nothing objected. R79
+    /// fixed the same rot in the baseline table by pinning it to a commit; a table that is read
+    /// as "where this lives" cannot carry a snapshot, so its anchors are symbols. The symbol scan
+    /// above then keeps them honest.
+    #[test]
+    fn the_traceability_table_points_at_symbols_not_at_line_numbers() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+
+        let table = PLAN
+            .split("\n## 追溯表\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## 里程碑验收与回滚\n").next())
+            .expect("the plan no longer has a traceability table");
+        let mut rows = 0;
+        let mut symbols = 0_usize;
+        for line in table.lines() {
+            if !line.starts_with("| ") || line.starts_with("| 任务 ") || line.starts_with("|---")
+            {
+                continue;
+            }
+            rows += 1;
+            let mut rest = line;
+            while let Some(at) = rest.find("src/") {
+                rest = &rest[at..];
+                let close = rest.find('`').unwrap_or(rest.len());
+                let citation = &rest[..close];
+                let looks_like_a_range = citation
+                    .split_once("::")
+                    .map_or_else(|| citation.split_once(':').map(|(_, spec)| spec), |_| None)
+                    .is_some_and(|spec| {
+                        !spec.is_empty()
+                            && spec
+                                .chars()
+                                .all(|c| c.is_ascii_digit() || c == ',' || c == '-')
+                    });
+                assert!(
+                    !looks_like_a_range,
+                    "the traceability table cites `{citation}`: a line range is true only until \
+                     the next edit, so this table points at `src/<file>.rs::<symbol>` instead"
+                );
+                if citation.contains("::") {
+                    symbols += 1;
+                }
+                rest = &rest[close..];
+            }
+        }
+        assert_eq!(rows, 10, "the traceability table has {rows} rows");
+        assert!(
+            symbols >= 15,
+            "only {symbols} rows of the traceability table point at a symbol: the scan is not \
+             looking at the table"
+        );
+    }
+
     /// The evidence summary repeats the lifecycle its card declares, in a third place.
     ///
     /// The same two tokens are written three times: in the card, in the status view's table and in
