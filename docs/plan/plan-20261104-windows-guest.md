@@ -182,6 +182,7 @@
 | 2026-11-13 08:10:00 UTC | review R70（指向不存在的章节，等于没有那张表） | F75：README 的 Windows 状态说明写着「所以**下面的支持矩阵**仍然只声明 Linux，0.4.0 未发布」——但整篇 README 里**根本没有支持矩阵**（全文只有这一个 `matrix` 词）。而计划自身的 `REL-01` 验收写的是「README 支持矩阵只包含实际通过核心冒烟的 Windows 版本」，也就是说这张表是我们承诺要给别人核对的东西，却一直不存在：读者按指引往下找，什么也找不到；我们也无法用一张不存在的表证明「没越界宣称」。修：在状态说明正下方补上真实的支持矩阵（Guest OS / crate 状态 / 是否声明支持 / 缺什么证据），并把措辞从「lists Linux only」改为「claims Linux only」以与表内容一致。表中 Windows 一行明写 `Claimed support = no`、缺的证据是那 7 个 `windows_*` 冒烟（`rg -c` 核对恰为 7 个），Linux 一行写明 `0.3.1` 已发布。纯文档、无行为变化，不动 CHANGELOG | `REL-01`（发布卡要求 README 支持矩阵诚实）、`OSX-01`（Windows 状态声明）| README、Review log、覆盖矩阵、plan-status |
 | 2026-11-13 08:40:00 UTC | review R71（启动阶段不能有一步没预算） | F76：`DeploySeed::build` 直接 `cmd.output().await` 跑 `xorriso`，**没有任何预算**。这与 R62（QMP 10s）、R63（SSH 关闭 5s、SIGKILL 30s+5s）是同一族：控制面里每个可能卡住的步骤都必须有上限。种子介质只有三个小文件（客户端公钥、每 VM 主机密钥、`deploy.json`），健康时毫秒级完成；但 `xorriso` 读的是暂存目录，一旦该目录落在无响应的网络挂载或僵死的 FUSE 上，`Machine::init` 会在**首启 deadline 还没开始计时之前**无限挂住——用户拿到的是一个永远不返回的测试，而不是一条能读的错。修：新增 `SEED_BUILD_BUDGET = 120s` 与 `bounded_output(cmd, budget, what)`，`cmd.kill_on_drop(true)` 是让预算真正生效的一半——deadline 到点时 future 被丢弃必须**杀掉子进程**，否则孤儿 `xorriso` 继续写 ISO。错误里带上程序名、预算与「暂存目录应在响应的本地文件系统上」。新增 2 个 `#[tokio::test]`：正常命令返回输出；`/bin/sleep 30` 在 150ms 预算下必须报错、耗时远小于 10s、错误含 `/bin/sleep`/`150ms`/`killed`，并实测 `pgrep -af "sleep 30"` 无孤儿。`cargo test --lib` 179 → 181 | `OSX-02`（首启部署）、`TRN-01`（部署预算语义）| `src/windows.rs`、CHANGELOG、Review log、覆盖矩阵、plan-status |
 | 2026-11-13 09:10:00 UTC | review R72（`max_by` 的键必须真的代表「谁的地址仍然有效」） | F77：`lease_address_for` 用 `max_by(expiry)` 选地址（R 前轮引入，用来避开续约后已废弃的地址），但 `parse_lease_expiry` 只认 `YYYY-MM-DD HH:MM:SS`，其余一律返回空串。而 `virsh net-dhcp-leases` 对**永不过期**的租约（静态分配/保留）打印的是 `infinite`——它被解析成空串，于是排在**所有真实时间戳之下**。结果恰好反了：永不过期的那条是 guest 一直持有的地址，旁边那条带过期时间的才是它**已经放弃**的地址，而 `max_by` 会选中后者。三个拼写的排序必须是有意的：真实时间戳 < `infinite`，未识别的过期时间 < 两者。修：`parse_lease_expiry` 在日期解析失败后，若行内出现 `infinite`（大小写不敏感）就返回 `"infinite"`（字典序天然高于任何以数字开头的日期），其余仍返回空串（最低）；`DhcpLease::expiry` 的文档同步写清这三档顺序。新增 2 个单测：`infinite`/`Infinite` 都能识别；同一 MAC 的「过期行 + infinite 行」必须选中 infinite 那条地址。`cargo test --lib` 181 → 183 | `TRN-01`（地址发现）、`IP-01`（`get_ip` 语义）| `src/utils.rs`、CHANGELOG、Review log、覆盖矩阵、plan-status |
+| 2026-11-13 09:40:00 UTC | review R73（守卫要覆盖真正出问题的那条消息） | F78：`shutdown` 里那条最不该被误读的错误（SIGKILL 之后进程还在 = **机器没有关掉**）在源码里是两行字符串，但第二行的续行符丢了，于是用户读到的是 `...the machine was not shut down.` 后面跟 **30 个空格** 再跟 `Kill pid N manually...`。更值得注意的是：仓库里**早就有** `user_facing_messages_have_no_runs_of_spaces` 这个回归守卫，但它的清单里没有这条消息——守卫只覆盖了当时想到的两条，所以这条一直带着空格发布。修：把消息抽成 `unkillable_message(pid)`（可测），用真正的 `\` 续行让它成为一句话，并**把它加进那个守卫的清单**；新增单测断言含 `still running after SIGKILL`、含 `Kill pid 4242 manually`、以 `again` 结尾。另做了一次全仓扫描（`[^ ] {2,}[^ "]` 排除注释行）确认同类伪影只此一处，其余多空格均为表格对齐/emoji/测试数据。`cargo test --lib` 183 → 184 | `OSX-03`（关停语义）、`TRN-01`（会话收尾）| `src/machine.rs`、CHANGELOG、Review log、覆盖矩阵、plan-status |
 
 ## 已决议设计决策
 
@@ -784,6 +785,7 @@
 | 集成测试（`#[ignore]`） | `tests/windows_machine.rs`：`windows_transport`（地址、pin、unsupported、shutdown→spawn 重连）、`windows_pool`（双机地址/host key/会话隔离） |
 | README/CHANGELOG | README「Windows transport and security」；CHANGELOG Added ×4 / Changed ×1 |
 | 地址发现与 QEMU 退出 race | `launch` 把 DHCP lease 轮询与 `qemu_handle`、cancel token 一起 `select!`，QEMU 启动即退出时立即返回其真实错误并停 `swtpm`（R12，`src/machine.rs`） |
+| 守卫清单要跟着消息走 | 新增或修改用户可见消息时，必须把它加进覆盖那一类缺陷的守卫清单——「有守卫」不等于「守卫覆盖了它」（R73，`864514c`） |
 | 排序键要能解释自己的顺序 | 只要用 `max_by`/`min_by` 选「最新/最旧」，键的三档取值就必须各自有语义，并在文档里写明谁大于谁（R72，`56531d3`） |
 | 控制面每一步都要有预算 | launch/收尾/构建各步骤各自有上限，超时**杀掉子进程**再报错，绝不让调用方无限等待（R62/R63/R71，`5c54113`/`e0f56a2`） |
 | 引用必须落地 | 文档里「见下表/见下文」的每处指引都必须指向真实存在的内容，承诺的表就是承诺的证据（R70，`acf3c68`） |
@@ -1388,6 +1390,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R70 | 承诺的表必须真的存在 | PASS | 无开放项 | F75：README 与计划都引用「README 支持矩阵」，而 README 里没有这张表 | 补上真实矩阵（Linux 已发布 / Windows 未声明，列出缺失证据）（`acf3c68`）；纯文档 |
 | R71 | 启动阶段不能有一步没预算 | PASS | 无开放项 | F76：`DeploySeed::build` 跑 `xorriso` 无预算，暂存目录卡住会让 `init` 无限挂 | `SEED_BUILD_BUDGET=120s` + `bounded_output` + `kill_on_drop`，2 新单测（`e0f56a2`） |
 | R72 | 比较键必须代表真实语义 | PASS | 无开放项 | F77：`infinite` 租约被当作空串，排在最旧，于是选中已废弃地址 | `parse_lease_expiry` 识别 `infinite`，排序 = 未识别 < 时间戳 < infinite，2 新单测（`56531d3`） |
+| R73 | 守卫要覆盖真正出问题的那条消息 | PASS | 无开放项 | F78：`unkillable` 错误里有 30 个空格，且既有 no-runs-of-spaces 守卫没列它 | 抽出 `unkillable_message`、修续行、**把消息加进守卫清单**，1 新单测（`864514c`） |
 
 ### R1 findings 与修订对照
 
