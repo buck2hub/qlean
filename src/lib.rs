@@ -1449,6 +1449,51 @@ mod plan_doc_tests {
         );
     }
 
+    /// The plan describes the `copy` command the code actually runs.
+    ///
+    /// The FS-01 evidence row was written when Windows `copy` still handed a script to
+    /// `powershell`'s `-Command` argument. R60 moved the delivery to `-EncodedCommand`
+    /// (base64 of UTF-16LE) so the outer shell cannot expand `$` in a path, and R10 dropped a
+    /// redundant `-Command "..."` wrapper - but the row kept the old shape, three rows above
+    /// the R10 row that describes the new one. A reader comparing the card with the code, or
+    /// with the rest of the same table, found two different commands. The guard pins the row
+    /// to `copy_file_command` + `-EncodedCommand` and rejects the stale phrase returning.
+    #[test]
+    fn the_plan_describes_the_copy_command_the_code_runs() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        const WINDOWS: &str = include_str!("windows.rs");
+
+        assert!(
+            !PLAN.contains("-NonInteractive -Command \"Copy-Item"),
+            "that shape predates `-EncodedCommand` and contradicts the row that describes it"
+        );
+
+        let card = {
+            let start = PLAN
+                .find("### Task FS-01:")
+                .expect("the FS-01 card is gone: the guard would be reading nothing");
+            let end = PLAN
+                .find("### Task REL-01:")
+                .expect("the card after FS-01 is gone: the slice would run to the end of the file");
+            &PLAN[start..end]
+        };
+        assert!(
+            card.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains("powershell -NoProfile -NonInteractive -EncodedCommand"),
+            "the FS-01 row has to spell the delivery the code uses, not just mention the flag"
+        );
+        assert!(
+            card.contains("copy_file_command"),
+            "the FS-01 row has to name the function that builds the command"
+        );
+        assert!(
+            WINDOWS.contains("powershell_command(&copy_file_script(from, to))"),
+            "`copy_file_command` no longer hands the script to `powershell_command`"
+        );
+    }
+
     /// `upload` classifies the local path it was handed, not what that path points at.
     ///
     /// The tree branch learned to ask about each entry itself, but the first call still used

@@ -1234,7 +1234,7 @@
 | 组件校验 | 拒绝 `<>:"\|?*`、控制字符、结尾空格/点、保留设备名（`CON`/`NUL`/`COM1-9`/`LPT1-9`）；`..` 在构造与每次 `join` 时都拒绝，避免相对遍历逃逸根目录 |
 | Linux 不变 | `GuestPath` 对 Linux 原样保存（仅拒绝空串/NUL 与反斜杠开头），`create_dir_all` 仍用 `/` 前缀逐级创建 |
 | 所有远程 SFTP 入口 | `src/ssh.rs`：`create_dir_all(&GuestPath)`、`walk_remote_dir(&GuestPath)`、`upload_file(&Path, &GuestPath)`、`download_file(&GuestPath, &Path)`、`RemoteDirEntry::path() -> &GuestPath`；`src/machine.rs` 的 `upload`/`download`/`copy`/`create_dir`/`create_dir_all`/`exists`/`hard_link`/`metadata`/`read`/`read_dir`/`read_link`/`read_to_string`/`remove_dir_all`/`remove_file`/`rename`/`set_permissions`/`write` 全部经 `guest_path_from` 转换，不再用宿主 `Path::join` 拼客户机路径 |
-| `copy` 不再用 POSIX `cp` | Windows 走 `powershell -NoProfile -NonInteractive -Command "Copy-Item -LiteralPath '<from>' -Destination '<to>' -Force"`；`windows::powershell_literal` 用单引号字面量并加倍内部单引号，避免 `$`/反引号插值 |
+| `copy` 不再用 POSIX `cp` | Windows 走 `windows::copy_file_command` → `powershell -NoProfile -NonInteractive -EncodedCommand <base64(UTF-16LE)>`，脚本体是 `Copy-Item -LiteralPath '<from>' -Destination '<to>' -Force`；`windows::powershell_literal` 用单引号字面量并加倍内部单引号。经 `-EncodedCommand` 交付后，`$`/反引号在第一层 shell 里根本不存在，插值也无从发生（初版把这行写成「直接交给 `powershell` 的 `-Command` 参数」，那是 R60 之前的形状；R60 已改为编码交付，R10 又去掉了多余的 `-Command "..."` 外壳，本行 R147 更正） |
 | unsupported 语义 | `guest_path::ensure_supported(GuestOs, PosixOnlyOperation, &GuestPath)` 统一拒绝 Windows 的 `hard_link`/`read_link`/`set_permissions`，错误含操作名、sanitized guest 路径与原因（ACL vs mode bits）；Linux 三个操作不变 |
 | 链接不再静默跳过 | `upload` 目录树遇本地 symlink：Windows 直接报错；Linux 重建链接，`read_link` 或 `symlink` 失败即报错。`download` 遇远端 symlink/未知类型报错，不再 `continue` 静默成功 |
 | 递归删除 | `remove_dir_all` 先 `walk_remote_dir` 收集，再逆序删子项与父目录，符合 `std::fs::remove_dir_all` 语义（原实现仅单层 `remove_dir`） |
