@@ -121,6 +121,7 @@
 | 2026-11-12 15:50:00 UTC | review R9 补记（Secure Boot vars 与首启介质前置） | F12 修复：`OVMF_CANDIDATES` 为每个 code 镜像列出多个 vars 模板，secboot 优先 Microsoft 已注册的 `.ms`/`.secboot` 模板，普通模板仅作 fallback（setup mode）；F13 修复：`ensure_host_support` 增加 `xorriso`（首启 seed 介质的必需构建器），与其他缺口一次性报出（`7ddc686`） | N/A（细化 ADR-WIN-02 的 Secure Boot 判定与 `OSX-02` 前置检查，不改变既有决策） | `OSX-02` 实现证据、Review log、ADR-WIN-02、`src/firmware.rs`、README、CHANGELOG |
 | 2026-11-12 16:10:00 UTC | review R10（Windows 命令构造） | F14 修复：`Machine::copy` 的 Windows 分支改为直接执行 `Copy-Item`（`windows::copy_file_command`），不再套 `powershell -Command "..."`，避免外层 PowerShell 二次解析把路径中的 `$` 展开成空 | N/A（`FS-01` 既有 AC「Windows 文件语义」，无卡拆合） | `FS-01` 实现证据、Review log、`src/windows.rs`、`src/machine.rs`、CHANGELOG |
 | 2026-11-12 16:30:00 UTC | review R11（失败启动的可恢复性） | F15 修复：`init`/`spawn` 把 cancel token 当「已启动」标记，启动失败后 token 残留，之后每次尝试都报 `Machine already initialized`/`already spawned`，且残留的连接任务不会被取消；现在只在机器确实在运行时拒绝重复启动，失败时取消并清除 token（`bf0710c`） | N/A（`OSX-03`/`TRN-01` 既有「有界重试后清理」AC 与故障恢复矩阵，无卡拆合） | `OSX-03` 实现证据、故障恢复矩阵、Review log、`src/machine.rs`、README（Windows 状态说明改为「已实现但未发布/未支持」）、CHANGELOG |
+| 2026-11-12 17:00:00 UTC | review R12（首启地址发现与目录创建） | F16 修复：Windows 首启的 DHCP lease 轮询在 `select!` 之前执行且不可取消，QEMU 启动即死时要等满 900s 并误报「无 lease」（`d2a85ab`）；F17 修复：`create_dir_all` 会尝试 mkdir/stat Windows 盘根 `C:`（drive-relative，部分服务器会失败），改为对两种 OS 的根一律跳过（`1e1af91`） | N/A（`TRN-01`/`FS-01` 既有 AC：有界重试后清理、Windows 目录创建，无卡拆合） | `TRN-01`/`FS-01` 实现证据、故障恢复矩阵、Review log、`src/machine.rs`、`src/ssh.rs`、CHANGELOG |
 
 ## 已决议设计决策
 
@@ -716,6 +717,7 @@
 | 单测 | `src/ssh.rs`：pin 匹配/不匹配、未 pin TOFU、OpenSSH 往返、取消即失败（5 个）；`src/utils.rs`：lease 解析 MAC 映射/大小写/表头空行/IPv6（4 个） |
 | 集成测试（`#[ignore]`） | `tests/windows_machine.rs`：`windows_transport`（地址、pin、unsupported、shutdown→spawn 重连）、`windows_pool`（双机地址/host key/会话隔离） |
 | README/CHANGELOG | README「Windows transport and security」；CHANGELOG Added ×4 / Changed ×1 |
+| 地址发现与 QEMU 退出 race | `launch` 把 DHCP lease 轮询与 `qemu_handle`、cancel token 一起 `select!`，QEMU 启动即退出时立即返回其真实错误并停 `swtpm`（R12，`src/machine.rs`） |
 | 提交 | `6711671` |
 
 **Acceptance criteria:**
@@ -956,6 +958,7 @@
 | 集成测试（`#[ignore]`） | `tests/windows_machine.rs::windows_files`：`C:\qlean-fs-test` 下建目录、写/读/`read_to_string`、`copy`、`rename`、`remove_dir_all`、文件与目录 `upload`/`download` 往返、`read_link` 报错 |
 | README/CHANGELOG | README 新增「Windows file operations」支持矩阵与路径规则；CHANGELOG Added 四条 |
 | Windows `copy` | `Machine::copy` 的 Windows 分支由 `windows::copy_file_command` 生成，直接执行 `Copy-Item -LiteralPath … -Destination … -Force`（单引号字面量，`$`/反引号/空格/非 ASCII 原样保留），不再套一层 `powershell -Command "..."`（R10，`src/windows.rs`、`src/machine.rs`） |
+| 目录创建根跳过 | `create_dir_all` 对 POSIX `/` 与 Windows 盘根 `C:` 一律跳过，避免 drive-relative 的 `stat('C:')` 让递归创建失败（R12，`src/ssh.rs`） |
 | 提交 | `443ec5d` |
 
 **Acceptance criteria:**
@@ -1132,6 +1135,7 @@
 |---|---|---|---|
 | OVMF/swtpm 缺失 | 无运行 VM | 清晰报错并清理已创建 run dir | 静默降级、半启动 VM |
 | 地址发现/连接超时 | 可保留 sanitized 日志 | 有界重试后终止 QEMU、释放端点并清理 | 遗留 QEMU、调用 get_ip 循环等待 |
+| QEMU 启动即退出（发现 lease 期间） | 无运行 VM | 与 lease 轮询 race，立即报 QEMU 的真实错误并停 `swtpm` | 等满部署预算后误报「无 DHCP lease」 |
 | host key 不匹配 | 无会话 | 立即失败并清理，不自动接受新 key | 静默信任任意 key |
 | Windows 首启后重启失败 | 可保留失败 run dir 供排查（clear=false） | 终止进程、记录状态；修复后新建干净 VM 验证 | 删除证据后宣称成功或复用半部署状态 |
 | `init`/`spawn` 启动失败（含首启超时、`read_pid` 失败） | 无运行 VM、无残留会话 | 取消并清除 cancel token、停 `swtpm`、必要时终止 QEMU 后可在同一 `Machine` 上重试 | 遗留 `already initialized` 之类的误导报错或无法重试 |
@@ -1205,6 +1209,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R9 | 硬件对接面复核（QEMU 设备/OVMF 配对/swtpm 权限） | PASS | 无开放项 | F9：所有 guest 都被追加 `vhost-vsock-pci`，Windows 因此依赖 `/dev/vhost-vsock`；F10：`prepare_vars` 要求 code 与 vars 等长，而所有 stock 固件的 vars 远小于 code，真实宿主上必然失败；F11：swtpm 控制 socket 用默认权限创建；F12：secboot code 搭配的是空 KEK 的普通 vars 模板，guest 实为 Secure Boot setup mode（Windows 11 拒绝）；F13：`ensure_host_support` 未检查 `xorriso`，首启 seed 介质构建失败会延后暴露 | F9 `vsock_args` 分派 + 2 单测（`f42a942`）；F10 规则修正 + 2 单测（`8ae13ec`）；F11 `mode=0600` + `swtpm_args` 单测（`3e7ebd0`）；F12 候选表按 code 列出多个 vars 模板并优先 `.ms`/`.secboot`（`fec2e4d`）；F13 前置检查补 `xorriso`（`7ddc686`）；门禁 `cargo fmt --check`、clippy `-D warnings`、`cargo test --lib` 77 passed、`cargo test --no-run` 全绿 |
 | R10 | Windows 命令构造复核（`Machine::copy` 的 PowerShell 调用） | PASS | 无开放项 | F14：`copy` 把 cmdlet 包在 `powershell -Command "..."` 里，而 guest 默认 shell 已是 PowerShell，外层会再解析一次双引号字符串并展开 `$`，复制 `C:/Program Files/a$b.txt` 这类路径会静默指向别的文件 | F14 抽出 `windows::copy_file_command` 直接发射 cmdlet（单引号字面量，仅一层解析）+ 单测断言不含 `-Command`/`"`（`ec6a9a1`）；门禁 `cargo fmt --check`、clippy `-D warnings`、`cargo test --lib` 79 passed、`cargo test --no-run` 全绿 |
 | R11 | 失败启动的可恢复性复核（`init`/`spawn` 状态标记） | PASS | 无开放项 | F15：`ssh_cancel_token` 同时充当「已启动」标记，`launch` 失败（含 Windows 首启超时拆除、`read_pid` 失败）后 token 残留，同一 `Machine` 上无法重试且报错文案误导；残留连接任务也未被取消 | F15 `init`/`spawn` 仅在 `pid`/`ssh` 存在时拒绝重复启动，失败路径新增 `abandon_launch()` 取消并清除 token，顺带修掉 `warn!` 里的多余空格（`bf0710c`）；门禁 `cargo fmt --check`、clippy `-D warnings`、`cargo test --lib` 79 passed、`cargo test --no-run` 全绿 |
+| R12 | 首启地址发现与 Windows 目录创建复核 | PASS | 无开放项 | F16：`find_lease_address` 在 `launch` 的 `select!` 之前串行执行且不响应取消，Windows 首启时最长 900s 内即使 QEMU 已退出也不会报真正原因；F17：`create_dir_all` 对 Windows 盘根 `C:` 仍执行 mkdir/stat，drive-relative 请求不保证解析到盘根，严格服务器会让整条递归创建失败 | F16 将地址发现与 `qemu_handle`/cancel token 一起 race，端点解析改为 owned 参数以解除 `self` 借用（`d2a85ab`）；F17 两种 OS 的根一律跳过（`1e1af91`）；门禁 `cargo fmt --check`、clippy `-D warnings`、`cargo test --lib` 79 passed、`cargo test --no-run` 全绿 |
 
 ### R1 findings 与修订对照
 
