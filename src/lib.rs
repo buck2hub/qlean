@@ -314,6 +314,19 @@ mod plan_doc_tests {
         bullets
     }
 
+    /// Byte offset of the heading line that starts with `heading`.
+    ///
+    /// Prose may *mention* a heading - the revision history quotes card names when it
+    /// describes a change to them - so a plain `find` can slice between two mentions inside
+    /// one paragraph and assert nothing. Offsets taken here only ever point at a real heading
+    /// line, which is what a guard that slices a card needs.
+    fn heading_offset(text: &str, heading: &str) -> usize {
+        text.match_indices(heading)
+            .find(|(at, _)| *at == 0 || text[..*at].ends_with('\n'))
+            .map(|(at, _)| at)
+            .unwrap_or_else(|| panic!("the plan has no `{heading}` heading of its own"))
+    }
+
     /// The body of the section whose heading line is exactly `heading`.
     ///
     /// Several headings are also quoted inside revision-history rows, so locating a section by
@@ -1469,12 +1482,12 @@ mod plan_doc_tests {
         );
 
         let card = {
-            let start = PLAN
-                .find("### Task FS-01:")
-                .expect("the FS-01 card is gone: the guard would be reading nothing");
-            let end = PLAN
-                .find("### Task REL-01:")
-                .expect("the card after FS-01 is gone: the slice would run to the end of the file");
+            let start = heading_offset(PLAN, "### Task FS-01:");
+            let end = heading_offset(PLAN, "### Task REL-01:");
+            assert!(
+                start < end,
+                "the cards are out of order: the FS-01 slice is empty"
+            );
             &PLAN[start..end]
         };
         assert!(
