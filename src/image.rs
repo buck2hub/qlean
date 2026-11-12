@@ -640,6 +640,16 @@ async fn download_with_hash(url: &str, dest_path: &PathBuf, hash_type: ShaType) 
 
     let hash = hasher.finalize_hex();
 
+    // A proxy or server that closes the stream early ends the loop with a clean EOF, so the
+    // byte count is the only evidence of a truncated transfer. Check it before the `.part`
+    // file is promoted, otherwise the user is told the *checksum* is wrong when in fact
+    // only part of the image arrived.
+    if let Some(problem) = truncation_problem(total_size, downloaded) {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        let _ = tokio::fs::remove_file(&len_sidecar).await;
+        bail!("{problem} (from {url})");
+    }
+
     download_span.pb_set_finish_message(&format!("{} MiB downloaded", downloaded / (1024 * 1024)));
     std::mem::drop(_download_enter);
 
@@ -660,6 +670,43 @@ async fn download_with_hash(url: &str, dest_path: &PathBuf, hash_type: ShaType) 
     Ok(hash)
 }
 
+/// Describe a transfer whose byte count does not match the advertised length.
+///
+/// `None` when the length was unknown (chunked responses) or matched exactly.
+fn truncation_problem(expected: Option<u64>, downloaded: u64) -> Option<String> {
+    let expected = expected?;
+    if expected == downloaded {
+        return None;
+    }
+    Some(if downloaded < expected {
+        format!(
+            "download truncated after {downloaded} of {expected} bytes ({} bytes missing); retry the download",
+            expected - downloaded
+        )
+    } else {
+        format!(
+            "download sent {downloaded} bytes but only {expected} were announced; the response is corrupt"
+        )
+    })
+}
+
+/// Reject a fetched image whose digest does not match, deleting the unusable file.
+///
+/// Leaving the file behind wastes a full image on disk and keeps a corrupt artifact in the
+/// cache directory, where a later run could mistake it for a usable image.
+async fn verify_fetched(dest: &Path, expected_hash: &str, computed: &str) -> Result<()> {
+    if computed.eq_ignore_ascii_case(expected_hash) {
+        return Ok(());
+    }
+    let _ = tokio::fs::remove_file(dest).await;
+    bail!(
+        "hash mismatch for {}: expected {}, got {}; the file was removed",
+        dest.display(),
+        expected_hash,
+        computed
+    )
+}
+
 /// Fetch image file from remote source or local path and verify it against the expected hash.
 async fn fetch_from_source(
     source: &ImageSource,
@@ -670,12 +717,7 @@ async fn fetch_from_source(
     match source {
         ImageSource::Url(url) => {
             let computed = download_with_hash(url, dest, hash_type.clone()).await?;
-            anyhow::ensure!(
-                computed.eq_ignore_ascii_case(expected_hash),
-                "hash mismatch: expected {}, got {}",
-                expected_hash,
-                computed
-            );
+            verify_fetched(dest, expected_hash, &computed).await?;
         }
         ImageSource::LocalPath(src) => {
             anyhow::ensure!(src.exists(), "file does not exist: {}", src.display());
@@ -693,12 +735,7 @@ async fn fetch_from_source(
             .await
             .with_context(|| "copy/hash task failed")??;
 
-            anyhow::ensure!(
-                computed.eq_ignore_ascii_case(expected_hash),
-                "hash mismatch: expected {}, got {}",
-                expected_hash,
-                computed
-            );
+            verify_fetched(dest, expected_hash, &computed).await?;
         }
     }
     Ok(())
@@ -1211,6 +1248,53 @@ dummy
 
         assert_eq!(shell, stream, "streaming must match shell");
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_truncation_problem_is_silent_for_unknown_or_matching_lengths() {
+        assert!(truncation_problem(None, 1234).is_none());
+        assert!(truncation_problem(Some(4096), 4096).is_none());
+    }
+
+    #[test]
+    fn test_truncation_problem_names_short_and_overlong_transfers() {
+        let short = truncation_problem(Some(4096), 3000).expect("short transfer must be reported");
+        assert!(
+            short.contains("truncated after 3000 of 4096 bytes"),
+            "{short}"
+        );
+        assert!(short.contains("1096 bytes missing"), "{short}");
+
+        // A response that delivers more than it announced is corrupt, not truncated.
+        let long =
+            truncation_problem(Some(4096), 5000).expect("overlong transfer must be reported");
+        assert!(long.contains("sent 5000 bytes"), "{long}");
+        assert!(long.contains("corrupt"), "{long}");
+        assert!(!long.contains("truncated"), "{long}");
+    }
+
+    #[tokio::test]
+    async fn test_verify_fetched_removes_the_rejected_file() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("image.qcow2");
+        tokio::fs::write(&path, b"corrupt").await?;
+
+        let err = verify_fetched(&path, "deadbeef", "feedface")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("hash mismatch"), "{err}");
+        assert!(err.contains("removed"), "{err}");
+        assert!(
+            !path.exists(),
+            "a rejected image must not stay in the cache"
+        );
+
+        // A matching digest keeps the file.
+        tokio::fs::write(&path, b"good").await?;
+        verify_fetched(&path, "DEADBEEF", "deadbeef").await?;
+        assert!(path.exists(), "case-insensitive match must keep the file");
         Ok(())
     }
 }
