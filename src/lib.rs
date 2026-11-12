@@ -8,6 +8,9 @@
 //! - **RAII-style interface**: Automatic resource management ensures VMs are properly cleaned up.
 //! - **Out-of-the-box**: Automated image downloading with verification, no manual configuration needed.
 //! - **Linux native**: Native support for Linux hosts with multiple guest distributions and architectures.
+//! - **Windows guests** (unreleased, tracked as 0.4.0): `GuestOs::Windows` runs a licensed qcow2 you
+//!   supply over OVMF + a per-VM TPM 2.0 and a TCP transport. It needs QEMU, OVMF, `swtpm`,
+//!   `xorriso` and libvirt on the host; see the README "Windows image contract" section.
 //!
 //! # Examples
 //!
