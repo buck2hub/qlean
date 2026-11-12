@@ -1212,7 +1212,25 @@ StandardError=journal
                 }
                 // Windows guests confirm their first-boot deployment on the first
                 // session and drop the seed medium afterwards; no-op for Linux.
-                self.confirm_deployment().await?;
+                if let Err(e) = self.confirm_deployment().await {
+                    // A guest that never confirms deployment cannot be used and still
+                    // has the seed medium (client public key plus per-VM host private
+                    // key) attached. Tear the VM down instead of returning an error
+                    // while leaving QEMU, swtpm and the seed behind.
+                    if let Some(ssh) = self.ssh.as_mut() {
+                        let _ = ssh.close().await;
+                    }
+                    self.ssh = None;
+                    self.ip = None;
+                    if let Some(pid) = self.pid.take() {
+                        terminate_qemu(pid).await;
+                    }
+                    let _ = qemu_handle.await;
+                    if let Some(mut swtpm) = self.swtpm.take() {
+                        swtpm.stop().await;
+                    }
+                    return Err(e);
+                }
                 Ok(())
             }
             Err(e) => {
