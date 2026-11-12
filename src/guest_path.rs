@@ -115,8 +115,10 @@ impl GuestPath {
     /// Join a single child name, refusing names that would escape the path.
     ///
     /// `child` may come from a host-relative walk (always simple names) or from
-    /// [`GuestPath::strip_prefix`]; separators inside `child` are normalized but `..` is
-    /// rejected so a traversal cannot be smuggled in.
+    /// [`GuestPath::strip_prefix`]. On Windows both separators spell one thing, so `\` becomes
+    /// `/`; on Linux a backslash is an ordinary character in a name and stays one, because the
+    /// walk that drives `download`, `upload` and `remove_dir_all` feeds raw entry names through
+    /// here. `..` is rejected so a traversal cannot be smuggled in.
     pub(crate) fn join(&self, child: impl AsRef<str>) -> Result<Self> {
         let child = child.as_ref();
         let relative = self.normalize_relative(child)?;
@@ -208,7 +210,10 @@ impl GuestPath {
     }
 
     fn normalize_relative(&self, child: &str) -> Result<String> {
-        let child = child.replace('\\', "/");
+        let child = match self.guest_os {
+            GuestOs::Windows => child.replace('\\', "/"),
+            GuestOs::Linux => child.to_owned(),
+        };
         if child.starts_with('/') {
             // `Path::join` replaces the base for an absolute argument, so accepting one
             // here would either silently escape the base or silently nest a nonsense
@@ -332,6 +337,32 @@ mod tests {
             win(r"C:\Program Files\Qlean").as_str(),
             "C:/Program Files/Qlean"
         );
+    }
+
+    /// A backslash separates on Windows and is an ordinary character on Linux.
+    ///
+    /// [`GuestPath::new`] already keeps the spelling it was given, but `join` rewrote every
+    /// backslash for every guest, so the walk behind `download`, `upload` and
+    /// `remove_dir_all` addressed a Linux file named `a\b` as `a/b` - a different file - and
+    /// failed outright on a legal name such as `a\..\b`.
+    #[test]
+    fn a_linux_guest_keeps_a_backslash_as_an_ordinary_name_character() {
+        let dir = posix("/tmp/dir");
+        assert_eq!(
+            dir.join("a\\b")
+                .expect("a backslash is a legal POSIX name")
+                .as_str(),
+            "/tmp/dir/a\\b"
+        );
+        assert_eq!(dir.join("a\\b").expect("joined").file_name(), Some("a\\b"));
+        assert_eq!(
+            dir.join("a\\..\\b").expect("still just a name").as_str(),
+            "/tmp/dir/a\\..\\b"
+        );
+
+        // Windows is unchanged: both separators mean the same thing there.
+        assert_eq!(win("C:/dir").join("a\\b").unwrap().as_str(), "C:/dir/a/b");
+        assert_eq!(posix("/").join("a\\b").unwrap().as_str(), "/a\\b");
     }
 
     #[test]

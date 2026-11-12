@@ -216,8 +216,11 @@ which is what makes Windows results meaningful:
 
 Every remote path is converted to a guest path before it reaches SFTP
 (`GuestPath`), so a Windows drive path is never reinterpreted with host `Path`
-semantics. Both `/` and `\` are accepted on input, and paths are sent to the guest with
-`/` separators, which `sshd` accepts on both operating systems.
+semantics. On a Windows guest both `/` and `\` are accepted on input and paths are sent
+with `/` separators, which `sshd` accepts on both operating systems. A Linux guest path
+keeps `\` as an ordinary character in a name, the way `std::path` does - including for
+entries inside an uploaded or downloaded tree, so a file named `a\b` is not addressed as
+`a/b`.
 
 | Operation | Windows guest | Linux guest |
 |---|---|---|

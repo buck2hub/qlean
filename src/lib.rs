@@ -2495,6 +2495,57 @@ mod plan_doc_tests {
         );
     }
 
+    /// The README says how each guest spells a backslash, and [`GuestPath`] does what it says.
+    ///
+    /// `join` used to fold `\` into `/` for every guest, which turned a Linux entry named
+    /// `a\b` into `a/b` for the walk that drives `download`, `upload` and `remove_dir_all`.
+    /// The rule is per guest, so the sentence and the behaviour have to be checked together:
+    /// a phrase-only guard would pass on a README that describes code nobody has.
+    #[test]
+    fn the_readme_states_how_each_guest_spells_a_backslash() {
+        use crate::guest_path::GuestPath;
+        use crate::image::GuestOs;
+
+        let linux = GuestPath::new(GuestOs::Linux, "/tmp/tree")
+            .expect("a Linux path")
+            .join("a\\b")
+            .expect("a backslash is a legal character in a POSIX name");
+        let windows = GuestPath::new(GuestOs::Windows, "C:/tree")
+            .expect("a Windows path")
+            .join("a\\b")
+            .expect("Windows accepts both separators");
+
+        assert_eq!(
+            linux.as_str(),
+            "/tmp/tree/a\\b",
+            "a Linux guest path must keep a backslash as part of the name"
+        );
+        assert_eq!(
+            windows.as_str(),
+            "C:/tree/a/b",
+            "a Windows guest path must treat a backslash as a separator"
+        );
+
+        // Locate the paragraph by what it says, not by the heading above it: renaming the
+        // heading is not a change to this rule.
+        const README: &str = include_str!("../README.md");
+        let paragraph = README
+            .split("\n\n")
+            .find(|chunk| chunk.contains("Every remote path is converted to a guest path"))
+            .expect("the README must still explain how a remote path becomes a guest path");
+        let flat = paragraph.split_whitespace().collect::<Vec<_>>().join(" ");
+        for claim in [
+            "On a Windows guest both `/` and `\\` are accepted on input",
+            "A Linux guest path keeps `\\` as an ordinary character in a name",
+        ] {
+            assert!(
+                flat.contains(claim),
+                "the README no longer states `{claim}`, which is what `GuestPath::join` now \
+                 does for each guest"
+            );
+        }
+    }
+
     /// The newest round's evidence reads the same in the plan and in the status view.
     ///
     /// Each round's summary is written twice - once in the revision history, once in the status
