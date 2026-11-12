@@ -519,6 +519,51 @@ mod plan_doc_tests {
             "the trace table's 指定测试 column yielded only {checked} labels"
         );
     }
+    /// Every `QLEAN_*` override the crate reads is named in the README.
+    ///
+    /// The overrides are the only way to point the crate at a different OVMF, swtpm or timeout
+    /// without recompiling, so an override nobody documented is an override nobody can use - and
+    /// the failure is silent, because the code keeps working for whoever wrote it. Test hooks are
+    /// the exception, and they are named here so adding one stays a decision rather than a leak.
+    #[test]
+    fn every_environment_override_the_crate_reads_is_documented() {
+        const README: &str = include_str!("../README.md");
+        // Test hooks: they take effect only inside a test that asks for them.
+        const TEST_HOOKS: &[&str] = &["QLEAN_REFUSED_KILL_PID"];
+
+        let mut read: Vec<&str> = Vec::new();
+        for (path, source) in CRATE_SOURCES {
+            if !path.starts_with("src/") {
+                continue;
+            }
+            let mut rest = *source;
+            while let Some(at) = rest.find("\"QLEAN_") {
+                let after = &rest[at + 1..];
+                let end = after.find('"').expect("an override name is not closed");
+                read.push(&after[..end]);
+                rest = &after[end..];
+            }
+        }
+        read.sort_unstable();
+        read.dedup();
+        assert!(
+            read.len() >= 4,
+            "the crate reads only {} QLEAN_ overrides",
+            read.len()
+        );
+
+        for name in read {
+            if TEST_HOOKS.contains(&name) {
+                continue;
+            }
+            assert!(
+                README.contains(name),
+                "the crate reads {name} but the README never mentions it, so only its author \
+                 knows it exists"
+            );
+        }
+    }
+
     /// The plan keeps every section the template makes mandatory.
     ///
     /// The template's rule is that mandatory sections may not be dropped - a section that does not
