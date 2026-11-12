@@ -128,6 +128,7 @@
 | 2026-11-12 19:50:00 UTC | review R16（公开文档与门禁补强） | F23 修复：`upload`/`download` 的公开文档用 intra-doc 链接指向 `pub(crate) GuestPath`，`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 直接失败（`rustdoc::private_intra_doc_links`），改为代码字面量（`9297994`）；同轮把 rustdoc 与 benches 编译纳入每卡门禁 | N/A（无卡拆合） | Review log、Verification 判定口径、`src/machine.rs` |
 | 2026-11-12 20:20:00 UTC | review R17（宿主前置聚合的测试有效性） | F24：`ensure_host_support` 的「一次性报告全部缺失前置」AC 只有一个自证式测试——它用字面量拼出期望消息再断言自己的文本，`ensure_host_support` 改成只报第一条也不会失败；现抽出 `host_support_problems(kvm, ovmf, swtpm, swtpm_available, xorriso_available)` 纯函数，用真实调用结果断言 | N/A（`OSX-02` AC-A3 的可测部分现已真正覆盖） | `OSX-02` 实现证据、Review log、`src/firmware.rs` |
 | 2026-11-12 20:50:00 UTC | review R18（CI 覆盖面审计，findings-only） | 无代码缺陷；记录一条需要 `REL-01` 修的执行缺口：`.github/workflows/check-and-test.yml` 的 test job 只有 `cargo test --no-run`（只编译不运行），而唯一能在任意宿主运行的验证面（85 个 `cargo test --lib` 单测）因此从未在 CI 上被检查；同时 CI 的 clippy 为 `cargo clippy -- -D warnings`，未带 `--all-targets --all-features`，测试与 bench 代码不被 lint。两处修复均属 `REL-01` 的 write set（该卡 AC 已写明对齐 clippy 命令），故只登记不改动 | N/A（不新增卡；缺口归属 `REL-01` AC-04） | `REL-01` Current evidence、Review log、`.github/workflows/check-and-test.yml` |
+| 2026-11-12 21:20:00 UTC | review R19（验收项到断言的追溯） | F25：`windows_files` 只断言 `read_link` 报错，而 FS-01 的 AC 要求 `hard_link`/`read_link`/`set_permissions` 三个 POSIX-only 入口都明确报错；单测覆盖了 `ensure_supported` 层，但一次昂贵的硬件冒烟跑完仍不能证明后两个入口的接线正确。补两条断言（`daa6f19`） | N/A（不新增卡；补齐 `FS-01` 既有 AC 的硬件证据面） | `FS-01` 实现证据、Review log、`tests/windows_machine.rs` |
 
 ## 已决议设计决策
 
@@ -966,7 +967,7 @@
 | 链接不再静默跳过 | `upload` 目录树遇本地 symlink：Windows 直接报错；Linux 重建链接，`read_link` 或 `symlink` 失败即报错。`download` 遇远端 symlink/未知类型报错，不再 `continue` 静默成功 |
 | 递归删除 | `remove_dir_all` 先 `walk_remote_dir` 收集，再逆序删子项与父目录，符合 `std::fs::remove_dir_all` 语义（原实现仅单层 `remove_dir`） |
 | 单测 | `src/guest_path.rs` 9 个（盘符/根/分隔符、空格与非 ASCII、非法与不支持形式、非法字符与保留名、`..` 与 join 逃逸、join/parent、ancestors、strip_prefix、POSIX-only 拒绝 + Linux 可用、Linux 原样），`cargo test --lib windows_path` 过滤 |
-| 集成测试（`#[ignore]`） | `tests/windows_machine.rs::windows_files`：`C:\qlean-fs-test` 下建目录、写/读/`read_to_string`、`copy`、`rename`、`remove_dir_all`、文件与目录 `upload`/`download` 往返、`read_link` 报错 |
+| 集成测试（`#[ignore]`） | `tests/windows_machine.rs::windows_files`：`C:\qlean-fs-test` 下建目录、写/读/`read_to_string`、`copy`、`rename`、`remove_dir_all`、文件与目录 `upload`/`download` 往返，`read_link`/`hard_link`/`set_permissions` 三个 POSIX-only 入口逐一报错（R19，`daa6f19`） |
 | README/CHANGELOG | README 新增「Windows file operations」支持矩阵与路径规则；CHANGELOG Added 四条 |
 | Windows `copy` | `Machine::copy` 的 Windows 分支由 `windows::copy_file_command` 生成，直接执行 `Copy-Item -LiteralPath … -Destination … -Force`（单引号字面量，`$`/反引号/空格/非 ASCII 原样保留），不再套一层 `powershell -Command "..."`（R10，`src/windows.rs`、`src/machine.rs`） |
 | 目录创建根跳过 | `create_dir_all` 对 POSIX `/` 与 Windows 盘根 `C:` 一律跳过，避免 drive-relative 的 `stat('C:')` 让递归创建失败（R12，`src/ssh.rs`） |
@@ -1232,6 +1233,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R16 | 公开文档与门禁复核 | PASS | 无开放项 | F23：Windows 工作新增的公开文档注释（`upload`/`download`）链接到私有类型 `GuestPath`，`cargo doc` 在 `-D warnings` 下报 `private_intra_doc_links` 并失败；此前门禁只跑 fmt/clippy/test，未覆盖 rustdoc | 改为代码字面量（`9297994`）；门禁补 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 与 `cargo test --no-run --all-targets`（含 `benches/hash_benchmark.rs`），两者现已通过；`cargo fmt --check`、clippy `-D warnings`、`cargo test --lib` 83 passed 全绿 |
 | R17 | 宿主前置聚合的测试有效性复核 | PASS | 无开放项 | F24：`test_explicit_gaps_error_is_actionable` 把期望错误消息用同一批字符串拼出来再断言，未调用任何生产代码，属自证式测试；`ensure_host_support` 若退化成只报第一个缺失项也仍会通过 | 抽出 `host_support_problems` 纯函数并把探针结果作为参数，新增 3 个测试：四项同时缺失时逐条命中且聚合消息为 4 行、宿主齐全时返回空、只缺一项时只报该项（`5981c5c`）；`cargo test --lib` 83 → 85 passed |
 | R18 | CI 覆盖面审计 | PASS（findings-only，无代码改动） | 缺口转 `REL-01` AC-04 | CI 的 `test` job 是 `cargo test --no-run`：只编译、不执行，因此本计划新增的 85 个单测（唯一不依赖 KVM/镜像的验证面）在 CI 上从未运行；clippy job 用 `cargo clippy -- -D warnings`，不含 `--all-targets --all-features`，测试与 benches 不被 lint | 不改 workflow：`.github/workflows/check-and-test.yml` 属 `REL-01` write set，且该卡 AC-04 已要求「CI 对 push 与 PR 均触发 format/clippy/test」并把 clippy 对齐到 `--all-targets --all-features`；本地门禁已按更严口径执行（fmt/clippy --all-targets/rustdoc -D warnings/`cargo test --lib`/`--no-run --all-targets`），故登记为发布前必须关闭的执行缺口 |
+| R19 | 验收项到断言的追溯 | PASS | 无开放项 | 逐条比对 7 个 `windows_*` 冒烟的断言与卡片 AC：`windows_files` 只验证 `read_link`，缺 `hard_link`/`set_permissions` 两处接线证明；其余 6 个测试的断言与 AC 一一对应（固件生命周期、首启 marker 与 authorized_keys、pinned host key 与 PTY 拒绝、池内地址/host key 互异、PowerShell 引号/流分离/退出码、`get_ip` 缓存与双机互异） | 补两条断言，复用宿主临时文件的 `Permissions` 避免引入 unix-only 依赖（`daa6f19`）；`cargo fmt --check`、clippy `-D warnings`、`cargo test --lib` 85 passed、`cargo test --no-run --all-targets` 全绿，`--ignored` 仍为 7 failed（DEP-01 门未绕过） |
 
 ### R1 findings 与修订对照
 
