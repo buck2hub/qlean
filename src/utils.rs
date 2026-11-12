@@ -303,12 +303,12 @@ impl CommandExt for tokio::process::Command {
     }
 }
 
+/// Programs Qlean shells out to, whatever the guest OS is.
+const REQUIRED_PROGRAMS: [&str; 4] = ["qemu-system-x86_64", "qemu-img", "xorriso", "virsh"];
+
 /// Ensure the guest-independent host prerequisites (CLI tools and the Qlean network).
 pub(crate) async fn ensure_host_prerequisites() -> Result<()> {
-    check_command_available("qemu-system-x86_64").await?;
-    check_command_available("qemu-img").await?;
-    check_command_available("xorriso").await?;
-    check_command_available("virsh").await?;
+    check_commands_available(&REQUIRED_PROGRAMS).await?;
     ensure_network().await?;
     Ok(())
 }
@@ -325,12 +325,58 @@ pub(crate) async fn ensure_prerequisites(guest_os: crate::image::GuestOs) -> Res
     Ok(())
 }
 
-async fn check_command_available(cmd: &str) -> Result<()> {
-    let _ = tokio::process::Command::new(cmd)
-        .arg("--version")
-        .output()
-        .await
-        .with_context(|| format!("could not find {}", cmd))?;
+/// How probing one required program turned out.
+#[derive(Debug)]
+enum ProgramProbe {
+    /// The program answered `--version`.
+    Available,
+    /// The program is not on `PATH` (or cannot be executed).
+    Missing(String),
+    /// The program exists but `--version` failed, so the installation is broken.
+    Broken(String),
+}
+
+/// Turn probe results into the lines of a single aggregated error.
+///
+/// Installing one package per failed run is what this avoids: the caller reports every
+/// missing or broken program at once.
+fn program_problems(probes: &[(&str, ProgramProbe)]) -> Vec<String> {
+    probes
+        .iter()
+        .filter_map(|(program, probe)| match probe {
+            ProgramProbe::Available => None,
+            ProgramProbe::Missing(reason) => Some(format!(
+                "`{program}` is required but was not found ({reason}): install it and try again"
+            )),
+            ProgramProbe::Broken(status) => Some(format!(
+                "`{program}` is installed but `{program} --version` failed ({status}): the installation looks broken"
+            )),
+        })
+        .collect()
+}
+
+async fn check_commands_available(programs: &[&'static str]) -> Result<()> {
+    let mut probes = Vec::with_capacity(programs.len());
+    for program in programs {
+        let probe = match tokio::process::Command::new(program)
+            .arg("--version")
+            .output()
+            .await
+        {
+            Ok(output) if output.status.success() => ProgramProbe::Available,
+            // A program that cannot run `--version` is not usable, even if it exists.
+            Ok(output) => ProgramProbe::Broken(output.status.to_string()),
+            Err(error) => ProgramProbe::Missing(error.to_string()),
+        };
+        probes.push((*program, probe));
+    }
+
+    let problems = program_problems(&probes);
+    anyhow::ensure!(
+        problems.is_empty(),
+        "required host programs are missing:\n- {}",
+        problems.join("\n- ")
+    );
     Ok(())
 }
 
@@ -546,6 +592,49 @@ mod tests {
             ""
         );
         assert_eq!(parse_lease_expiry(""), "");
+    }
+
+    #[test]
+    fn test_program_problems_reports_every_gap_at_once() {
+        let probes = [
+            ("qemu-img", ProgramProbe::Available),
+            (
+                "virsh",
+                ProgramProbe::Missing("No such file or directory (os error 2)".to_string()),
+            ),
+            (
+                "xorriso",
+                ProgramProbe::Broken("exit status: 1".to_string()),
+            ),
+        ];
+        let problems = program_problems(&probes);
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems[0].contains("`virsh`") && problems[0].contains("was not found"));
+        assert!(problems[1].contains("`xorriso`") && problems[1].contains("looks broken"));
+        // A missing program must not also be reported as broken, and vice versa.
+        assert!(!problems[0].contains("looks broken"));
+        assert!(!problems[1].contains("was not found"));
+    }
+
+    #[test]
+    fn test_program_problems_is_empty_when_everything_is_available() {
+        let probes = [
+            ("qemu-img", ProgramProbe::Available),
+            ("virsh", ProgramProbe::Available),
+        ];
+        assert!(program_problems(&probes).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_check_commands_available_names_the_missing_program() {
+        let err = check_commands_available(&["qlean-definitely-not-installed"])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("qlean-definitely-not-installed"), "{err}");
+        assert!(err.contains("was not found"), "{err}");
+        // All four real programs being present must not be required for this assertion.
+        assert!(!err.contains("`virsh`"), "{err}");
     }
 
     #[test]
