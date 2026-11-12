@@ -17,7 +17,7 @@ use russh_sftp::client::fs::{Metadata, ReadDir};
 use serde::{Deserialize, Serialize};
 use shell_escape::unix::escape;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
 use crate::{
@@ -1141,7 +1141,27 @@ StandardError=journal
         };
 
         let mut qemu_handle = tokio::spawn(launch_qemu(qemu_params));
-        let pid = read_pid(&self.id).await?;
+        let pid = match read_pid(&self.id).await {
+            Ok(pid) => pid,
+            Err(e) => {
+                // QEMU was spawned but never wrote its pid file, so it cannot be
+                // signalled by pid. Wait a bounded time for the task to finish on its
+                // own, then stop the TPM instead of leaving a half-started VM behind.
+                if tokio::time::timeout(Duration::from_secs(10), &mut qemu_handle)
+                    .await
+                    .is_err()
+                {
+                    warn!(
+                        "VM-{} did not exit after its pid file could not be read;                          it may still be running",
+                        self.id
+                    );
+                }
+                if let Some(mut swtpm) = self.swtpm.take() {
+                    swtpm.stop().await;
+                }
+                return Err(e);
+            }
+        };
         self.pid = Some(pid);
 
         // Windows guests cannot use vsock: resolve the DHCP lease for this VM's MAC
