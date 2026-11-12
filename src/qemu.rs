@@ -147,6 +147,22 @@ fn windows_firmware_args(firmware: &VmFirmware, tpm_socket: Option<&Path>) -> Ve
     args
 }
 
+/// QEMU arguments for the guest transport.
+///
+/// Only Linux guests speak `vsock`. A Windows guest has no vsock driver, and attaching
+/// `vhost-vsock-pci` would additionally require `/dev/vhost-vsock` plus the
+/// `vhost_vsock` module on the host, so QEMU would refuse to start on a host that is
+/// perfectly able to run a Windows guest.
+fn vsock_args(guest_os: GuestOs, cid: u32) -> Vec<String> {
+    if guest_os == GuestOs::Windows {
+        return Vec::new();
+    }
+    vec![
+        "-device".to_string(),
+        format!("vhost-vsock-pci,id=vhost-vsock-pci0,guest-cid={cid}"),
+    ]
+}
+
 pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
     // Prepare QEMU command
     let is_windows = params.image.guest_os == GuestOs::Windows;
@@ -165,13 +181,7 @@ pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> 
         qemu_cmd.args(["-machine", "hpet=off"]);
     }
 
-    qemu_cmd.args([
-        "-device",
-        &format!(
-            "vhost-vsock-pci,id=vhost-vsock-pci0,guest-cid={}",
-            params.cid
-        ),
-    ]);
+    qemu_cmd.args(vsock_args(params.image.guest_os, params.cid));
 
     let dirs = QleanDirs::new()?;
     let run_dir = dirs.runs.join(&params.vmid);
@@ -398,6 +408,24 @@ mod tests {
             "{joined}"
         );
         assert!(joined.contains("-device tpm-tis,tpmdev=tpm0"), "{joined}");
+    }
+
+    #[test]
+    fn test_windows_guest_gets_no_vsock_device() {
+        assert!(
+            vsock_args(GuestOs::Windows, 42).is_empty(),
+            "Windows guests have no vsock driver and must not require /dev/vhost-vsock"
+        );
+    }
+
+    #[test]
+    fn test_linux_guest_keeps_the_vsock_device() {
+        let args = vsock_args(GuestOs::Linux, 42);
+        assert_eq!(args[0], "-device");
+        assert!(
+            args[1].starts_with("vhost-vsock-pci,") && args[1].contains("guest-cid=42"),
+            "{args:?}"
+        );
     }
 
     #[test]
