@@ -186,6 +186,7 @@
 | 2026-11-13 10:10:00 UTC | review R74（失败的方向指错了机器） | F79：`find_lease_address` 的轮询里，`virsh net-dhcp-leases` **失败**时只写一行 `debug!`，然后继续轮询；预算耗尽后统一抛出「no DHCP lease for MAC ... the guest may still be booting, or it did not bring up its virtio network device」。也就是说：如果 libvirt 根本连不上（服务没起、socket 权限、URI 不对），用户等满 300s/900s 后被告知**去看 guest**——而 guest 从未被检查过，`(leases seen: [])` 也解释不了任何事。这与本仓库已经修过的 `virsh net-list` 那一条（失败被读成「网络不存在」）是同一族：**把基础设施失败说成对象状态**。修：轮询里分别记录 `saw_a_listing` 与最后一次 `virsh` 的 stderr，超时消息抽成 `lease_timeout_message(...)`（可测）：从没成功过 → 明说「读不到租约表、根本没检查过 guest」，附 `virsh` 原话与 `virsh -c ... net-list --all` 的验证命令；成功过 → 保持原诊断（附已见租约）并把最后一次 `virsh` 错误当 context 附在末尾。新增 3 个单测覆盖两个分支与 context 分支。`cargo test --lib` 184 → 187 | `TRN-01`（地址发现）、`IP-01`（`get_ip`）| `src/utils.rs`、CHANGELOG、Review log、覆盖矩阵、plan-status |
 | 2026-11-13 10:40:00 UTC | review R75（预算必须能打断单次调用） | F80：`find_lease_address` 的文档写着「Polling is bounded by `timeout`」，但循环体里 `virsh ... .output().await` **没有单次上限**——它只检查两次调用之间的 deadline。也就是说：budget 是对「循环」的，不是对「卡住」的；`libvirtd` 若在一次 RPC 上僵住，检查 deadline 的那行代码永远不会被执行到，300s/900s 的承诺只在「每次都返回」这个前提成立时才成立。这与 R71（`xorriso` 无预算）同族，且是同一个 helper 能解决的事。修：把 R71 的 `bounded_output` 从 `windows.rs` 挪到 `utils.rs`（单一实现，两个调用点共用），`find_lease_address` 每次调用都用 `min(剩余预算, ≥1ms)` 作为上限，超时把错误记入 `last_error` 交给 R74 的两支诊断——于是「单次调用被放弃」会被如实归因为 libvirt 读不到，而不是 guest 没上网。原 `windows::tests` 里的 2 个 `bounded_output` 单测一并迁到 `utils::tests`。`cargo test --lib` 187 不变（迁移，无新增） | `TRN-01`（地址发现预算）、`IP-01`（`get_ip`）| `src/utils.rs`、`src/windows.rs`、CHANGELOG、Review log、覆盖矩阵、plan-status |
 | 2026-11-13 11:10:00 UTC | review R76（同一个操作有两份实现，只有一份有预算） | F81：R71 给 Windows 的 seed ISO 构建加了预算，但**同样的构建在 `machine.rs` 里还有一份**（Linux cloud-init seed），它仍然是裸 `.output().await`；同理 `qemu-img create`（建 overlay）、`qemu-img resize`、以及 `ensure_network` 的 6 处 `virsh`、依赖探测的 `<program> --version` 全都没有上限。于是「启动路径上的本地工具都有预算」这句话只在 Windows 分支为真。修：`machine.rs` 三处改用共享的 `crate::utils::bounded_output` + 新常量 `LOCAL_TOOL_BUDGET=120s`；`utils.rs` 的 6 处 `virsh` 用 `VIRSH_CALL_BUDGET=60s`、依赖探测用 `PROBE_BUDGET=10s`；并新增源码守卫 `test_production_code_never_awaits_a_command_without_a_budget`（`include_str!` 扫 8 个生产文件，禁止字面量 `.output().await`，守卫自身的匹配串用 `concat!` 拆开以免自匹配）。现在 `rg -n '\.output\(\)' src/*.rs` 只剩 helper 自身与 `image.rs` 的测试辅助函数。`cargo test --lib` 187 → 188 | `EXE-01`/`TRN-01`（启动路径）、`IP-01`（`get_ip`）| `src/machine.rs`、`src/utils.rs`、CHANGELOG、Review log、覆盖矩阵、plan-status |
+| 2026-11-13 11:40:00 UTC | review R77（给挂住的程序开「重新安装」处方） | F82：R76 给依赖探测加了 10s 预算，但预算超时被归类成 `ProgramProbe::Missing`，于是消息变成「`virsh` is required but was not found (`virsh` did not finish within 10s … the process was killed): install it and try again」——一句话里同时说「找不到」和「跑了 10 秒」，并且**处方是错的**：它明明装着，只是卡住了（等一个陈旧锁、一个不可达的挂载点）。用户照做会重装一个本来就正常的包，然后再次卡住。这是 R74 的同一族缺陷：把「阻塞」说成「不存在」。修：`bounded_output` 拆成 `run_bounded`（返回带类型的 `BoundedFailure::{NotRun, Killed}`）与薄封装 `bounded_output`（拍平成 `anyhow`，既有 8 个调用点一字不改）；探测改用 `run_bounded`，`Killed` 映射到新变体 `ProgramProbe::Unusable`，消息改为「装着但没应答，查它在等什么（陈旧锁 / 不可达挂载），别重装」。新增 2 个单测：`NotRun`/`Killed` 分流、以及 `Unusable` 的消息不得含 `was not found` 或 `install it and try again`。`cargo test --lib` 188 → 190 | 依赖检查（`ensure_prerequisites`）、`TRN-01` | `src/utils.rs`、CHANGELOG、Review log、覆盖矩阵、plan-status |
 
 ## 已决议设计决策
 
@@ -788,6 +789,7 @@
 | 集成测试（`#[ignore]`） | `tests/windows_machine.rs`：`windows_transport`（地址、pin、unsupported、shutdown→spawn 重连）、`windows_pool`（双机地址/host key/会话隔离） |
 | README/CHANGELOG | README「Windows transport and security」；CHANGELOG Added ×4 / Changed ×1 |
 | 地址发现与 QEMU 退出 race | `launch` 把 DHCP lease 轮询与 `qemu_handle`、cancel token 一起 `select!`，QEMU 启动即退出时立即返回其真实错误并停 `swtpm`（R12，`src/machine.rs`） |
+| 处方要跟着诊断走 | 报错里的下一步必须对得上真实原因：卡住 ≠ 没装，缺依赖 ≠ 配置错（R74/R77，`48fc514`） |
 | 同一个操作只有一份实现 | seed 构建、`virsh` 调用、超时文案都必须共用同一处代码，否则修了一半等于没修（R71→R76，`700a35e`） |
 | 预算是针对单次调用，不是针对循环 | 「有 deadline」不等于「能打断卡住的那一步」：每次外部调用都要用自己的上限（`剩余预算` 或显式常量）（R71/R75，`1ad7cc2`） |
 | 基础设施失败不能说成对象状态 | libvirt/进程/网络的失败必须按失败本身报错，不能折叠成「对象还没就绪」（R? `virsh net-list`、R74，`d29f468`） |
@@ -1400,6 +1402,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R74 | 失败的方向要指对机器 | PASS | 无开放项 | F79：`virsh` 一直失败时超时消息仍让用户去查 guest | `lease_timeout_message` 分两支（libvirt 不可读 / guest 无租约），3 新单测（`d29f468`） |
 | R75 | 预算必须能打断单次调用 | PASS | 无开放项 | F80：`virsh` 调用无单次上限，僵住的 libvirtd 可越过 deadline | `bounded_output` 迁入 `utils` 并用于每次 `virsh` 调用（`1ad7cc2`） |
 | R76 | 同一个操作不能有两份实现 | PASS | 宿主工具链（DEP-02）仍是外部阻塞 | F81：Linux seed 构建/`qemu-img`/`virsh`/`--version` 仍无预算，只有 Windows 分支被 R71 覆盖 | 全部改走 `bounded_output` + 源码守卫（`700a35e`） |
+| R77 | 处方要跟着诊断走 | PASS | 宿主工具链（DEP-02）仍是外部阻塞 | F82：探测超时被归类为「未安装」，给出错误的重装建议 | `BoundedFailure` 类型化 + `ProgramProbe::Unusable`，2 新单测（`48fc514`） |
 
 ### R1 findings 与修订对照
 
