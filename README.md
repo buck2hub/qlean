@@ -95,9 +95,12 @@ already be generalized and ship a first-boot task that consumes Qlean's seed med
    (`viostor`/`vioscsi` for the disk, `NetKVM` for the network, `vioserial` if you also
    use it), enable the OpenSSH Server optional feature, and pre-generalize it
    (`sysprep /generalize /oobe /shutdown`).
-2. Create a local account named `qlean` (a member of `Administrators` is supported). Give
-   it no static password for Qlean's own use: Qlean never sets or carries a password, and
-   password authentication must stay disabled.
+2. Create a local account named `qlean` (a member of `Administrators` is supported) and
+   give it a password nobody types: Qlean never sets, carries or uses a password, and
+   `PasswordAuthentication` must stay disabled. The account must not have a *blank*
+   password — Windows refuses network logon for blank-password accounts
+   (`LimitBlankPasswordUse`), so public key authentication fails even when the key is
+   installed correctly.
 3. Ship a scheduled task that runs on first boot, finds the seed medium by its volume
    label `QLEANSEED`, and then:
    - installs `qlean/authorized_keys` as

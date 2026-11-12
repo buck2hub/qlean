@@ -42,6 +42,32 @@ mod host_key_window_tests {
     }
 
     #[test]
+    fn an_auth_rejection_is_told_apart_from_a_transport_failure() {
+        let rejected = anyhow::anyhow!(AUTH_REJECTED).context("connect attempt");
+        assert!(is_auth_rejection(&rejected));
+        let unreachable = anyhow::anyhow!("Connection refused (os error 111)");
+        assert!(!is_auth_rejection(&unreachable));
+        // A host key mismatch is a different story and must not be classified as auth.
+        let mismatch = anyhow::anyhow!("the guest {}", PINNED_KEY_REJECTED);
+        assert!(!is_auth_rejection(&mismatch));
+    }
+
+    #[test]
+    fn the_auth_message_names_the_install_locations_and_the_blank_password_trap() {
+        let addr = "192.168.221.42:22".parse().unwrap();
+        let message = auth_rejected_message(addr, Duration::from_secs(900));
+        assert!(message.contains("900-second"), "{message}");
+        assert!(
+            message.contains("administrators_authorized_keys"),
+            "{message}"
+        );
+        assert!(message.contains("PubkeyAuthentication yes"), "{message}");
+        assert!(message.contains("blank"), "{message}");
+        assert!(message.contains("LimitBlankPasswordUse"), "{message}");
+        assert!(message.contains("Windows image contract"), "{message}");
+    }
+
+    #[test]
     fn the_pending_key_message_names_the_cause_and_the_contract() {
         let addr = "192.168.221.42:22".parse().unwrap();
         let message = host_key_pending_message(addr, Duration::from_secs(900));
@@ -279,6 +305,39 @@ fn host_key_rejection_message(transport_name: &str, pinned: bool) -> String {
 ///
 /// Only a rejected pinned host key is fatal here: a refused connection means sshd is not up
 /// yet, while a wrong key means the retry loop can never succeed.
+/// Message an SSH server produces when it refuses the client's public key.
+pub(crate) const AUTH_REJECTED: &str = "Authentication (with publickey) failed";
+
+/// Whether the server rejected the public key rather than failing to speak SSH.
+///
+/// `Permission denied` after a successful handshake means the guest is reachable and the
+/// client key is not trusted *yet*. During a first boot that is expected; afterwards it is
+/// the real cause of the failure and must not be reported as "the guest is not reachable".
+fn is_auth_rejection(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains(AUTH_REJECTED))
+}
+
+/// Message for a Windows guest that keeps refusing Qlean's public key.
+fn auth_rejected_message(addr: std::net::SocketAddr, budget: Duration) -> String {
+    format!(
+        "the Windows guest at {addr} completed the SSH handshake but rejected Qlean's public \
+         key for the whole {}-second budget.\n\
+         The first-boot task must install `{}`/authorized_keys where Windows OpenSSH reads it \
+         (`C:\\ProgramData\\ssh\\administrators_authorized_keys` for an administrator account, \
+         otherwise `%USERPROFILE%\\.ssh\\authorized_keys`) with an ACL that grants only \
+         `Administrators`, `SYSTEM` and the file owner, and `sshd_config` must keep \
+         `PubkeyAuthentication yes` and `PasswordAuthentication no`.\n\
+         Windows also refuses network logon for an account with a *blank* password \
+         (`LimitBlankPasswordUse`), which makes public key authentication fail even when the \
+         key is installed correctly; give the account a password nobody types and never \
+         enable password authentication. See the README \"Windows image contract\"",
+        budget.as_secs(),
+        crate::windows::SEED_VOLUME_LABEL
+    )
+}
+
 /// Whether a pinned host key mismatch must end the attempt loop at once.
 ///
 /// After deployment the guest's host key is fixed, so a mismatch is a hard error: the
@@ -474,7 +533,7 @@ impl Session {
         .await
         .with_context(|| format!("SSH authentication timed out for user {username}"))??;
         if !auth_res.success() {
-            bail!("Authentication (with publickey) failed");
+            bail!("{AUTH_REJECTED}");
         }
         Ok(Self {
             session,
@@ -976,6 +1035,7 @@ pub(crate) async fn connect_ssh_windows(
     let deadline = Instant::now() + timeout;
     let mut last_err: Option<anyhow::Error> = None;
     let mut key_mismatch: Option<anyhow::Error> = None;
+    let mut auth_rejected: Option<anyhow::Error> = None;
 
     while Instant::now() < deadline {
         if cancel_token.is_cancelled() {
@@ -1031,6 +1091,13 @@ pub(crate) async fn connect_ssh_windows(
                 key_mismatch = Some(e);
                 sleep(Duration::from_millis(250)).await;
             }
+            // The guest answered and refused the key: keep waiting (a first boot may not
+            // have installed it yet), but remember it, because it is the real story if
+            // the budget runs out.
+            Err(e) if is_auth_rejection(&e) => {
+                auth_rejected = Some(e);
+                sleep(Duration::from_millis(250)).await;
+            }
             Err(e) => {
                 last_err = Some(e);
                 sleep(Duration::from_millis(250)).await;
@@ -1042,6 +1109,9 @@ pub(crate) async fn connect_ssh_windows(
     // the generic "not reachable" message.
     if let Some(mismatch) = key_mismatch {
         return Err(mismatch).context(host_key_pending_message(addr, timeout));
+    }
+    if let Some(rejected) = auth_rejected {
+        return Err(rejected).context(auth_rejected_message(addr, timeout));
     }
     Err(last_err.unwrap_or_else(|| {
         anyhow::anyhow!(
