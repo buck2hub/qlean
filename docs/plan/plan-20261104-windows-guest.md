@@ -123,6 +123,7 @@
 | 2026-11-12 16:30:00 UTC | review R11（失败启动的可恢复性） | F15 修复：`init`/`spawn` 把 cancel token 当「已启动」标记，启动失败后 token 残留，之后每次尝试都报 `Machine already initialized`/`already spawned`，且残留的连接任务不会被取消；现在只在机器确实在运行时拒绝重复启动，失败时取消并清除 token（`bf0710c`） | N/A（`OSX-03`/`TRN-01` 既有「有界重试后清理」AC 与故障恢复矩阵，无卡拆合） | `OSX-03` 实现证据、故障恢复矩阵、Review log、`src/machine.rs`、README（Windows 状态说明改为「已实现但未发布/未支持」）、CHANGELOG |
 | 2026-11-12 17:00:00 UTC | review R12（首启地址发现与目录创建） | F16 修复：Windows 首启的 DHCP lease 轮询在 `select!` 之前执行且不可取消，QEMU 启动即死时要等满 900s 并误报「无 lease」（`d2a85ab`）；F17 修复：`create_dir_all` 会尝试 mkdir/stat Windows 盘根 `C:`（drive-relative，部分服务器会失败），改为对两种 OS 的根一律跳过（`1e1af91`） | N/A（`TRN-01`/`FS-01` 既有 AC：有界重试后清理、Windows 目录创建，无卡拆合） | `TRN-01`/`FS-01` 实现证据、故障恢复矩阵、Review log、`src/machine.rs`、`src/ssh.rs`、CHANGELOG |
 | 2026-11-12 17:40:00 UTC | review R13（地址选择与路径拼接） | F18 修复：lease 查找取首个匹配行，双栈网络下可能选中链路本地 IPv6（无 scope id，必然连不上），且解析成功导致不再重试，现仅接受 IPv4 并在超时错误中说明（`ed09b5b`）；F19 修复：`GuestPath::join` 会静默吞掉前导分隔符（Linux 上把 `/etc/passwd` 变成相对路径），现显式拒绝绝对子路径；`\\?\C:` 设备路径此前被误报为 UNC（`33567ed`） | N/A（`TRN-01`/`FS-01` 既有 AC：按本 VM MAC 解析且不回退到别机、路径校验，无卡拆合） | `TRN-01`/`FS-01` 实现证据、Review log、`src/utils.rs`、`src/guest_path.rs`、CHANGELOG |
+| 2026-11-12 18:20:00 UTC | review R14（启动失败时的资源收尾） | F20 修复：QEMU 在 SSH 阶段退出时 `launch` 直接返回，`self.pid` 与 `swtpm` 句柄残留（TPM 进程活到 Machine 被 drop，且仍报告有 pid）；SSH 任务 panic 更严重，`?` 直接把 `qemu_handle` 分离（QEMU 继续运行），现统一走终止 QEMU + 停 swtpm + 清 pid 的失败分支（`e412251`、`77cc1fc`） | N/A（`OSX-03` 既有 AC：启动失败不遗留进程与句柄，无卡拆合） | `OSX-03` 实现证据、故障恢复矩阵、Review log、`src/machine.rs` |
 
 ## 已决议设计决策
 
@@ -654,6 +655,7 @@
 | 首启失败清理 | `Machine::launch` 在 `confirm_deployment` 失败时关闭会话、`terminate_qemu`、`Swtpm::stop` 并清空 `pid`/`ssh`/`ip`，不留运行中 VM 与挂载中的 seed（R8，`f9cc1ee`） |
 | 重复 init 拒绝 | `Machine::init` 在 `GuestOs::Windows && deploy_seed.is_none()` 时直接报错并提示 `spawn`，避免以已删除的 seed 引导（R8，`178ac03`） |
 | 失败启动可重试 | `init`/`spawn` 在启动失败时取消并清除 cancel token（`abandon_launch`），仅在 `pid`/`ssh` 存在时拒绝重复启动；首启超时拆除后可在同一机器上重试（R11，`src/machine.rs`） |
+| 启动失败收尾 | QEMU 在 SSH 阶段退出或 SSH 任务 panic 时清 `pid`、停 `swtpm`、终止 QEMU，不再遗留 TPM 进程或分离的 QEMU（R14，`src/machine.rs`） |
 | 提交 | `8812fb4` |
 
 **Full-suite trigger:** `T-1: 共享 seed 与 Machine 初始化路径`
@@ -1139,6 +1141,7 @@
 | OVMF/swtpm 缺失 | 无运行 VM | 清晰报错并清理已创建 run dir | 静默降级、半启动 VM |
 | 地址发现/连接超时 | 可保留 sanitized 日志 | 有界重试后终止 QEMU、释放端点并清理 | 遗留 QEMU、调用 get_ip 循环等待 |
 | QEMU 启动即退出（发现 lease 期间） | 无运行 VM | 与 lease 轮询 race，立即报 QEMU 的真实错误并停 `swtpm` | 等满部署预算后误报「无 DHCP lease」 |
+| QEMU 在 SSH 阶段退出 / SSH 任务 panic | 无运行 VM | 统一失败分支：终止 QEMU、清 `pid`、停 `swtpm`，再返回错误 | TPM 进程残留、`is_running` 误报、seed 介质随 VM 继续运行 |
 | host key 不匹配 | 无会话 | 立即失败并清理，不自动接受新 key | 静默信任任意 key |
 | Windows 首启后重启失败 | 可保留失败 run dir 供排查（clear=false） | 终止进程、记录状态；修复后新建干净 VM 验证 | 删除证据后宣称成功或复用半部署状态 |
 | `init`/`spawn` 启动失败（含首启超时、`read_pid` 失败） | 无运行 VM、无残留会话 | 取消并清除 cancel token、停 `swtpm`、必要时终止 QEMU 后可在同一 `Machine` 上重试 | 遗留 `already initialized` 之类的误导报错或无法重试 |
@@ -1214,6 +1217,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R11 | 失败启动的可恢复性复核（`init`/`spawn` 状态标记） | PASS | 无开放项 | F15：`ssh_cancel_token` 同时充当「已启动」标记，`launch` 失败（含 Windows 首启超时拆除、`read_pid` 失败）后 token 残留，同一 `Machine` 上无法重试且报错文案误导；残留连接任务也未被取消 | F15 `init`/`spawn` 仅在 `pid`/`ssh` 存在时拒绝重复启动，失败路径新增 `abandon_launch()` 取消并清除 token，顺带修掉 `warn!` 里的多余空格（`bf0710c`）；门禁 `cargo fmt --check`、clippy `-D warnings`、`cargo test --lib` 79 passed、`cargo test --no-run` 全绿 |
 | R12 | 首启地址发现与 Windows 目录创建复核 | PASS | 无开放项 | F16：`find_lease_address` 在 `launch` 的 `select!` 之前串行执行且不响应取消，Windows 首启时最长 900s 内即使 QEMU 已退出也不会报真正原因；F17：`create_dir_all` 对 Windows 盘根 `C:` 仍执行 mkdir/stat，drive-relative 请求不保证解析到盘根，严格服务器会让整条递归创建失败 | F16 将地址发现与 `qemu_handle`/cancel token 一起 race，端点解析改为 owned 参数以解除 `self` 借用（`d2a85ab`）；F17 两种 OS 的根一律跳过（`1e1af91`）；门禁 `cargo fmt --check`、clippy `-D warnings`、`cargo test --lib` 79 passed、`cargo test --no-run` 全绿 |
 | R13 | 地址选择与路径拼接复核 | PASS | 无开放项 | F18：`find_lease_address` 返回首个 MAC 匹配的 lease，双栈网络下 `fe80::/10` 行会排在前面，`SocketAddr::new(link_local, 22)` 不可达却已算成功，连接循环不再重试；F19：`normalize_relative` 用 `trim_matches('/')`，`join("/etc/passwd")` 在 Linux 上静默变成 `etc/passwd`，与 `Path::join` 语义相反；`normalize_windows` 先判 UNC，导致 `\\?\C:` 报 UNC 而非设备路径 | F18 新增 `lease_address_for`（仅 IPv4，含双栈/仅 IPv6/别机 MAC 三个用例）并在超时文案注明（`ed09b5b`）；F19 拒绝前导分隔符、设备路径先于 UNC 判定，补 Linux/Windows 用例（`33567ed`）；门禁 `cargo fmt --check`、clippy `-D warnings`、`cargo test --lib` 83 passed、`cargo test --no-run` 全绿 |
+| R14 | 启动失败时的资源收尾复核 | PASS | 无开放项 | F20：SSH 阶段 `select!` 的 QEMU 分支只 `bail!`，不清 `pid`、不停 `swtpm`；SSH 任务 panic 时 `result.map_err(..)?` 直接返回，`qemu_handle` 被 detach，QEMU 带着 seed 介质（客户端公钥 + 每 VM 主机私钥）继续运行 | QEMU 退出分支改为清 `pid` + `swtpm.stop()`（`e412251`，并修正该分支不可再次 await 已完成 join handle）；SSH panic 改为错误值注入既有失败分支（`77cc1fc`）；门禁 `cargo fmt --check`、clippy `-D warnings`、`cargo test --lib` 83 passed、`cargo test --no-run` 全绿 |
 
 ### R1 findings 与修订对照
 
