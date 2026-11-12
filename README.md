@@ -123,8 +123,10 @@ reports `C:\ProgramData\qlean\deployed`. It contains the client's *public* key, 
 per-VM host *private* key and `qlean/deploy.json`; the client private key stays in the
 host secrets directory. The deployment budget is 900s by default (independent of the
 Linux SSH connect timeout of 180s/300s) and can be tuned with `MachineConfig::ssh_timeout`.
-It bounds both halves of the first boot: waiting for `sshd` to answer and waiting for the
-deploy marker, since a guest that is still deploying does not accept connections yet.
+One deadline bounds the whole first boot — the DHCP lease wait, the wait for `sshd` to
+answer and the wait for the deploy marker — so a slow phase leaves less for the next one
+instead of each phase starting a fresh budget. Raise `MachineConfig::ssh_timeout` when an
+image genuinely needs a longer first boot.
 Later boots use the plain connect budget again. On timeout Qlean keeps the seed medium and
 returns an error naming the expected marker file and this section; the failed VM is torn
 down (session closed, QEMU terminated, `swtpm` stopped) so no half-deployed guest survives.

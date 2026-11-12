@@ -63,6 +63,13 @@ pub struct Machine {
     /// Public half of the per-VM SSH host key (Windows guests only), kept on the
     /// host so the transport can pin it instead of trusting the first key seen.
     ssh_host_key: Option<String>,
+    /// Deadline shared by every phase of a Windows first boot.
+    ///
+    /// The documented deployment budget bounds the *whole* first boot: waiting for the
+    /// DHCP lease, waiting for `sshd` and waiting for the deploy marker. Giving each
+    /// phase a fresh budget would allow three times the documented wait, so the phases
+    /// share one deadline. `None` means no first boot is in progress.
+    first_boot_deadline: Option<std::time::Instant>,
 }
 
 /// Removes a half-built run directory unless construction completed.
@@ -252,6 +259,23 @@ fn resolve_connect_timeout(config: &MachineConfig, guest_os: GuestOs, is_init: b
     resolve_ssh_timeout(config)
 }
 
+/// What is left of a shared deadline, or `None` once it has passed.
+fn remaining_budget(deadline: std::time::Instant) -> Option<Duration> {
+    let now = std::time::Instant::now();
+    (deadline > now).then(|| deadline - now)
+}
+
+/// Message for a first boot that used up its deployment budget before `phase`.
+fn spent_first_boot_budget(phase: &str, budget: Duration) -> anyhow::Error {
+    anyhow::anyhow!(
+        "the Windows first boot used its whole {}s deployment budget before {phase}.\n\
+         The budget covers the entire first boot (DHCP lease, `sshd`, deploy marker), not one \
+         phase, so a later phase gets no fresh wait. Raise `MachineConfig::ssh_timeout` if this \
+         image genuinely needs longer; see the README \"Windows image contract\"",
+        budget.as_secs()
+    )
+}
+
 fn resolve_ssh_timeout(config: &MachineConfig) -> Duration {
     config
         .ssh_timeout
@@ -348,6 +372,7 @@ impl Machine {
                 swtpm: None,
                 deploy_seed: Some(seed),
                 ssh_host_key: Some(host_key.pubkey_str.trim().to_string()),
+                first_boot_deadline: None,
             });
         }
 
@@ -551,6 +576,7 @@ StandardError=journal
             swtpm: None,
             deploy_seed: None,
             ssh_host_key: None,
+            first_boot_deadline: None,
         })
     }
 
@@ -1066,6 +1092,12 @@ StandardError=journal
 
         let timeout = windows::deploy_timeout(&self.config);
         let start = std::time::Instant::now();
+        // A first boot that is still running shares one deadline with the lease and `sshd`
+        // waits, so the documented budget bounds the whole boot instead of one phase.
+        let remaining = self
+            .first_boot_deadline
+            .and_then(remaining_budget)
+            .unwrap_or(timeout);
         // A marker poll that cannot reach the guest says nothing about deployment: the
         // session may have died because the guest rebooted. Retrying that for the whole
         // budget would report "deployment did not finish" 15 minutes later, so give up
@@ -1090,7 +1122,7 @@ StandardError=journal
                     }
                 }
             }
-            if start.elapsed() >= timeout {
+            if start.elapsed() >= remaining {
                 bail!("{}", windows::deploy_timeout_message(timeout));
             }
             tokio::time::sleep(windows::DEPLOY_POLL_INTERVAL).await;
@@ -1221,6 +1253,11 @@ StandardError=journal
         );
 
         let ssh_timeout = resolve_connect_timeout(&self.config, self.image.guest_os, is_init);
+        // One deadline for the whole Windows first boot: the lease wait, the `sshd` wait and
+        // the deploy-marker wait draw from the same budget instead of starting fresh each
+        // time. Later boots keep the plain connect budget with no shared deadline.
+        self.first_boot_deadline = (is_init && self.image.guest_os == GuestOs::Windows)
+            .then(|| std::time::Instant::now() + ssh_timeout);
 
         // Helper: read pid written by launch_qemu.
         async fn read_pid(vmid: &str) -> Result<u32> {
@@ -1345,10 +1382,16 @@ StandardError=journal
             // the 900s deployment budget. Race it against QEMU and cancellation so a VM
             // that died right after starting reports why, instead of waiting out the
             // whole budget and blaming the (absent) DHCP lease.
+            let discovery_budget = match self.first_boot_deadline {
+                Some(deadline) => remaining_budget(deadline).ok_or_else(|| {
+                    spent_first_boot_budget("the DHCP lease appeared", ssh_timeout)
+                })?,
+                None => ssh_timeout,
+            };
             let discovery = discover_windows_endpoint(
                 self.mac_address.clone(),
                 self.ssh_host_key.clone(),
-                ssh_timeout,
+                discovery_budget,
             );
             tokio::pin!(discovery);
             let discovered = tokio::select! {
@@ -1403,9 +1446,14 @@ StandardError=journal
         let mut ssh_handle = match windows_endpoint {
             Some((addr, host_key)) => {
                 info!("🔎 VM-{} connecting over tcp to {addr}", self.id);
+                let connect_budget = match self.first_boot_deadline {
+                    Some(deadline) => remaining_budget(deadline)
+                        .ok_or_else(|| spent_first_boot_budget("`sshd` answered", ssh_timeout))?,
+                    None => ssh_timeout,
+                };
                 tokio::spawn(connect_ssh_windows(
                     addr,
-                    ssh_timeout,
+                    connect_budget,
                     self.keypair.to_owned(),
                     cancel_token.clone(),
                     host_key.clone(),
@@ -2018,6 +2066,36 @@ fn session_or_operation_error<'a>(
 #[cfg(test)]
 mod timeout_tests {
     use super::*;
+
+    #[test]
+    fn a_shared_deadline_has_no_budget_once_it_passed() {
+        let now = std::time::Instant::now();
+        assert!(remaining_budget(now + Duration::from_secs(30)).is_some());
+        assert!(
+            remaining_budget(now).is_none(),
+            "a deadline that is exactly now must not hand out a wait"
+        );
+        assert!(
+            remaining_budget(now - Duration::from_secs(1)).is_none(),
+            "a spent deadline must never turn into a wait again"
+        );
+    }
+
+    #[test]
+    fn a_spent_first_boot_budget_names_the_phase_and_the_whole_boot() {
+        let error = spent_first_boot_budget("`sshd` answered", Duration::from_secs(900));
+        let message = error.to_string();
+        assert!(message.contains("`sshd` answered"), "{message}");
+        assert!(
+            message.contains("whole 900s deployment budget"),
+            "{message}"
+        );
+        assert!(
+            message.contains("not one phase"),
+            "the message must say that later phases get no fresh wait: {message}"
+        );
+        assert!(message.contains("ssh_timeout"), "{message}");
+    }
 
     fn config(ssh_timeout: Option<u64>) -> MachineConfig {
         MachineConfig {
