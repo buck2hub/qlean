@@ -2122,6 +2122,43 @@ mod plan_doc_tests {
     }
 
     #[test]
+    fn the_liveness_refusal_is_an_error_in_the_branch_and_in_the_changelog() {
+        const MACHINE: &str = include_str!("../src/machine.rs");
+        const CHANGELOG: &str = include_str!("../CHANGELOG.md");
+        // A live process without a control socket is the one answer that must never be `false`:
+        // `false` is what callers read as "this run directory is free".
+        let body = function_body(MACHINE, "pub async fn is_running(&self) -> Result<bool>");
+        let arm = body
+            .split("RunningCheck::LiveWithoutSocket =>")
+            .nth(1)
+            .expect("`is_running` no longer has a branch for a live QEMU without a socket");
+        assert!(
+            arm.trim_start().starts_with("bail!("),
+            "the live-process-without-socket branch now answers instead of refusing: {arm}"
+        );
+        // The CHANGELOG tells users the same thing; if the branch changes, that sentence is a
+        // lie and this equality is the only thing that would notice.
+        assert!(
+            CHANGELOG.contains(
+                "a live process without a socket is an error, so a second QEMU cannot be \
+                 started on the same disk"
+            ),
+            "the CHANGELOG no longer states that a live process without a socket is an error"
+        );
+        // And the three answers are covered by tests that run without QEMU (R169).
+        for name in [
+            "is_running_refuses_a_live_qemu_that_lost_its_socket",
+            "is_running_answers_false_when_the_recorded_pid_is_no_longer_our_qemu",
+            "is_running_answers_false_for_a_machine_that_never_started",
+        ] {
+            assert!(
+                MACHINE.contains(&format!("async fn {name}()")),
+                "the liveness test `{name}` is gone, so `is_running` lost a covered answer"
+            );
+        }
+    }
+
+    #[test]
     fn the_knob_that_keeps_a_run_directory_says_what_it_keeps() {
         const MACHINE: &str = include_str!("../src/machine.rs");
         const README: &str = include_str!("../README.md");

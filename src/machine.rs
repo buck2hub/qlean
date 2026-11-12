@@ -2664,6 +2664,116 @@ mod shutdown_tests {
 }
 
 #[cfg(test)]
+mod liveness_tests {
+    use super::*;
+
+    /// A machine whose socket path is unique to this test process, so the test never reads a
+    /// socket left in the real `~/.qlean/runs/`.
+    fn machine_with_pid(pid: Option<u32>) -> Machine {
+        let mut machine = Machine::for_tests_with_pid(pid);
+        machine.id = format!("liveness-{}", std::process::id());
+        machine
+    }
+
+    /// A live process whose `argv[0]` is QEMU - a copy of `sleep`, so the test needs no QEMU
+    /// on PATH and still looks exactly like a QEMU to `/proc/<pid>/cmdline`.
+    fn spawn_lookalike_qemu(dir: &std::path::Path) -> std::process::Child {
+        std::fs::create_dir_all(dir).expect("create the lookalike directory");
+        let program = dir.join("qemu-system-x86_64");
+        std::fs::copy("/bin/sleep", &program).expect("copy a program to the QEMU name");
+        std::process::Command::new(&program)
+            .arg("30")
+            .spawn()
+            .expect("start the lookalike")
+    }
+
+    /// Wait until `/proc/<pid>/cmdline` names the lookalike.
+    ///
+    /// `spawn` returns as soon as the child is forked; until it `exec`s, its command line is
+    /// still this test binary's, so `process_is_qemu` answers `false` and the first draft of
+    /// this test failed about one run in five.
+    fn wait_until_the_child_is_qemu(pid: u32) {
+        for _ in 0..200 {
+            if process_is_qemu(pid) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the lookalike never appeared as QEMU in /proc/{pid}/cmdline");
+    }
+
+    #[tokio::test]
+    async fn is_running_refuses_a_live_qemu_that_lost_its_socket() {
+        // The state a hung or half-torn-down launch leaves behind. `false` here would let a
+        // caller start a second QEMU on a disk the first one still owns, so the check has to
+        // refuse instead of answering - and nothing but the decision table was tested.
+        let dir = std::env::temp_dir().join(format!("qlean-liveness-{}", std::process::id()));
+        let mut child = spawn_lookalike_qemu(&dir);
+        wait_until_the_child_is_qemu(child.id());
+        let machine = machine_with_pid(Some(child.id()));
+        let socket = qmp::qmp_socket_path(&machine.id).expect("a socket path");
+        assert!(
+            !socket.exists(),
+            "the test's own run directory must not exist: {}",
+            socket.display()
+        );
+
+        let error = machine
+            .is_running()
+            .await
+            .expect_err("a live QEMU without its control socket is not `false`");
+        let text = error.to_string();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            text.contains("still has a live QEMU process"),
+            "the refusal must say the process is what is still there: {text}"
+        );
+        assert!(
+            text.contains("control socket at"),
+            "the refusal must name the missing socket: {text}"
+        );
+        assert!(
+            text.contains(&socket.display().to_string()),
+            "the refusal must print the socket it looked for: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn is_running_answers_false_when_the_recorded_pid_is_no_longer_our_qemu() {
+        // A pid that exists but is not QEMU - the pid was reused, or QEMU already exited and
+        // the socket went with it. This is the one case where a missing socket really is
+        // proof, and the answer must be `false` rather than an error.
+        let machine = machine_with_pid(Some(std::process::id()));
+        assert!(
+            !process_is_qemu(std::process::id()),
+            "the test binary is not QEMU; the case is only meaningful if it says so"
+        );
+        assert!(
+            !machine
+                .is_running()
+                .await
+                .expect("a reused pid is not an error"),
+            "a recorded pid that is not QEMU means the domain is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn is_running_answers_false_for_a_machine_that_never_started() {
+        let machine = machine_with_pid(None);
+        assert!(
+            !machine
+                .is_running()
+                .await
+                .expect("a machine that never started is not an error"),
+            "a machine that never started is not running"
+        );
+    }
+}
+
+#[cfg(test)]
 mod upload_name_tests {
     use super::*;
 
