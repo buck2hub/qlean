@@ -36,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cached image metadata records `guest_os`; legacy metadata without the field deserializes as `Linux`, and a cache entry recorded for a different guest OS is rejected with an actionable error
 - Windows image cache entries use a `windows-` name prefix so they can never share a cache slot with a Linux image
 - Windows guests reject TCG: a launch without KVM acceleration now fails with an actionable error instead of silently emulating
+- A `secboot` OVMF code image paired with a vars template that carries no Microsoft keys (including via `QLEAN_OVMF_CODE`/`QLEAN_OVMF_VARS`) is now refused with an actionable error instead of booting in Secure Boot setup mode, which Windows 11 rejects
 - `Machine::open_interactive_shell` returns an actionable error for `GuestOs::Windows` instead of attempting a vsock shell
 
 ### Fixed

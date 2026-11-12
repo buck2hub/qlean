@@ -131,6 +131,47 @@ fn is_secure_boot_name(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether an OVMF vars template already carries Microsoft's Secure Boot keys.
+///
+/// UEFI stores Secure Boot variables as UTF-16 strings, so an *enrolled* template
+/// contains the vendor subject verbatim as UTF-16LE text. The plain templates next to
+/// a `secboot` code image do not, and pairing them boots the guest in setup mode, which
+/// Windows 11 refuses to install from.
+fn vars_template_enrolls_microsoft_keys(template: &Path) -> std::io::Result<bool> {
+    const NEEDLE: &str = "Microsoft Corporation";
+    let bytes = std::fs::read(template)?;
+    let needle: Vec<u8> = NEEDLE.bytes().flat_map(|byte| [byte, 0x00]).collect();
+    Ok(bytes.windows(needle.len()).any(|window| window == needle))
+}
+
+/// Refuse a Secure Boot firmware/vars pairing that would boot in setup mode.
+///
+/// This is the one firmware mistake that only shows up deep inside a Windows install,
+/// as an unsupported-configuration error with no hint about the firmware, so it is
+/// rejected while the resolver still knows which files the user pointed at.
+fn ensure_secure_boot_pair(code: &Path, vars_template: &Path, secure_boot: bool) -> Result<()> {
+    if !secure_boot {
+        return Ok(());
+    }
+    match vars_template_enrolls_microsoft_keys(vars_template) {
+        Ok(true) => Ok(()),
+        Ok(false) => bail!(
+            "Secure Boot firmware {} is paired with the vars template {}, which carries no \
+             Microsoft Secure Boot keys: the guest would boot in setup mode and Windows 11 \
+             refuses to install from it.\n\
+             Point {ENV_OVMF_VARS} at the enrolled template that ships with the same package \
+             (for example OVMF_VARS.4m.ms.fd next to OVMF_CODE.secboot.4m.fd), or pair a code \
+             image without `secboot` and disable Secure Boot.",
+            code.display(),
+            vars_template.display()
+        ),
+        Err(error) => bail!(
+            "could not read the OVMF vars template {} to confirm its Secure Boot keys: {error}",
+            vars_template.display()
+        ),
+    }
+}
+
 /// Resolve firmware using an injectable existence probe.
 fn resolve_ovmf_with(exists: &dyn Fn(&Path) -> bool) -> Option<FirmwarePaths> {
     OVMF_CANDIDATES.iter().find_map(|(code, vars, secure)| {
@@ -167,21 +208,27 @@ pub(crate) fn resolve_ovmf() -> Result<FirmwarePaths> {
                 "{ENV_OVMF_VARS} points at {}, which is not a file",
                 vars.display()
             );
+            let secure_boot = is_secure_boot_name(&code);
+            ensure_secure_boot_pair(&code, &vars, secure_boot)?;
             Ok(FirmwarePaths {
-                secure_boot: is_secure_boot_name(&code),
+                secure_boot,
                 code,
                 vars_template: vars,
             })
         }
-        (Some(_), None) | (None, Some(_)) => bail!(
-            "{ENV_OVMF_CODE} and {ENV_OVMF_VARS} must be set together; {INSTALL_HINT}"
-        ),
-        (None, None) => resolve_ovmf_with(&|path| path.is_file()).ok_or_else(|| {
-            anyhow::anyhow!(
-                "no OVMF firmware found (looked for {} known layouts under /usr/share); {INSTALL_HINT}",
-                OVMF_CANDIDATES.len()
-            )
-        }),
+        (Some(_), None) | (None, Some(_)) => {
+            bail!("{ENV_OVMF_CODE} and {ENV_OVMF_VARS} must be set together; {INSTALL_HINT}")
+        }
+        (None, None) => {
+            let paths = resolve_ovmf_with(&|path| path.is_file()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no OVMF firmware found (looked for {} known layouts under /usr/share); {INSTALL_HINT}",
+                    OVMF_CANDIDATES.len()
+                )
+            })?;
+            ensure_secure_boot_pair(&paths.code, &paths.vars_template, paths.secure_boot)?;
+            Ok(paths)
+        }
     }
 }
 
@@ -461,6 +508,37 @@ mod tests {
     fn write_file(path: &Path, len: usize) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, vec![0u8; len]).unwrap();
+    }
+
+    fn write_utf16(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes: Vec<u8> = text.bytes().flat_map(|byte| [byte, 0x00]).collect();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn test_secure_boot_pair_rejects_a_template_without_microsoft_keys() {
+        let root = temp_dir("secboot-pair");
+        let code = root.join("OVMF_CODE.secboot.4m.fd");
+        write_file(&code, 4096);
+        let plain = root.join("OVMF_VARS.4m.fd");
+        write_file(&plain, 1024);
+        let enrolled = root.join("OVMF_VARS.4m.ms.fd");
+        write_utf16(&enrolled, "Microsoft Corporation");
+
+        assert!(!vars_template_enrolls_microsoft_keys(&plain).unwrap());
+        assert!(vars_template_enrolls_microsoft_keys(&enrolled).unwrap());
+
+        let error = ensure_secure_boot_pair(&code, &plain, true)
+            .expect_err("a setup-mode pairing must be refused")
+            .to_string();
+        assert!(error.contains("setup mode"), "{error}");
+        assert!(error.contains("QLEAN_OVMF_VARS"), "{error}");
+        assert!(error.contains("OVMF_VARS.4m.ms.fd"), "{error}");
+
+        ensure_secure_boot_pair(&code, &enrolled, true).expect("enrolled template is accepted");
+        // Without Secure Boot the template contents do not matter.
+        ensure_secure_boot_pair(&code, &plain, false).expect("no Secure Boot, no key check");
     }
 
     #[test]
