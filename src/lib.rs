@@ -3469,6 +3469,48 @@ mod plan_doc_tests {
         );
     }
 
+    /// Every device name the README names is a name the code actually reserves.
+    ///
+    /// The README lists examples of the reserved names rather than all of them, so the list in
+    /// `guest_path` is the authority. Nothing tied the two together: an example could name a
+    /// device the validator happily accepts, which tells a user their path is refused while the
+    /// path works - or, worse, the other way round once the list is trimmed.
+    #[test]
+    fn the_device_names_the_readme_names_are_the_ones_the_code_reserves() {
+        const README: &str = include_str!("../README.md");
+        const GUEST_PATH: &str = include_str!("../src/guest_path.rs");
+
+        let sentence = README
+            .split("reserved device names (")
+            .nth(1)
+            .expect("the README no longer lists reserved device names");
+        let list = &sentence[..sentence
+            .find(')')
+            .expect("the example list is unterminated")];
+        let named: Vec<&str> = list
+            .split(',')
+            .map(|name| name.trim().trim_matches('`'))
+            .filter(|name| !name.is_empty() && *name != "...")
+            .collect();
+        assert!(
+            named.len() >= 4,
+            "the README should name several examples, not {named:?}"
+        );
+
+        let reserved = GUEST_PATH
+            .split("const WINDOWS_RESERVED_NAMES")
+            .nth(1)
+            .and_then(|rest| rest.split("= [").nth(1))
+            .and_then(|rest| rest.split(']').next())
+            .expect("`guest_path` no longer keeps a reserved-name list");
+        for name in named {
+            assert!(
+                reserved.contains(&format!("\"{name}\"")),
+                "README.md names `{name}` as a reserved device, but `WINDOWS_RESERVED_NAMES` does not list it"
+            );
+        }
+    }
+
     /// `CRATE_SOURCES` lists every crate source that exists, and nothing that does not.
     ///
     /// The list is hand-written, so a new module under `src/` would silently sit outside every
