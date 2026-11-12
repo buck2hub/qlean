@@ -845,6 +845,136 @@ mod plan_doc_tests {
         found
     }
 
+    /// A tally as a round writes it outside the `本轮计数：` sentence.
+    ///
+    /// Rounds R1-R147 state their counts in Chinese numerals in prose - the revision history
+    /// writes `负结果（两条）`, the review log writes `负结果两条（…）` - and only R148 onwards share
+    /// the digit sentence `本轮计数：变异 4 条被抓`. A guard that reads digits therefore covers four
+    /// rounds out of a hundred and fifty-one and says nothing about the other hundred and
+    /// forty-seven, which is how R152's F160 hid: mutating R144's log row from `负结果两条` to
+    /// `负结果三条` left the two documents disagreeing and the guard green.
+    fn spelled_tally(text: &str, label: &str) -> Option<usize> {
+        /// Read one numeral: ASCII digits, `两`, or the Chinese spelling up to ninety-nine.
+        fn read_numeral(text: &str) -> Option<(usize, usize)> {
+            fn digit_value(ch: char) -> Option<usize> {
+                Some(match ch {
+                    '零' => 0,
+                    '一' => 1,
+                    '二' | '两' => 2,
+                    '三' => 3,
+                    '四' => 4,
+                    '五' => 5,
+                    '六' => 6,
+                    '七' => 7,
+                    '八' => 8,
+                    '九' => 9,
+                    _ => return None,
+                })
+            }
+            let ascii: String = text.chars().take_while(char::is_ascii_digit).collect();
+            if !ascii.is_empty() {
+                return Some((ascii.parse().ok()?, ascii.len()));
+            }
+            let mut consumed = 0;
+            let mut value = None;
+            let mut after_ten = 0usize;
+            for ch in text.chars() {
+                if ch == '十' {
+                    after_ten = value.take().unwrap_or(1) * 10;
+                    consumed += ch.len_utf8();
+                    continue;
+                }
+                match digit_value(ch) {
+                    Some(digit) => {
+                        if after_ten > 0 {
+                            after_ten += digit;
+                        } else if value.is_none() {
+                            value = Some(digit);
+                        } else {
+                            break;
+                        }
+                        consumed += ch.len_utf8();
+                    }
+                    None => break,
+                }
+            }
+            if after_ten > 0 {
+                Some((after_ten, consumed))
+            } else {
+                Some((value?, consumed))
+            }
+        }
+
+        /// A tally written as `<numeral> 条`, optionally behind an opening parenthesis.
+        fn leading_tally(text: &str) -> Option<(usize, usize)> {
+            let stripped = text.trim_start_matches(['（', '(', ' ']);
+            let skipped = text.len() - stripped.len();
+            let (count, used) = read_numeral(stripped)?;
+            let tail = &stripped[used..];
+            let spaces = tail.len() - tail.trim_start_matches(' ').len();
+            if tail[spaces..].starts_with('条') {
+                // The reported length covers the numeral, the spaces and `条`, so a caller can
+                // ask whether the tally ended exactly where it expected to.
+                Some((count, skipped + used + spaces + '条'.len_utf8()))
+            } else {
+                None
+            }
+        }
+
+        /// The clause a label sits in: a tally never describes a neighbour's clause.
+        fn clause(text: &str) -> &str {
+            let cut = text
+                .char_indices()
+                .find(|(_, ch)| matches!(ch, '；' | '。' | '|' | '\n'))
+                .map(|(at, _)| at)
+                .unwrap_or(text.len());
+            &text[..cut]
+        }
+
+        let mut found = None;
+        let mut search = 0;
+        while let Some(offset) = text[search..].find(label) {
+            let at = search + offset;
+            search = at + label.len();
+            let after = clause(&text[at + label.len()..]);
+            let window_end = after
+                .char_indices()
+                .nth(12)
+                .map(|(at, _)| at)
+                .unwrap_or(after.len());
+            // The tally follows the label directly (`变异四条`) or behind a word or two
+            // (`变异实测（三条被抓）`).
+            if let Some(count) = after[..window_end]
+                .char_indices()
+                .find_map(|(at, _)| leading_tally(&after[at..]).map(|(count, _)| count))
+            {
+                found = Some(count);
+                continue;
+            }
+            // A tally can also be written in front of the label (`两条变异被抓`), and then it
+            // has to end where the label begins - otherwise `负结果两条` next door would be read
+            // as this label's count, which is exactly how R114 first looked like a disagreement.
+            let before = text[..at]
+                .rsplit(['；', '。', '|', '\n'])
+                .next()
+                .unwrap_or_default();
+            let prefix_start = before
+                .char_indices()
+                .rev()
+                .nth(8)
+                .map(|(at, _)| at)
+                .unwrap_or(0);
+            let prefix = &before[prefix_start..];
+            if let Some(count) = prefix.char_indices().find_map(|(at, _)| {
+                let (count, used) = leading_tally(&prefix[at..])?;
+                prefix[at + used..].trim_end().is_empty().then_some(count)
+            }) {
+                found = Some(count);
+            }
+        }
+        found
+    }
+
     /// The review log reads newest-first, with every round exactly once and none missing.
     ///
     /// The log grew in two directions: rounds 1-94 were appended oldest-first, then rounds 95+
@@ -2681,45 +2811,92 @@ mod plan_doc_tests {
         }
     }
 
-    /// The newest round's evidence reads the same in the plan and in the status view.
+    /// Each round's evidence reads the same in the plan and in the status view.
     ///
-    /// Each round's summary is written twice - once in the revision history, once in the status
-    /// view's digest - and R148 exists because the two drifted: the plan's R147 row lost its
-    /// negative results to a stray `cp` restore, the digest kept the shorter claim, and the
-    /// commit message described evidence that was no longer in the tree. Counting the mutations
-    /// and the negative results in both places is cheap and catches exactly that drift.
+    /// Each round's summary is written twice - once in the revision history, once in the review
+    /// log's row - and the status view's digest carries the newest round again. R148 exists
+    /// because the two drifted: the plan's R147 row lost its negative results to a stray `cp`
+    /// restore, and the commit message described evidence that was no longer in the tree.
+    ///
+    /// R152 is the same failure one level up: the guard R148 added only read the newest round,
+    /// so one hundred and forty-seven rounds could disagree with themselves unnoticed. Both
+    /// spellings of a tally are read now, and the guard refuses to report success on a scan that
+    /// looked at only a handful of rounds.
     #[test]
-    fn the_newest_round_states_the_same_counts_in_both_documents() {
+    fn every_round_states_the_same_counts_in_both_documents() {
         const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
         const STATUS: &str = include_str!("../docs/plan/plan-status.md");
 
-        let newest = PLAN
-            .lines()
-            .skip_while(|line| line.trim_end() != "## Review log")
-            .filter_map(|line| line.strip_prefix("| R"))
-            .map(|rest| {
-                rest.chars()
-                    .take_while(char::is_ascii_digit)
-                    .collect::<String>()
-            })
-            .filter(|digits| !digits.is_empty())
-            .filter_map(|digits| digits.parse::<u32>().ok())
-            .next()
-            .expect("the review log has no rounds");
+        let lines: Vec<&str> = PLAN.lines().collect();
+        let log_at = lines
+            .iter()
+            .position(|line| line.trim_end() == "## Review log")
+            .expect("the plan has no Review log section");
+
+        let rounds = |row: &str| {
+            row.strip_prefix("| R")
+                .map(|rest| {
+                    rest.chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>()
+                })
+                .filter(|digits| !digits.is_empty())
+                .and_then(|digits| digits.parse::<u32>().ok())
+        };
+
+        let mut compared = 0usize;
+        let mut newest = 0u32;
+        for line in &lines[log_at..] {
+            let Some(round) = rounds(line) else {
+                continue;
+            };
+            newest = newest.max(round);
+            let heading = format!("review R{round}（");
+            let Some(history) = lines.iter().find(|row| row.contains(&heading)) else {
+                continue;
+            };
+            for (label, what) in [("变异", "mutations caught"), ("负结果", "negative results")]
+            {
+                let planned = spelled_tally(history, label);
+                let logged = spelled_tally(line, label);
+                match (planned, logged) {
+                    (Some(planned), Some(logged)) => {
+                        assert_eq!(
+                            planned, logged,
+                            "R{round} states {planned} {what} in the revision history and \
+                             {logged} in the review log: the same round cannot have two tallies"
+                        );
+                        compared += 1;
+                    }
+                    (None, None) => {}
+                    // Sixteen rows used to state a count in one document only, so the same
+                    // evidence could be read as one number here and nothing there; R152 filled
+                    // them in. A round that goes back to stating a count in one place only is a
+                    // round whose evidence cannot be cross-checked, so it fails here.
+                    (planned, logged) => panic!(
+                        "R{round} states {what} in only one of the two documents \
+                         (history: {planned:?}, log: {logged:?}): state the count in both, or the \
+                         two views of this round cannot be compared"
+                    ),
+                }
+            }
+        }
+
+        // The scan has to be wide enough to be worth anything: a silent change of shape would
+        // otherwise turn this guard into a test of an empty set, which is how F160 hid.
         assert!(
-            newest >= 140,
-            "the newest round is R{newest}: the scan is not reading the log"
+            compared >= 70,
+            "only {compared} tallies were compared in both documents; the guard is not reading \
+             the tables it was written for. The floor is the number R152 measured - older \
+             rounds describe their evidence in prose without a count at all, so this guard \
+             speaks about the pairs that do count, and about every round from R148 on."
+        );
+        assert!(
+            newest >= 150,
+            "the newest round found is R{newest}: the scan is not reading the review log"
         );
 
-        // The revision history carries the round's own tally; the review log's row is a
-        // verdict, not a count.
-        let row = PLAN
-            .lines()
-            .find(|line| line.contains(&format!("review R{newest}（")))
-            .expect("the newest round has no revision-history row of its own");
-
-        // The digest is one table cell of the plan's row; the round's sentence ends where the
-        // next round's number begins.
+        // The status view repeats the newest round, so it gets its own comparison.
         let digest = STATUS
             .lines()
             .find(|line| line.starts_with("| [`plan-20261104-windows-guest.md`]"))
@@ -2727,21 +2904,16 @@ mod plan_doc_tests {
         let start = digest
             .rfind(&format!("R{newest} "))
             .unwrap_or_else(|| panic!("the status digest never mentions R{newest}"));
-        // The digest lists its rounds oldest-first, so everything after the newest round's
-        // number belongs to that round.
         let sentence = &digest[start..];
-
-        // Both documents state the round's tally in one fixed sentence, so the guard reads a
-        // number instead of guessing which mention of "变异" is the count and which one is the
-        // stale claim being quoted.
-        for (label, what) in [
-            ("变异 ", "mutations caught"),
-            ("负结果 ", "negative results"),
-        ] {
-            let planned = tally(row, label)
-                .unwrap_or_else(|| panic!("the plan's R{newest} row states no {what}"));
-            let reported = tally(sentence, label)
+        for (label, what) in [("变异", "mutations caught"), ("负结果", "negative results")] {
+            let reported = tally(sentence, &format!("{label} "))
                 .unwrap_or_else(|| panic!("the status digest states no {what} for R{newest}"));
+            let newest_row = lines
+                .iter()
+                .find(|row| row.contains(&format!("review R{newest}（")))
+                .expect("the newest round has no revision-history row of its own");
+            let planned = spelled_tally(newest_row, label)
+                .unwrap_or_else(|| panic!("the plan's R{newest} row states no {what}"));
             assert_eq!(
                 planned, reported,
                 "the plan's R{newest} row says {planned} {what} and the status view says \
