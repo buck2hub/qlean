@@ -135,6 +135,7 @@
 | 2026-11-12 10:35:00 UTC | review R23（发布打包前置检查） | F29：`cargo package --allow-dirty --no-verify` 打包成功但警告 `crypto-bigint v0.7.5`（经 russh→rsa→crypto-primes 间接依赖）在 crates.io 已 yanked；发布点留下的锁文件会带着被撤回的依赖，接手者安装时只能看到警告。patch 级更新锁文件 `crypto-bigint 0.7.5 → 0.7.11`（连带 `ctutils 0.4.2 → 0.4.8`），无 manifest/API 变更（`bf83b3c`）；CI run `43198568379`（push/`main`）四 job 全绿；`cargo package` 现打包 27 个文件、598.4KiB，无 yanked 警告。同时勾选「兼容与文档收口」的 CI 项（R22 已落地） | N/A（不新增卡；`Cargo.lock` 属 `REL-01` write set，但为发布前置的依赖卫生，非发布动作） | `REL-01` Current evidence、Review log、实施证据汇总、兼容与文档收口、`Cargo.lock`、plan-status |
 | 2026-11-12 10:55:00 UTC | review R24（打包全验证与治理性发现，findings-only） | `cargo publish --dry-run --allow-dirty` 全验证通过（从 `target/package/qlean-0.3.1` 重新编译整个 crate），7 个 ignored 硬件测试实测全部快速失败于 DEP-01 守卫（无静默跳过、无挂起）。两条治理性发现，均属 `REL-01` 发布面、本轮不改：① 远端仅存在 tag `v0.1.0`/`v0.2.0`/`v0.3.0`，而 CHANGELOG 历史段落引用的 `v0.2.1`/`v0.2.2`/`v0.2.3`/`v0.3.1` 从未打过 tag，其 compare/release 链接 404；② 本机 DNS 把 `buck2hub.com` 解析到保留网段 `198.18.1.149`，外链可用性在本环境不可判定（`buck2hub.com` 与 crates.io API 探针均为代理伪影），因此不依据本轮探测改动任何外链 | N/A（不新增卡；两条发现登记给 `REL-01`） | `REL-01` Current evidence、Review log、兼容与文档收口（CHANGELOG 链接判据） |
 | 2026-11-12 11:10:00 UTC | review R25（文档滞后项对齐 R22/R24 事实） | F30：三处文档滞后——「当前缺口」表 GAP-07 仍写「CI 无 push 触发」（R22 已修并取得 run 证据）、「与其它计划的关系」表仍把 push 门列为待办、测试矩阵「编译门槛」写成 `cargo test --no-run`（CI 实为 `--all-targets`）。三处均按实测事实更新 | N/A（不新增卡；不改代码） | 当前缺口表、与其它计划的关系表、测试矩阵、Review log、plan-status |
+| 2026-11-12 11:30:00 UTC | review R26（路径层不变量与诊断准确性） | F31：`validate_windows_components` 对 `..` 命中的是「结尾空格或点」规则，报错为 `` `..` ends with a space or dot, which Windows strips ``——拒绝行为正确但诊断误导（Windows 会剥掉结尾点，`..` 是遍历语义，两者成因不同，调用方会按错误方向排查）。由新增的组合式不变量测试（768 种拼写 × 结构不变量）与「拒绝原因分类」测试发现。修：`..` 组件优先显式拒绝并给出 `` `..` is not allowed in a Windows guest path ``（`70a3155`）；同时把 28 个非法形态的断言从「有错即可」收紧为「必须命中对应检查」，NUL 与纯控制字符分列，新增纯控制字符用例。`cargo test --lib windows_path` 9 → 11，`cargo test --lib` 85 → 87 | N/A（`FS-01` 既有 AC：路径规范化与非法形式拒绝；无卡拆合） | `FS-01` 实现证据与门禁行、Review log、`src/guest_path.rs`、plan-status |
 
 ## 已决议设计决策
 
@@ -972,7 +973,7 @@
 | unsupported 语义 | `guest_path::ensure_supported(GuestOs, PosixOnlyOperation, &GuestPath)` 统一拒绝 Windows 的 `hard_link`/`read_link`/`set_permissions`，错误含操作名、sanitized guest 路径与原因（ACL vs mode bits）；Linux 三个操作不变 |
 | 链接不再静默跳过 | `upload` 目录树遇本地 symlink：Windows 直接报错；Linux 重建链接，`read_link` 或 `symlink` 失败即报错。`download` 遇远端 symlink/未知类型报错，不再 `continue` 静默成功 |
 | 递归删除 | `remove_dir_all` 先 `walk_remote_dir` 收集，再逆序删子项与父目录，符合 `std::fs::remove_dir_all` 语义（原实现仅单层 `remove_dir`） |
-| 单测 | `src/guest_path.rs` 9 个（盘符/根/分隔符、空格与非 ASCII、非法与不支持形式、非法字符与保留名、`..` 与 join 逃逸、join/parent、ancestors、strip_prefix、POSIX-only 拒绝 + Linux 可用、Linux 原样），`cargo test --lib windows_path` 过滤 |
+| 单测 | `src/guest_path.rs` 11 个（盘符/根/分隔符、空格与非 ASCII、非法与不支持形式、非法字符与保留名、`..` 与 join 逃逸、join/parent、ancestors、strip_prefix、POSIX-only 拒绝 + Linux 可用、Linux 原样，外加 R26 的两个：768 种拼写的结构不变量、28 个非法形态的拒绝原因分类），`cargo test --lib windows_path` 过滤 |
 | 集成测试（`#[ignore]`） | `tests/windows_machine.rs::windows_files`：`C:\qlean-fs-test` 下建目录、写/读/`read_to_string`、`copy`、`rename`、`remove_dir_all`、文件与目录 `upload`/`download` 往返，`read_link`/`hard_link`/`set_permissions` 三个 POSIX-only 入口逐一报错（R19，`daa6f19`） |
 | README/CHANGELOG | README 新增「Windows file operations」支持矩阵与路径规则；CHANGELOG Added 四条 |
 | Windows `copy` | `Machine::copy` 的 Windows 分支由 `windows::copy_file_command` 生成，直接执行 `Copy-Item -LiteralPath … -Destination … -Force`（单引号字面量，`$`/反引号/空格/非 ASCII 原样保留），不再套一层 `powershell -Command "..."`（R10，`src/windows.rs`、`src/machine.rs`） |
@@ -994,7 +995,7 @@
 **Verification:**
 
 - [x] `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings`
-- [x] `cargo test --lib windows_path`（9 passed）
+- [x] `cargo test --lib windows_path`（11 passed；R26 增补组合式不变量与拒绝原因分类两组）
 - [x] `cargo test --lib`（69 passed）
 - [x] `cargo test --no-run`
 - [ ] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine windows_files -- --ignored --exact --test-threads=1` —— `blocked`
@@ -1249,6 +1250,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R23 | 发布打包前置检查 | PASS | 无开放项 | 发布点从未验证过打包产物：`cargo package` 暴露锁文件含已 yanked 的 `crypto-bigint v0.7.5`（russh→rsa→crypto-primes 传递依赖），而仓库其它门（fmt/clippy/rustdoc/单测）都不会报出这一点 | `cargo update -p crypto-bigint` 升到 0.7.11（连带 ctutils 0.4.8），本地全门重跑（fmt/clippy/rustdoc/`cargo test --lib` 85 passed/`--no-run --all-targets`）全绿，`cargo package` 不再有 yanked 警告；CI run `43198568379`（push/`main`/`bf83b3c`）四 job 全绿 |
 | R24 | 打包全验证与治理性发现 | PASS（findings-only，无代码改动） | 两条发现移交 `REL-01`：CHANGELOG 历史 compare 链接指向从未存在的 tag；外链可用性在本环境不可判定（DNS 代理伪影） | 打包面已用 `cargo publish --dry-run` 全验证（从打包产物重编译）；硬件守卫面用 `cargo test --test windows_machine -- --ignored --test-threads=1` 实测 7 failed，全部快速返回 DEP-01 提示。发现①：`gh api repos/buck2hub/qlean/tags` 仅 `v0.1.0`/`v0.2.0`/`v0.3.0`，而 CHANGELOG 引用 `v0.2.1`…`v0.3.1`，GitHub compare/release 404（发布面历史问题，不在本计划写集内）；发现②：`getent hosts buck2hub.com` → `198.18.1.149`（保留网段），curl 全部外链探测经代理，结论不可用，故不改外链 |
 | R25 | 文档滞后项对齐 | PASS | 无开放项 | R22 落地后计划内仍有 3 处「将来时」表述未回写：GAP-07 表项、与其它计划关系表中的 push 门待办、测试矩阵编译门槛命令过窄（`--no-run` 而非 `--no-run --all-targets`） | 逐条改为实测事实并标注 R22 提交与 run 证据；其余 GAP 行保持 `in-progress`（实现完成但硬件证据缺失），未提前标关闭 |
+| R26 | 路径层不变量与诊断准确性 | PASS | 无开放项 | F31：`..` 组件被「结尾空格或点」规则拦下，诊断说 Windows 会剥掉结尾点，而真实原因是遍历语义——行为对、解释错；既有 9 个手写用例都没覆盖「拒绝原因是否对得上」，也没覆盖拼写交叉组合后的规范化不变量 | 新增两个测试：① 768 种驱动盘/分隔符/组件/结尾分隔符交叉拼写，断言规范化后盘符大写、`/` 唯一分隔、无结尾 `/`、重解析幂等、`file_name`/`parent().join()`/`ancestors` 首尾一致；② 28 个非法形态按「必须命中哪条检查」断言（UNC/设备路径/drive-relative/无盘符/`..`/NUL/控制字符/非法字符/结尾空格点/保留名）。测试先暴露 F31 与两处期望偏差（空串、NUL 由更早的守卫报出），修 `..` 显式拒绝后全绿（`70a3155`）；`cargo test --lib` 87 passed |
 
 ### R1 findings 与修订对照
 
