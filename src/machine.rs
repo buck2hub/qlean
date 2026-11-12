@@ -462,10 +462,12 @@ StandardError=journal
             .args(["-as", "mkisofs"])
             .args(["-V", "cidata"])
             .args(["-J", "-R"])
-            .args(["-o", seed_iso_path.to_str().unwrap()])
-            .args(["-graft-points"])
-            .arg(format!("user-data={}", user_data_path.to_string_lossy()))
-            .arg(format!("meta-data={}", meta_data_path.to_string_lossy()));
+            // `-o` takes the path as its own argument, so no string conversion is needed.
+            .arg("-o")
+            .arg(&seed_iso_path)
+            .arg("-graft-points")
+            .arg(crate::utils::path_argument("user-data=", &user_data_path))
+            .arg(crate::utils::path_argument("meta-data=", &meta_data_path));
         debug!(
             "Creating seed ISO with command:\n{:?}",
             xorriso_command.to_string()

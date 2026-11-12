@@ -266,9 +266,9 @@ impl DeploySeed {
             .args(["-o"])
             .arg(&self.iso)
             .arg("-graft-points")
-            .arg(format!(
-                "{SEED_ROOT}={}",
-                self.dir.join(SEED_ROOT).display()
+            .arg(crate::utils::path_argument(
+                &format!("{SEED_ROOT}="),
+                &self.dir.join(SEED_ROOT),
             ));
         debug!("Creating Windows seed ISO with command:\n{:?}", cmd);
 

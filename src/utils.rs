@@ -219,6 +219,17 @@ pub(crate) fn create_dir(purpose: &str, path: &Path) -> Result<()> {
     restrict_dir(path)
 }
 
+/// Build a `key=path` command-line argument without lossy path conversion.
+///
+/// `format!("{key}={}", path.display())` (and `to_string_lossy`) replaces non-UTF-8 bytes
+/// with `U+FFFD`, so a home directory that is not valid UTF-8 would silently point the
+/// tool at a different, non-existent path. `OsString` keeps the bytes intact.
+pub(crate) fn path_argument(prefix: &str, path: &Path) -> std::ffi::OsString {
+    let mut argument = std::ffi::OsString::from(prefix);
+    argument.push(path.as_os_str());
+    argument
+}
+
 /// Make a directory owner-only (`0700`).
 ///
 /// Applied to every directory Qlean creates and to the per-VM run directory, so the
@@ -592,6 +603,36 @@ mod tests {
             ""
         );
         assert_eq!(parse_lease_expiry(""), "");
+    }
+
+    #[test]
+    fn test_path_argument_keeps_non_utf8_bytes_intact() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        // A home directory that is not valid UTF-8, for example a byte from a legacy locale.
+        let raw = std::ffi::OsString::from_vec(b"/home/l\xffgacy/seed/user-data".to_vec());
+        let path = std::path::PathBuf::from(raw);
+        let argument = path_argument("user-data=", &path);
+
+        // `Path::display()` would replace `\xff` with U+FFFD here.
+        assert!(path.to_string_lossy().contains('\u{fffd}'));
+        let expected = b"user-data=/home/l\xffgacy/seed/user-data";
+        assert_eq!(argument.as_os_str().as_bytes(), expected);
+    }
+
+    #[test]
+    fn test_path_argument_prefixes_without_separator_side_effects() {
+        let path = std::path::PathBuf::from("/run/qlean/abc/seed");
+        let argument = path_argument("qlean=", &path);
+        assert_eq!(
+            argument,
+            std::ffi::OsString::from("qlean=/run/qlean/abc/seed")
+        );
+        // An empty prefix yields the bare path.
+        assert_eq!(
+            path_argument("", &path),
+            std::ffi::OsString::from("/run/qlean/abc/seed")
+        );
     }
 
     #[test]
