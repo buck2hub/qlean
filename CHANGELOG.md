@@ -58,6 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Windows guests were launched with `vhost-vsock-pci`, so a Windows VM needed `/dev/vhost-vsock` and the `vhost_vsock` module and failed to start without them; the device is now added only for Linux guests
 - OVMF setup required the code image and vars template to be exactly the same size, which no stock firmware pair satisfies (a ~528 KiB vars template ships next to a multi-megabyte code image); only a vars template larger than the code image is now rejected
 - The `swtpm` control socket was created with default permissions; it is now owner-only (`mode=0600`)
+- A local image whose file name is not valid UTF-8 gets its own cache entry instead of sharing `custom-image` with every other such image and being re-downloaded on every switch
 - A Windows first boot spends one deployment budget across the DHCP lease wait, the `sshd` wait and the deploy-marker wait, matching the documented contract; a spent budget names the phase that never ran
 - A Windows guest that completes the handshake and rejects Qlean's key now reports that at the end of the budget, naming the authorized_keys install location, the ACL, and the blank-password trap (`LimitBlankPasswordUse`) instead of a generic "not reachable"
 - During a Windows first boot a host key that is not the deployed one is retried until the deploy budget is spent and then reported as exactly that; after deployment a mismatch stays fatal

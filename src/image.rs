@@ -429,14 +429,27 @@ fn cache_name_from_source(source: &ImageSource) -> String {
             let last = path.rsplit('/').next().unwrap_or("custom-image.qcow2");
             stem_from_filename(last)
         }
-        ImageSource::LocalPath(path) => {
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("custom-image.qcow2");
-            stem_from_filename(name)
-        }
+        ImageSource::LocalPath(path) => local_cache_stem(path.file_name()),
     }
+}
+
+/// Cache stem for a local image file name, distinct even when it is not UTF-8.
+///
+/// A file name that is not valid UTF-8 cannot be rendered, and falling back to one
+/// shared name (`custom-image`) would map every such image onto the same cache entry:
+/// two different images would keep evicting each other and be re-downloaded on every
+/// switch. The fallback therefore carries a hash of the raw name bytes, which is stable
+/// across runs and different for different files.
+fn local_cache_stem(name: Option<&std::ffi::OsStr>) -> String {
+    if let Some(text) = name.and_then(|name| name.to_str()) {
+        return stem_from_filename(text);
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in name.map(|name| name.as_encoded_bytes()).unwrap_or_default() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("custom-image-{hash:016x}")
 }
 
 enum StreamingHasher {
@@ -976,6 +989,37 @@ f0442f3cd0087a609ecd5241109ddef0cbf4a1e05372e13d82c97fc77b35b2d8ecff85aea6770915
             "https://example.com/path/debian-13-buck2.qcow2?X-Amz-Signature=deadbeef".to_string(),
         );
         assert_eq!(cache_name_from_source(&src), "debian-13-buck2");
+    }
+
+    #[test]
+    fn test_two_non_utf8_images_get_distinct_cache_names() {
+        use std::os::unix::ffi::OsStrExt;
+        let first = ImageSource::LocalPath(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+            b"/images/windows-\xff.qcow2",
+        )));
+        let second = ImageSource::LocalPath(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+            b"/images/windows-\xfe.qcow2",
+        )));
+        let (a, b) = (
+            cache_name_from_source(&first),
+            cache_name_from_source(&second),
+        );
+        assert_ne!(
+            a, b,
+            "two different images must not share one cache entry: {a}"
+        );
+        assert!(a.starts_with("custom-image-"), "{a}");
+        assert_eq!(
+            a,
+            cache_name_from_source(&first),
+            "the fallback name must be stable across runs"
+        );
+    }
+
+    #[test]
+    fn test_utf8_local_image_keeps_its_stem() {
+        let src = ImageSource::LocalPath(std::path::PathBuf::from("/images/windows-11.qcow2"));
+        assert_eq!(cache_name_from_source(&src), "windows-11");
     }
 
     #[test]
