@@ -1789,6 +1789,54 @@ mod plan_doc_tests {
     /// phantom cells when rendered. Nothing checked either table, so the drift survived 140
     /// rounds. A row now has to match its header, the review log's `P2 处置` cell has to say
     /// something, and rows that render short or long are named by round.
+    /// Seven smoke tests are the only place a real Windows guest is exercised.
+    ///
+    /// The plan's matrix promises that, when the host cannot run them, all seven stop at the
+    /// same prerequisite gate instead of one of them skipping it and reporting a pass. That
+    /// promise is about the suite, so it has to be checked against the suite: a test that
+    /// returned early, built no machine, or forgot the image gate would leave the promise
+    /// describing a suite that no longer exists - and a green `--ignored` run would then mean
+    /// "nothing to do here" rather than "the gate answered".
+    #[test]
+    fn every_windows_smoke_test_stops_at_the_prerequisite_gate() {
+        const SMOKE: &str = include_str!("../tests/windows_machine.rs");
+
+        let names = [
+            "windows_firmware_lifecycle",
+            "windows_first_boot",
+            "windows_transport",
+            "windows_pool",
+            "windows_exec",
+            "windows_get_ip",
+            "windows_files",
+        ];
+        assert_eq!(names.len(), 7, "the plan counts seven Windows smoke tests");
+        assert_eq!(
+            SMOKE.matches("#[tokio::test]").count(),
+            names.len(),
+            "a Windows smoke test was added or removed without updating the plan's count"
+        );
+
+        for name in names {
+            let signature = format!("async fn {name}(");
+            let body = function_body(SMOKE, &signature);
+            assert!(
+                body.contains("windows_image_config()?"),
+                "`{name}` does not ask for the Windows image first, so it may never reach the \
+                 prerequisite gate the plan promises it stops at"
+            );
+            assert!(
+                body.contains("Machine::new(") || body.contains("pool.add("),
+                "`{name}` builds no machine, so nothing in it can reach the QEMU prerequisites"
+            );
+            assert!(
+                !body.contains("return Ok(())"),
+                "`{name}` returns success early, which would let it report a pass without \
+                 running the guest it is supposed to exercise"
+            );
+        }
+    }
+
     #[test]
     fn every_table_row_has_the_columns_its_header_declares() {
         let plan = include_str!("../docs/plan/plan-20261104-windows-guest.md");
