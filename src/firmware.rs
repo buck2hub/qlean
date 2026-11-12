@@ -318,11 +318,6 @@ pub(crate) fn ensure_host_support() -> Result<()> {
 /// Secure Boot variable store that must survive shutdown/spawn cycles.
 pub(crate) fn prepare_vars(run_dir: &Path, firmware: &FirmwarePaths) -> Result<PathBuf> {
     let dest = run_dir.join("ovmf_vars.fd");
-    if dest.is_file() {
-        debug!("Reusing per-VM OVMF vars image at {}", dest.display());
-        return Ok(dest);
-    }
-
     let code_len = std::fs::metadata(&firmware.code)
         .with_context(|| format!("failed to stat OVMF code image {}", firmware.code.display()))?
         .len();
@@ -355,10 +350,54 @@ pub(crate) fn prepare_vars(run_dir: &Path, firmware: &FirmwarePaths) -> Result<P
         );
     }
 
+    if dest.is_file() {
+        // The per-VM vars image survives restarts and holds the guest's NVRAM, so it is not
+        // overwritten. A size that no longer matches the template means it was written by a
+        // different OVMF build (the distribution upgraded the firmware) or left truncated:
+        // booting on it either corrupts NVRAM or fails inside the firmware.
+        let dest_len = std::fs::metadata(&dest)
+            .with_context(|| {
+                format!(
+                    "failed to stat the per-VM OVMF vars image {}",
+                    dest.display()
+                )
+            })?
+            .len();
+        anyhow::ensure!(
+            dest_len == vars_len,
+            "the per-VM OVMF vars image {} is {} bytes but the vars template {} is {} bytes: \
+             the firmware was replaced or the image was truncated. Delete {} to start from the \
+             template (this discards the guest's Secure Boot and TPM NVRAM) and boot again",
+            dest.display(),
+            dest_len,
+            firmware.vars_template.display(),
+            vars_len,
+            dest.display()
+        );
+        // `std::fs::copy` reproduced the template's mode when this image was created, so a
+        // read-only template also left a read-only pflash image behind.
+        crate::utils::restrict_file(&dest).with_context(|| {
+            format!(
+                "failed to make the per-VM OVMF vars image {} writable",
+                dest.display()
+            )
+        })?;
+        debug!("Reusing per-VM OVMF vars image at {}", dest.display());
+        return Ok(dest);
+    }
+
     std::fs::copy(&firmware.vars_template, &dest).with_context(|| {
         format!(
             "failed to copy OVMF vars template {} to {}",
             firmware.vars_template.display(),
+            dest.display()
+        )
+    })?;
+    // Match the template's mode, not the template's permissions: QEMU must be able to write
+    // the variables back, and the file is firmware state.
+    crate::utils::restrict_file(&dest).with_context(|| {
+        format!(
+            "failed to restrict the per-VM OVMF vars image {} to 0600",
             dest.display()
         )
     })?;
@@ -619,6 +658,64 @@ mod tests {
         let again = prepare_vars(&run_dir, &firmware).unwrap();
         assert_eq!(again, dest);
         assert_eq!(std::fs::read(&again).unwrap(), vec![1u8; 64]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_prepare_vars_makes_a_read_only_template_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Some distributions ship the vars template as `0444`; `std::fs::copy` reproduces
+        // the source mode, which would leave QEMU unable to write the variables back.
+        let root = temp_dir("vars-readonly");
+        let run_dir = root.join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let code = root.join("code.fd");
+        let vars_template = root.join("vars.fd");
+        write_file(&code, 64);
+        write_file(&vars_template, 64);
+        std::fs::set_permissions(&vars_template, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let firmware = FirmwarePaths {
+            code,
+            vars_template,
+            secure_boot: false,
+        };
+
+        let dest = prepare_vars(&run_dir, &firmware).expect("a read-only template is usable");
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "per-VM vars must be writable and owner-only");
+        // The point of 0600 here: a writable pflash image holding NVRAM and keys.
+        std::fs::write(&dest, vec![2u8; 64]).expect("vars image must be writable");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_prepare_vars_rejects_a_stale_per_vm_image() {
+        // The distribution replaced OVMF after this VM was created: booting on the old
+        // NVRAM either corrupts it or fails inside the firmware, so say so instead.
+        let root = temp_dir("vars-stale");
+        let run_dir = root.join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let code = root.join("code.fd");
+        let vars_template = root.join("vars.fd");
+        write_file(&code, 4096);
+        write_file(&vars_template, 540);
+        let dest = run_dir.join("ovmf_vars.fd");
+        write_file(&dest, 256);
+        let firmware = FirmwarePaths {
+            code,
+            vars_template,
+            secure_boot: true,
+        };
+
+        let err = prepare_vars(&run_dir, &firmware).unwrap_err().to_string();
+        assert!(err.contains("540") && err.contains("256"), "{err}");
+        assert!(err.contains("Delete"), "must say how to recover: {err}");
+        // The guest's NVRAM must not be silently replaced by the template.
+        assert_eq!(std::fs::read(&dest).unwrap().len(), 256);
 
         let _ = std::fs::remove_dir_all(&root);
     }

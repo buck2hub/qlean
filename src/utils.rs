@@ -247,6 +247,27 @@ pub(crate) fn path_argument(prefix: &str, path: &Path) -> std::ffi::OsString {
     argument
 }
 
+/// Make a file owner-only and owner-writable (`0600`).
+///
+/// Files Qlean generates hold secrets (client keys, seeds) or firmware state, and a copy of
+/// a file can inherit the source's mode: `std::fs::copy` reproduces the permission bits, so
+/// a stock `0444` OVMF vars template would become a per-VM pflash image the owner cannot
+/// write, which QEMU reports as a read-only firmware device.
+pub(crate) fn restrict_file(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |error| anyhow::anyhow!("failed to restrict {} to 0600: {error}", path.display()),
+        )?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
 /// Make a directory owner-only (`0700`).
 ///
 /// Applied to every directory Qlean creates and to the per-VM run directory, so the

@@ -376,18 +376,7 @@ async fn seal_seed_medium(path: &Path) -> Result<()> {
 }
 
 async fn set_owner_only(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .await
-            .with_context(|| format!("failed to restrict permissions on {}", path.display()))?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
+    crate::utils::restrict_file(path)
 }
 
 /// Quote a path as a PowerShell single-quoted literal.
