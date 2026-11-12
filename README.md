@@ -379,8 +379,9 @@ This defines a **NAT** network named `qlean` in libvirt, backed by the Linux bri
   ```rust
   pub struct ImageConfig {
     /// Guest operating system family, defaults to `GuestOs::Linux`.
-    /// `GuestOs::Windows` requires an amd64 image plus an explicit
-    /// `source` and `digest`; `distro` is ignored for Windows images.
+    ///
+    /// `GuestOs::Windows` requires `arch = GuestArch::Amd64`, `source` and `digest`;
+    /// `distro` is ignored for Windows images.
     pub guest_os: GuestOs,
     /// Architecture of the image, defaults to `GuestArch::Amd64`.
     pub arch: GuestArch,
@@ -411,8 +412,12 @@ This defines a **NAT** network named `qlean` in libvirt, backed by the Linux bri
     pub disk: Option<u32>,
     /// Whether to clear the runtime directory after use, defaults to `true`.
     pub clear: bool,
-    /// Timeout in seconds for SSH over vsock to wait during launch, 
-    /// defaults to `180` with KVM and `300` under TCG.
+    /// Launch timeout in seconds.
+    ///
+    /// Linux guests wait this long for SSH over vsock during launch; the default is
+    /// `180` with KVM and `300` under TCG. A Windows guest has no vsock, so on its first
+    /// boot this is the budget for the whole deployment (default `900`), and on later
+    /// boots the plain budget for finding and connecting to the guest.
     pub ssh_timeout: Option<u64>,
   }
   ```

@@ -132,7 +132,12 @@ pub struct MachineConfig {
     pub disk: Option<u32>,
     /// Whether to clear the runtime directory after use, defaults to `true`.
     pub clear: bool,
-    /// Timeout in seconds for SSH over vsock to wait during launch, defaults to `180` with KVM and `300` under TCG.
+    /// Launch timeout in seconds.
+    ///
+    /// Linux guests wait this long for SSH over vsock during launch; the default is `180`
+    /// with KVM and `300` under TCG. A Windows guest has no vsock, so on its first boot
+    /// this is the budget for the whole deployment (default `900`), and on later boots the
+    /// plain budget for finding and connecting to the guest.
     pub ssh_timeout: Option<u64>,
 }
 
@@ -155,7 +160,7 @@ impl MachineConfig {
         }
     }
 
-    /// Set the timeout in seconds for SSH over vsock to wait during launch.
+    /// Set the launch timeout in seconds (see [`MachineConfig::ssh_timeout`]).
     pub fn with_timeout(self, ssh_timeout: u64) -> Self {
         Self {
             ssh_timeout: Some(ssh_timeout),
@@ -2327,6 +2332,63 @@ mod timeout_tests {
             2,
             "remaining_budget must only be defined and used by remaining_first_boot_budget"
         );
+    }
+
+    /// Doc-comment text (`/// ...`) that documents `declaration` in `source`.
+    ///
+    /// The lines are joined into one string because the README wraps its excerpt at a
+    /// different column than the crate source; the wording, not the wrapping, is compared.
+    fn doc_text_before(source: &str, declaration: &str) -> String {
+        let lines: Vec<&str> = source.lines().collect();
+        let end = lines
+            .iter()
+            .position(|line| line.trim() == declaration)
+            .unwrap_or_else(|| panic!("`{declaration}` is not declared in the scanned file"));
+        let mut docs: Vec<String> = Vec::new();
+        for line in lines[..end].iter().rev() {
+            let trimmed = line.trim();
+            match trimmed.strip_prefix("///") {
+                Some(rest) => docs.push(rest.trim().to_string()),
+                // A blank line or an attribute above the field ends nothing: both can sit
+                // between the doc comment and the declaration.
+                None if docs.is_empty() && (trimmed.is_empty() || trimmed.starts_with("#[")) => {
+                    continue;
+                }
+                None => break,
+            }
+        }
+        docs.reverse();
+        docs.join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn the_readme_documents_the_config_fields_the_way_the_crate_does() {
+        // The bug: `ssh_timeout` was documented as "SSH over vsock" everywhere, including the
+        // API excerpt in the README, while a Windows guest uses it as the budget for its
+        // first-boot deployment. The README copy is not generated, so it drifted silently.
+        // Compare the two verbatim.
+        let readme = include_str!("../README.md");
+        let machine_rs = include_str!("machine.rs");
+        let image_rs = include_str!("image.rs");
+
+        for (field, declaration, crate_docs) in [
+            ("ssh_timeout", "pub ssh_timeout: Option<u64>,", machine_rs),
+            ("guest_os", "pub guest_os: GuestOs,", image_rs),
+        ] {
+            let documented = doc_text_before(crate_docs, declaration);
+            assert!(
+                !documented.is_empty(),
+                "`{field}` has no doc comment in the crate"
+            );
+            assert_eq!(
+                doc_text_before(readme, declaration),
+                documented,
+                "the README's `{field}` doc comment drifted from the crate's"
+            );
+        }
     }
 
     #[test]
