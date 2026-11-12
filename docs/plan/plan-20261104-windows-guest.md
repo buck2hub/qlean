@@ -75,7 +75,7 @@
 | GAP-04 | vsock、root/true probe 与任意服务端密钥接受硬编码 | Windows 传输不可达；直接加 TCP 会有地址发现和 MITM 风险 | `src/ssh.rs:89-104,571-630` | `SPK-01` → `TRN-01` |
 | GAP-05 | shell、IP、路径与部分文件操作硬编码 POSIX | Windows 命令和文件语义不兼容 | `src/machine.rs:495-516,922-1137`、`src/ssh.rs:831-841` | `EXE-01`/`IP-01`/`FS-01` |
 | GAP-06 | spawn/池/InteractiveShell 的支持边界未定义 | 首启成功仍可能在重启、双机或第二会话失败 | `src/machine.rs:451-493`、`src/pool.rs` | `OSX-03`/`TRN-01` |
-| GAP-07 | CI 无 push 触发，发布远端门不可执行 | 发布后无法按模板取得指定 ref 的 CI 证据 | `.github/workflows/check-and-test.yml:1-7` | `REL-01` |
+| GAP-07 | CI 无 push 触发，发布远端门不可执行（R22 已关闭：`push`(main)+PR 双触发，run `43197579979` 取得指定 ref 的 CI 证据） | 发布后无法按模板取得指定 ref 的 CI 证据 | `.github/workflows/check-and-test.yml:1-8` | `REL-01`（已关闭，R22 `4d4d1e9`） |
 | GAP-08 | 无 Windows 首启部署超时维度（Linux `ssh_timeout` 默认 180/300s 不覆盖部署时长） | 首启部署可能超时失败，核心证据难以取得 | `src/machine.rs:72,165-167` | `OSX-03` |
 | GAP-09 | 无 Windows VM 资源默认值讨论 | 支持矩阵可能声明默认资源下不满足最低要求的版本 | `src/machine.rs:63-68,156-157` | `OSX-02` |
 
@@ -87,7 +87,7 @@
 | `plan-template.md` | 模板 | 使用 v1.1；R1 同步修复模板状态机与发布规则歧义 |
 | `plan-status.md` | 执行状况单一视图 | 每卡同步状态、版本/commit、UTC 时间 |
 | `README.md` / `CHANGELOG.md` | 用户契约 | 每个行为卡同卡更新；`REL-01` 只做收口审计与版本段定稿 |
-| `.github/workflows/check-and-test.yml` | CI 契约 | `REL-01` 增加 push 发布门并对齐 clippy 命令 |
+| `.github/workflows/check-and-test.yml` | CI 契约 | `REL-01`：push 发布门与 clippy 对齐已由 R22 落地（`4d4d1e9`，run `43197579979`）|
 
 ## 评审结论与修订记录
 
@@ -134,6 +134,7 @@
 | 2026-11-12 10:20:00 UTC | review R22（CI 门实际执行与远端证据） | F28（R18 登记项落地）：`.github/workflows/check-and-test.yml` 的 test job 只有 `cargo test --no-run`（单测从未在 CI 执行）、clippy 缺 `--all-targets --all-features`（测试与 bench 不被 lint）、workflow 只在 `pull_request` 触发且 `paths-ignore` 忽略自身，故直推 `main` 的 57 个提交一次 CI 都没有。改为 `push`（`main`）+ `pull_request` 双触发、clippy 全 target/all features、新增 `cargo test --lib` 与 rustdoc 门、不再忽略 `.github/**`（`4d4d1e9`）；推后取得真实远端运行证据：run `43197579979`、event=`push`、ref=`refs/heads/main`、commit=`4d4d1e9`，4 个 job 全绿，CI 日志中 `running 85 tests` / `test result: ok. 85 passed` 证明单测确实被执行 | N/A（不新增卡；落地 `REL-01` AC-04 的 CI 部分，发布动作仍阻塞） | 事实基线 CI 行、门禁说明、`REL-01` Current evidence/AC-04、Review log、实施证据汇总、`.github/workflows/check-and-test.yml`、plan-status |
 | 2026-11-12 10:35:00 UTC | review R23（发布打包前置检查） | F29：`cargo package --allow-dirty --no-verify` 打包成功但警告 `crypto-bigint v0.7.5`（经 russh→rsa→crypto-primes 间接依赖）在 crates.io 已 yanked；发布点留下的锁文件会带着被撤回的依赖，接手者安装时只能看到警告。patch 级更新锁文件 `crypto-bigint 0.7.5 → 0.7.11`（连带 `ctutils 0.4.2 → 0.4.8`），无 manifest/API 变更（`bf83b3c`）；CI run `43198568379`（push/`main`）四 job 全绿；`cargo package` 现打包 27 个文件、598.4KiB，无 yanked 警告。同时勾选「兼容与文档收口」的 CI 项（R22 已落地） | N/A（不新增卡；`Cargo.lock` 属 `REL-01` write set，但为发布前置的依赖卫生，非发布动作） | `REL-01` Current evidence、Review log、实施证据汇总、兼容与文档收口、`Cargo.lock`、plan-status |
 | 2026-11-12 10:55:00 UTC | review R24（打包全验证与治理性发现，findings-only） | `cargo publish --dry-run --allow-dirty` 全验证通过（从 `target/package/qlean-0.3.1` 重新编译整个 crate），7 个 ignored 硬件测试实测全部快速失败于 DEP-01 守卫（无静默跳过、无挂起）。两条治理性发现，均属 `REL-01` 发布面、本轮不改：① 远端仅存在 tag `v0.1.0`/`v0.2.0`/`v0.3.0`，而 CHANGELOG 历史段落引用的 `v0.2.1`/`v0.2.2`/`v0.2.3`/`v0.3.1` 从未打过 tag，其 compare/release 链接 404；② 本机 DNS 把 `buck2hub.com` 解析到保留网段 `198.18.1.149`，外链可用性在本环境不可判定（`buck2hub.com` 与 crates.io API 探针均为代理伪影），因此不依据本轮探测改动任何外链 | N/A（不新增卡；两条发现登记给 `REL-01`） | `REL-01` Current evidence、Review log、兼容与文档收口（CHANGELOG 链接判据） |
+| 2026-11-12 11:10:00 UTC | review R25（文档滞后项对齐 R22/R24 事实） | F30：三处文档滞后——「当前缺口」表 GAP-07 仍写「CI 无 push 触发」（R22 已修并取得 run 证据）、「与其它计划的关系」表仍把 push 门列为待办、测试矩阵「编译门槛」写成 `cargo test --no-run`（CI 实为 `--all-targets`）。三处均按实测事实更新 | N/A（不新增卡；不改代码） | 当前缺口表、与其它计划的关系表、测试矩阵、Review log、plan-status |
 
 ## 已决议设计决策
 
@@ -1124,7 +1125,7 @@
 | Windows 传输/池 `(new)` | host key、重连、双机端点与 readiness | `cargo test --test windows_machine windows_transport -- --ignored --exact --test-threads=1`；`windows_pool` 同理 |
 | Windows 语义 `(new)` | exec/get_ip/文件与目录往返/unsupported | `cargo test --test windows_machine windows_exec -- --ignored --exact --test-threads=1`；`windows_get_ip`、`windows_files` 同理 |
 | Windows 全量核心门 | 上述所有 Windows 用例，每个支持版本 | 设置镜像 env 后：`cargo test --test windows_machine -- --ignored --test-threads=1` |
-| 编译门槛 | CI 编译所有 target，包括 ignored Windows 测试 | `cargo test --no-run` |
+| 编译门槛 | CI 编译所有 target，包括 ignored Windows 测试 | `cargo test --no-run --all-targets` |
 | 性能 | hash 流式无回归 | `cargo bench --bench hash_benchmark` |
 
 ## 追溯表
@@ -1247,6 +1248,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R22 | CI 门实际执行与远端证据 | PASS | 无开放项 | R18 登记的缺口：CI 只编译不运行（85 个单测从不在 CI 执行）、clippy 未覆盖测试/bench 代码、workflow 只在 PR 触发而本仓库直推 `main`（57 个提交零 CI 记录），且 `paths-ignore` 忽略 `.github/**` 使 workflow 改动无法自证 | workflow 改为 push(main)+PR 双触发、clippy `--all-targets --all-features`、新增 `cargo test --lib` 与 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、去掉对 `.github/**` 的忽略（`4d4d1e9`）；推后真实运行 run `43197579979`（event=`push`, ref=`refs/heads/main`, commit=`4d4d1e9`）4 job 全绿，日志含 `running 85 tests` → `test result: ok. 85 passed` |
 | R23 | 发布打包前置检查 | PASS | 无开放项 | 发布点从未验证过打包产物：`cargo package` 暴露锁文件含已 yanked 的 `crypto-bigint v0.7.5`（russh→rsa→crypto-primes 传递依赖），而仓库其它门（fmt/clippy/rustdoc/单测）都不会报出这一点 | `cargo update -p crypto-bigint` 升到 0.7.11（连带 ctutils 0.4.8），本地全门重跑（fmt/clippy/rustdoc/`cargo test --lib` 85 passed/`--no-run --all-targets`）全绿，`cargo package` 不再有 yanked 警告；CI run `43198568379`（push/`main`/`bf83b3c`）四 job 全绿 |
 | R24 | 打包全验证与治理性发现 | PASS（findings-only，无代码改动） | 两条发现移交 `REL-01`：CHANGELOG 历史 compare 链接指向从未存在的 tag；外链可用性在本环境不可判定（DNS 代理伪影） | 打包面已用 `cargo publish --dry-run` 全验证（从打包产物重编译）；硬件守卫面用 `cargo test --test windows_machine -- --ignored --test-threads=1` 实测 7 failed，全部快速返回 DEP-01 提示。发现①：`gh api repos/buck2hub/qlean/tags` 仅 `v0.1.0`/`v0.2.0`/`v0.3.0`，而 CHANGELOG 引用 `v0.2.1`…`v0.3.1`，GitHub compare/release 404（发布面历史问题，不在本计划写集内）；发现②：`getent hosts buck2hub.com` → `198.18.1.149`（保留网段），curl 全部外链探测经代理，结论不可用，故不改外链 |
+| R25 | 文档滞后项对齐 | PASS | 无开放项 | R22 落地后计划内仍有 3 处「将来时」表述未回写：GAP-07 表项、与其它计划关系表中的 push 门待办、测试矩阵编译门槛命令过窄（`--no-run` 而非 `--no-run --all-targets`） | 逐条改为实测事实并标注 R22 提交与 run 证据；其余 GAP 行保持 `in-progress`（实现完成但硬件证据缺失），未提前标关闭 |
 
 ### R1 findings 与修订对照
 
