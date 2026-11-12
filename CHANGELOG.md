@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Building the Windows seed ISO ran `xorriso` without a deadline, so a stuck build (an unreachable network mount under the staging directory, a hung FUSE mount) blocked `Machine::init` forever before the first-boot deadline had even started; the build now has a 120s budget and the child process is killed at the deadline with an error that names `xorriso` and the staging directory assumption
 - A lease that never expires (`infinite`) was parsed as "no expiry", so it ranked below every expiring row and the lookup could return an address the guest had already abandoned; it now outranks real timestamps, while a row with an unrecognizable expiry still ranks lowest
 - Teardown's "still running after SIGKILL" error carried a 30-space hole where a line continuation was intended, and the guard that rejects padded user-facing messages did not cover it; the message is now one sentence and is part of that guard
+- A DHCP lease lookup where `virsh net-dhcp-leases` never succeeded was reported as "the guest may still be booting", so an unreachable or unreadable libvirt sent the reader to the wrong machine after the full budget; the timeout now says the lease table could not be read, keeps `virsh`'s own message, and only speculates about the guest when a listing actually succeeded
 
 ### Changed
 

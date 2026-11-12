@@ -179,6 +179,11 @@ pub(crate) async fn find_lease_address(
     let mac = mac.to_ascii_lowercase();
     let deadline = tokio::time::Instant::now() + timeout;
     let mut last_seen = Vec::new();
+    // A failing `virsh` is not the same finding as "the guest has no lease": libvirt may be
+    // down or unreadable, and blaming the guest for 900s sends the reader to the wrong
+    // machine. Track both facts so the timeout can say which one happened.
+    let mut saw_a_listing = false;
+    let mut last_error: Option<String> = None;
 
     loop {
         let output = tokio::process::Command::new("virsh")
@@ -191,32 +196,70 @@ pub(crate) async fn find_lease_address(
             .context("failed to execute virsh to read DHCP leases for the qlean network")?;
 
         if output.status.success() {
+            saw_a_listing = true;
             last_seen = parse_dhcp_leases(&String::from_utf8_lossy(&output.stdout));
             if let Some(ip) = lease_address_for(&last_seen, &mac) {
                 debug!("MAC {mac} leased {ip}");
                 return Ok(ip);
             }
         } else {
-            debug!(
-                "virsh net-dhcp-leases failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            debug!("virsh net-dhcp-leases failed: {stderr}");
+            last_error = Some(stderr);
         }
 
         if tokio::time::Instant::now() >= deadline {
             bail!(
-                "no DHCP lease for MAC {mac} on the `qlean` network within {}s (leases seen: {:?}).\n\
-                 The guest may still be booting, or it did not bring up its virtio network device.\n\
-                 Only IPv4 leases are usable: an IPv6-only lease is reported above but never dialled.",
-                timeout.as_secs(),
-                last_seen
-                    .iter()
-                    .map(|lease| format!("{}={} (expires {})", lease.mac, lease.ip, lease.expiry))
-                    .collect::<Vec<_>>()
+                "{}",
+                lease_timeout_message(
+                    timeout,
+                    &mac,
+                    &last_seen,
+                    saw_a_listing,
+                    last_error.as_deref()
+                )
             );
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
+}
+
+/// Explain a lease lookup that ran out of budget.
+///
+/// The two causes need different words: when `virsh` never answered, the guest was never
+/// asked and nothing is known about it; when it did answer, the listed leases are the
+/// evidence. Reporting the first case as "the guest may still be booting" would point at
+/// the guest while the real problem is the host's libvirt.
+fn lease_timeout_message(
+    timeout: std::time::Duration,
+    mac: &str,
+    last_seen: &[DhcpLease],
+    saw_a_listing: bool,
+    last_error: Option<&str>,
+) -> String {
+    let listed = last_seen
+        .iter()
+        .map(|lease| format!("{}={} (expires {})", lease.mac, lease.ip, lease.expiry))
+        .collect::<Vec<_>>();
+    if !saw_a_listing {
+        return format!(
+            "could not read DHCP leases on the `qlean` network within {}s: `virsh \
+             net-dhcp-leases` never succeeded, so the guest was never checked (last error: {}).\n\
+             Fix libvirt access first: `virsh -c {VIRSH_CONNECTION_URI} net-list --all` must work \
+             as this user.",
+            timeout.as_secs(),
+            last_error.unwrap_or("none reported")
+        );
+    }
+    let last_error = last_error
+        .map(|error| format!("\nThe last `virsh net-dhcp-leases` call failed: {error}"))
+        .unwrap_or_default();
+    format!(
+        "no DHCP lease for MAC {mac} on the `qlean` network within {}s (leases seen: {listed:?}).\n\
+         The guest may still be booting, or it did not bring up its virtio network device.\n\
+         Only IPv4 leases are usable: an IPv6-only lease is reported above but never dialled.{last_error}",
+        timeout.as_secs()
+    )
 }
 
 pub(crate) struct QleanDirs {
@@ -869,6 +912,68 @@ mod tests {
         assert_eq!(
             lease_address_for(&leases, "52:54:00:aa:bb:cc").map(|ip| ip.to_string()),
             Some("192.168.221.77".to_string())
+        );
+    }
+
+    #[test]
+    fn test_lease_timeout_message_blames_libvirt_when_virsh_never_answered() {
+        // The guest was never checked, so the message must not speculate about it.
+        let message = lease_timeout_message(
+            std::time::Duration::from_secs(300),
+            "52:54:00:aa:bb:cc",
+            &[],
+            false,
+            Some("error: failed to connect to the hypervisor"),
+        );
+        assert!(message.contains("never succeeded"), "{message}");
+        assert!(
+            message.contains("failed to connect to the hypervisor"),
+            "{message}"
+        );
+        assert!(message.contains(VIRSH_CONNECTION_URI), "{message}");
+        assert!(
+            !message.contains("may still be booting"),
+            "an unreachable libvirt must not be reported as a slow guest: {message}"
+        );
+    }
+
+    #[test]
+    fn test_lease_timeout_message_reports_the_leases_it_saw() {
+        let leases = parse_dhcp_leases(&format!(
+            "{LEASES_HEADER} 2026-11-12 09:35:00   52:54:00:11:22:33   ipv4       192.168.221.43/24    *  -\n"
+        ));
+        let message = lease_timeout_message(
+            std::time::Duration::from_secs(900),
+            "52:54:00:aa:bb:cc",
+            &leases,
+            true,
+            None,
+        );
+        assert!(
+            message.contains("no DHCP lease for MAC 52:54:00:aa:bb:cc"),
+            "{message}"
+        );
+        assert!(message.contains("192.168.221.43"), "{message}");
+        assert!(message.contains("900s"), "{message}");
+        assert!(message.contains("virtio network device"), "{message}");
+        assert!(!message.contains("last `virsh"), "{message}");
+    }
+
+    #[test]
+    fn test_lease_timeout_message_keeps_a_failing_call_as_context() {
+        let message = lease_timeout_message(
+            std::time::Duration::from_secs(60),
+            "52:54:00:aa:bb:cc",
+            &[],
+            true,
+            Some("error: network 'qlean' not found"),
+        );
+        assert!(message.contains("may still be booting"), "{message}");
+        assert!(
+            message.contains(
+                "last `virsh net-dhcp-leases` call failed: error: network 'qlean' not found"
+            ),
+            "{message}"
         );
     }
 
