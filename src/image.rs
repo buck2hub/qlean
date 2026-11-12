@@ -406,6 +406,24 @@ fn parse_prefixed_digest(s: &str) -> Result<(ShaType, String)> {
         body.chars().all(|c| c.is_ascii_hexdigit()),
         "digest body must be hexadecimal"
     );
+    // A digest of the wrong length can never match the computed one, and the resulting
+    // error would say "digest mismatch" — pointing at the image (corrupt?) instead of at
+    // the truncated or half-pasted digest the user actually passed.
+    let expected = match sha_type {
+        ShaType::Sha256 => 64,
+        ShaType::Sha512 => 128,
+    };
+    anyhow::ensure!(
+        body.len() == expected,
+        "{} digest must be {expected} hexadecimal characters, got {} (`{}`)",
+        algo.trim().to_ascii_lowercase(),
+        body.len(),
+        if body.len() > 16 {
+            format!("{}...", &body[..16])
+        } else {
+            body.to_string()
+        }
+    );
     Ok((sha_type, body.to_string()))
 }
 
@@ -1190,11 +1208,36 @@ f0442f3cd0087a609ecd5241109ddef0cbf4a1e05372e13d82c97fc77b35b2d8ecff85aea6770915
 
     #[test]
     fn test_parse_prefixed_digest_case_insensitive() {
-        let (algo, hex) = parse_prefixed_digest("SHA512:AbCd").unwrap();
+        let upper = "AB".repeat(64);
+        let (algo, hex) = parse_prefixed_digest(&format!("SHA512:{upper}")).unwrap();
         assert_eq!(algo, ShaType::Sha512);
-        assert_eq!(hex, "AbCd");
+        assert_eq!(hex, upper);
 
         assert!(parse_prefixed_digest("md5:abcd").is_err());
+    }
+
+    #[test]
+    fn test_parse_prefixed_digest_rejects_the_wrong_length() {
+        // A short digest never matches the computed one, and the mismatch used to be
+        // reported as a corrupt image instead of the typo it is.
+        let error = parse_prefixed_digest("sha256:abc").unwrap_err().to_string();
+        assert!(error.contains("64"), "{error}");
+        assert!(error.contains("got 3"), "{error}");
+
+        let error = parse_prefixed_digest(&format!("sha256:{}", "a".repeat(128)))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("64"), "{error}");
+        assert!(error.contains("got 128"), "{error}");
+
+        let error = parse_prefixed_digest(&format!("sha512:{}", "b".repeat(64)))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("128"), "{error}");
+        assert!(error.contains("got 64"), "{error}");
+
+        assert!(parse_prefixed_digest(&format!("sha256:{}", "c".repeat(64))).is_ok());
+        assert!(parse_prefixed_digest(&format!("sha512:{}", "d".repeat(128))).is_ok());
     }
 
     #[test]

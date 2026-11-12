@@ -15,7 +15,7 @@
 //! Without both environment variables every test returns an explanatory error
 //! instead of silently skipping.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use qlean::{GuestOs, Image, ImageConfig, Machine, MachineConfig, MachinePool};
 use serial_test::serial;
 
@@ -36,6 +36,23 @@ fn windows_image_config() -> Result<ImageConfig> {
     })?;
     if !std::path::Path::new(&path).is_file() {
         bail!("QLEAN_WINDOWS_IMAGE={path} is not a readable qcow2 file");
+    }
+    // Being a file is not being a qcow2. A Linux disk or a stray text file would boot far
+    // enough to burn the whole deployment budget and then fail with "the guest address was
+    // never obtained", which points nowhere near the wrong variable.
+    let magic = {
+        use std::io::Read;
+        let mut magic = [0u8; 4];
+        std::fs::File::open(&path)
+            .and_then(|mut file| file.read_exact(&mut magic))
+            .with_context(|| format!("QLEAN_WINDOWS_IMAGE={path} could not be read"))?;
+        magic
+    };
+    if magic != [0x51, 0x46, 0x49, 0xfb] {
+        bail!(
+            "QLEAN_WINDOWS_IMAGE={path} is not a qcow2 image: it starts with {magic:02x?}, but qcow2 \
+             starts with [51, 46, 49, fb]. Point the variable at the licensed Windows qcow2 (DEP-01)"
+        );
     }
     Ok(ImageConfig::default()
         .with_guest_os(GuestOs::Windows)
