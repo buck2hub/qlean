@@ -1040,8 +1040,9 @@ StandardError=journal
     /// Upload file or directory to the machine.
     ///
     /// Remote paths are always built as `GuestPath` values, so a Windows drive path is never
-    /// reinterpreted as a host path. Uploading a tree that contains a symbolic link fails
-    /// instead of silently skipping the link.
+    /// reinterpreted as a host path. A symbolic link - the local path itself or an entry
+    /// inside a tree - is never followed: a Windows guest rejects it by name, while a Linux
+    /// guest gets the link recreated.
     pub async fn upload<P: AsRef<Path>, Q: AsRef<Path>>(
         &mut self,
         local_path: P,
@@ -1058,8 +1059,12 @@ StandardError=journal
         );
         let (ssh, cancel_token) = self.get_ssh("upload files")?;
 
-        let meta = tokio::fs::metadata(local_path).await?;
-        if meta.is_file() {
+        // Classify the local path itself, not what it points at. `metadata` follows a link, so
+        // a link handed to `upload` used to pass for the file it points at: its target's bytes
+        // were uploaded and, on a Windows guest, the rule below never ran.
+        let meta = tokio::fs::symlink_metadata(local_path).await?;
+        let is_link = meta.file_type().is_symlink();
+        if meta.is_file() || is_link {
             // Decide final remote target path (dir vs file path)
             let remote_target = {
                 let is_dir = {
@@ -1076,6 +1081,11 @@ StandardError=journal
             // Ensure remote parent directory exists
             if let Some(parent) = remote_target.parent() {
                 ssh.create_dir_all(&parent).await?;
+            }
+
+            if is_link {
+                upload_symbolic_link(ssh, os, local_path, &remote_target).await?;
+                return Ok(());
             }
 
             ssh.upload_file(local_path, &remote_target, cancel_token.clone())
@@ -1112,35 +1122,7 @@ StandardError=journal
                     ssh.upload_file(entry.path(), &remote_entry, cancel_token.clone())
                         .await?;
                 } else if ty.is_symlink() {
-                    if os == GuestOs::Windows {
-                        bail!(
-                            "symbolic links are not supported when uploading to a Windows guest: {}",
-                            remote_entry.as_str()
-                        );
-                    }
-                    // Recreate the link (Linux guests only). A failure here must not be
-                    // reported as a successful upload.
-                    let target = tokio::fs::read_link(entry.path()).await.with_context(|| {
-                        format!("failed to read the link at {:?}", entry.path())
-                    })?;
-                    if let Some(parent) = remote_entry.parent() {
-                        ssh.create_dir_all(&parent).await?;
-                    }
-                    {
-                        let sftp = ssh.get_sftp().await?;
-                        crate::ssh::create_symlink(
-                            sftp,
-                            remote_entry.as_str(),
-                            &target.to_string_lossy(),
-                        )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "failed to recreate the symbolic link {}",
-                                remote_entry.as_str()
-                            )
-                        })?;
-                    }
+                    upload_symbolic_link(ssh, os, entry.path(), &remote_entry).await?;
                 } else {
                     bail!(
                         "unsupported filesystem entry while uploading {:?}: only files, directories and (Linux) symbolic links are supported",
@@ -2281,6 +2263,42 @@ fn guest_path_from(os: GuestOs, path: &Path) -> Result<GuestPath> {
 }
 
 /// Basename of a local path, as a UTF-8 name that can be joined onto a guest path.
+/// Transfer one symbolic link to the guest, refusing it on a guest that cannot store it.
+///
+/// `upload` reaches a link two ways: as the path it was handed, and as an entry inside the
+/// tree it was handed. Both are the same rule, so both go through this function - a second
+/// copy is how the two cases drifted apart in the first place. A recreate that fails is an
+/// error, never a silently successful upload.
+async fn upload_symbolic_link(
+    ssh: &mut Session,
+    os: GuestOs,
+    local_link: &Path,
+    remote_link: &GuestPath,
+) -> Result<()> {
+    if os == GuestOs::Windows {
+        bail!(
+            "symbolic links are not supported when uploading to a Windows guest: {}",
+            remote_link.as_str()
+        );
+    }
+    let target = tokio::fs::read_link(local_link)
+        .await
+        .with_context(|| format!("failed to read the link at {:?}", local_link))?;
+    if let Some(parent) = remote_link.parent() {
+        ssh.create_dir_all(&parent).await?;
+    }
+    let sftp = ssh.get_sftp().await?;
+    crate::ssh::create_symlink(sftp, remote_link.as_str(), &target.to_string_lossy())
+        .await
+        .with_context(|| {
+            format!(
+                "failed to recreate the symbolic link {}",
+                remote_link.as_str()
+            )
+        })?;
+    Ok(())
+}
+
 fn local_basename(path: &Path) -> Result<&str> {
     path.file_name()
         .and_then(|name| name.to_str())

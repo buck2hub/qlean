@@ -1449,6 +1449,59 @@ mod plan_doc_tests {
         );
     }
 
+    /// `upload` classifies the local path it was handed, not what that path points at.
+    ///
+    /// The tree branch learned to ask about each entry itself, but the first call still used
+    /// `tokio::fs::metadata` - a following `stat` - so a link handed straight to `upload`
+    /// looked like the file it points at. The bytes uploaded were the target's, and on a
+    /// Windows guest the rule that refuses links never ran, because that branch was never
+    /// reached. A local `sftp-server` shows what the guest would have done with the write:
+    /// `OPEN(WRITE|CREAT|TRUNC)` on the link answers a handle and the link survived while the
+    /// target's bytes were replaced. The guard requires the own-attribute call and one shared
+    /// refusal, and rejects a second copy of that refusal message appearing again.
+    #[test]
+    fn the_upload_root_is_classified_without_following_links() {
+        let source = include_str!("machine.rs");
+        let body = function_body(
+            source,
+            "    pub async fn upload<P: AsRef<Path>, Q: AsRef<Path>>(",
+        );
+
+        assert!(
+            body.matches("symlink_metadata(local_path)").count() == 1,
+            "the upload root has to be classified from its own attributes"
+        );
+        assert!(
+            !body.contains("tokio::fs::metadata(local_path)"),
+            "`tokio::fs::metadata` follows links, so a link would be uploaded as its target"
+        );
+        let root = {
+            let end = body
+                .find("ssh.upload_file(local_path")
+                .expect("`upload` no longer sends the file it was handed");
+            &body[..end]
+        };
+        assert!(
+            root.contains("if is_link"),
+            "a link handed to `upload` has to be decided before it is sent as a file"
+        );
+        let flat = root.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains(
+                "upload_symbolic_link(ssh, os, local_path, &remote_target).await?; return Ok(());"
+            ),
+            "the link has to be transferred and the call has to end there, not fall through \
+             to sending the target's bytes as well"
+        );
+        assert!(
+            source
+                .matches("symbolic links are not supported when uploading to a Windows guest")
+                .count()
+                == 1,
+            "the Windows refusal belongs in one place, or the two call sites drift apart"
+        );
+    }
+
     /// The README states the symlink rules per guest, and the code keeps them.
     ///
     /// The bullet used to say that uploading a tree with a symlink and downloading one both
@@ -1463,8 +1516,9 @@ mod plan_doc_tests {
         let flat = README.split_whitespace().collect::<Vec<_>>().join(" ");
 
         for sentence in [
-            "uploading a tree to a Windows guest fails with an error naming the first link",
-            "uploading to a Linux guest recreates each link on the guest",
+            "uploading a link to a Windows guest fails with an error naming the link",
+            "whether the link is the path handed to `upload` or an entry inside a tree",
+            "uploading to a Linux guest recreates the link on the guest",
             "Downloading never turns a link into its target",
             "or the path the download was asked for, is reported as a link",
         ] {
