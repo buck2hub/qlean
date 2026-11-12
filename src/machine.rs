@@ -280,6 +280,25 @@ async fn discover_windows_endpoint(
     Ok((std::net::SocketAddr::new(ip, windows::SSH_PORT), host_key))
 }
 
+/// Error for a Windows launch whose QEMU task finished before the guest reached a DHCP lease.
+///
+/// Kept in one place because two `select!` branches report it: the QEMU branch, and the
+/// cancellation branch when the cancellation was caused by that QEMU exit. Both must say
+/// the same thing, and it must name the QEMU outcome rather than the cancellation.
+fn qemu_exit_before_lease(
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> anyhow::Error {
+    match result {
+        Ok(Ok(())) => anyhow::anyhow!("QEMU exited before the Windows guest obtained a DHCP lease"),
+        Ok(Err(e)) => {
+            anyhow::anyhow!("QEMU failed before the Windows guest obtained a DHCP lease: {e}")
+        }
+        Err(e) => {
+            anyhow::anyhow!("QEMU task error before the Windows guest obtained a DHCP lease: {e}")
+        }
+    }
+}
+
 /// Connection budget for `Machine::launch`.
 ///
 /// A Windows guest's first boot must also finish its deployment before `sshd`
@@ -1524,22 +1543,21 @@ StandardError=journal
                     if let Some(mut swtpm) = self.swtpm.take() {
                         swtpm.stop().await;
                     }
-                    return Err(match result {
-                        Ok(Ok(())) => anyhow::anyhow!(
-                            "QEMU exited before the Windows guest obtained a DHCP lease"
-                        ),
-                        Ok(Err(e)) => anyhow::anyhow!(
-                            "QEMU failed before the Windows guest obtained a DHCP lease: {e}"
-                        ),
-                        Err(e) => anyhow::anyhow!(
-                            "QEMU task error before the Windows guest obtained a DHCP lease: {e}"
-                        ),
-                    });
+                    return Err(qemu_exit_before_lease(result));
                 }
                 _ = cancel_token.cancelled() => {
                     self.pid = None;
                     if let Some(mut swtpm) = self.swtpm.take() {
                         swtpm.stop().await;
+                    }
+                    // `launch_qemu` cancels this very token as part of reporting its own
+                    // exit, so the cancellation can be the *consequence* of the launch
+                    // failing. `select!` polls ready branches in random order, which used
+                    // to surface "launch was cancelled" (naming the symptom) for a guest
+                    // that simply never started (the cause). A finished task is the
+                    // earlier event; report it.
+                    if qemu_handle.is_finished() {
+                        return Err(qemu_exit_before_lease(qemu_handle.await));
                     }
                     return Err(anyhow::anyhow!(
                         "VM-{} launch was cancelled before the guest obtained a DHCP lease",
@@ -2263,6 +2281,36 @@ mod timeout_tests {
             "the message must say that later phases get no fresh wait: {message}"
         );
         assert!(message.contains("ssh_timeout"), "{message}");
+    }
+
+    #[test]
+    fn a_qemu_exit_is_reported_as_the_cause_of_the_cancelled_launch() {
+        // The defect: `launch_qemu` cancels the launch token before its task reports the
+        // result, so the cancellation branch could win the `select!` race and tell the user
+        // "launch was cancelled" for a guest whose QEMU had just failed to start. The
+        // cancellation is the symptom; the QEMU outcome is the cause.
+        let failed = qemu_exit_before_lease(Ok(Err(anyhow::anyhow!("bridge helper failed"))));
+        let message = failed.to_string();
+        assert!(
+            message.contains("QEMU failed before the Windows guest obtained a DHCP lease"),
+            "{message}"
+        );
+        assert!(
+            message.contains("bridge helper failed"),
+            "the QEMU reason must survive: {message}"
+        );
+        assert!(
+            !message.contains("cancelled"),
+            "a failed QEMU must not be reported as a cancellation: {message}"
+        );
+
+        let clean = qemu_exit_before_lease(Ok(Ok(())));
+        assert!(
+            clean
+                .to_string()
+                .contains("QEMU exited before the Windows guest obtained a DHCP lease"),
+            "{clean}"
+        );
     }
 
     #[test]
