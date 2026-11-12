@@ -20,6 +20,7 @@ use tracing::{debug, info};
 use walkdir::WalkDir;
 
 use crate::{
+    firmware::{self, Swtpm, VmFirmware},
     image::{GuestArch, GuestOs, Image},
     is_kvm_available,
     qemu::launch_qemu,
@@ -48,6 +49,8 @@ pub struct Machine {
     ssh_cancel_token: Option<CancellationToken>,
     mac_address: String,
     ip: Option<String>,
+    /// Software TPM backing a Windows guest's TPM 2.0 device.
+    swtpm: Option<Swtpm>,
 }
 
 #[derive(Clone)]
@@ -412,6 +415,7 @@ StandardError=journal
             ssh_cancel_token: None,
             mac_address: gen_random_mac(),
             ip: None,
+            swtpm: None,
         })
     }
 
@@ -564,6 +568,10 @@ StandardError=journal
 
                 tokio::time::sleep(poll_interval).await;
             }
+        }
+
+        if let Some(mut swtpm) = self.swtpm.take() {
+            swtpm.stop().await;
         }
 
         let dirs = QleanDirs::new()?;
@@ -872,6 +880,33 @@ StandardError=journal
             .expect("Machine not initialized or spawned")
             .clone();
         self.qemu_should_exit.store(false, Ordering::SeqCst);
+        // Windows guests need OVMF (per-VM vars) and a TPM 2.0 backed by swtpm.
+        let mut machine_firmware: Option<VmFirmware> = None;
+        let mut tpm_socket: Option<PathBuf> = None;
+        if self.image.guest_os == GuestOs::Windows {
+            firmware::ensure_host_support()?;
+            let dirs = QleanDirs::new()?;
+            let run_dir = dirs.runs.join(&self.id);
+            tokio::fs::create_dir_all(&run_dir).await?;
+            let resolved = firmware::resolve_ovmf()?;
+            let vars = firmware::prepare_vars(&run_dir, &resolved)?;
+            if self.swtpm.is_none() {
+                self.swtpm = Some(Swtpm::start(&run_dir).await?);
+            }
+            let socket = self
+                .swtpm
+                .as_ref()
+                .expect("swtpm was just started")
+                .socket()
+                .to_path_buf();
+            machine_firmware = Some(VmFirmware {
+                code: resolved.code,
+                vars,
+                secure_boot: resolved.secure_boot,
+            });
+            tpm_socket = Some(socket);
+        }
+
         let qemu_params = crate::qemu::QemuLaunchParams {
             cid: self.cid,
             image: self.image.to_owned(),
@@ -881,6 +916,8 @@ StandardError=journal
             mac_address: self.mac_address.to_owned(),
             cancel_token: cancel_token.clone(),
             expected_to_exit: self.qemu_should_exit.clone(),
+            firmware: machine_firmware,
+            tpm_socket,
         };
 
         let mut qemu_handle = tokio::spawn(launch_qemu(qemu_params));
@@ -923,6 +960,9 @@ StandardError=journal
                     terminate_qemu(pid).await;
                 }
                 let _ = qemu_handle.await;
+                if let Some(mut swtpm) = self.swtpm.take() {
+                    swtpm.stop().await;
+                }
                 bail!(e)
             }
         }

@@ -12,11 +12,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `GuestOs` and `ImageConfig::guest_os` (default `GuestOs::Linux`) for describing the guest operating system family
 - `ImageConfig::with_guest_os`, `Image::guest_os()` and `Machine::guest_os()` accessors
 - Windows image validation: `GuestOs::Windows` requires `GuestArch::Amd64` plus an explicit `source` and `digest`
+- Windows guests boot on OVMF UEFI firmware (`q35`, per-VM `ovmf_vars.fd` that survives restarts) and a per-VM TPM 2.0 device backed by `swtpm`
+- Host prerequisite checks for Windows guests (KVM, OVMF, `swtpm`) that report every missing prerequisite in one actionable error, with `QLEAN_OVMF_CODE`/`QLEAN_OVMF_VARS`/`QLEAN_SWTPM` overrides
+- README Windows host setup with minimum/recommended VM resources
 
 ### Changed
 
 - Cached image metadata records `guest_os`; legacy metadata without the field deserializes as `Linux`, and a cache entry recorded for a different guest OS is rejected with an actionable error
 - Windows image cache entries use a `windows-` name prefix so they can never share a cache slot with a Linux image
+- Windows guests reject TCG: a launch without KVM acceleration now fails with an actionable error instead of silently emulating
 
 ### Migration
 

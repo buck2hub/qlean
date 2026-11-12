@@ -1,4 +1,5 @@
 use std::{
+    path::{Path, PathBuf},
     process::Stdio,
     sync::{
         Arc,
@@ -6,6 +7,7 @@ use std::{
     },
 };
 
+use anyhow::{Context, bail};
 use console::strip_ansi_codes;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -16,7 +18,8 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     MachineConfig,
-    image::GuestArch,
+    firmware::VmFirmware,
+    image::{GuestArch, GuestOs},
     is_kvm_available,
     machine::MachineImage,
     utils::{CommandExt, QLEAN_BRIDGE_NAME, QleanDirs},
@@ -69,12 +72,95 @@ pub(crate) struct QemuLaunchParams {
     pub is_init: bool,
     pub cancel_token: CancellationToken,
     pub mac_address: String,
+    /// OVMF firmware for Windows guests.
+    pub firmware: Option<VmFirmware>,
+    /// swtpm control socket for Windows guests.
+    pub tpm_socket: Option<PathBuf>,
+}
+
+/// Acceleration choice for a launch.
+#[derive(Debug, PartialEq, Eq)]
+enum Accel {
+    Kvm,
+    Tcg,
+}
+
+/// Pick an accelerator, refusing the TCG fallback for Windows guests.
+fn select_accel(
+    kvm_available: bool,
+    host_matches: bool,
+    guest_os: GuestOs,
+) -> anyhow::Result<Accel> {
+    if kvm_available && host_matches {
+        return Ok(Accel::Kvm);
+    }
+    if guest_os == GuestOs::Windows {
+        // Windows guests are KVM-only: never silently degrade to TCG emulation.
+        bail!(
+            "Windows guests require KVM acceleration on a host with a matching architecture; \
+             KVM is unavailable or the host cannot run this guest architecture, and TCG \
+             emulation is not supported for Windows guests"
+        );
+    }
+    Ok(Accel::Tcg)
+}
+
+/// QEMU arguments for a Windows guest's firmware and TPM 2.0 device.
+///
+/// Windows boots only on UEFI. Secure Boot additionally needs SMM and the secure
+/// pflash property; the resolution step reports which OVMF build was found instead
+/// of silently downgrading the firmware.
+fn windows_firmware_args(firmware: &VmFirmware, tpm_socket: Option<&Path>) -> Vec<String> {
+    let mut args = vec![
+        "-machine".to_string(),
+        if firmware.secure_boot {
+            "q35,hpet=off,smm=on".to_string()
+        } else {
+            "q35,hpet=off".to_string()
+        },
+    ];
+    if firmware.secure_boot {
+        args.push("-global".to_string());
+        args.push("driver=cfi.pflash01,property=secure,value=on".to_string());
+    }
+    args.push("-drive".to_string());
+    args.push(format!(
+        "if=pflash,format=raw,unit=0,readonly=on,file={}",
+        firmware.code.to_string_lossy()
+    ));
+    args.push("-drive".to_string());
+    args.push(format!(
+        "if=pflash,format=raw,unit=1,file={}",
+        firmware.vars.to_string_lossy()
+    ));
+    if let Some(socket) = tpm_socket {
+        args.push("-chardev".to_string());
+        args.push(format!(
+            "socket,id=chrtpm,path={}",
+            socket.to_string_lossy()
+        ));
+        args.push("-tpmdev".to_string());
+        args.push("emulator,id=tpm0,chardev=chrtpm".to_string());
+        args.push("-device".to_string());
+        args.push("tpm-tis,tpmdev=tpm0".to_string());
+    }
+    args
 }
 
 pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
     // Prepare QEMU command
+    let is_windows = params.image.guest_os == GuestOs::Windows;
+
     let mut qemu_cmd = tokio::process::Command::new(qemu_system_program(params.image.arch));
-    if params.image.arch == GuestArch::Amd64 {
+    if is_windows {
+        let firmware = params.firmware.as_ref().with_context(
+            || "Windows guest launched without OVMF firmware; internal invariant violated",
+        )?;
+        qemu_cmd.args(windows_firmware_args(
+            firmware,
+            params.tpm_socket.as_deref(),
+        ));
+    } else if params.image.arch == GuestArch::Amd64 {
         // Decrease idle CPU usage on x86_64.
         qemu_cmd.args(["-machine", "hpet=off"]);
     }
@@ -158,14 +244,20 @@ pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> 
         ]);
     }
 
-    if is_kvm_available() && host_arch() == Some(params.image.arch) {
-        // KVM acceleration
-        qemu_cmd.args(["-accel", "kvm"]).args(["-cpu", "host"]);
-    } else {
-        qemu_cmd.args(["-accel", "tcg"]);
-        warn!(
-            "KVM acceleration is unavailable for this host/guest architecture pair. Falling back to TCG emulation, which may be slower."
-        );
+    match select_accel(
+        is_kvm_available(),
+        host_arch() == Some(params.image.arch),
+        params.image.guest_os,
+    )? {
+        Accel::Kvm => {
+            qemu_cmd.args(["-accel", "kvm"]).args(["-cpu", "host"]);
+        }
+        Accel::Tcg => {
+            qemu_cmd.args(["-accel", "tcg"]);
+            warn!(
+                "KVM acceleration is unavailable for this host/guest architecture pair. Falling back to TCG emulation, which may be slower."
+            );
+        }
     }
 
     // Spawn QEMU process
@@ -261,5 +353,97 @@ fn map_qemu_exit_status(
             "QEMU exited with error code: {:?}",
             status.code()
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn firmware(secure_boot: bool) -> VmFirmware {
+        VmFirmware {
+            code: PathBuf::from("/usr/share/OVMF/OVMF_CODE.fd"),
+            vars: PathBuf::from("/run/qlean/abc/ovmf_vars.fd"),
+            secure_boot,
+        }
+    }
+
+    #[test]
+    fn test_windows_firmware_args_with_secure_boot_and_tpm() {
+        let args = windows_firmware_args(
+            &firmware(true),
+            Some(Path::new("/run/qlean/abc/swtpm.sock")),
+        );
+        let joined = args.join(" ");
+        assert!(joined.contains("-machine q35,hpet=off,smm=on"), "{joined}");
+        assert!(
+            joined.contains("driver=cfi.pflash01,property=secure,value=on"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains(
+                "if=pflash,format=raw,unit=0,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd"
+            ),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("if=pflash,format=raw,unit=1,file=/run/qlean/abc/ovmf_vars.fd"),
+            "{joined}"
+        );
+        // The vars image must never be read-only: it carries per-VM boot state.
+        assert!(!joined.contains("unit=1,readonly=on"), "{joined}");
+        assert!(
+            joined.contains("-tpmdev emulator,id=tpm0,chardev=chrtpm"),
+            "{joined}"
+        );
+        assert!(joined.contains("-device tpm-tis,tpmdev=tpm0"), "{joined}");
+    }
+
+    #[test]
+    fn test_windows_firmware_args_without_secure_boot() {
+        let args = windows_firmware_args(&firmware(false), None);
+        let joined = args.join(" ");
+        assert!(joined.contains("-machine q35,hpet=off"), "{joined}");
+        assert!(!joined.contains("smm=on"), "{joined}");
+        assert!(!joined.contains("cfi.pflash01"), "{joined}");
+        // No TPM socket means no TPM device at all; never half-configured.
+        assert!(!joined.contains("tpm"), "{joined}");
+        assert!(joined.contains("if=pflash"), "{joined}");
+    }
+
+    #[test]
+    fn test_select_accel_prefers_kvm() {
+        assert_eq!(
+            select_accel(true, true, GuestOs::Linux).unwrap(),
+            Accel::Kvm
+        );
+        assert_eq!(
+            select_accel(true, true, GuestOs::Windows).unwrap(),
+            Accel::Kvm
+        );
+    }
+
+    #[test]
+    fn test_select_accel_keeps_tcg_for_linux_only() {
+        assert_eq!(
+            select_accel(false, true, GuestOs::Linux).unwrap(),
+            Accel::Tcg
+        );
+        assert_eq!(
+            select_accel(true, false, GuestOs::Linux).unwrap(),
+            Accel::Tcg
+        );
+    }
+
+    #[test]
+    fn test_select_accel_never_falls_back_to_tcg_for_windows() {
+        for (kvm, host_matches) in [(false, true), (true, false), (false, false)] {
+            let err = select_accel(kvm, host_matches, GuestOs::Windows)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("TCG"), "{err}");
+            assert!(err.contains("KVM"), "{err}");
+        }
     }
 }

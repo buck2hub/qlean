@@ -49,6 +49,38 @@ sudo sh -c 'echo "allow qlbr0" > /etc/qemu/bridge.conf'
 sudo chmod 644 /etc/qemu/bridge.conf
 ```
 
+#### Windows guest prerequisites
+
+Windows guests are KVM-only. On a host that will run `GuestOs::Windows`, additionally install:
+
+| Requirement | Purpose | Check |
+|---|---|---|
+| KVM (`/dev/kvm`) | Windows guests never fall back to TCG | `test -w /dev/kvm` |
+| OVMF UEFI firmware | Windows boots only on UEFI | `ls /usr/share/edk2/x64/OVMF_CODE.4m.fd` (Arch), `ls /usr/share/OVMF/OVMF_CODE_4M.fd` (Debian/Ubuntu) |
+| `swtpm` | Per-VM TPM 2.0 device | `command -v swtpm` |
+
+```bash
+# Arch
+sudo pacman -S qemu-full libvirt edk2-ovmf swtpm xorriso
+# Debian / Ubuntu
+sudo apt install qemu-system-x86 ovmf swtpm xorriso
+```
+
+Qlean locates OVMF by probing the known Arch/Debian/Fedora/Bazzite layouts. Point it at a
+specific pair with `QLEAN_OVMF_CODE` and `QLEAN_OVMF_VARS` (both must be set), and override
+the TPM binary with `QLEAN_SWTPM`. Secure Boot is used only when the resolved code image is
+an OVMF `secboot` build; otherwise the firmware is reported as Secure Boot disabled — Qlean
+never silently swaps in a different firmware.
+
+| Guest | Minimum (Qlean defaults) | Recommended |
+|---|---|---|
+| Windows 10 | `core: 2`, `mem: 4096` MB | `core: 4`, `mem: 8192` MB |
+| Windows 11 | `core: 2`, `mem: 4096` MB, TPM 2.0 | `core: 4`, `mem: 8192` MB |
+
+The defaults (`core: 2`, `mem: 4096`) match the Windows 10/11 minimums. Leave `disk`
+unset so the qcow2 overlay grows on demand, or set it to at least `64` GB to match the
+Windows 11 install requirement.
+
 ### Getting Started
 
 Add the dependency to your `Cargo.toml`:

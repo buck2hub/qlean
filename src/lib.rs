@@ -25,6 +25,7 @@ use kvm_ioctls::Kvm;
 
 use crate::utils::ensure_prerequisites;
 
+mod firmware;
 mod image;
 mod machine;
 mod pool;

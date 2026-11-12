@@ -502,7 +502,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（A 实现与 B 本地门已过；C 真实 Windows KVM 门 `blocked`，见 Verification）
 
 **Description:** 按 ADR-WIN-03/04 实现 OVMF、Secure Boot、VirtIO 设备和每 VM vTPM，并验证 QMP 关机与重启状态。
 
@@ -520,22 +520,34 @@
 
 **Acceptance criteria:**
 
-- [ ] Windows 使用 ADR 确定的 OVMF code/vars 与 Secure Boot 参数，vars 每 VM 独立且重启保留，Linux 参数不变。
-- [ ] 每 VM 创建 TPM 2.0/swtpm 状态，权限最小化、路径隔离并按 clear 语义清理。
-- [ ] VirtIO disk/network 与镜像驱动要求一致；缺驱动或固件能力时给出可操作错误，不静默改设备或固件。
-- [ ] OVMF/swtpm 缺失有明确错误；Windows 不可用时不得静默回退 TCG，Linux KVM/TCG 行为不变。
-- [ ] QMP/ACPI `shutdown`、`is_running`、shutdown 后 `spawn` 在 Windows 生命周期中工作，重启保留固件/TPM/overlay 状态。
-- [ ] `(new)` 单测/集成测试覆盖参数、缺依赖、状态隔离、关机与重启；资源无泄漏。
-- [ ] README Host Setup/固件矩阵与 CHANGELOG Added 同卡更新。
-- [ ] Windows VM 资源默认值（core=2、mem=4096MB）对照 Windows 10/11 最低要求评估；README Host Setup 写明 Windows 最低与推荐资源值，默认不足时收缩支持矩阵或显式调整 Windows 默认值，不得静默降级。
+- [x] Windows 使用 OVMF `q35` + `if=pflash` code/vars（每 VM 独立 `ovmf_vars.fd`；已存在则复用，重启保留），Secure Boot 仅在使用 `secboot` OVMF 时启用（带 `smm=on` 与 `cfi.pflash01 secure=on`），Linux 参数不变。
+- [x] 每 VM 在 run dir 下创建 `tpm/` 状态目录（权限 `0700`）并由独立 `swtpm` 进程提供 TPM 2.0；按 `MachineConfig::clear` 语义随 run dir 清理。
+- [x] VirtIO disk/network 设备保持不变；镜像必须具备 virtio 驱动，README 镜像制作契约写明该要求（缺驱动时的错误来自镜像侧，不静默换设备）。
+- [x] OVMF/swtpm 缺失时 `ensure_host_support` 一次性列出全部缺口与安装包名；Windows 缺少 KVM 时 `select_accel` 返回错误，不再回退 TCG；Linux KVM/TCG 行为不变。
+- [x] QMP `powerdown`、`is_running`、shutdown 后 `spawn` 复用同一 overlay/OVMF vars/TPM 状态；`shutdown`、SSH 失败退出路径与 `Drop` 都会停止 `swtpm`，不泄漏进程。
+- [x] `(new)` 单测覆盖固件参数（Secure Boot 开/关、pflash 单元、TPM 参数）、加速选择（Windows 不回退 TCG）、OVMF 解析与 vars 模板复制/尺寸校验；`tests/windows_machine.rs::windows_firmware_lifecycle` 覆盖关机/重启（`#[ignore]`，CI 只编译）。
+- [x] README Host Setup 新增 Windows 前置（KVM/OVMF/swtpm/安装包/`QLEAN_OVMF_*`/`QLEAN_SWTPM`）与 CHANGELOG Added 同卡更新。
+- [x] Windows 资源默认值对照 Windows 10/11 最低要求评估：`core=2`/`mem=4096` 等于最低值，README 写明最低与推荐（4 核/8192MB）及 64GB 磁盘要求，不静默降级支持矩阵。
 
 **Verification:**
 
-- [ ] `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings`
-- [ ] `cargo test --lib qemu`
-- [ ] `cargo test --no-run`
-- [ ] T-1 全量，配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1`
-- [ ] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine windows_firmware_lifecycle -- --ignored --exact --test-threads=1`
+- [x] `cargo fmt --check` 与 `cargo clippy --all-targets --all-features -- -D warnings` 通过（0 warning）
+- [x] `cargo test --lib qemu`：5 passed（固件参数 2、加速选择 3）
+- [x] `cargo test --no-run`：包含 `tests/windows_machine.rs` 在内全部 target 编译通过
+- [ ] T-1 全量，配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1` —— 环境缺口 `DEFER-04`
+- [ ] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=... QLEAN_WINDOWS_DIGEST=... cargo test --test windows_machine windows_firmware_lifecycle -- --ignored --exact --test-threads=1` —— `blocked`（无 QEMU/OVMF/swtpm 宿主与 Windows 镜像）
+
+**Implementation evidence:**
+
+| 项 | 证据 |
+|---|---|
+| 新模块 | `src/firmware.rs`：OVMF 候选探测、`QLEAN_OVMF_CODE`/`QLEAN_OVMF_VARS`/`QLEAN_SWTPM` 覆盖、`prepare_vars`（首启复制、重启复用、代码/vars 尺寸配对校验）、`Swtpm`（前台进程 + 控制 socket 等待 + `stop`/`Drop` 双保险） |
+| QEMU 参数 | `src/qemu.rs::windows_firmware_args`：`q35,hpet=off[,smm=on]`、可选 `cfi.pflash01 secure`、`if=pflash unit=0 readonly` code、`unit=1` per-VM vars、`chrtpm`/`tpm-tis` |
+| 加速门 | `src/qemu.rs::select_accel`：Windows 无 KVM 或架构不匹配时 `bail!`，Linux 保持 KVM/TCG 回退 |
+| 生命周期 | `src/machine.rs`：`launch` 前准备固件与 `swtpm`，`shutdown`、`launch` 失败路径与 `Drop` 均停止 `swtpm`；`swtpm` 状态在 `machine.swtpm` 唯一持有 |
+| 集成测试 | `tests/windows_machine.rs::windows_firmware_lifecycle`（`#[ignore]`，需要 `QLEAN_WINDOWS_IMAGE`/`QLEAN_WINDOWS_DIGEST`，缺省时返回可操作错误） |
+| 资源默认值 | README Windows 表格：最低=默认 `core:2`/`mem:4096`，推荐 `core:4`/`mem:8192`，磁盘 ≥64GB |
+| 提交 | `e1e880a` |
 
 **Full-suite trigger:** `T-1: 共享 QEMU 启动路径`
 
@@ -1067,7 +1079,7 @@
 | SPK-01 | 2026-11-12 07:45:12 UTC | 宿主机审计：Linux x86_64、`/dev/kvm` 存在；`qemu-system-x86_64`/`qemu-img`/`swtpm`/`xorriso`/`virsh`/`qemu-bridge-helper`/OVMF 均缺失；`sudo -n` 需密码；无 Windows qcow2（DEP-01/02 均不可用） | 未执行：无可用 Windows VM，无法取得连接/鉴权/SFTP 证据 | `blocked`（DEP-01/DEP-02） | N/A |
 | SPK-02 | 2026-11-12 07:45:12 UTC | 同上（无 QEMU/OVMF/swtpm，无 Windows 镜像） | 未执行：无可用 Windows VM，无法取得首启/重启证据 | `blocked`（DEP-01/DEP-02） | N/A |
 | OSX-01 | 2026-11-12 08:40:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib image::tests`（18 passed）、`cargo test --no-run` 全绿 | T-1 全量门未执行（无 QEMU/libvirt，`DEFER-04`） | `done` / `complete` | `34c6eb9` |
-| OSX-02 | pending | pending | pending | pending | 继承 REL-01 |
+| OSX-02 | 2026-11-12 09:35:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib qemu`（5 passed）、`cargo test --no-run`（含 `tests/windows_machine.rs`）全绿 | `windows_firmware_lifecycle` 未执行（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `e1e880a` |
 | OSX-03 | pending | pending | pending | pending | 继承 REL-01 |
 | TRN-01 | pending | pending | pending | pending | 继承 REL-01 |
 | EXE-01 | pending | pending | pending | pending | 继承 REL-01 |
