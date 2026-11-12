@@ -994,7 +994,7 @@
 
 **Task type:** `release`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `blocked` / 空（2026-11-12 R5 消歧：`SPK-01`/`SPK-02` 因 DEP-01/02 不可用而 `blocked`，全部真实 Windows KVM 核心冒烟（`windows_firmware_lifecycle`、`windows_first_boot`、`windows_transport`、`windows_pool`、`windows_exec`、`windows_get_ip`、`windows_files`）与 Linux 全量门（DEFER-04）均无证据。禁止用 TCG、`--no-run` 或 DEFER 替代，因此不 bump、不 tag、不发布）
 
 **Description:** 作为唯一发布点聚合全部守卫，定稿 CHANGELOG、对齐 CI、发布 0.4.0；已吸收原 DOC-01 的只读文档收口审计，不承担各行为卡的补文档责任。
 
@@ -1009,6 +1009,14 @@
 | 当前版本 0.3.1 | `Cargo.toml:1-4` |
 | CI 仅 pull_request，clippy 命令与模板不一致 | `.github/workflows/check-and-test.yml:1-7,76-100` |
 | CHANGELOG Unreleased/0.3.1 | `CHANGELOG.md:8-24` |
+
+| 发布前阻塞项（2026-11-12） | 状态 |
+|---|---|
+| `SPK-01`/`SPK-02` 传输与首启 spike | `blocked`：无合法 Windows qcow2（DEP-01）、无 Windows KVM 宿主（DEP-02） |
+| `OSX-01` | `done` / `complete`（纯代码 + 文档门） |
+| `OSX-02`/`OSX-03`/`TRN-01`/`EXE-01`/`IP-01`/`FS-01` | `in-progress` / `locally-accepted`：实现与本地门已过，真实 Windows KVM 冒烟 `blocked` |
+| Linux 全量门 | `blocked`：本机无配置齐全的 Linux VM 宿主（DEFER-04） |
+| 结论 | 0.4.0 不发；`Cargo.toml` 保持 0.3.1，不打 tag，不写发布日期 |
 
 **Acceptance criteria:**
 
@@ -1159,7 +1167,7 @@
 | EXE-01 | 2026-11-12 12:10:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_exec`（5 passed）、`cargo test --no-run` 全绿 | `windows_exec` 真实 PowerShell 冒烟未取得（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `64b1046` |
 | IP-01 | 2026-11-12 12:50:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_ip`（6 passed）、`cargo test --no-run` 全绿 | `windows_get_ip` 与双机一致性未取得（DEP-01/02 不可用） | `in-progress` / `locally-accepted` | `eb8fd90` |
 | FS-01 | 2026-11-12 13:20:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_path`（9 passed）、`cargo test --lib`（69 passed）、`cargo test --no-run` 全绿 | `windows_files` 与 Linux 文件回归未取得（DEP-01/02、DEFER-04） | `in-progress` / `locally-accepted` | `443ec5d` |
-| REL-01 | pending | pending | pending | pending | pending |
+| REL-01 | 2026-11-12 13:30:00 UTC | 未执行发布动作 | `SPK-01`/`SPK-02` 与全部真实 Windows KVM 冒烟 `blocked`（DEP-01/02）；Linux 全量门 `blocked`（DEFER-04） | `blocked` / 空 | — |
 
 ## Review log
 

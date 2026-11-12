@@ -25,7 +25,7 @@
 | EXE-01 | implementation | in-progress | locally-accepted | TRN-01 | 继承 REL-01 / `64b1046`（DEFER-04） | 2026-11-12 12:10:00 UTC | PowerShell 原文 + 退出码契约（`src/exec.rs`）；顺带修正非 0 退出被报为 success 的既有缺陷；真实 `windows_exec` 冒烟 `blocked`（DEP-01/02） |
 | IP-01 | implementation | in-progress | locally-accepted | EXE-01 | 继承 REL-01 / `eb8fd90`（DEFER-04） | 2026-11-12 12:50:00 UTC | 缓存优先 + PowerShell 查询按本 VM MAC 消歧；真实 `windows_get_ip`/双机一致性 `blocked`（DEP-01/02） |
 | FS-01 | implementation | in-progress | locally-accepted | IP-01 | 继承 REL-01 / `443ec5d`（DEFER-04） | 2026-11-12 13:20:00 UTC | `GuestPath` 唯一转换层 + Windows 文件语义与 unsupported 分支；真实 `windows_files`/Linux 回归 `blocked` |
-| REL-01 | release | pending | 空 | SPK-01, SPK-02, OSX-01, OSX-02, OSX-03, TRN-01, EXE-01, IP-01, FS-01 | 0.4.0 / — | 2026-11-04 04:10:47 UTC | 唯一发布点；已吸收 DOC-01 的收口审计 |
+| REL-01 | release | blocked | 空 | SPK-01, SPK-02, OSX-01, OSX-02, OSX-03, TRN-01, EXE-01, IP-01, FS-01 | 0.4.0 / — | 2026-11-12 13:30:00 UTC | 唯一发布点；`SPK-01`/`SPK-02` 与全部真实 Windows KVM 冒烟 `blocked`（DEP-01/02），Linux 全量门 `blocked`（DEFER-04），故不 bump/tag/发布 |
 
 ## 延后项与外部/跨计划依赖
 
