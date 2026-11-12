@@ -20,7 +20,7 @@ use tracing::{debug, info};
 use walkdir::WalkDir;
 
 use crate::{
-    image::{GuestArch, Image},
+    image::{GuestArch, GuestOs, Image},
     is_kvm_available,
     qemu::launch_qemu,
     qmp,
@@ -54,6 +54,7 @@ pub struct Machine {
 pub(crate) struct MachineImage {
     pub overlay: PathBuf,
     pub arch: GuestArch,
+    pub guest_os: GuestOs,
     pub seed: PathBuf,
 }
 
@@ -395,6 +396,7 @@ StandardError=journal
         let machine_image = MachineImage {
             overlay: overlay_image.clone(),
             arch: image.guest_arch(),
+            guest_os: image.guest_os(),
             seed: seed_iso_path,
         };
 
@@ -786,6 +788,14 @@ StandardError=journal
             .cloned()
             .expect("Machine not initialized or spawned");
         Ok((ssh, cancel_token))
+    }
+
+    /// Guest operating system family of this machine's image.
+    ///
+    /// This is the single source of truth for OS-dependent behavior (deployment,
+    /// transport, command shell); do not re-derive it from the image name.
+    pub fn guest_os(&self) -> GuestOs {
+        self.image.guest_os
     }
 
     /// Get the IP address of the machine.

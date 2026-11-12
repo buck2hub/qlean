@@ -201,6 +201,10 @@ This defines a **NAT** network named `qlean` in libvirt, backed by the Linux bri
 
   ```rust
   pub struct ImageConfig {
+    /// Guest operating system family, defaults to `GuestOs::Linux`.
+    /// `GuestOs::Windows` requires an amd64 image plus an explicit
+    /// `source` and `digest`; `distro` is ignored for Windows images.
+    pub guest_os: GuestOs,
     /// Architecture of the image, defaults to `GuestArch::Amd64`.
     pub arch: GuestArch,
     /// Distribution of the image, defaults to `Distro::Debian`.
@@ -236,9 +240,29 @@ This defines a **NAT** network named `qlean` in libvirt, backed by the Linux bri
   }
   ```
 
+### Guest OS and Image Validation
+
+`GuestOs::Linux` is the default and keeps the existing built-in cloud image catalog
+and cloud-init deployment. `GuestOs::Windows` is an explicit opt-in that requires:
+
+- `arch = GuestArch::Amd64` (no other guest architecture is supported),
+- an explicit `source` and `digest` — there is no built-in Windows image catalog,
+  so an omitted pair is an error instead of a silent fallback to a Linux image.
+
+Windows images use their own `windows-` cache namespace, and cached image metadata
+records `guest_os`: metadata written before this field existed defaults to `Linux`,
+and a cache entry whose recorded OS does not match the request is rejected instead
+of being handed to the wrong guest.
+
+> **Status:** Windows guest VMs are not supported yet in this release line. The
+> `GuestOs` dimension currently covers image configuration, validation and cache
+> isolation only; Windows deployment, transport and command semantics land in the
+> same 0.4.0 release train.
+
 ### Image Interface
 
 - `Image::new(config)` - Create a new image with specified configuration.
+- `Image::guest_os()` - Guest operating system family of the image.
 
 ### Machine Core Interface
 
@@ -251,6 +275,7 @@ This defines a **NAT** network named `qlean` in libvirt, backed by the Linux bri
 - `Machine::download(src, dst)` - Download a file or directory from the VM.
 - `Machine::get_ip()` - Get the IP address of the VM.
 - `Machine::is_running()` - Check if the VM is currently running.
+- `Machine::guest_os()` - Guest operating system family of the machine's image (single source of truth for OS-dependent behavior).
 - `Machine::open_interactive_shell(cols, rows)` - Open a dedicated interactive SSH shell (PTY) over a new vsock session. Does not block the management SSH session used by `exec` and upload. Requires the machine to already be running.
 
 ### Interactive Shell
@@ -313,6 +338,42 @@ The following methods provide filesystem operations compatible with `std::fs` se
 - `Machine::rename(from, to)` - Rename or move a file/directory.
 - `Machine::set_permissions(path, perm)` - Set file/directory permissions.
 - `Machine::write(path, contents)` - Write bytes to a file.
+
+## Migration
+
+### 0.3.x → 0.4.0
+
+`ImageConfig` gained a `guest_os` field. `ImageConfig` is a public struct with public
+fields, so struct-literal construction stops compiling:
+
+```rust
+// 0.3.x
+let image = Image::new(ImageConfig {
+    arch: GuestArch::Amd64,
+    distro: Distro::Debian,
+    source: None,
+    digest: None,
+    clear: false,
+});
+
+// 0.4.0
+let image = Image::new(ImageConfig {
+    arch: GuestArch::Amd64,
+    distro: Distro::Debian,
+    ..ImageConfig::default()
+});
+
+// or, avoiding literals entirely
+let image = Image::new(
+    ImageConfig::default()
+        .with_distro(Distro::Debian)
+        .with_guest_os(GuestOs::Linux),
+);
+```
+
+`ImageConfig::default()`, the builder methods and the Linux runtime behavior are
+unchanged; the break is source-level only. This release is a `0.x` minor bump
+because the change cannot be expressed as a non-breaking addition.
 
 ## License
 

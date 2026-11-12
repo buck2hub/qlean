@@ -21,9 +21,24 @@ pub struct Image {
     path: PathBuf,
     arch: GuestArch,
     distro: Distro,
+    #[serde(default)]
+    pub(crate) guest_os: GuestOs,
     pub(crate) digest: (ShaType, String),
     #[serde(default)]
     pub(crate) clear: bool,
+}
+
+/// Guest operating system family.
+///
+/// Defaults to [`GuestOs::Linux`] so that configs and cached image metadata written
+/// before the field existed keep their previous meaning.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, Clone, Copy, Default)]
+pub enum GuestOs {
+    /// Linux cloud images (the built-in catalog, cloud-init deployment).
+    #[default]
+    Linux,
+    /// Windows images. Requires an explicit `source` + `digest` and `GuestArch::Amd64`.
+    Windows,
 }
 
 /// Distribution of the image: Debian, Ubuntu, Fedora or Arch.
@@ -68,6 +83,12 @@ impl Default for ImageSource {
 /// Configuration for a virtual machine image.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ImageConfig {
+    /// Guest operating system family, defaults to `GuestOs::Linux`.
+    ///
+    /// `GuestOs::Windows` requires `arch = GuestArch::Amd64`, `source` and `digest`;
+    /// `distro` is ignored for Windows images.
+    #[serde(default)]
+    pub guest_os: GuestOs,
     /// Architecture of the image, defaults to `GuestArch::Amd64`.
     pub arch: GuestArch,
     /// Distribution of the image, defaults to `Distro::Debian`.
@@ -81,6 +102,11 @@ pub struct ImageConfig {
 }
 
 impl ImageConfig {
+    /// Set the guest operating system family, defaults to [`GuestOs::Linux`].
+    pub fn with_guest_os(self, guest_os: GuestOs) -> Self {
+        Self { guest_os, ..self }
+    }
+
     /// Set the distribution of the image.
     pub fn with_distro(self, distro: Distro) -> Self {
         Self { distro, ..self }
@@ -113,12 +139,28 @@ impl ImageConfig {
     }
 
     /// `source` and `digest` must both be set or both omitted.
+    ///
+    /// Windows guests additionally require an explicit `source` + `digest` and the
+    /// amd64 architecture: there is no built-in Windows image catalog, so an implicit
+    /// catalog lookup would silently fall back to a Linux cloud image.
     fn validate(&self) -> Result<()> {
         anyhow::ensure!(
             (self.source.is_none() && self.digest.is_none())
                 || (self.source.is_some() && self.digest.is_some()),
             "source and digest must both be set or both omitted"
         );
+        if self.guest_os == GuestOs::Windows {
+            anyhow::ensure!(
+                self.arch == GuestArch::Amd64,
+                "guest_os=Windows only supports amd64 guests, got {:?}",
+                self.arch
+            );
+            anyhow::ensure!(
+                self.source.is_some() && self.digest.is_some(),
+                "guest_os=Windows requires an explicit `source` and `digest`: \
+                 the built-in image catalog only provides Linux cloud images"
+            );
+        }
         Ok(())
     }
 }
@@ -130,6 +172,38 @@ impl AsRef<ImageConfig> for ImageConfig {
 }
 
 fn image_cache_name(
+    guest_os: GuestOs,
+    distro: Distro,
+    arch: GuestArch,
+    override_source: &Option<ImageSource>,
+    override_digest: Option<&(ShaType, String)>,
+) -> Result<String> {
+    let base = cache_name_base(distro, arch, override_source, override_digest)?;
+    // Windows images are namespaced so that a Windows qcow2 and a Linux image that
+    // happen to share a source filename or digest never share a cache slot.
+    Ok(match guest_os {
+        GuestOs::Linux => base,
+        GuestOs::Windows => format!("{WINDOWS_CACHE_PREFIX}{base}"),
+    })
+}
+
+/// Prefix applied to Windows image cache entries; keeps Linux cache names unchanged.
+const WINDOWS_CACHE_PREFIX: &str = "windows-";
+
+/// Reject a cached image whose recorded guest OS does not match the request.
+fn ensure_cached_guest_os(name: &str, requested: GuestOs, cached: GuestOs) -> Result<()> {
+    anyhow::ensure!(
+        requested == cached,
+        "cached image {} belongs to guest OS {:?}, but {:?} was requested; \
+         remove the cached image or use a different source/digest",
+        name,
+        cached,
+        requested
+    );
+    Ok(())
+}
+
+fn cache_name_base(
     distro: Distro,
     arch: GuestArch,
     override_source: &Option<ImageSource>,
@@ -638,6 +712,11 @@ impl Image {
     pub(crate) fn guest_arch(&self) -> GuestArch {
         self.arch
     }
+
+    /// Guest operating system family of this image.
+    pub fn guest_os(&self) -> GuestOs {
+        self.guest_os
+    }
 }
 
 impl Image {
@@ -654,6 +733,7 @@ impl Image {
             .transpose()?;
 
         let name = image_cache_name(
+            config.guest_os,
             config.distro,
             config.arch,
             &override_source,
@@ -661,6 +741,7 @@ impl Image {
         )?;
 
         if let Ok(image) = Self::load(&name).await {
+            ensure_cached_guest_os(&name, config.guest_os, image.guest_os)?;
             if let Some((expected_type, expected_hex)) = &override_digest {
                 anyhow::ensure!(
                     &image.digest.0 == expected_type
@@ -706,6 +787,7 @@ impl Image {
             path: image_path,
             arch: config.arch,
             distro: config.distro,
+            guest_os: config.guest_os,
             digest: image_digest,
             clear: config.clear,
         };
@@ -840,7 +922,14 @@ f0442f3cd0087a609ecd5241109ddef0cbf4a1e05372e13d82c97fc77b35b2d8ecff85aea6770915
             "https://example.com/orion-images/abc123/debian-13-buck2.qcow2?X-Amz-Signature=deadbeef"
                 .to_string(),
         ));
-        let name = image_cache_name(Distro::Debian, GuestArch::Amd64, &src, Some(&digest)).unwrap();
+        let name = image_cache_name(
+            GuestOs::Linux,
+            Distro::Debian,
+            GuestArch::Amd64,
+            &src,
+            Some(&digest),
+        )
+        .unwrap();
         assert_eq!(name, "sha256-abc123");
     }
 
@@ -859,13 +948,153 @@ f0442f3cd0087a609ecd5241109ddef0cbf4a1e05372e13d82c97fc77b35b2d8ecff85aea6770915
             distro: Distro::Debian,
             source: Some("https://example.com/image.qcow2".to_string()),
             digest: Some("sha256:abcdef123456".to_string()),
-            clear: false,
+            ..ImageConfig::default()
         };
 
         let json = serde_json::to_string(&config).unwrap();
         let decoded: ImageConfig = serde_json::from_str(&json).unwrap();
 
         assert_eq!(decoded, config);
+    }
+
+    #[test]
+    fn test_guest_os_defaults_to_linux() {
+        assert_eq!(ImageConfig::default().guest_os, GuestOs::Linux);
+        assert_eq!(GuestOs::default(), GuestOs::Linux);
+
+        // Cached image metadata written before `guest_os` existed keeps its meaning.
+        let legacy = r#"{
+            "name": "debian-13-generic-amd64.qcow2",
+            "path": "/tmp/debian.qcow2",
+            "arch": "Amd64",
+            "distro": "Debian",
+            "digest": ["Sha512", "abc"],
+            "clear": false
+        }"#;
+        let decoded: Image = serde_json::from_str(legacy).unwrap();
+        assert_eq!(decoded.guest_os, GuestOs::Linux);
+
+        let legacy_config: ImageConfig = serde_json::from_str(
+            r#"{
+                "arch": "Amd64",
+                "distro": "Debian",
+                "source": null,
+                "digest": null,
+                "clear": false
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(legacy_config.guest_os, GuestOs::Linux);
+    }
+
+    #[test]
+    fn test_with_guest_os_builder() {
+        let config = ImageConfig::default().with_guest_os(GuestOs::Windows);
+        assert_eq!(config.guest_os, GuestOs::Windows);
+        // Builder chains keep the remaining fields untouched.
+        assert_eq!(config.arch, GuestArch::Amd64);
+        assert_eq!(
+            ImageConfig::default()
+                .with_guest_os(GuestOs::Windows)
+                .with_source("https://example.com/win.qcow2".to_string())
+                .with_digest("sha256:abc".to_string())
+                .guest_os,
+            GuestOs::Windows
+        );
+    }
+
+    #[test]
+    fn test_windows_config_requires_source_and_digest() {
+        let err = ImageConfig::default()
+            .with_guest_os(GuestOs::Windows)
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("explicit `source` and `digest`"), "{err}");
+
+        // Only one of the pair is still rejected.
+        let err = ImageConfig::default()
+            .with_guest_os(GuestOs::Windows)
+            .with_source("https://example.com/win.qcow2".to_string())
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("source and digest"), "{err}");
+
+        assert!(
+            ImageConfig::default()
+                .with_guest_os(GuestOs::Windows)
+                .with_source("https://example.com/win.qcow2".to_string())
+                .with_digest("sha256:abc".to_string())
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_windows_config_rejects_non_amd64() {
+        let err = ImageConfig::default()
+            .with_guest_os(GuestOs::Windows)
+            .with_arch(GuestArch::Aarch64)
+            .with_source("https://example.com/win.qcow2".to_string())
+            .with_digest("sha256:abc".to_string())
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("only supports amd64"), "{err}");
+    }
+
+    #[test]
+    fn test_linux_config_keeps_builtin_catalog() {
+        // The Linux path may still resolve built-in catalog entries without overrides.
+        let name = image_cache_name(
+            GuestOs::Linux,
+            Distro::Debian,
+            GuestArch::Amd64,
+            &None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(name, "debian-13-generic-amd64");
+        assert!(!name.starts_with(WINDOWS_CACHE_PREFIX));
+    }
+
+    #[test]
+    fn test_windows_cache_name_is_namespaced() {
+        let digest = (ShaType::Sha256, "abc123".to_string());
+        let src = Some(ImageSource::Url(
+            "https://example.com/win.qcow2".to_string(),
+        ));
+        let windows = image_cache_name(
+            GuestOs::Windows,
+            Distro::Debian,
+            GuestArch::Amd64,
+            &src,
+            Some(&digest),
+        )
+        .unwrap();
+        let linux = image_cache_name(
+            GuestOs::Linux,
+            Distro::Debian,
+            GuestArch::Amd64,
+            &src,
+            Some(&digest),
+        )
+        .unwrap();
+        assert_eq!(windows, "windows-sha256-abc123");
+        assert_ne!(windows, linux);
+    }
+
+    #[test]
+    fn test_ensure_cached_guest_os_mismatch() {
+        assert!(ensure_cached_guest_os("img", GuestOs::Linux, GuestOs::Linux).is_ok());
+        assert!(ensure_cached_guest_os("img", GuestOs::Windows, GuestOs::Windows).is_ok());
+
+        let err = ensure_cached_guest_os("windows-img", GuestOs::Windows, GuestOs::Linux)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("belongs to guest OS"), "{err}");
+        assert!(ensure_cached_guest_os("linux-img", GuestOs::Linux, GuestOs::Windows).is_err());
     }
 
     #[test]

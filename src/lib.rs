@@ -36,6 +36,7 @@ mod utils;
 // Re-export public types and functions
 pub use image::Distro;
 pub use image::GuestArch;
+pub use image::GuestOs;
 pub use image::Image;
 pub use image::ImageConfig;
 pub use machine::{Machine, MachineConfig};

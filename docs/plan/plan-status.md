@@ -8,7 +8,7 @@
 
 | 计划 | 主题 | 状态 | 目标分支 | 目标版本 | 最近更新时间 |
 |---|---|---|---|---|---|
-| [`plan-20261104-windows-guest.md`](plan-20261104-windows-guest.md) | Windows 客户机支持 | `in-progress`（R5 环境消歧：`SPK-01`/`SPK-02` 因 DEP-01/02 不可用而 `blocked`；实现卡在临时接受的 ADR 上推进，`REL-01` 阻塞） | `main` | 0.4.0（minor；公开结构体字面量构造的源码兼容破坏） | 2026-11-12 07:45:12 UTC |
+| [`plan-20261104-windows-guest.md`](plan-20261104-windows-guest.md) | Windows 客户机支持 | `in-progress`（R5 环境消歧：`SPK-01`/`SPK-02` 因 DEP-01/02 不可用而 `blocked`；实现卡在临时接受的 ADR 上推进，`OSX-01` 已完成，`REL-01` 阻塞） | `main` | 0.4.0（minor；公开结构体字面量构造的源码兼容破坏） | 2026-11-12 08:40:00 UTC |
 
 ## 任务卡状态
 
@@ -18,7 +18,7 @@
 |---|---|---|---|---|---|---|---|
 | SPK-01 | spike | blocked | 空 | DEP-01, DEP-02 | — / — | 2026-11-12 07:45:12 UTC | 传输可行性；DEP-01/02 不可用（无 QEMU/无 Windows 镜像）；ADR-WIN-02 已临时接受 TCP |
 | SPK-02 | spike | blocked | 空 | SPK-01, DEP-01, DEP-02 | — / — | 2026-11-12 07:45:12 UTC | 引导/部署可行性；DEP-01/02 不可用；ADR-WIN-03 已临时接受首启 seed 盘 |
-| OSX-01 | implementation | pending | 空 | 无（R5 取消 SPK-02 边） | 继承 REL-01 / — | 2026-11-12 07:45:12 UTC | GuestOs 抽象与镜像校验；串行起点 |
+| OSX-01 | implementation | done / complete | 34c6eb9 | 无（R5 取消 SPK-02 边） | 继承 REL-01 / DEFER-04（Linux 全量门环境缺口） | 2026-11-12 08:40:00 UTC | GuestOs 抽象与镜像校验；串行起点；T-1 全量门登记 DEFER-04 |
 | OSX-02 | implementation | pending | 空 | SPK-02, OSX-01 | 继承 REL-01 / — | 2026-11-12 07:20:33 UTC | Windows 固件与 QEMU 生命周期；R4 补资源默认值 AC |
 | OSX-03 | implementation | pending | 空 | OSX-02 | 继承 REL-01 / — | 2026-11-12 07:20:33 UTC | Windows 首次部署；具体方案待 SPK-02 回写；R4 补部署超时 AC |
 | TRN-01 | implementation | pending | 空 | SPK-01, OSX-03 | 继承 REL-01 / — | 2026-11-04 04:10:47 UTC | Windows 传输、地址发现与主机密钥校验 |

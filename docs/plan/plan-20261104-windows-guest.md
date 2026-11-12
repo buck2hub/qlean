@@ -69,7 +69,7 @@
 
 | ID | 缺口 | 影响 | 证据 | 计划动作 |
 |---|---|---|---|---|
-| GAP-01 | 无 guest-OS 抽象与 OS/架构/source 校验 | Windows 配置可能错误落到 Debian 内置镜像或缓存 | `src/image.rs:645-711` | `OSX-01` |
+| GAP-01 | 无 guest-OS 抽象与 OS/架构/source 校验 | Windows 配置可能错误落到 Debian 内置镜像或缓存 | `src/image.rs:645-711` | `OSX-01`（已关闭） |
 | GAP-02 | 无 OVMF/vTPM/Secure Boot 决策与 Windows QEMU 生命周期 | Windows 10/11 引导、重启和关机无保证 | `src/qemu.rs:74-169` | `SPK-02` → `OSX-02` |
 | GAP-03 | 引导硬编码 cloud-init NoCloud | Windows 首次部署不可用 | `src/machine.rs:220-399` | `SPK-02` → `OSX-03` |
 | GAP-04 | vsock、root/true probe 与任意服务端密钥接受硬编码 | Windows 传输不可达；直接加 TCP 会有地址发现和 MITM 风险 | `src/ssh.rs:89-104,571-630` | `SPK-01` → `TRN-01` |
@@ -425,11 +425,7 @@
 
 **Granularity:** `type=spike; axis=Windows 固件/部署可行性; recovery=无生产改动; complete=yes; self-contained=yes; AC=6/8; VER=2/8; landing=0; prod-files=0; scope=M; deps=SPK-01,DEP-01,DEP-02; writeset=序列化于 SPK-01; release=no-release; split-from=N/A; exception=N/A`
 
-### Task OSX-01: 引入 `GuestOs` 与镜像校验
-
-**Task type:** `implementation`
-
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 新增 OS 维度、builder、持久化默认值和镜像/source/cache 校验，防止 Windows 配置落到 Linux 镜像。
 
@@ -447,23 +443,32 @@
 
 **Acceptance criteria:**
 
-- [ ] `GuestOs`、`ImageConfig::guest_os`（默认 Linux）与 `with_guest_os` 已公开并重导出，相关 Serde 字段使用默认值。
-- [ ] Windows 仅接受 amd64 + source + digest；缺任一项或不支持架构时提前返回可操作错误，Linux 内置目录逻辑不变。
-- [ ] `Image`/`MachineImage` 携带 `guest_os`，后续分派有唯一事实源。
-- [ ] 缓存加载同时匹配请求的 `guest_os`；旧元数据默认 Linux，不能把 Linux 缓存交给 Windows 配置。
-- [ ] `ImageConfig::default()` 与既有 builder 的 Linux 行为不变，仓库内字面量构造按 ADR 迁移。
-- [ ] README API/Migration 与 CHANGELOG Added/Changed 同卡说明源码破坏、迁移方式和 0.4.0 目标。
-- [ ] `(new)` 单测覆盖默认值、旧 JSON、无效组合、缓存 OS 不匹配和 builder。
+- [x] `GuestOs`、`ImageConfig::guest_os`（默认 Linux）与 `with_guest_os` 已公开并重导出，相关 Serde 字段使用默认值。
+- [x] Windows 仅接受 amd64 + source + digest；缺任一项或不支持架构时提前返回可操作错误，Linux 内置目录逻辑不变。
+- [x] `Image`/`MachineImage` 携带 `guest_os`，后续分派有唯一事实源。
+- [x] 缓存加载同时匹配请求的 `guest_os`；旧元数据默认 Linux，不能把 Linux 缓存交给 Windows 配置。
+- [x] `ImageConfig::default()` 与既有 builder 的 Linux 行为不变，仓库内字面量构造按 ADR 迁移。
+- [x] README API/Migration 与 CHANGELOG Added/Changed 同卡说明源码破坏、迁移方式和 0.4.0 目标。
+- [x] `(new)` 单测覆盖默认值、旧 JSON、无效组合、缓存 OS 不匹配和 builder。
 
 **Verification:**
 
-- [ ] `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings`
-- [ ] `cargo test --lib guest_os`
-- [ ] `cargo test --lib image::tests`
-- [ ] `cargo test --no-run`
-- [ ] T-1 全量，配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1`
+- [x] `cargo fmt --check` 与 `cargo clippy --all-targets --all-features -- -D warnings` 均通过（0 warning）
+- [x] `cargo test --lib guest_os`：4 passed（默认值/旧 JSON/builder/缓存 OS 不匹配）
+- [x] `cargo test --lib image::tests`：18 passed, 0 failed
+- [x] `cargo test --no-run`：全部 test target 编译通过
+- [ ] T-1 全量，配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1` —— 本机无 QEMU/libvirt/xorriso（DEP-02 不可用），登记为 `DEFER-04`；卡内已用 `cargo test --lib` + `cargo test --no-run` 覆盖 ER-14 的替代门。
 
-**Full-suite trigger:** `T-1: 公开 API 与镜像缓存单一事实源`
+**Implementation evidence:**
+
+| 项 | 证据 |
+|---|---|
+| 新增 API | `GuestOs { Linux, Windows }`（默认 `Linux`）、`ImageConfig::guest_os`、`with_guest_os`、`Image::guest_os()`、`Machine::guest_os()`；`pub use image::GuestOs` |
+| 校验 | `ImageConfig::validate()`：Windows 强制 `GuestArch::Amd64` 与显式 `source`+`digest`，错误文案含修复路径 |
+| 缓存隔离 | `image_cache_name` 按 `guest_os` 命名，Windows 使用 `windows-` 前缀；`ensure_cached_guest_os` 拒绝 OS 不匹配条目（旧 JSON 默认 Linux） |
+| 单一事实源 | `Image::guest_os` 随元数据持久化；`MachineImage::guest_os` 由 `image.guest_os()` 填充；公开 `Machine::guest_os()` 供后续卡分派 |
+| 迁移 | 仓库内 `ImageConfig` 字面量改为 `..ImageConfig::default()`；README 新增 Guest OS 小节与 Migration；CHANGELOG `[Unreleased]` Added/Changed/Migration |
+| 提交 | `34c6eb9` |
 
 **Dependencies:** 无（R5 取消 `SPK-02 -> OSX-01` 边：本卡不消费任何 Phase 0 产物；串行写集起点）
 
@@ -1061,7 +1066,7 @@
 |---|---|---|---|---|---|
 | SPK-01 | 2026-11-12 07:45:12 UTC | 宿主机审计：Linux x86_64、`/dev/kvm` 存在；`qemu-system-x86_64`/`qemu-img`/`swtpm`/`xorriso`/`virsh`/`qemu-bridge-helper`/OVMF 均缺失；`sudo -n` 需密码；无 Windows qcow2（DEP-01/02 均不可用） | 未执行：无可用 Windows VM，无法取得连接/鉴权/SFTP 证据 | `blocked`（DEP-01/DEP-02） | N/A |
 | SPK-02 | 2026-11-12 07:45:12 UTC | 同上（无 QEMU/OVMF/swtpm，无 Windows 镜像） | 未执行：无可用 Windows VM，无法取得首启/重启证据 | `blocked`（DEP-01/DEP-02） | N/A |
-| OSX-01 | pending | pending | pending | pending | 继承 REL-01 |
+| OSX-01 | 2026-11-12 08:40:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib image::tests`（18 passed）、`cargo test --no-run` 全绿 | T-1 全量门未执行（无 QEMU/libvirt，`DEFER-04`） | `done` / `complete` | `34c6eb9` |
 | OSX-02 | pending | pending | pending | pending | 继承 REL-01 |
 | OSX-03 | pending | pending | pending | pending | 继承 REL-01 |
 | TRN-01 | pending | pending | pending | pending | 继承 REL-01 |
@@ -1113,6 +1118,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | DEFER-01 | Windows 内置镜像目录 | 当前许可限制 | 出现可合法再分发的镜像源 | `plan-<date>-windows-catalog.md` |
 | DEFER-02 | Windows on ARM | 尚无真实需求，固件/驱动未验证 | 真实需求 + 新可行性验证 | 新计划 |
 | DEFER-03 | Windows TCG 冒烟矩阵 | 核心目标是 KVM，TCG 启动成本未验证 | 真实 TCG 需求 + 可接受时限 | 新测试计划；不得替代本计划 KVM 门 |
+| DEFER-04 | Linux VM 全量门 `cargo test -- --test-threads=1` 的本地执行 | 当前实现宿主无 QEMU/libvirt/xorriso/qemu-bridge-helper（DEP-02 不可用），VM 集成测试无法运行 | 配置齐全的 Linux KVM 宿主机可用时（与 DEP-02 解除同步） | 本计划 / `REL-01` 收口门；不得替代任何 Windows KVM 核心验收 |
 
 ## 完成判据
 
