@@ -118,7 +118,9 @@ Linux SSH connect timeout of 180s/300s) and can be tuned with `MachineConfig::ss
 It bounds both halves of the first boot: waiting for `sshd` to answer and waiting for the
 deploy marker, since a guest that is still deploying does not accept connections yet.
 Later boots use the plain connect budget again. On timeout Qlean keeps the seed medium and
-returns an error naming the expected marker file and this section.
+returns an error naming the expected marker file and this section; the failed VM is torn
+down (session closed, QEMU terminated, `swtpm` stopped) so no half-deployed guest survives.
+A Windows machine can be initialized only once — after its deployment use `spawn`.
 
 #### Windows transport and security
 
