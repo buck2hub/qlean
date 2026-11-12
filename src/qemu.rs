@@ -343,64 +343,158 @@ pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> 
         }
     });
 
-    // Capture and log stderr
+    // Capture and log stderr, and keep a bounded tail of it.
+    //
+    // QEMU explains its own refusals on stderr (`qemu-system-x86_64: Could not open
+    // '/dev/kvm': Permission denied`, `UNIX socket path ... is too long`), but that text
+    // used to reach the log only. A caller left with "QEMU exited with status 1; check its
+    // log for the reason" has to go hunting for a log file, and a Windows first boot
+    // reports that same blank reason after burning its whole deployment budget. The tail
+    // lets the exit error carry the cause it was already given (F96).
+    let stderr_tail = new_stderr_tail();
     let stderr = qemu_child.stderr.take().expect("Failed to capture stderr");
-    let stderr_task = tokio::spawn(async move {
-        let reader = BufReader::new(stderr);
-        let mut lines = reader.lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            error!("{}", strip_ansi_codes(&line));
-        }
-    });
+    let tail_for_task = Arc::clone(&stderr_tail);
+    let stderr_task = tokio::spawn(async move { capture_stderr(stderr, tail_for_task).await });
 
-    let result = match resolve_qemu_wait_timeout() {
-        Some(limit) => match timeout(limit, qemu_child.wait()).await {
-            Err(_) => {
-                error!(
-                    "QEMU process timed out after {} seconds; killing process before cancelling SSH",
-                    limit.as_secs()
-                );
-                // Ensure the guest is gone before sticky-canceling SSH. Previously a
-                // hard-coded 6h wait timeout cancelled the token while QEMU could still
-                // be alive, leaving keep-alive VMs "running" with dead Machine::exec.
-                let _ = qemu_child.kill().await;
-                let _ = qemu_child.wait().await;
-                Err(anyhow::anyhow!(
-                    "QEMU process timed out after {} seconds",
-                    limit.as_secs()
-                ))
-            }
-            Ok(Err(e)) => {
-                error!("Failed to wait for QEMU: {}", e);
-                Err(e.into())
-            }
-            Ok(Ok(status)) => map_qemu_exit_status(status, pid, &params.expected_to_exit),
-        },
-        None => match qemu_child.wait().await {
-            Err(e) => {
-                error!("Failed to wait for QEMU: {}", e);
-                Err(e.into())
-            }
-            Ok(status) => map_qemu_exit_status(status, pid, &params.expected_to_exit),
-        },
-    };
+    let waited: std::result::Result<std::process::ExitStatus, anyhow::Error> =
+        match resolve_qemu_wait_timeout() {
+            Some(limit) => match timeout(limit, qemu_child.wait()).await {
+                Err(_) => {
+                    error!(
+                        "QEMU process timed out after {} seconds; killing process before cancelling SSH",
+                        limit.as_secs()
+                    );
+                    // Ensure the guest is gone before sticky-canceling SSH. Previously a
+                    // hard-coded 6h wait timeout cancelled the token while QEMU could still
+                    // be alive, leaving keep-alive VMs "running" with dead Machine::exec.
+                    let _ = qemu_child.kill().await;
+                    let _ = qemu_child.wait().await;
+                    Err(anyhow::anyhow!(
+                        "QEMU process timed out after {} seconds",
+                        limit.as_secs()
+                    ))
+                }
+                Ok(Err(e)) => {
+                    error!("Failed to wait for QEMU: {}", e);
+                    Err(e.into())
+                }
+                Ok(Ok(status)) => Ok(status),
+            },
+            None => match qemu_child.wait().await {
+                Err(e) => {
+                    error!("Failed to wait for QEMU: {}", e);
+                    Err(e.into())
+                }
+                Ok(status) => Ok(status),
+            },
+        };
 
     // Cancel any ongoing operations due to QEMU exit (or intentional kill after timeout)
     params.cancel_token.cancel();
 
-    // Wait for logging tasks to complete
+    // Wait for logging tasks to complete. The stderr tail has to be complete before the
+    // exit status is described, otherwise the reason would be read while QEMU's last
+    // words are still in flight.
     let _ = tokio::join!(stdout_task, stderr_task);
 
-    result
+    qemu_exit_result(waited, pid, &params.expected_to_exit, &stderr_tail)
+}
+
+/// Turn the wait outcome and the captured stderr tail into the reported result.
+///
+/// Kept separate from `launch_qemu` so that the wiring ("the tail actually reaches the
+/// error") is testable without booting a guest: a version of this function that drops
+/// `reason` on the floor would leave every test green while users keep reading
+/// `exited with status 1; check its log`.
+fn qemu_exit_result(
+    waited: std::result::Result<std::process::ExitStatus, anyhow::Error>,
+    pid: u32,
+    expected_to_exit: &Arc<AtomicBool>,
+    tail: &StderrTail,
+) -> anyhow::Result<()> {
+    match waited {
+        Ok(status) => {
+            let reason = stderr_reason(tail);
+            map_qemu_exit_status(status, pid, expected_to_exit, reason.as_deref())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// How many trailing QEMU stderr lines may travel with an exit error.
+const STDERR_TAIL_LINES: usize = 10;
+/// Longest stderr line kept verbatim; QEMU can echo a whole command line.
+const STDERR_TAIL_WIDTH: usize = 400;
+
+/// The trailing QEMU stderr lines, shared between the reader task and the exit report.
+type StderrTail = Arc<std::sync::Mutex<std::collections::VecDeque<String>>>;
+
+fn new_stderr_tail() -> StderrTail {
+    Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()))
+}
+
+fn push_stderr_line(tail: &StderrTail, line: &str) {
+    let line = line.trim_end();
+    if line.is_empty() {
+        return;
+    }
+    let line = if line.chars().count() > STDERR_TAIL_WIDTH {
+        let cut: String = line.chars().take(STDERR_TAIL_WIDTH).collect();
+        format!("{cut}…")
+    } else {
+        line.to_string()
+    };
+    // A poisoned lock still holds usable data, and this runs on the failure path where
+    // losing the reason would be worst: recover the guard instead of panicking.
+    let mut guard = match tail.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.len() == STDERR_TAIL_LINES {
+        guard.pop_front();
+    }
+    guard.push_back(line);
+}
+
+/// Drain QEMU's stderr: every line is logged as it arrives and the last few are kept.
+async fn capture_stderr<R>(reader: R, tail: StderrTail)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut lines = BufReader::new(reader).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let line = strip_ansi_codes(&line).into_owned();
+        error!("{line}");
+        push_stderr_line(&tail, &line);
+    }
+}
+
+fn stderr_reason(tail: &StderrTail) -> Option<String> {
+    let guard = match tail.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.is_empty() {
+        return None;
+    }
+    let lines: Vec<&str> = guard.iter().map(String::as_str).collect();
+    Some(lines.join(" | "))
 }
 
 fn map_qemu_exit_status(
     status: std::process::ExitStatus,
     pid: u32,
     expected_to_exit: &Arc<AtomicBool>,
+    reason: Option<&str>,
 ) -> anyhow::Result<()> {
     let expected = expected_to_exit.load(Ordering::SeqCst);
     let detail = describe_exit(&status);
+    // Keep the symptom first and the cause second: the status is what the caller can
+    // match on, the reason is what tells them which knob to turn.
+    let suffix = match reason {
+        Some(reason) => format!("QEMU said: {reason}"),
+        None => "check its log for the reason".to_string(),
+    };
 
     if status.success() {
         if expected {
@@ -408,7 +502,7 @@ fn map_qemu_exit_status(
             return Ok(());
         }
         error!("Process {} exited unexpectedly", pid);
-        return Err(anyhow::anyhow!("QEMU exited unexpectedly"));
+        return Err(anyhow::anyhow!("QEMU exited unexpectedly; {suffix}"));
     }
 
     // A shutdown was requested: teardown sends SIGTERM and then SIGKILL, so a signal
@@ -420,7 +514,7 @@ fn map_qemu_exit_status(
     }
 
     Err(anyhow::anyhow!(
-        "QEMU {detail} before the VM was asked to stop; check its log for the reason"
+        "QEMU {detail} before the VM was asked to stop; {suffix}"
     ))
 }
 
@@ -975,16 +1069,16 @@ mod tests {
         // Tearing a Windows guest down escalates to SIGTERM/SIGKILL when the guest ignores
         // ACPI powerdown, so this must not be reported as "QEMU exited with error code".
         assert!(
-            map_qemu_exit_status(killed_by(15), 42, &exiting(true)).is_ok(),
+            map_qemu_exit_status(killed_by(15), 42, &exiting(true), None).is_ok(),
             "SIGTERM during the requested shutdown is the normal outcome"
         );
-        assert!(map_qemu_exit_status(killed_by(9), 42, &exiting(true)).is_ok());
-        assert!(map_qemu_exit_status(exit_code(1), 42, &exiting(true)).is_ok());
+        assert!(map_qemu_exit_status(killed_by(9), 42, &exiting(true), None).is_ok());
+        assert!(map_qemu_exit_status(exit_code(1), 42, &exiting(true), None).is_ok());
     }
 
     #[test]
     fn test_an_unexpected_death_reports_the_signal_instead_of_none() {
-        let error = map_qemu_exit_status(killed_by(9), 42, &exiting(false))
+        let error = map_qemu_exit_status(killed_by(9), 42, &exiting(false), None)
             .expect_err("a guest that was never asked to stop must not die silently")
             .to_string();
         assert!(error.contains("signal 9"), "{error}");
@@ -995,12 +1089,12 @@ mod tests {
 
     #[test]
     fn test_an_unexpected_exit_status_is_named() {
-        let clean = map_qemu_exit_status(exit_code(0), 42, &exiting(false))
+        let clean = map_qemu_exit_status(exit_code(0), 42, &exiting(false), None)
             .expect_err("exit without a request is still a failure")
             .to_string();
         assert!(clean.contains("exited unexpectedly"), "{clean}");
 
-        let failed = map_qemu_exit_status(exit_code(3), 42, &exiting(false))
+        let failed = map_qemu_exit_status(exit_code(3), 42, &exiting(false), None)
             .expect_err("a non-zero status is a failure")
             .to_string();
         assert!(failed.contains("status 3"), "{failed}");
@@ -1009,7 +1103,91 @@ mod tests {
 
     #[test]
     fn test_an_expected_exit_is_not_an_error() {
-        assert!(map_qemu_exit_status(exit_code(0), 42, &exiting(true)).is_ok());
+        assert!(map_qemu_exit_status(exit_code(0), 42, &exiting(true), None).is_ok());
+    }
+
+    /// A launch failure must return the cause QEMU printed, not only its exit status.
+    ///
+    /// QEMU explains every refusal on stderr (`Could not open '/dev/kvm'`, `UNIX socket
+    /// path ... is too long`). Reporting `exited with status 1; check its log` threw that
+    /// away: on a Windows guest the caller had already spent the deployment budget and
+    /// the actionable sentence sat in a log file instead of in the error.
+    #[tokio::test]
+    async fn test_a_launch_failure_returns_the_reason_the_process_printed() {
+        // A real process, because the claim is about the pipe between the reader task and
+        // the error: a hand-built string would prove nothing about that wiring.
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(
+                "echo \"qemu-system-x86_64: Could not open '/dev/kvm': Permission denied\" >&2; \
+                 echo 'qemu-system-x86_64: failed to initialize kvm' >&2; exit 9",
+            )
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the stand-in process");
+
+        let stderr = child.stderr.take().expect("stderr pipe");
+        let tail = new_stderr_tail();
+        capture_stderr(stderr, Arc::clone(&tail)).await;
+        let status = child.wait().await.expect("wait for the stand-in process");
+
+        let reason = stderr_reason(&tail).expect("the process's own words must be kept");
+        assert!(reason.contains("/dev/kvm"), "{reason}");
+
+        let error = qemu_exit_result(Ok(status), 42, &exiting(false), &tail)
+            .expect_err("an unexpected death is a failure")
+            .to_string();
+        assert!(error.contains("status 9"), "{error}");
+        assert!(
+            error.contains("/dev/kvm"),
+            "the cause must travel with the symptom: {error}"
+        );
+        assert!(
+            !error.contains("check its log"),
+            "a known reason must not be replaced by a pointer to the log: {error}"
+        );
+    }
+
+    #[test]
+    fn test_the_stderr_tail_is_bounded_and_still_points_at_the_log_when_empty() {
+        let tail = new_stderr_tail();
+        for index in 0..(STDERR_TAIL_LINES + 5) {
+            push_stderr_line(&tail, &format!("line {index}"));
+        }
+        let reason = stderr_reason(&tail).expect("kept lines must be reported");
+        let kept: Vec<&str> = reason.split(" | ").collect();
+        assert_eq!(kept.len(), STDERR_TAIL_LINES, "{reason}");
+        assert_eq!(
+            kept[0], "line 5",
+            "the oldest lines must be dropped: {reason}"
+        );
+        assert_eq!(
+            kept[STDERR_TAIL_LINES - 1],
+            format!("line {}", STDERR_TAIL_LINES + 4),
+            "the newest line must be last: {reason}"
+        );
+
+        // A blank line carries no reason and would only add noise.
+        push_stderr_line(&tail, "   ");
+        assert_eq!(
+            stderr_reason(&tail).unwrap().split(" | ").count(),
+            STDERR_TAIL_LINES
+        );
+
+        // One enormous line (QEMU echoes whole command lines) must not flood the error.
+        let long = "x".repeat(STDERR_TAIL_WIDTH + 100);
+        let long_tail = new_stderr_tail();
+        push_stderr_line(&long_tail, &long);
+        let kept = stderr_reason(&long_tail).unwrap();
+        assert!(kept.ends_with('…'), "a long line must be truncated: {kept}");
+        assert_eq!(kept.chars().count(), STDERR_TAIL_WIDTH + 1);
+
+        // With nothing captured the message still has to say something useful.
+        let bare = qemu_exit_result(Ok(exit_code(1)), 42, &exiting(false), &new_stderr_tail())
+            .expect_err("a non-zero status is a failure")
+            .to_string();
+        assert!(bare.contains("check its log"), "{bare}");
     }
 
     #[test]
