@@ -44,6 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CONOUT$` and `CLOCK$` were accepted as ordinary file names: SFTP then opened the console
   instead of a file, or failed with a message about a device nobody asked for. Windows guest
   paths now refuse them, like `CON` and `NUL`.
+- Uploading a directory to a Windows guest quietly reshaped the tree when a local entry name
+  contained a backslash: `a\b` was sent as `a/b`, so the file landed in a directory that may
+  not have existed, and an entry really named `b` in `a` was overwritten. A name is not a
+  path, so the entry is now refused by name, and the error says to rename it.
 - Allocating a guest CID panicked in a debug build and wrapped to a reserved value in a
   release build when a run directory already recorded the highest CID a guest may use: the
   next machine either crashed the library or was booted with an address the host cannot

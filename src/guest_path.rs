@@ -121,10 +121,12 @@ impl GuestPath {
     /// Join a single child name, refusing names that would escape the path.
     ///
     /// `child` may come from a host-relative walk (always simple names) or from
-    /// [`GuestPath::strip_prefix`]. On Windows both separators spell one thing, so `\` becomes
-    /// `/`; on Linux a backslash is an ordinary character in a name and stays one, because the
-    /// walk that drives `download`, `upload` and `remove_dir_all` feeds raw entry names through
-    /// here. `..` is rejected so a traversal cannot be smuggled in.
+    /// [`GuestPath::strip_prefix`]. A child is a *name* (or a `/`-separated run of names), never a
+    /// user's path spelling: the walk that drives `upload` feeds raw entry names through here. So
+    /// a backslash in a child is a character in a name, and Windows has no name containing one -
+    /// splitting it into a separator would upload a different tree, silently overwriting an entry
+    /// whose name really is `a/b`. Windows refuses it by name; on Linux a backslash is an ordinary
+    /// character in a name and stays one. `..` is rejected so a traversal cannot be smuggled in.
     pub(crate) fn join(&self, child: impl AsRef<str>) -> Result<Self> {
         let child = child.as_ref();
         let relative = self.normalize_relative(child)?;
@@ -217,7 +219,20 @@ impl GuestPath {
 
     fn normalize_relative(&self, child: &str) -> Result<String> {
         let child = match self.guest_os {
-            GuestOs::Windows => child.replace('\\', "/"),
+            GuestOs::Windows => {
+                if child.contains('\\') {
+                    // A name is not a path. Windows has no file name containing a backslash, so a
+                    // host entry called `a\b` cannot be uploaded under its own name; reading the
+                    // backslash as a separator would upload `a/b` instead - a different tree, and
+                    // one that silently overwrites an entry whose name really is `b` in `a`.
+                    bail!(
+                        "cannot join `{child}` onto a Windows guest path: a Windows file name \
+                         cannot contain a backslash, and reading it as a path separator would \
+                         upload a different tree than the one on disk; rename the local entry"
+                    );
+                }
+                child.to_owned()
+            }
             GuestOs::Linux => child.to_owned(),
         };
         if child.starts_with('/') {
@@ -366,9 +381,54 @@ mod tests {
             "/tmp/dir/a\\..\\b"
         );
 
-        // Windows is unchanged: both separators mean the same thing there.
-        assert_eq!(win("C:/dir").join("a\\b").unwrap().as_str(), "C:/dir/a/b");
+        // Windows has no name containing a backslash, so the walk refuses the entry instead of
+        // addressing `a/b` - the tree on disk stays the tree that is uploaded.
+        let error = win("C:/dir")
+            .join("a\\b")
+            .expect_err("a Windows name cannot contain a backslash");
+        let message = error.to_string();
+        assert!(
+            message.contains("a\\b"),
+            "the refusal must name the entry: {message}"
+        );
+        assert!(
+            message.contains("rename the local entry"),
+            "the refusal must say what to do: {message}"
+        );
         assert_eq!(posix("/").join("a\\b").unwrap().as_str(), "/a\\b");
+    }
+
+    /// A host entry name containing a backslash cannot be uploaded to a Windows guest.
+    ///
+    /// The walk behind `upload` calls `join` with the entry's own name, and Windows has no name
+    /// containing a backslash. Folding it into a separator (what `join` did before R177) uploaded
+    /// `a/b` instead of `a\b`: a directory appeared that nobody asked for, and an entry really
+    /// named `b` in `a` was silently overwritten. A name is not a path, so it is refused by name.
+    #[test]
+    fn a_windows_guest_refuses_a_name_with_a_backslash_instead_of_splitting_it() {
+        let error = win("C:/tree")
+            .join("a\\b")
+            .expect_err("Windows has no file name containing a backslash");
+        let message = error.to_string();
+        assert!(
+            message.contains("`a\\b`"),
+            "the refusal must name the entry it refused: {message}"
+        );
+        assert!(
+            message.contains("rename the local entry"),
+            "the refusal must say what the user can do: {message}"
+        );
+
+        // Controls: a `/`-separated child (what the walk sends for a nested entry) still joins,
+        // and a Linux guest still keeps the backslash as part of the name.
+        assert_eq!(
+            win("C:/tree").join("a/b").expect("joined").as_str(),
+            "C:/tree/a/b"
+        );
+        assert_eq!(
+            posix("/tree").join("a\\b").expect("joined").as_str(),
+            "/tree/a\\b"
+        );
     }
 
     #[test]
@@ -477,10 +537,13 @@ mod tests {
             base.join("sub dir").unwrap().as_str(),
             "C:/Users/qlean/sub dir"
         );
+        // `join` takes a name (or names separated by `/` as `strip_prefix` returns them), so a
+        // backslash is a character in a name here and Windows refuses it.
         assert_eq!(
-            base.join(r"sub\deeper").unwrap().as_str(),
+            base.join("sub/deeper").unwrap().as_str(),
             "C:/Users/qlean/sub/deeper"
         );
+        assert!(base.join(r"sub\deeper").is_err());
         assert_eq!(base.parent().unwrap().as_str(), "C:/Users");
         assert!(win("C:").parent().is_none());
         assert!(win("C:").join("Users").unwrap().as_str() == "C:/Users");

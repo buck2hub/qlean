@@ -220,7 +220,10 @@ semantics. On a Windows guest both `/` and `\` are accepted on input and paths a
 with `/` separators, which `sshd` accepts on both operating systems. A Linux guest path
 keeps `\` as an ordinary character in a name, the way `std::path` does - including for
 entries inside an uploaded or downloaded tree, so a file named `a\b` is not addressed as
-`a/b`.
+`a/b`. A name is not a path, so for a Windows guest a host entry whose name contains a
+backslash is refused by name instead of being split into directories: Windows has no such
+name, and `a\b` would otherwise be uploaded as `a/b`, overwriting an entry whose name really
+is `b` in `a`.
 
 | Operation | Windows guest | Linux guest |
 |---|---|---|

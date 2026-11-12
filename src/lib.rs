@@ -3864,8 +3864,12 @@ mod plan_doc_tests {
     ///
     /// `join` used to fold `\` into `/` for every guest, which turned a Linux entry named
     /// `a\b` into `a/b` for the walk that drives `download`, `upload` and `remove_dir_all`.
-    /// The rule is per guest, so the sentence and the behaviour have to be checked together:
-    /// a phrase-only guard would pass on a README that describes code nobody has.
+    /// R177 found the other half of the same rule missing: the Windows arm had no test at all,
+    /// so a host entry named `a\b` was still rewritten into the tree `a/b` - a different tree,
+    /// and one that silently overwrote an entry whose name really is `b` in `a`. A child of
+    /// `join` is a name, and Windows has no name with a backslash, so the entry is refused by
+    /// name. Both arms are checked here together with the sentences that describe them: a
+    /// phrase-only guard would pass on a README that describes code nobody has.
     #[test]
     fn the_readme_states_how_each_guest_spells_a_backslash() {
         use crate::guest_path::GuestPath;
@@ -3877,18 +3881,32 @@ mod plan_doc_tests {
             .expect("a backslash is a legal character in a POSIX name");
         let windows = GuestPath::new(GuestOs::Windows, "C:/tree")
             .expect("a Windows path")
-            .join("a\\b")
-            .expect("Windows accepts both separators");
+            .join("a\\b");
+        // A name is not a path: the walk feeds entry names through `join`, and Windows has no
+        // file name containing a backslash. Splitting it would upload `a/b` instead.
+        let refusal = windows
+            .as_ref()
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| panic!("a Windows name with a backslash must be refused"));
+        assert!(
+            refusal.contains("a\\b") && refusal.contains("rename the local entry"),
+            "the refusal must name the entry and what to do: {refusal}"
+        );
 
         assert_eq!(
             linux.as_str(),
             "/tmp/tree/a\\b",
             "a Linux guest path must keep a backslash as part of the name"
         );
+        // The control: a name without a backslash still joins, so this arm is not simply broken.
         assert_eq!(
-            windows.as_str(),
-            "C:/tree/a/b",
-            "a Windows guest path must treat a backslash as a separator"
+            GuestPath::new(GuestOs::Windows, "C:/tree")
+                .expect("a Windows path")
+                .join("a/b")
+                .expect("a `/`-separated child is what the walk sends")
+                .as_str(),
+            "C:/tree/a/b"
         );
 
         // Locate the paragraph by what it says, not by the heading above it: renaming the
@@ -3902,6 +3920,7 @@ mod plan_doc_tests {
         for claim in [
             "On a Windows guest both `/` and `\\` are accepted on input",
             "A Linux guest path keeps `\\` as an ordinary character in a name",
+            "a host entry whose name contains a backslash is refused by name",
         ] {
             assert!(
                 flat.contains(claim),
