@@ -141,7 +141,6 @@ mod plan_doc_tests {
         ),
     ];
 
-    /// Each card's id, lifecycle and acceptance token, in the order the plan declares them.
     /// The UTC date of the machine running the tests, as `YYYY-MM-DD`.
     ///
     /// Written out rather than pulled from a crate so the guard below needs no dependency: the
@@ -168,6 +167,38 @@ mod plan_doc_tests {
         format!("{year:04}-{month:02}-{day:02}")
     }
 
+    /// The body of the function whose signature starts with `signature`, braces balanced.
+    ///
+    /// Every guard below that reasons about *where* code lives needs this: a check that a name
+    /// is somewhere in a file cannot tell "the gate is in `Machine::new`" from "the gate is in
+    /// some other function in the same file", and that difference is the whole point.
+    fn body_of(source: &str, signature: &str) -> String {
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} is gone: the guard would be reading nothing"));
+        let mut depth = 0i32;
+        let mut body = String::new();
+        let mut seen = false;
+        for ch in source[start..].chars() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    seen = true;
+                }
+                '}' => depth -= 1,
+                _ => {}
+            }
+            if seen {
+                body.push(ch);
+            }
+            if seen && depth == 0 {
+                break;
+            }
+        }
+        body
+    }
+
+    /// Each card's id, lifecycle and acceptance token, in the order the plan declares them.
     fn card_states(plan: &str) -> Vec<(String, String, String)> {
         let mut cards: Vec<(String, String, String)> = Vec::new();
         let mut current: Option<String> = None;
@@ -1215,6 +1246,76 @@ mod plan_doc_tests {
 
     /// The seven ignored Windows smoke tests all stop at the precondition the plan describes.
     ///
+    /// Every Windows smoke test reaches the host gate, because it builds its machine through it.
+    ///
+    /// The seven ignored tests are the only evidence that will ever exist for a real Windows
+    /// boot, and the gate that stops them on an unprepared host lives inside `Machine::new`.
+    /// A test that started QEMU some other way would still be called "the Windows smoke test"
+    /// while skipping the one check that says whether the host can run it at all.
+    #[test]
+    fn the_windows_smoke_tests_all_go_through_the_prerequisite_gate() {
+        let suite = CRATE_SOURCES
+            .iter()
+            .find(|(path, _)| *path == "tests/windows_machine.rs")
+            .map(|(_, source)| *source)
+            .expect("the Windows suite is not in CRATE_SOURCES");
+
+        let mut tested = 0;
+        for (index, line) in suite.lines().enumerate() {
+            let trimmed = line.trim_start();
+            let Some(name) = trimmed.strip_prefix("async fn windows_") else {
+                continue;
+            };
+            if name.starts_with("image_config") {
+                continue;
+            }
+            let name = format!("windows_{}", name.trim_end_matches("() -> Result<()> {"));
+            let body: String = suite
+                .lines()
+                .skip(index + 1)
+                .scan(1i32, |depth, line| {
+                    *depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+                    Some((*depth, line))
+                })
+                .take_while(|(depth, _)| *depth > 0)
+                .map(|(_, line)| line)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                body.contains("Machine::new") || body.contains("MachinePool::new"),
+                "{name} builds its machine without Machine::new or MachinePool::new, so it never \
+                 passes firmware::ensure_host_support"
+            );
+            tested += 1;
+        }
+        assert_eq!(tested, 7, "the suite should hold seven Windows smoke tests");
+
+        let machine = body_of(
+            CRATE_SOURCES
+                .iter()
+                .find(|(path, _)| *path == "src/machine.rs")
+                .map(|(_, source)| *source)
+                .expect("src/machine.rs is not in CRATE_SOURCES"),
+            "pub async fn new(image: &Image, config: &MachineConfig)",
+        );
+        assert!(
+            machine.contains("firmware::ensure_host_support()?"),
+            "Machine::new no longer gates a Windows guest on firmware::ensure_host_support"
+        );
+        let pool = body_of(
+            CRATE_SOURCES
+                .iter()
+                .find(|(path, _)| *path == "src/pool.rs")
+                .map(|(_, source)| *source)
+                .expect("src/pool.rs is not in CRATE_SOURCES"),
+            "pub async fn add(",
+        );
+        assert!(
+            pool.contains("Machine::new(image, config)"),
+            "MachinePool::add no longer builds its machines through Machine::new"
+        );
+    }
+
     /// Every `src/file.rs::symbol` the plan points at names something that is there.
     ///
     /// The write-set rows exist so a reader can go and look at the implementation. Three of them
