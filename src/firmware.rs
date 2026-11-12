@@ -12,7 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::is_kvm_available;
 
@@ -426,6 +426,32 @@ fn swtpm_args(state_dir: &Path, socket: &Path, log: &Path) -> Vec<String> {
     ]
 }
 
+/// How long `swtpm` gets to flush its state before it is killed.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+/// Ask a child process to terminate, so it can flush its state first.
+///
+/// `Child::start_kill` only sends `SIGKILL`, which gives `swtpm` no chance to write the TPM
+/// state file. Non-Unix hosts keep the old behaviour (they cannot run a Windows guest).
+fn signal_terminate(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            // SAFETY: `kill` with a positive pid only delivers a signal; it does not touch
+            // memory, and the pid belongs to the child this handle owns.
+            let sent = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+            if sent == 0 {
+                return;
+            }
+            debug!(
+                "failed to send SIGTERM to pid {pid}: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    let _ = child.start_kill();
+}
+
 /// A running `swtpm` process backing one VM's TPM 2.0 device.
 pub(crate) struct Swtpm {
     child: tokio::process::Child,
@@ -502,22 +528,54 @@ impl Swtpm {
         }
     }
 
+    /// Wrap an arbitrary child process, so the shutdown ladder can be tested without
+    /// `swtpm` installed.
+    #[cfg(test)]
+    pub(crate) fn from_child(child: tokio::process::Child, socket: PathBuf) -> Self {
+        Self { child, socket }
+    }
+
     /// Path of the swtpm control socket used by QEMU's TPM chardev.
     pub(crate) fn socket(&self) -> &Path {
         &self.socket
     }
 
     /// Stop the TPM process; safe to call more than once.
+    ///
+    /// `swtpm` writes its state to disk while shutting down, so a `SIGKILL` can leave a
+    /// half-written state file behind and the guest then loses the TPM identity it sealed
+    /// secrets against (on Windows: BitLocker recovery). Ask it to terminate, wait, and only
+    /// kill if it does not.
     pub(crate) async fn stop(&mut self) {
-        let _ = self.child.start_kill();
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await;
+        signal_terminate(&mut self.child);
+        if tokio::time::timeout(SHUTDOWN_GRACE, self.child.wait())
+            .await
+            .is_err()
+        {
+            warn!("swtpm did not exit within {SHUTDOWN_GRACE:?}; killing it");
+            let _ = self.child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await;
+        }
     }
 
-    /// Stop the process from synchronous code (for example `Drop`), without waiting.
+    /// Stop the process from synchronous code (for example `Drop`).
     ///
-    /// `Drop` cannot await, so this only signals the child; the reaper still runs when the
-    /// runtime next polls the process handle.
+    /// `Drop` cannot await, so this signals the child, waits synchronously for a bounded
+    /// time and then kills it. The wait matters: dropping a child configured with
+    /// `kill_on_drop` would `SIGKILL` it immediately after the signal.
     pub(crate) fn stop_now(&mut self) {
+        signal_terminate(&mut self.child);
+        let started = Instant::now();
+        while started.elapsed() < SHUTDOWN_GRACE {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(error) => {
+                    warn!("failed to wait for swtpm: {error}");
+                    break;
+                }
+            }
+        }
         let _ = self.child.start_kill();
     }
 }
@@ -718,6 +776,70 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap().len(), 256);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn test_stop_now_lets_the_child_terminate_gracefully() {
+        // `sleep` exits on SIGTERM, so the synchronous shutdown must not fall through to
+        // SIGKILL and must not block for the whole grace period.
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("sleep is available");
+        let mut swtpm = Swtpm::from_child(child, PathBuf::from("/nonexistent/swtpm.sock"));
+
+        let started = Instant::now();
+        swtpm.stop_now();
+        let elapsed = started.elapsed();
+        assert!(elapsed < SHUTDOWN_GRACE, "took {elapsed:?}");
+        let status = swtpm.child.try_wait().expect("try_wait works");
+        assert!(status.is_some(), "child must be gone after a graceful stop");
+    }
+
+    #[tokio::test]
+    async fn test_stop_kills_a_child_that_ignores_sigterm() {
+        // A hung `swtpm` must not hang the shutdown path: the grace period expires and the
+        // process is killed.
+        // The trailing loop keeps `sh` as the surviving process: a bare last command would
+        // be `exec`ed and inherit the default `SIGTERM` disposition instead of the trap.
+        // The marker file proves the trap is installed before the signal is sent, otherwise
+        // the test would race the shell's startup and pass for the wrong reason.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let marker = dir.path().join("trapped");
+        let child = tokio::process::Command::new("sh")
+            .args([
+                "-c",
+                &format!(
+                    "trap '' TERM; : > {}; while :; do sleep 0.05; done",
+                    marker.display()
+                ),
+            ])
+            .kill_on_drop(true)
+            .spawn()
+            .expect("sh is available");
+        let mut swtpm = Swtpm::from_child(child, PathBuf::from("/nonexistent/swtpm.sock"));
+        for _ in 0..250 {
+            if marker.is_file() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(marker.is_file(), "the shell must install the trap first");
+
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_secs(20), swtpm.stop())
+            .await
+            .expect("stop must finish");
+        assert!(
+            started.elapsed() >= SHUTDOWN_GRACE,
+            "the grace period must expire before the child is killed"
+        );
+        let status = swtpm.child.try_wait().expect("try_wait works");
+        assert!(
+            status.is_some(),
+            "child must be killed after the grace period"
+        );
     }
 
     #[test]

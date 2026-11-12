@@ -2269,6 +2269,7 @@ dependencies = [
  "hex",
  "indicatif",
  "kvm-ioctls",
+ "libc",
  "nanoid",
  "qapi",
  "rand 0.10.2",
