@@ -120,6 +120,7 @@
 | 2026-11-12 15:20:00 UTC | review R9（硬件对接面） | F9~F11 修复：vsock 设备仅为 Linux 添加（`f42a942`）；OVMF code/vars 等长校验改为「vars 不得大于 code」（`8ae13ec`）；swtpm 控制 socket 改 `mode=0600`（`3e7ebd0`） | N/A（`OSX-01`/`OSX-02` 既有 AC，无卡拆合） | `OSX-01`/`OSX-02` 实现证据、Review log、`src/qemu.rs`、`src/firmware.rs`、CHANGELOG |
 | 2026-11-12 15:50:00 UTC | review R9 补记（Secure Boot vars 与首启介质前置） | F12 修复：`OVMF_CANDIDATES` 为每个 code 镜像列出多个 vars 模板，secboot 优先 Microsoft 已注册的 `.ms`/`.secboot` 模板，普通模板仅作 fallback（setup mode）；F13 修复：`ensure_host_support` 增加 `xorriso`（首启 seed 介质的必需构建器），与其他缺口一次性报出（`7ddc686`） | N/A（细化 ADR-WIN-02 的 Secure Boot 判定与 `OSX-02` 前置检查，不改变既有决策） | `OSX-02` 实现证据、Review log、ADR-WIN-02、`src/firmware.rs`、README、CHANGELOG |
 | 2026-11-12 16:10:00 UTC | review R10（Windows 命令构造） | F14 修复：`Machine::copy` 的 Windows 分支改为直接执行 `Copy-Item`（`windows::copy_file_command`），不再套 `powershell -Command "..."`，避免外层 PowerShell 二次解析把路径中的 `$` 展开成空 | N/A（`FS-01` 既有 AC「Windows 文件语义」，无卡拆合） | `FS-01` 实现证据、Review log、`src/windows.rs`、`src/machine.rs`、CHANGELOG |
+| 2026-11-12 16:30:00 UTC | review R11（失败启动的可恢复性） | F15 修复：`init`/`spawn` 把 cancel token 当「已启动」标记，启动失败后 token 残留，之后每次尝试都报 `Machine already initialized`/`already spawned`，且残留的连接任务不会被取消；现在只在机器确实在运行时拒绝重复启动，失败时取消并清除 token（`bf0710c`） | N/A（`OSX-03`/`TRN-01` 既有「有界重试后清理」AC 与故障恢复矩阵，无卡拆合） | `OSX-03` 实现证据、故障恢复矩阵、Review log、`src/machine.rs`、CHANGELOG |
 
 ## 已决议设计决策
 
@@ -650,6 +651,7 @@
 | 首启连接预算 | `src/machine.rs::resolve_connect_timeout`：Windows `init` 以 `windows::deploy_timeout`（默认 900s）作为连接/readiness 预算，`spawn` 与 Linux 仍用 `resolve_ssh_timeout`；`timeout_tests` 3 个单测覆盖三条分支（R8 修复，提交 `0e72b45`） |
 | 首启失败清理 | `Machine::launch` 在 `confirm_deployment` 失败时关闭会话、`terminate_qemu`、`Swtpm::stop` 并清空 `pid`/`ssh`/`ip`，不留运行中 VM 与挂载中的 seed（R8，`f9cc1ee`） |
 | 重复 init 拒绝 | `Machine::init` 在 `GuestOs::Windows && deploy_seed.is_none()` 时直接报错并提示 `spawn`，避免以已删除的 seed 引导（R8，`178ac03`） |
+| 失败启动可重试 | `init`/`spawn` 在启动失败时取消并清除 cancel token（`abandon_launch`），仅在 `pid`/`ssh` 存在时拒绝重复启动；首启超时拆除后可在同一机器上重试（R11，`src/machine.rs`） |
 | 提交 | `8812fb4` |
 
 **Full-suite trigger:** `T-1: 共享 seed 与 Machine 初始化路径`
@@ -1132,6 +1134,7 @@
 | 地址发现/连接超时 | 可保留 sanitized 日志 | 有界重试后终止 QEMU、释放端点并清理 | 遗留 QEMU、调用 get_ip 循环等待 |
 | host key 不匹配 | 无会话 | 立即失败并清理，不自动接受新 key | 静默信任任意 key |
 | Windows 首启后重启失败 | 可保留失败 run dir 供排查（clear=false） | 终止进程、记录状态；修复后新建干净 VM 验证 | 删除证据后宣称成功或复用半部署状态 |
+| `init`/`spawn` 启动失败（含首启超时、`read_pid` 失败） | 无运行 VM、无残留会话 | 取消并清除 cancel token、停 `swtpm`、必要时终止 QEMU 后可在同一 `Machine` 上重试 | 遗留 `already initialized` 之类的误导报错或无法重试 |
 | crates.io 发布失败 | 本地/远端 tag 可能已建 | 按 ER-09 记录，下窗口处理 | 伪造发布证据或撤回已发布 crate |
 
 ## 风险登记
@@ -1201,6 +1204,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R8 | 首启生命周期复核（连接预算/失败清理/重复 init） | PASS | 无开放项 | F5：Windows `init` 仍用 180s/300s 连接预算等待 `sshd`，900s 部署预算永远不可达；F6：`confirm_deployment` 失败经 `?` 透传，留下运行中的 QEMU、`swtpm` 与仍挂载的 seed（含客户端公钥与每 VM host 私钥）；F7：`read_pid` 失败直接透传，跳过 `swtpm` 停止；F8：已部署的 Windows 机器可再次 `init`，此时 seed ISO 已删除 | F5 修复 `resolve_connect_timeout` + 3 个单测（`0e72b45`）；F6 失败即关会话/杀 QEMU/停 swtpm/清端点（`f9cc1ee`）；F7 有界等待并停 swtpm（`83a8b0c`）；F8 `init` 前置拒绝并提示 `spawn`（`178ac03`）；门禁 `cargo fmt --check`、clippy `-D warnings`、`cargo test --lib` 72 passed、`cargo test --no-run` 全绿 |
 | R9 | 硬件对接面复核（QEMU 设备/OVMF 配对/swtpm 权限） | PASS | 无开放项 | F9：所有 guest 都被追加 `vhost-vsock-pci`，Windows 因此依赖 `/dev/vhost-vsock`；F10：`prepare_vars` 要求 code 与 vars 等长，而所有 stock 固件的 vars 远小于 code，真实宿主上必然失败；F11：swtpm 控制 socket 用默认权限创建；F12：secboot code 搭配的是空 KEK 的普通 vars 模板，guest 实为 Secure Boot setup mode（Windows 11 拒绝）；F13：`ensure_host_support` 未检查 `xorriso`，首启 seed 介质构建失败会延后暴露 | F9 `vsock_args` 分派 + 2 单测（`f42a942`）；F10 规则修正 + 2 单测（`8ae13ec`）；F11 `mode=0600` + `swtpm_args` 单测（`3e7ebd0`）；F12 候选表按 code 列出多个 vars 模板并优先 `.ms`/`.secboot`（`fec2e4d`）；F13 前置检查补 `xorriso`（`7ddc686`）；门禁 `cargo fmt --check`、clippy `-D warnings`、`cargo test --lib` 77 passed、`cargo test --no-run` 全绿 |
 | R10 | Windows 命令构造复核（`Machine::copy` 的 PowerShell 调用） | PASS | 无开放项 | F14：`copy` 把 cmdlet 包在 `powershell -Command "..."` 里，而 guest 默认 shell 已是 PowerShell，外层会再解析一次双引号字符串并展开 `$`，复制 `C:/Program Files/a$b.txt` 这类路径会静默指向别的文件 | F14 抽出 `windows::copy_file_command` 直接发射 cmdlet（单引号字面量，仅一层解析）+ 单测断言不含 `-Command`/`"`（`ec6a9a1`）；门禁 `cargo fmt --check`、clippy `-D warnings`、`cargo test --lib` 79 passed、`cargo test --no-run` 全绿 |
+| R11 | 失败启动的可恢复性复核（`init`/`spawn` 状态标记） | PASS | 无开放项 | F15：`ssh_cancel_token` 同时充当「已启动」标记，`launch` 失败（含 Windows 首启超时拆除、`read_pid` 失败）后 token 残留，同一 `Machine` 上无法重试且报错文案误导；残留连接任务也未被取消 | F15 `init`/`spawn` 仅在 `pid`/`ssh` 存在时拒绝重复启动，失败路径新增 `abandon_launch()` 取消并清除 token，顺带修掉 `warn!` 里的多余空格（`bf0710c`）；门禁 `cargo fmt --check`、clippy `-D warnings`、`cargo test --lib` 79 passed、`cargo test --no-run` 全绿 |
 
 ### R1 findings 与修订对照
 

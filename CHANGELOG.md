@@ -40,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A failed `init`/`spawn` left the cancel token behind, so retrying on the same `Machine` reported "already initialized"/"already spawned" for a VM that never started
 - `Machine::copy` wrapped `Copy-Item` in `powershell -Command "..."` inside an already-PowerShell shell, so `$` in a Windows path was expanded and the copy silently targeted a different file
 - The Windows host prerequisite check omitted `xorriso`, so a host without it passed the check and failed later while staging the seed medium
 - Secure Boot paired a `secboot` code image with the plain (empty-key) vars template, which boots in setup mode; the Microsoft-enrolled `.ms`/`.secboot` templates are now preferred
