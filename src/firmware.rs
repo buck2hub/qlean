@@ -338,7 +338,7 @@ pub(crate) fn resolve_ovmf() -> Result<FirmwarePaths> {
 }
 
 /// Program that builds the Windows seed ISO medium.
-const SEED_ISO_BUILDER: &str = "xorriso";
+pub(crate) const SEED_ISO_BUILDER: &str = "xorriso";
 
 /// Program used to run the software TPM.
 fn swtpm_program() -> PathBuf {

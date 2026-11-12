@@ -208,6 +208,20 @@ fn qmp_chardev_args(socket: &Path) -> anyhow::Result<Vec<String>> {
     ])
 }
 
+/// `-drive` argument that attaches the first-boot seed medium.
+///
+/// Kept separate from [`launch_qemu`] for the same reason as [`qmp_chardev_args`]: the exact
+/// string can then be handed to a real QEMU and asked what it realized. The IDE attachment is
+/// deliberate — some images do not reliably scan virtio CD-ROM paths during early boot, so a
+/// Windows guest that silently stops seeing the seed would spend its whole deployment budget
+/// waiting for a marker it can never read.
+fn seed_drive_option(seed: &Path) -> anyhow::Result<String> {
+    Ok(format!(
+        "file={},if=ide,media=cdrom,readonly=on",
+        qemu_option_path("seed ISO", seed)?
+    ))
+}
+
 pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
     // Prepare QEMU command
     let is_windows = params.image.guest_os == GuestOs::Windows;
@@ -276,13 +290,7 @@ pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> 
 
     // Seed ISO is only used for initial boot with cloud-init.
     if params.is_init {
-        let seed_drive = format!(
-            // Use an emulated CD-ROM device for maximum compatibility with NoCloud on Fedora/Arch.
-            // Some images do not reliably scan virtio-cdrom paths during early boot.
-            "file={},if=ide,media=cdrom,readonly=on",
-            qemu_option_path("seed ISO", &params.image.seed)?
-        );
-        qemu_cmd.args(["-drive", &seed_drive]);
+        qemu_cmd.args(["-drive", &seed_drive_option(&params.image.seed)?]);
     }
 
     match select_accel(
@@ -706,6 +714,133 @@ mod tests {
         let _ = child.start_kill();
         let _ = child.wait().await;
         tpm.stop().await;
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    /// Check the first-boot seed medium against a real QEMU.
+    ///
+    /// The deployment depends on the guest finding the seed ISO on a bus its early boot
+    /// scans. QEMU accepts almost any `-drive` line, so a device that ends up unattached,
+    /// on a bus the firmware never probes, or not read-only still yields a running VM and a
+    /// 900s wait for a marker the guest could never write. `query-block` is the only thing
+    /// that distinguishes "the argument was accepted" from "the guest has this CD-ROM".
+    #[tokio::test]
+    #[ignore = "needs qemu-system-x86_64 and xorriso on the host"]
+    async fn test_the_seed_medium_really_is_an_ide_cdrom() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let qemu = Path::new(qemu_system_program(GuestArch::Amd64));
+        if !program_runs(qemu) {
+            assert!(smoke_unavailable(&format!(
+                "`{}` is not runnable",
+                qemu.display()
+            )));
+            return;
+        }
+        if !program_runs(Path::new(crate::firmware::SEED_ISO_BUILDER)) {
+            assert!(smoke_unavailable("`xorriso` is not runnable"));
+            return;
+        }
+
+        let run_dir = std::env::temp_dir().join(format!("qlean-qemu-seed-{}", std::process::id()));
+        std::fs::create_dir_all(run_dir.join("seed")).expect("test run dir");
+        std::fs::write(
+            run_dir.join("seed").join("deploy.json"),
+            b"{\"marker\":1}\n",
+        )
+        .expect("seed payload");
+        let iso = run_dir.join("seed.iso");
+        let mut iso_cmd = tokio::process::Command::new(crate::firmware::SEED_ISO_BUILDER);
+        iso_cmd
+            .arg("-as")
+            .arg("mkisofs")
+            .arg("-V")
+            .arg(crate::windows::SEED_VOLUME_LABEL)
+            .arg("-J")
+            .arg("-R")
+            .arg("-o")
+            .arg(&iso)
+            .arg("-graft-points")
+            .arg(format!("qlean={}", run_dir.join("seed").display()));
+        crate::utils::run_bounded(
+            iso_cmd,
+            Duration::from_secs(120),
+            "build the smoke seed ISO",
+        )
+        .await
+        .expect("seed ISO built");
+        assert!(iso.is_file(), "xorriso did not produce {}", iso.display());
+
+        let drive = seed_drive_option(&iso).expect("seed drive argument");
+        let mut child = tokio::process::Command::new(qemu)
+            .args([
+                "-drive", &drive, "-m", "512", "-display", "none", "-S", "-qmp", "stdio",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn qemu");
+        let mut stdout = child.stdout.take().expect("qemu stdout");
+        let mut qmp_stdin = child.stdin.take().expect("qemu stdin");
+
+        let mut greeting = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            let read = tokio::time::timeout(Duration::from_secs(20), stdout.read(&mut byte))
+                .await
+                .expect("QEMU must emit the QMP greeting within 20s")
+                .expect("read qemu stdout");
+            if read == 0 {
+                break;
+            }
+            greeting.push(byte[0]);
+            if greeting.ends_with(b"\n") && greeting.windows(4).any(|w| w == b"QMP\"") {
+                break;
+            }
+        }
+        let greeting = String::from_utf8_lossy(&greeting).to_string();
+        assert!(
+            greeting.contains("\"QMP\""),
+            "QEMU rejected the seed drive argument: {greeting}"
+        );
+
+        qmp_stdin
+            .write_all(b"{\"execute\":\"qmp_capabilities\"}\n{\"execute\":\"query-block\"}\n")
+            .await
+            .expect("write qmp commands");
+        let mut replies = Vec::new();
+        let mut chunk = [0u8; 8192];
+        while let Ok(Ok(read)) =
+            tokio::time::timeout(Duration::from_millis(300), stdout.read(&mut chunk)).await
+        {
+            if read == 0 {
+                break;
+            }
+            replies.extend_from_slice(&chunk[..read]);
+        }
+        let replies = String::from_utf8_lossy(&replies).to_string();
+        let iso_name = iso.file_name().unwrap().to_string_lossy().to_string();
+        assert!(
+            replies.contains("\"device\": \"ide0-cd0\""),
+            "the seed medium did not show up as an IDE CD-ROM: {replies}"
+        );
+        assert!(
+            replies.contains(&format!("\"file\": \"{}\"", iso.display())),
+            "the IDE CD-ROM is not backed by the seed ISO {}: {replies}",
+            iso.display()
+        );
+        assert!(
+            replies.contains("\"ro\": true") && replies.contains("\"tray_open\": false"),
+            "the seed medium must be inserted read-only: {replies}"
+        );
+        println!(
+            "real QEMU realized the seed medium as ide0-cd0 from {iso_name} (read-only, tray closed)"
+        );
+
+        let _ = child.start_kill();
+        let _ = child.wait().await;
         let _ = std::fs::remove_dir_all(&run_dir);
     }
 
