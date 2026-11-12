@@ -588,6 +588,110 @@ mod tests {
         Ok(())
     }
 
+    /// Run `xorriso` the same way [`DeploySeed::build`] does, with a budget.
+    async fn xorriso(args: &[&str]) -> Result<std::process::Output> {
+        let mut cmd = tokio::process::Command::new("xorriso");
+        cmd.args(args);
+        let output =
+            crate::utils::bounded_output(cmd, SEED_BUILD_BUDGET, "inspect the seed ISO").await?;
+        anyhow::ensure!(
+            output.status.success(),
+            "`xorriso {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        Ok(output)
+    }
+
+    /// Build the seed medium with a **real** `xorriso` and check what the guest will see.
+    ///
+    /// The unit tests around it only exercise the staging directory and the sealing of a
+    /// stand-in file, so nothing here proved that the actual argument list produces a
+    /// medium with the documented volume label and the documented `qlean/` layout — the
+    /// one thing the image's first-boot task depends on. Ignored because `xorriso` is not
+    /// a CI dependency; run it on a host that has it:
+    ///
+    /// ```text
+    /// cargo test --lib -- --ignored windows_seed_medium
+    /// ```
+    #[tokio::test]
+    #[ignore = "needs a real `xorriso` on the host; run with --ignored"]
+    async fn test_windows_seed_medium_has_the_documented_label_and_layout() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir()?;
+        let (seed, host_key) = stage(tmp.path()).await?;
+        seed.build().await?;
+        let iso = seed.iso_path().to_string_lossy().into_owned();
+
+        // The medium carries the guest host private key, so the real `xorriso` output must
+        // be sealed too — not only the stand-in file the unit test uses.
+        let mode = std::fs::metadata(seed.iso_path())?.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the built seed medium should be 0600, got {mode:o}"
+        );
+
+        // The label is what the first-boot task searches for on the guest side.
+        let pvd = String::from_utf8_lossy(&xorriso(&["-indev", &iso, "-pvd_info"]).await?.stdout)
+            .into_owned();
+        assert!(
+            pvd.contains(&format!("Volume Id    : {SEED_VOLUME_LABEL}")),
+            "the medium must carry the volume label {SEED_VOLUME_LABEL}:\n{pvd}"
+        );
+
+        // Windows reads Joliet, not Rock Ridge, so the names must survive that view.
+        let listing = String::from_utf8_lossy(
+            &xorriso(&[
+                "-indev",
+                &iso,
+                "-rockridge",
+                "off",
+                "-joliet",
+                "on",
+                "-ls",
+                &format!("/{SEED_ROOT}"),
+            ])
+            .await?
+            .stdout,
+        )
+        .into_owned();
+        for name in ["authorized_keys", "deploy.json", "ssh_host_ed25519_key"] {
+            assert!(
+                listing.contains(&format!("'{name}'")),
+                "the seed root must contain {name} under Joliet:\n{listing}"
+            );
+        }
+
+        // The bytes on the medium are what the guest installs, so compare them, not the
+        // staging directory they came from.
+        let extracted = tmp.path().join("extracted");
+        xorriso(&[
+            "-osirrox",
+            "on",
+            "-indev",
+            &iso,
+            "-extract",
+            &format!("/{SEED_ROOT}"),
+            &extracted.to_string_lossy(),
+        ])
+        .await?;
+        assert_eq!(
+            std::fs::read_to_string(extracted.join("authorized_keys"))?,
+            format!("{CLIENT_PUBKEY}\n"),
+            "the medium must carry the client public key, unchanged"
+        );
+        assert_eq!(
+            std::fs::read_to_string(extracted.join("ssh_host_ed25519_key"))?,
+            host_key.privkey_str,
+            "the medium must carry this VM's host key byte for byte"
+        );
+        let contract: DeployContract =
+            serde_json::from_str(&std::fs::read_to_string(extracted.join("deploy.json"))?)?;
+        assert_eq!(contract, DeployContract::current());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_windows_deploy_host_key_is_per_vm() -> Result<()> {
         let first = tempfile::tempdir()?;
