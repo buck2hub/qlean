@@ -516,13 +516,16 @@ StandardError=journal
             }
         }
 
-        if self.ssh_cancel_token.is_none() {
-            self.ssh_cancel_token = Some(CancellationToken::new());
-        } else {
+        // Same rule as `spawn`: a leftover token from a failed launch must not block a retry.
+        if self.ssh_cancel_token.is_some() && (self.pid.is_some() || self.ssh.is_some()) {
             bail!("Machine already initialized");
         }
+        self.ssh_cancel_token = Some(CancellationToken::new());
 
-        self.launch(true).await?;
+        if let Err(err) = self.launch(true).await {
+            self.abandon_launch();
+            return Err(err);
+        }
 
         Ok(())
     }
@@ -531,15 +534,32 @@ StandardError=journal
     pub async fn spawn(&mut self) -> Result<()> {
         info!("🔥 Spawning VM-{}", self.id);
 
-        if self.ssh_cancel_token.is_none() {
-            self.ssh_cancel_token = Some(CancellationToken::new());
-        } else {
+        // Only a machine that is actually up counts as spawned: a failed launch leaves
+        // the token behind, and refusing to retry would make the error unrecoverable.
+        if self.ssh_cancel_token.is_some() && (self.pid.is_some() || self.ssh.is_some()) {
             bail!("Machine already spawned");
         }
+        self.ssh_cancel_token = Some(CancellationToken::new());
 
-        self.launch(false).await?;
+        if let Err(err) = self.launch(false).await {
+            self.abandon_launch();
+            return Err(err);
+        }
 
         Ok(())
+    }
+
+    /// Drop the cancel token of a launch that failed, so the machine can be retried.
+    ///
+    /// The token also serves as the "this machine was started" marker, so it has to be
+    /// cancelled (to stop any leftover connection task) and cleared; otherwise the next
+    /// `init`/`spawn` would report "already initialized" for a machine that never started.
+    fn abandon_launch(&mut self) {
+        if let Some(token) = self.ssh_cancel_token.take() {
+            token.cancel();
+        }
+        self.ssh = None;
+        self.ip = None;
     }
 
     /// Open a dedicated interactive SSH shell (PTY) over a new vsock session.
@@ -1163,7 +1183,7 @@ StandardError=journal
                     .is_err()
                 {
                     warn!(
-                        "VM-{} did not exit after its pid file could not be read;                          it may still be running",
+                        "VM-{} did not exit after its pid file could not be read; it may still be running",
                         self.id
                     );
                 }
