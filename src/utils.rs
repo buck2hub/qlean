@@ -40,6 +40,27 @@ pub(crate) struct DhcpLease {
     pub expiry: String,
 }
 
+/// Run `cmd` and collect its output, but never wait longer than `budget`.
+///
+/// A budget that does not also end the child process is not a budget: `kill_on_drop`
+/// kills it when the output future is dropped at the deadline, so nothing keeps running
+/// (and writing the file it was told to write) after the caller gave up.
+pub(crate) async fn bounded_output(
+    mut cmd: tokio::process::Command,
+    budget: std::time::Duration,
+    what: &str,
+) -> Result<std::process::Output> {
+    let program = cmd.as_std().get_program().to_string_lossy().into_owned();
+    cmd.kill_on_drop(true);
+    match tokio::time::timeout(budget, cmd.output()).await {
+        Ok(output) => Ok(output?),
+        Err(_) => bail!(
+            "`{program}` did not finish within {budget:?} while trying to {what}; \
+             the process was killed"
+        ),
+    }
+}
+
 /// Normalize a MAC address for comparison (`-`, `:` and case are not significant).
 ///
 /// One implementation, used by both the DHCP lease path and the in-guest address query:
@@ -169,7 +190,9 @@ fn lease_address_for(leases: &[DhcpLease], mac: &str) -> Option<std::net::IpAddr
 
 /// Resolve a MAC address to its leased address on Qlean's libvirt network.
 ///
-/// Polling is bounded by `timeout` and never runs an unbounded retry loop. The guest
+/// Polling is bounded by `timeout` and never runs an unbounded retry loop: the deadline
+/// ends the wait, and every `virsh` call is capped by the remaining budget too, so a wedged
+/// libvirtd cannot outlive the deadline by hanging inside one call. The guest
 /// must be given the chance to reach DHCP, so transient "no lease yet" results are
 /// expected until the address appears.
 pub(crate) async fn find_lease_address(
@@ -186,26 +209,36 @@ pub(crate) async fn find_lease_address(
     let mut last_error: Option<String> = None;
 
     loop {
-        let output = tokio::process::Command::new("virsh")
-            .arg("-c")
+        let mut cmd = tokio::process::Command::new("virsh");
+        cmd.arg("-c")
             .arg(VIRSH_CONNECTION_URI)
             .arg("net-dhcp-leases")
-            .arg("qlean")
-            .output()
-            .await
-            .context("failed to execute virsh to read DHCP leases for the qlean network")?;
+            .arg("qlean");
 
-        if output.status.success() {
-            saw_a_listing = true;
-            last_seen = parse_dhcp_leases(&String::from_utf8_lossy(&output.stdout));
-            if let Some(ip) = lease_address_for(&last_seen, &mac) {
-                debug!("MAC {mac} leased {ip}");
-                return Ok(ip);
+        // One wedged `virsh` must not outlive the deadline: cap the call by whatever is
+        // left of the budget (at least a millisecond, so the loop always makes progress).
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let budget = remaining.max(std::time::Duration::from_millis(1));
+        match bounded_output(cmd, budget, "read the DHCP lease table").await {
+            Ok(output) if output.status.success() => {
+                saw_a_listing = true;
+                last_seen = parse_dhcp_leases(&String::from_utf8_lossy(&output.stdout));
+                if let Some(ip) = lease_address_for(&last_seen, &mac) {
+                    debug!("MAC {mac} leased {ip}");
+                    return Ok(ip);
+                }
             }
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            debug!("virsh net-dhcp-leases failed: {stderr}");
-            last_error = Some(stderr);
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                debug!("virsh net-dhcp-leases failed: {stderr}");
+                last_error = Some(stderr);
+            }
+            Err(error) => {
+                // The call itself was abandoned; that is a libvirt finding, not a guest one.
+                let error = format!("{error:#}");
+                debug!("{error}");
+                last_error = Some(error);
+            }
         }
 
         if tokio::time::Instant::now() >= deadline {
@@ -913,6 +946,43 @@ mod tests {
             lease_address_for(&leases, "52:54:00:aa:bb:cc").map(|ip| ip.to_string()),
             Some("192.168.221.77".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn test_bounded_output_returns_a_finished_command() {
+        let mut cmd = tokio::process::Command::new("/bin/echo");
+        cmd.arg("hi");
+        let output = bounded_output(cmd, std::time::Duration::from_secs(30), "echo")
+            .await
+            .expect("echo finishes well within the budget");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hi");
+    }
+
+    #[tokio::test]
+    async fn test_bounded_output_kills_a_hung_command_at_the_deadline() {
+        // A stuck child must not hang the caller forever: the budget has to end the wait,
+        // name the program and say how long it waited.
+        let mut cmd = tokio::process::Command::new("/bin/sleep");
+        cmd.arg("30");
+        let started = std::time::Instant::now();
+        let error = bounded_output(
+            cmd,
+            std::time::Duration::from_millis(150),
+            "prove the budget",
+        )
+        .await
+        .expect_err("sleep 30 must not finish inside a 150ms budget")
+        .to_string();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the budget must end the wait, took {:?}",
+            started.elapsed()
+        );
+        assert!(error.contains("/bin/sleep"), "{error}");
+        assert!(error.contains("150ms"), "{error}");
+        assert!(error.contains("prove the budget"), "{error}");
+        assert!(error.contains("killed"), "{error}");
     }
 
     #[test]

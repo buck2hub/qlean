@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A lease that never expires (`infinite`) was parsed as "no expiry", so it ranked below every expiring row and the lookup could return an address the guest had already abandoned; it now outranks real timestamps, while a row with an unrecognizable expiry still ranks lowest
 - Teardown's "still running after SIGKILL" error carried a 30-space hole where a line continuation was intended, and the guard that rejects padded user-facing messages did not cover it; the message is now one sentence and is part of that guard
 - A DHCP lease lookup where `virsh net-dhcp-leases` never succeeded was reported as "the guest may still be booting", so an unreachable or unreadable libvirt sent the reader to the wrong machine after the full budget; the timeout now says the lease table could not be read, keeps `virsh`'s own message, and only speculates about the guest when a listing actually succeeded
+- Each `virsh net-dhcp-leases` call in the lease poll is now capped by what is left of the lookup budget, so a wedged libvirtd can no longer outlive the deadline by hanging inside one call; the bounded-run helper is shared with the seed ISO build instead of existing twice
 
 ### Changed
 
