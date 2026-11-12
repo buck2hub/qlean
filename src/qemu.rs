@@ -453,6 +453,173 @@ mod tests {
         std::process::ExitStatus::from_raw(signal)
     }
 
+    /// Give up on a real-QEMU smoke check whose prerequisites this host lacks.
+    ///
+    /// The check exists to catch an argument contract that only real QEMU can reject
+    /// (`swtpm_args` handshake, pflash pair, TPM device), so a missing binary is a skipped
+    /// host, not a pass. Everything after the spawn is a hard assertion.
+    fn smoke_unavailable(reason: &str) -> bool {
+        println!("SMOKE-UNAVAILABLE: {reason}");
+        true
+    }
+
+    fn program_runs(program: &Path) -> bool {
+        std::process::Command::new(program)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    /// Check that real QEMU accepts the Windows firmware/TPM argument list.
+    ///
+    /// Every other firmware test compares strings: nothing proved that
+    /// `swtpm_args` (`not-need-init,startup-clear`, owner-only control socket) really
+    /// completes QEMU's TPM handshake, that the copied vars image is accepted as pflash
+    /// unit=1, or that the option strings are spelled the way this QEMU wants. Those are
+    /// the failures that cannot be seen without the tools, and they are cheap to catch:
+    /// the VM is started with `-S`, so no guest code runs and no Windows image is needed.
+    ///
+    /// Run it where `qemu-system-x86_64`, `swtpm` and the distro OVMF package are installed:
+    ///
+    /// ```text
+    /// cargo test --lib -- --ignored qemu_firmware_contract
+    /// ```
+    #[tokio::test]
+    #[ignore = "needs qemu-system-x86_64 + swtpm + OVMF; run with --ignored on a real host"]
+    async fn test_windows_firmware_arguments_are_accepted_by_real_qemu() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let qemu = Path::new(qemu_system_program(GuestArch::Amd64));
+        if !program_runs(qemu) {
+            assert!(smoke_unavailable(&format!(
+                "`{}` is not runnable",
+                qemu.display()
+            )));
+            return;
+        }
+        let Ok(resolved) = crate::firmware::resolve_ovmf() else {
+            assert!(smoke_unavailable("no OVMF firmware pair on this host"));
+            return;
+        };
+        let run_dir = std::env::temp_dir().join(format!("qlean-qemu-fw-{}", std::process::id()));
+        std::fs::create_dir_all(&run_dir).expect("test run dir");
+        let vars = crate::firmware::prepare_vars(&run_dir, &resolved).expect("vars image");
+        let mut tpm = match crate::firmware::Swtpm::start(&run_dir).await {
+            Ok(tpm) => tpm,
+            Err(error) => {
+                assert!(smoke_unavailable(&format!(
+                    "`swtpm` did not start: {error}"
+                )));
+                let _ = std::fs::remove_dir_all(&run_dir);
+                return;
+            }
+        };
+
+        let firmware = VmFirmware {
+            code: resolved.code.clone(),
+            vars: vars.clone(),
+            secure_boot: resolved.secure_boot,
+        };
+        let mut args = windows_firmware_args(&firmware, Some(tpm.socket())).expect("firmware args");
+        for extra in ["-m", "512", "-display", "none", "-S", "-qmp", "stdio"] {
+            args.push(extra.to_string());
+        }
+        let mut child = tokio::process::Command::new(qemu)
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn qemu");
+        let mut stdout = child.stdout.take().expect("qemu stdout");
+        let mut stderr = child.stderr.take().expect("qemu stderr");
+        let mut qmp_stdin = child.stdin.take().expect("qemu stdin");
+
+        // The QMP greeting is emitted once the machine, both pflash units and the TPM
+        // device have been realized, so a rejected option never reaches it.
+        let mut greeting = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            let read = tokio::time::timeout(Duration::from_secs(20), stdout.read(&mut byte))
+                .await
+                .expect("QEMU must emit the QMP greeting within 20s")
+                .expect("read qemu stdout");
+            if read == 0 {
+                break;
+            }
+            greeting.push(byte[0]);
+            if greeting.ends_with(b"\n") && greeting.windows(4).any(|w| w == b"QMP\"") {
+                break;
+            }
+        }
+        let greeting = String::from_utf8_lossy(&greeting).to_string();
+        assert!(
+            greeting.contains("\"QMP\""),
+            "QEMU started without a QMP greeting: {greeting}"
+        );
+
+        // Ask QEMU what it realized. A `-device`/`-tpmdev` line that was dropped or spelled
+        // for another QEMU version still yields a running VM and a greeting, so the device
+        // list is what proves the TPM the guest will see is the one this code intends.
+        qmp_stdin
+            .write_all(b"{\"execute\":\"qmp_capabilities\"}\n{\"execute\":\"query-tpm\"}\n")
+            .await
+            .expect("write qmp commands");
+        let mut replies = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while let Ok(Ok(read)) =
+            tokio::time::timeout(Duration::from_millis(300), stdout.read(&mut chunk)).await
+        {
+            if read == 0 {
+                break;
+            }
+            replies.extend_from_slice(&chunk[..read]);
+        }
+        let replies = String::from_utf8_lossy(&replies).to_string();
+        assert!(
+            replies.contains("\"model\": \"tpm-tis\"") && replies.contains("\"chrtpm\""),
+            "QEMU did not realize the configured TPM 2.0 device: {replies}"
+        );
+
+        // A TPM that fails its handshake is not fatal to QEMU: it logs and boots the guest
+        // without one, which on Windows means a machine Windows 11 will not install on. So
+        // the absence of that log line is the real assertion, not a successful spawn.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let mut issues = Vec::new();
+        let mut buffer = [0u8; 4096];
+        while let Ok(Ok(read)) =
+            tokio::time::timeout(Duration::from_millis(200), stderr.read(&mut buffer)).await
+        {
+            if read == 0 {
+                break;
+            }
+            issues.extend_from_slice(&buffer[..read]);
+        }
+        let issues = String::from_utf8_lossy(&issues).to_string();
+        assert!(
+            child.try_wait().expect("qemu state").is_none(),
+            "QEMU exited with the Windows argument list: {issues}"
+        );
+        assert!(
+            !issues.contains("tpm-emulator"),
+            "the TPM handshake failed even though QEMU kept running: {issues}"
+        );
+        println!(
+            "real QEMU accepted the Windows argument list: firmware={} secure_boot={} vars={}",
+            resolved.code.display(),
+            resolved.secure_boot,
+            vars.display()
+        );
+
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        tpm.stop().await;
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
     #[test]
     fn test_a_killed_guest_is_not_a_launch_failure_during_teardown() {
         // Tearing a Windows guest down escalates to SIGTERM/SIGKILL when the guest ignores
