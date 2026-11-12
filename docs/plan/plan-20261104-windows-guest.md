@@ -125,6 +125,7 @@
 | 2026-11-12 17:40:00 UTC | review R13（地址选择与路径拼接） | F18 修复：lease 查找取首个匹配行，双栈网络下可能选中链路本地 IPv6（无 scope id，必然连不上），且解析成功导致不再重试，现仅接受 IPv4 并在超时错误中说明（`ed09b5b`）；F19 修复：`GuestPath::join` 会静默吞掉前导分隔符（Linux 上把 `/etc/passwd` 变成相对路径），现显式拒绝绝对子路径；`\\?\C:` 设备路径此前被误报为 UNC（`33567ed`） | N/A（`TRN-01`/`FS-01` 既有 AC：按本 VM MAC 解析且不回退到别机、路径校验，无卡拆合） | `TRN-01`/`FS-01` 实现证据、Review log、`src/utils.rs`、`src/guest_path.rs`、CHANGELOG |
 | 2026-11-12 18:20:00 UTC | review R14（启动失败时的资源收尾） | F20 修复：QEMU 在 SSH 阶段退出时 `launch` 直接返回，`self.pid` 与 `swtpm` 句柄残留（TPM 进程活到 Machine 被 drop，且仍报告有 pid）；SSH 任务 panic 更严重，`?` 直接把 `qemu_handle` 分离（QEMU 继续运行），现统一走终止 QEMU + 停 swtpm + 清 pid 的失败分支（`e412251`、`77cc1fc`） | N/A（`OSX-03` 既有 AC：启动失败不遗留进程与句柄，无卡拆合） | `OSX-03` 实现证据、故障恢复矩阵、Review log、`src/machine.rs` |
 | 2026-11-12 19:10:00 UTC | review R15（部署标记探测与池化启停） | F21 修复：`deploy_marker_present` 把传输错误当成「标记不存在」，guest 首启末尾重启时会在 900s 后误报「部署未完成」；现区分「guest 已应答」与「问不到」，连续 3 次传输失败即报「会话丢失，可 spawn 重试」（`9cc7eb0`）；F22 修复：`init_all` 一律 `init`（部署过的 Windows 会被拒绝），`spawn_all` 一律 `spawn`（从未部署的 Windows 会启动到不可达状态），现按部署状态分流（`2d8b772`） | N/A（`OSX-03`/`TRN-01` 既有 AC：首启失败可诊断、池内各 VM 独立，无卡拆合） | `OSX-03`/`TRN-01` 实现证据、故障恢复矩阵、Review log、`src/machine.rs`、`src/pool.rs` |
+| 2026-11-12 19:50:00 UTC | review R16（公开文档与门禁补强） | F23 修复：`upload`/`download` 的公开文档用 intra-doc 链接指向 `pub(crate) GuestPath`，`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 直接失败（`rustdoc::private_intra_doc_links`），改为代码字面量（`9297994`）；同轮把 rustdoc 与 benches 编译纳入每卡门禁 | N/A（无卡拆合） | Review log、Verification 判定口径、`src/machine.rs` |
 
 ## 已决议设计决策
 
@@ -307,7 +308,7 @@
 
 #### Verification 判定口径
 
-按 `plan-template.md` 生效。所有 `tests/windows_machine.rs` 用例均为 `(new)`、默认 `#[ignore]` 并由 `serial_test` 串行；CI 用 `cargo test --no-run` 编译。实际运行必须显式 `--ignored --test-threads=1`，并满足 `DEP-01`/`DEP-02`。命令中的 `/path/to/windows.qcow2` 与 digest 是执行者替换的参数，证据只记录 sanitized 标识，不记录私有绝对路径。
+按 `plan-template.md` 生效。本地每卡门禁：`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、相关 `cargo test --lib <filter>` 与 `cargo test --lib`、`cargo test --no-run`（含 benches）。所有 `tests/windows_machine.rs` 用例均为 `(new)`、默认 `#[ignore]` 并由 `serial_test` 串行；CI 用 `cargo test --no-run` 编译。实际运行必须显式 `--ignored --test-threads=1`，并满足 `DEP-01`/`DEP-02`。命令中的 `/path/to/windows.qcow2` 与 digest 是执行者替换的参数，证据只记录 sanitized 标识，不记录私有绝对路径。
 
 ### Task SPK-01: Windows 传输可行性 spike
 
@@ -1224,6 +1225,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R13 | 地址选择与路径拼接复核 | PASS | 无开放项 | F18：`find_lease_address` 返回首个 MAC 匹配的 lease，双栈网络下 `fe80::/10` 行会排在前面，`SocketAddr::new(link_local, 22)` 不可达却已算成功，连接循环不再重试；F19：`normalize_relative` 用 `trim_matches('/')`，`join("/etc/passwd")` 在 Linux 上静默变成 `etc/passwd`，与 `Path::join` 语义相反；`normalize_windows` 先判 UNC，导致 `\\?\C:` 报 UNC 而非设备路径 | F18 新增 `lease_address_for`（仅 IPv4，含双栈/仅 IPv6/别机 MAC 三个用例）并在超时文案注明（`ed09b5b`）；F19 拒绝前导分隔符、设备路径先于 UNC 判定，补 Linux/Windows 用例（`33567ed`）；门禁 `cargo fmt --check`、clippy `-D warnings`、`cargo test --lib` 83 passed、`cargo test --no-run` 全绿 |
 | R14 | 启动失败时的资源收尾复核 | PASS | 无开放项 | F20：SSH 阶段 `select!` 的 QEMU 分支只 `bail!`，不清 `pid`、不停 `swtpm`；SSH 任务 panic 时 `result.map_err(..)?` 直接返回，`qemu_handle` 被 detach，QEMU 带着 seed 介质（客户端公钥 + 每 VM 主机私钥）继续运行 | QEMU 退出分支改为清 `pid` + `swtpm.stop()`（`e412251`，并修正该分支不可再次 await 已完成 join handle）；SSH panic 改为错误值注入既有失败分支（`77cc1fc`）；门禁 `cargo fmt --check`、clippy `-D warnings`、`cargo test --lib` 83 passed、`cargo test --no-run` 全绿 |
 | R15 | 部署标记探测与池化启停复核 | PASS | 无开放项 | F21：`deploy_marker_present` 用 `Err(_) => false` 吞掉传输错误，`confirm_deployment` 便按「还没部署」轮询满 900s，最后报与事实无关的「部署未完成」；F22：`MachinePool::init_all` 无条件 `init`，Windows 二次启停必失败；`spawn_all` 无条件 `spawn`，未部署的 Windows 会启动成 sshd 无密钥的不可达 guest | F21 改为 `Result<bool>`，区分应答与失败，连续 3 次传输错误即返回带 `spawn` 提示的错误（`9cc7eb0`）；F22 新增 `wants_init`/`needs_first_boot`，池化两处按部署状态分流（`2d8b772`）；门禁 `cargo fmt --check`、clippy `-D warnings`、`cargo test --lib` 83 passed、`cargo test --no-run` 全绿 |
+| R16 | 公开文档与门禁复核 | PASS | 无开放项 | F23：Windows 工作新增的公开文档注释（`upload`/`download`）链接到私有类型 `GuestPath`，`cargo doc` 在 `-D warnings` 下报 `private_intra_doc_links` 并失败；此前门禁只跑 fmt/clippy/test，未覆盖 rustdoc | 改为代码字面量（`9297994`）；门禁补 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 与 `cargo test --no-run --all-targets`（含 `benches/hash_benchmark.rs`），两者现已通过；`cargo fmt --check`、clippy `-D warnings`、`cargo test --lib` 83 passed 全绿 |
 
 ### R1 findings 与修订对照
 
