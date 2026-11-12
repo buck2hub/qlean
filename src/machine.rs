@@ -771,7 +771,7 @@ StandardError=journal
             let mut kill_sent = false;
 
             loop {
-                let alive = std::path::Path::new(&format!("/proc/{pid}")).exists();
+                let alive = !process_is_gone(pid);
                 match teardown_step(alive, start.elapsed(), max_wait_time, kill_sent) {
                     TeardownStep::StillGone => {
                         debug!("QEMU process {} has exited", pid);
@@ -1286,7 +1286,7 @@ StandardError=journal
             // Give it a moment to exit; then SIGKILL.
             let start = std::time::Instant::now();
             while start.elapsed() < Duration::from_secs(5) {
-                if !std::path::Path::new(&format!("/proc/{}", pid)).exists() {
+                if process_is_gone(pid) {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1836,6 +1836,37 @@ fn cmdline_is_qemu(cmdline: &[u8]) -> bool {
     program.starts_with("qemu-system") || program.starts_with("qemu-kvm")
 }
 
+/// Process state letter from `/proc/<pid>/stat`, if the process still exists.
+///
+/// `/proc/<pid>` keeps existing for a **zombie**, so "the directory is there" is not
+/// evidence that anything is still running. A killed QEMU that nobody reaped (its launch
+/// task was aborted, or teardown ran from a different code path) therefore looked alive for
+/// the whole 30s teardown budget and produced a misleading "force killing" message.
+fn process_state(pid: u32) -> Option<char> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    process_state_of(&stat)
+}
+
+/// State letter of a `/proc/<pid>/stat` line (split out so it is testable without a pid).
+fn process_state_of(stat: &str) -> Option<char> {
+    // Field 2 is the command name in parentheses and may itself contain parentheses, so the
+    // state letter is the first non-space character after the last `)`.
+    let rest = stat.rsplit_once(')')?.1;
+    rest.split_whitespace().next()?.chars().next()
+}
+
+/// Whether `pid` is gone for teardown purposes.
+///
+/// Exited-but-unreaped (`Z`, and the transient `X`) counts as gone: such a process cannot be
+/// signalled back to life, and waiting for its `/proc` entry to disappear waits for a reaper
+/// that may never come.
+fn process_is_gone(pid: u32) -> bool {
+    match process_state(pid) {
+        None => true,
+        Some(state) => matches!(state, 'Z' | 'X' | 'x'),
+    }
+}
+
 /// Whether `pid` still looks like the QEMU process Qlean started.
 fn process_is_qemu(pid: u32) -> bool {
     match std::fs::read(format!("/proc/{pid}/cmdline")) {
@@ -2234,6 +2265,43 @@ mod timeout_tests {
             b"/usr/bin/qemu-img\0convert\0qemu-system-x86_64\0"
         ));
         assert!(!cmdline_is_qemu(b"/usr/bin/qemu-img\0create\0disk.qcow2\0"));
+    }
+
+    #[test]
+    fn process_state_reads_the_letter_after_the_command_name() {
+        // Field 2 may contain parentheses and spaces; the state letter follows the last `)`.
+        let stat = "  1234 (qemu-system-x86_64) S 1 1234 1234 0 -1 4194560";
+        assert_eq!(process_state_of(stat), Some('S'));
+        let stat = "  99 (odd)name) Z 1 1 1 0 -1 0";
+        assert_eq!(process_state_of(stat), Some('Z'));
+        assert_eq!(process_state_of("garbage"), None);
+    }
+
+    #[test]
+    fn a_killed_unreaped_child_counts_as_gone() {
+        // A zombie keeps its `/proc/<pid>` entry: teardown must not wait out its budget for a
+        // process that can no longer do anything.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a child to kill");
+        let pid = child.id();
+        assert!(!process_is_gone(pid), "a running child is not gone");
+        assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+        // SAFETY: the pid belongs to the child we just spawned.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        // Do not reap yet: this is exactly the zombie state teardown must recognise.
+        let mut gone = false;
+        for _ in 0..200 {
+            if process_is_gone(pid) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = child.wait();
+        assert!(gone, "a killed but unreaped child must count as gone");
+        assert!(process_is_gone(u32::MAX), "a missing pid is gone");
     }
 
     #[test]

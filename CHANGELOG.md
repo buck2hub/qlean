@@ -58,6 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Windows guests were launched with `vhost-vsock-pci`, so a Windows VM needed `/dev/vhost-vsock` and the `vhost_vsock` module and failed to start without them; the device is now added only for Linux guests
 - OVMF setup required the code image and vars template to be exactly the same size, which no stock firmware pair satisfies (a ~528 KiB vars template ships next to a multi-megabyte code image); only a vars template larger than the code image is now rejected
 - The `swtpm` control socket was created with default permissions; it is now owner-only (`mode=0600`)
+- Shutdown recognises a killed-but-unreaped QEMU as gone instead of waiting out the whole teardown budget on a zombie `/proc` entry and then reporting a misleading force kill
 - Qlean's own guest commands (address query, file copy) run through `powershell -EncodedCommand` and no longer need a specific OpenSSH `DefaultShell` in the image
 - `with_machine`/`with_pool` keep a closure's own failure as the primary error and attach a teardown failure to it, instead of replacing the reason a test failed
 - The deployment-marker probe quotes the marker path, so a path with a space cannot be read as "file not found" and make a finished deployment look unfinished for the whole budget
