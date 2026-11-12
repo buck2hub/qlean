@@ -121,6 +121,78 @@ fn combine_outcome<T>(outcome: Result<T>, shutdown: Result<()>) -> Result<T> {
 
 #[cfg(test)]
 mod plan_doc_tests {
+    /// Every Rust source the plan reasons about, so the guard tests can read real test names.
+    const CRATE_SOURCES: &[(&str, &str)] = &[
+        ("src/exec.rs", include_str!("../src/exec.rs")),
+        ("src/firmware.rs", include_str!("../src/firmware.rs")),
+        ("src/guest_path.rs", include_str!("../src/guest_path.rs")),
+        ("src/image.rs", include_str!("../src/image.rs")),
+        ("src/lib.rs", include_str!("../src/lib.rs")),
+        ("src/machine.rs", include_str!("../src/machine.rs")),
+        ("src/pool.rs", include_str!("../src/pool.rs")),
+        ("src/qemu.rs", include_str!("../src/qemu.rs")),
+        ("src/qmp.rs", include_str!("../src/qmp.rs")),
+        ("src/ssh.rs", include_str!("../src/ssh.rs")),
+        ("src/utils.rs", include_str!("../src/utils.rs")),
+        ("src/windows.rs", include_str!("../src/windows.rs")),
+        (
+            "tests/windows_machine.rs",
+            include_str!("../tests/windows_machine.rs"),
+        ),
+    ];
+
+    /// The test function names declared in `sources`, and the module names they live under.
+    ///
+    /// A test is a `fn`/`async fn` whose four preceding lines hold `#[test]`, `#[tokio::test…]`
+    /// or `#[ignore…]`. Reading the sources (rather than a hand-kept list) is the point: the plan
+    /// quotes test names, and a quote that no longer resolves is a promise to a reader.
+    fn test_names_in(sources: &[(&str, &str)]) -> (Vec<String>, Vec<String>) {
+        let mut names = Vec::new();
+        let mut modules = Vec::new();
+        for (path, source) in sources {
+            let lines: Vec<&str> = source.lines().collect();
+            for (index, line) in lines.iter().enumerate() {
+                let trimmed = line.trim();
+                let Some(rest) = trimmed
+                    .strip_prefix("fn ")
+                    .or_else(|| trimmed.strip_prefix("async fn "))
+                else {
+                    continue;
+                };
+                assert!(
+                    !path.is_empty(),
+                    "a crate source is registered without a path"
+                );
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                let attributed = lines[index.saturating_sub(4)..index].iter().any(|above| {
+                    let above = above.trim();
+                    above.starts_with("#[test]")
+                        || above.starts_with("#[tokio::test")
+                        || above.starts_with("#[ignore")
+                });
+                if attributed {
+                    names.push(name);
+                }
+            }
+            for line in &lines {
+                let trimmed = line.trim();
+                if let Some(rest) = trimmed.strip_prefix("mod ") {
+                    let name: String = rest
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    if !name.is_empty() {
+                        modules.push(name);
+                    }
+                }
+            }
+        }
+        (names, modules)
+    }
+
     /// The revision history is one timeline, newest first.
     ///
     /// Half of it used to grow downwards (R1 at the top, appended after the header) and the
@@ -312,54 +384,9 @@ mod plan_doc_tests {
     /// sources and requires every label to match at least one of them.
     #[test]
     fn the_plan_points_at_tests_that_can_be_run() {
-        const CRATE_SOURCES: &[(&str, &str)] = &[
-            ("src/exec.rs", include_str!("../src/exec.rs")),
-            ("src/firmware.rs", include_str!("../src/firmware.rs")),
-            ("src/guest_path.rs", include_str!("../src/guest_path.rs")),
-            ("src/image.rs", include_str!("../src/image.rs")),
-            ("src/lib.rs", include_str!("../src/lib.rs")),
-            ("src/machine.rs", include_str!("../src/machine.rs")),
-            ("src/pool.rs", include_str!("../src/pool.rs")),
-            ("src/qemu.rs", include_str!("../src/qemu.rs")),
-            ("src/qmp.rs", include_str!("../src/qmp.rs")),
-            ("src/ssh.rs", include_str!("../src/ssh.rs")),
-            ("src/utils.rs", include_str!("../src/utils.rs")),
-            ("src/windows.rs", include_str!("../src/windows.rs")),
-            (
-                "tests/windows_machine.rs",
-                include_str!("../tests/windows_machine.rs"),
-            ),
-        ];
         const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
 
-        let mut tests: Vec<String> = Vec::new();
-        for (path, source) in CRATE_SOURCES {
-            let lines: Vec<&str> = source.lines().collect();
-            for (index, line) in lines.iter().enumerate() {
-                let trimmed = line.trim();
-                let Some(rest) = trimmed
-                    .strip_prefix("fn ")
-                    .or_else(|| trimmed.strip_prefix("async fn "))
-                else {
-                    continue;
-                };
-                let name: String = rest
-                    .chars()
-                    .take_while(|c| c.is_alphanumeric() || *c == '_')
-                    .collect();
-                let attributes = lines[index.saturating_sub(4)..index].iter().any(|above| {
-                    let above = above.trim();
-                    above.starts_with("#[test]")
-                        || above.starts_with("#[tokio::test")
-                        || above.starts_with("#[ignore")
-                });
-                if attributes {
-                    tests.push(name);
-                } else if path.is_empty() {
-                    unreachable!();
-                }
-            }
-        }
+        let (tests, _modules) = test_names_in(CRATE_SOURCES);
         assert!(
             tests.len() >= 200,
             "the test-name scan found only {} tests: it is scanning the wrong thing",
@@ -438,6 +465,91 @@ mod plan_doc_tests {
         assert!(
             checked >= 10,
             "the trace table's 指定测试 column yielded only {checked} labels"
+        );
+    }
+    /// Every `cargo test` line the plan prints selects something.
+    ///
+    /// The plan asks reviewers to re-run named tests in almost every evidence row. A filter that
+    /// selects nothing is answered with `0 passed` and exit status 0, so a green line in a review
+    /// can mean "nothing ran". This walks every `cargo test` command in the plan, works out which
+    /// test binary it targets, and requires the filter to match at least one test there.
+    #[test]
+    fn the_plan_prints_only_filters_that_select_a_test() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+
+        let (unit, unit_modules) = test_names_in(
+            &CRATE_SOURCES
+                .iter()
+                .filter(|(path, _)| path.starts_with("src/"))
+                .copied()
+                .collect::<Vec<_>>(),
+        );
+        let (integration, _integration_modules) = test_names_in(
+            &CRATE_SOURCES
+                .iter()
+                .filter(|(path, _)| path.starts_with("tests/"))
+                .copied()
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            unit.len() >= 200 && !integration.is_empty(),
+            "the test-name scan found {} unit and {} integration tests",
+            unit.len(),
+            integration.len()
+        );
+
+        // The revision history is a record of what was wrong: it has to be able to quote a bad
+        // command. Everything else in the plan is read as an instruction to re-run something.
+        let lines: Vec<&str> = PLAN.lines().collect();
+        let history_start = lines
+            .iter()
+            .position(|line| line.trim_end() == "### 修订历史")
+            .expect("the plan has no 修订历史 section");
+        let history_end = lines[history_start + 1..]
+            .iter()
+            .position(|line| line.starts_with("## ") || line.starts_with("### "))
+            .map_or(lines.len(), |offset| history_start + 1 + offset);
+
+        let mut checked = 0;
+        for line in lines[..history_start].iter().chain(&lines[history_end..]) {
+            for (start, _) in line.match_indices("cargo test ") {
+                let rest = &line[start..];
+                let command: String = rest
+                    .chars()
+                    .take_while(|c| !matches!(c, '`' | '；' | '）' | '('))
+                    .collect();
+                let integration_target = command.contains("--test windows_machine");
+                let filter = command.split_whitespace().skip(2).find(|token| {
+                    !token.starts_with('-')
+                        && !matches!(*token, "lib" | "windows_machine" | "test")
+                        && token
+                            .chars()
+                            .all(|c| c.is_alphanumeric() || c == '_' || c == ':')
+                });
+                let Some(filter) = filter else {
+                    // `cargo test --lib`, `cargo test --no-run`: the whole suite, no filter.
+                    continue;
+                };
+                let (names, where_) = if integration_target {
+                    (&integration, "tests/windows_machine.rs")
+                } else {
+                    (&unit, "the lib tests")
+                };
+                checked += 1;
+                let last = filter.rsplit("::").next().unwrap_or(filter);
+                let segments_are_modules = filter
+                    .split("::")
+                    .all(|segment| unit_modules.iter().any(|module| module == segment));
+                assert!(
+                    names.iter().any(|name| name.contains(last)) || segments_are_modules,
+                    "the plan prints `{command}`, whose filter `{filter}` matches no test in \
+                     {where_}: cargo would print `0 passed` and the reader would call it green"
+                );
+            }
+        }
+        assert!(
+            checked >= 40,
+            "the plan only yielded {checked} runnable test filters: the scan is not looking at them"
         );
     }
 }
