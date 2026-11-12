@@ -49,13 +49,23 @@ impl PersistedSshKeypair {
 }
 
 pub(crate) fn get_ssh_key(dir: &Path) -> Result<PersistedSshKeypair> {
+    let privkey_path = dir.join("id_ed25519");
+
     // First try reading an existing keypair from disk.
     // If that fails we'll just create a new one.
     if let Ok(existing_keypair) = PersistedSshKeypair::from_dir(dir) {
         return Ok(existing_keypair);
     }
 
-    let privkey_path = dir.join("id_ed25519");
+    generate_keypair(&privkey_path)
+}
+
+/// Generate a fresh ed25519 keypair at `privkey_path` (private key) and
+/// `<privkey_path>.pub` (OpenSSH public key), both owned by the caller.
+///
+/// The private key is written with `0600` permissions before its content is
+/// flushed to disk, and its material is never logged.
+pub(crate) fn generate_keypair(privkey_path: &Path) -> Result<PersistedSshKeypair> {
     let pubkey_path = privkey_path.with_extension("pub");
 
     // Use `rand::rng()` (rand 0.10's thread-local CSPRNG) directly: it implements
@@ -72,18 +82,17 @@ pub(crate) fn get_ssh_key(dir: &Path) -> Result<PersistedSshKeypair> {
     let privkey_openssh = privkey.to_openssh(LineEnding::default())?.to_string();
     debug!("Writing SSH private key to {privkey_path:?}");
 
-    std::fs::write(&privkey_path, &privkey_openssh)?;
-    let mut perms = std::fs::metadata(&privkey_path)?.permissions();
+    std::fs::write(privkey_path, &privkey_openssh)?;
+    let mut perms = std::fs::metadata(privkey_path)?.permissions();
     perms.set_mode(0o600);
-    std::fs::set_permissions(&privkey_path, perms)?;
+    std::fs::set_permissions(privkey_path, perms)?;
 
-    let keypair = PersistedSshKeypair {
+    Ok(PersistedSshKeypair {
         pubkey_str: pubkey_openssh,
         _pubkey_path: pubkey_path,
         privkey_str: privkey_openssh,
-        privkey_path,
-    };
-    Ok(keypair)
+        privkey_path: privkey_path.to_path_buf(),
+    })
 }
 
 #[derive(Debug, Clone, Default)]

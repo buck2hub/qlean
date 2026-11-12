@@ -81,6 +81,40 @@ The defaults (`core: 2`, `mem: 4096`) match the Windows 10/11 minimums. Leave `d
 unset so the qcow2 overlay grows on demand, or set it to at least `64` GB to match the
 Windows 11 install requirement.
 
+#### Windows image contract
+
+Qlean does not regenerate or specialize an installed Windows image. A Windows image must
+already be generalized and ship a first-boot task that consumes Qlean's seed medium:
+
+1. Build the image with the virtio drivers for the devices Qlean attaches
+   (`viostor`/`vioscsi` for the disk, `NetKVM` for the network, `vioserial` if you also
+   use it), enable the OpenSSH Server optional feature, and pre-generalize it
+   (`sysprep /generalize /oobe /shutdown`).
+2. Create a local account named `qlean` (a member of `Administrators` is supported). Give
+   it no static password for Qlean's own use: Qlean never sets or carries a password, and
+   password authentication must stay disabled.
+3. Ship a scheduled task that runs on first boot, finds the seed medium by its volume
+   label `QLEANSEED`, and then:
+   - installs `qlean/authorized_keys` as
+     `C:\ProgramData\ssh\administrators_authorized_keys` (administrator accounts) or
+     `%USERPROFILE%\.ssh\authorized_keys`, with an ACL that only grants
+     `Administrators`, `SYSTEM` and the service account owning the file;
+   - installs `qlean/ssh_host_ed25519_key` as `C:\ProgramData\ssh\ssh_host_ed25519_key`
+     with the same owner-only ACL, so the host key Qlean pins really is the per-VM key;
+   - writes an `sshd_config` with `PubkeyAuthentication yes`, `PasswordAuthentication no`
+     and a `sftp` subsystem, then restarts `sshd`;
+   - writes `C:\ProgramData\qlean\deployed` once all of the above succeeded.
+4. Leave the image shut down and unconfigured; Qlean creates a per-VM overlay, a per-VM
+   `ovmf_vars.fd`, a per-VM TPM 2.0 state and a per-VM seed medium on every `init`.
+
+The seed medium is appended only on the first boot and is deleted as soon as the guest
+reports `C:\ProgramData\qlean\deployed`. It contains the client's *public* key, the
+per-VM host *private* key and `qlean/deploy.json`; the client private key stays in the
+host secrets directory. The deployment budget is 900s by default (independent of the
+Linux SSH connect timeout of 180s/300s) and can be tuned with `MachineConfig::ssh_timeout`;
+on timeout Qlean keeps the seed medium and returns an error naming the expected marker
+file and this section.
+
 ### Getting Started
 
 Add the dependency to your `Cargo.toml`:

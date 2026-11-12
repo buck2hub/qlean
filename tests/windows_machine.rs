@@ -71,3 +71,41 @@ async fn windows_firmware_lifecycle() -> Result<()> {
 
     Ok(())
 }
+
+/// First boot must deploy the seed medium and leave a usable SSH identity.
+///
+/// Needs the TCP transport from `TRN-01` to reach the guest, so it stays `#[ignore]`d
+/// together with the other Windows tests.
+#[tokio::test]
+#[ignore = "needs a licensed Windows image (DEP-01), a Windows KVM host (DEP-02) and the TCP transport (TRN-01)"]
+#[serial]
+async fn windows_first_boot() -> Result<()> {
+    tracing_subscriber_init();
+
+    let image = Image::new(windows_image_config()?).await?;
+    let mut vm = Machine::new(&image, &MachineConfig::default()).await?;
+
+    // The per-VM host key exists before boot and is exposed for pinning.
+    let host_key = vm
+        .ssh_host_key()
+        .ok_or_else(|| anyhow::anyhow!("Windows guests must expose a per-VM SSH host key"))?;
+    assert!(host_key.starts_with("ssh-ed25519 "), "{host_key}");
+
+    vm.init().await?;
+    let deployed = vm
+        .exec(r"cmd /c if exist C:\ProgramData\qlean\deployed echo deployed")
+        .await?;
+    assert!(
+        String::from_utf8_lossy(&deployed.stdout).contains("deployed"),
+        "first-boot deployment marker missing: {deployed:?}"
+    );
+
+    // The guest path contract must have installed the key for the qlean account.
+    let keys = vm
+        .exec("cmd /c type C:\\ProgramData\\ssh\\administrators_authorized_keys")
+        .await?;
+    assert!(String::from_utf8_lossy(&keys.stdout).contains("ssh-ed25519"));
+
+    vm.shutdown().await?;
+    Ok(())
+}

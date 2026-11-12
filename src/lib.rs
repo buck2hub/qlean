@@ -33,6 +33,7 @@ mod qemu;
 mod qmp;
 mod ssh;
 mod utils;
+mod windows;
 
 // Re-export public types and functions
 pub use image::Distro;

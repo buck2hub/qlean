@@ -583,7 +583,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（A 实现与 B 本地门已过；C 真实首启门需 `TRN-01` 传输 + DEP-01/02，`blocked`）
 
 **Description:** 按 SPK-02 回写的 ADR-WIN-03 实现首次部署、SSH 身份与主机密钥 provisioning；本卡在 spike 前不预设 autounattend。
 
@@ -601,14 +601,35 @@
 
 **Acceptance criteria:**
 
-- [ ] Windows 分支严格实现 ADR-WIN-03 选定方案，Linux cloud-init seed 字节语义不变。
-- [ ] 公钥写入 Windows OpenSSH 对应该账号的正确文件并设置 ACL（管理员场景含 `administrators_authorized_keys`），密码认证禁用且无静态明文管理密码。
-- [ ] sshd、PowerShell 默认 shell、SFTP 与 ADR 选定的 readiness 条件已配置，用户名作为单一事实源传给传输层。
-- [ ] 每 VM 生成独立 SSH host key，并把可 pinning 的公钥交给 `Machine`；若采用 seed 注入，host 私钥必须随机生成、seed 权限 0600、仅首启附加且在部署成功后删除 seed；重启后 host key 与部署结果保持稳定。
-- [ ] `init` 首启部署及后续 `spawn` 可用；test-only 连接助手取得真实首启证据，不把该助手当作生产传输完成。
-- [ ] `(new)` 单测覆盖 seed/配置内容、敏感信息不落日志、首次/普通启动差异及 host-key seed 清理。
-- [ ] README 镜像制作/部署/账号要求与 CHANGELOG Added 同卡更新。
-- [ ] Windows 首启部署超时参数化：部署等待维度（autounattend/sysprep/sshd ready）独立于 Linux 默认 180s/300s，默认值按 `SPK-02` 实测首启时长推荐并写入 README；超时必须返回可操作错误，残留状态按故障恢复矩阵处理。
+- [x] Windows 分支严格实现 ADR-WIN-03 选定方案（pre-generalized 镜像 + 每 VM seed 介质，不写 autounattend、不重建已安装镜像）；Linux cloud-init `user-data`/`meta-data`/seed ISO 字节语义不变（`Machine::new` 早返回于 Windows 分支，Linux 路径未改动）。
+- [x] 客户端公钥以 `qlean/authorized_keys` 注入 seed；README 契约要求镜像首启任务将其安装为 `C:\ProgramData\ssh\administrators_authorized_keys`（管理员）或用户级 `authorized_keys`，ACL 仅授权 `Administrators`/`SYSTEM`，并关闭 `PasswordAuthentication`；Qlean 从不生成、不传递静态管理密码。
+- [ ] sshd 默认 shell/SFTP 与用户名单一事实源：`windows::GUEST_USERNAME` 常量已建立并写入 `deploy.json`，README 契约已写明 `PubkeyAuthentication`/`sftp`；传输层消费该常量在 `TRN-01` 落地，故本项未勾选。
+- [x] 每 VM 用 `windows::generate_host_key` 生成独立 ed25519 host key（私钥落 seed，公钥经 `Machine::ssh_host_key()` 交给上层用于 pinning）；seed 文件权限 `0600`，seed ISO 仅在 `init`（`is_init`）附加，部署成功后 `confirm_deployment` 删除 ISO 与暂存目录；`spawn` 复用同一 overlay/vars/TPM，不再附加 seed。
+- [ ] `init` 首启部署与后续 `spawn` 可用 + test-only 连接助手取得真实首启证据：`init`/`spawn` 的启动路径已可用，部署确认挂在首个会话上（`confirm_deployment`），真实证据需 `TRN-01` 传输与 DEP-01/02，`blocked`。
+- [x] `(new)` 单测覆盖：seed 三件套内容与 `deploy.json` 契约、seed 文件 `0600`、每 VM host key 互不相同、`Debug` 不泄漏密钥材料、清理删除 ISO+目录、部署超时默认值与可操作错误文案。
+- [x] README 新增 “Windows image contract”（镜像/账号/ACL/首启任务/seed 消费规则）与 CHANGELOG Added 同卡更新。
+- [x] 部署等待维度参数化：`windows::deploy_timeout` 默认 900s（独立于 Linux 180s/300s），`MachineConfig::ssh_timeout` 可覆盖；超时返回含 marker 路径、README 章节与 seed 保留说明的可操作错误，README 记录默认值来源（`SPK-02` 未执行，需在真实宿主复测）。
+
+**Verification:**
+
+- [x] `cargo fmt --check` 与 `cargo clippy --all-targets --all-features -- -D warnings` 通过（0 warning）
+- [x] `cargo test --lib windows_deploy`：7 passed
+- [x] `cargo test --lib windows_deploy_timeout`：2 passed（默认值 + 超时错误路径）
+- [x] `cargo test --no-run`：含 `tests/windows_machine.rs::windows_first_boot` 在内全部 target 编译通过
+- [ ] T-1 全量，配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1` —— 环境缺口 `DEFER-04`
+- [ ] 满足 DEP-01/02 且 `TRN-01` 已落地：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine windows_first_boot -- --ignored --exact --test-threads=1` —— `blocked`
+- [ ] 首启后关机、`spawn` 与 host-key seed 清理的 sanitized 证据 —— `blocked`（无 Windows 镜像与 KVM 宿主）
+
+**Implementation evidence:**
+
+| 项 | 证据 |
+|---|---|
+| 新模块 | `src/windows.rs`：`DeploySeed::stage/build/remove`、`DeployContract`（version/username/marker）、`generate_host_key`、`deploy_timeout`、`deploy_timeout_message`；seed 文件 `0600`，`Debug` 只含路径 |
+| 集成点 | `src/machine.rs`：`Machine::new` 的 Windows 早返回分支、`Machine::ssh_host_key()`、`confirm_deployment()`（轮询 `C:\ProgramData\qlean\deployed` 后删除 seed）、`deploy_marker_present()` |
+| 密钥来源 | `src/ssh.rs` 抽出 `generate_keypair(&Path)`，客户端与 per-VM host key 共用同一实现（权限 `0600`） |
+| 日志安全 | seed 只记录目录路径与文件名清单，不记录密钥内容；`DeploySeed` 自定义 `Debug` |
+| README | “Windows image contract”：virtio 驱动、OpenSSH Server、`sysprep /generalize`、`qlean` 账号、ACL 规则、首启任务步骤、seed 生命周期、900s 预算 |
+| 提交 | `0a745a5` |
 
 **Verification:**
 
@@ -1080,7 +1101,7 @@
 | SPK-02 | 2026-11-12 07:45:12 UTC | 同上（无 QEMU/OVMF/swtpm，无 Windows 镜像） | 未执行：无可用 Windows VM，无法取得首启/重启证据 | `blocked`（DEP-01/DEP-02） | N/A |
 | OSX-01 | 2026-11-12 08:40:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib image::tests`（18 passed）、`cargo test --no-run` 全绿 | T-1 全量门未执行（无 QEMU/libvirt，`DEFER-04`） | `done` / `complete` | `34c6eb9` |
 | OSX-02 | 2026-11-12 09:35:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib qemu`（5 passed）、`cargo test --no-run`（含 `tests/windows_machine.rs`）全绿 | `windows_firmware_lifecycle` 未执行（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `e1e880a` |
-| OSX-03 | pending | pending | pending | pending | 继承 REL-01 |
+| OSX-03 | 2026-11-12 10:20:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_deploy`（7 passed）、`cargo test --lib windows_deploy_timeout`（2 passed）、`cargo test --no-run` 全绿 | `windows_first_boot` 与首启/重启 seed 清理证据未取得（需 `TRN-01` + DEP-01/02），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `0a745a5` |
 | TRN-01 | pending | pending | pending | pending | 继承 REL-01 |
 | EXE-01 | pending | pending | pending | pending | 继承 REL-01 |
 | IP-01 | pending | pending | pending | pending | 继承 REL-01 |

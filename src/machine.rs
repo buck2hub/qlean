@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use nanoid::nanoid;
 use russh_sftp::client::fs::{Metadata, ReadDir};
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,7 @@ use crate::{
     qmp,
     ssh::{InteractiveShell, PersistedSshKeypair, Session, connect_ssh, get_ssh_key},
     utils::{CommandExt, HEX_ALPHABET, QleanDirs, gen_random_mac, get_free_cid},
+    windows::{self, DeploySeed},
 };
 
 /// Virtual machine.
@@ -51,6 +52,12 @@ pub struct Machine {
     ip: Option<String>,
     /// Software TPM backing a Windows guest's TPM 2.0 device.
     swtpm: Option<Swtpm>,
+    /// First-boot deployment medium for a Windows guest, deleted once the guest
+    /// confirms the deployment.
+    deploy_seed: Option<DeploySeed>,
+    /// Public half of the per-VM SSH host key (Windows guests only), kept on the
+    /// host so the transport can pin it instead of trusting the first key seen.
+    ssh_host_key: Option<String>,
 }
 
 #[derive(Clone)]
@@ -220,6 +227,40 @@ impl Machine {
 
         // Get a free CID
         let cid = get_free_cid(&dirs.runs, &run_dir)?;
+
+        // Windows guests follow ADR-WIN-03: a pre-generalized image plus a per-VM
+        // seed medium, instead of cloud-init NoCloud user-data.
+        if image.guest_os() == GuestOs::Windows {
+            let host_key = windows::generate_host_key(&run_dir)?;
+            let seed =
+                DeploySeed::stage(&run_dir, ssh_keypair.pubkey_str.trim(), &host_key).await?;
+            seed.build().await?;
+            let seed_iso_path = seed.iso_path().to_path_buf();
+
+            let machine_image = MachineImage {
+                overlay: overlay_image,
+                arch: image.guest_arch(),
+                guest_os: image.guest_os(),
+                seed: seed_iso_path,
+            };
+
+            return Ok(Self {
+                id: machine_id,
+                image: machine_image,
+                config: config.clone(),
+                keypair: ssh_keypair,
+                ssh: None,
+                cid,
+                pid: None,
+                qemu_should_exit: Arc::new(AtomicBool::new(false)),
+                ssh_cancel_token: None,
+                mac_address: gen_random_mac(),
+                ip: None,
+                swtpm: None,
+                deploy_seed: Some(seed),
+                ssh_host_key: Some(host_key.pubkey_str.trim().to_string()),
+            });
+        }
 
         // Prepare cloud-init config
         let meta_data = MetaData {
@@ -416,6 +457,8 @@ StandardError=journal
             mac_address: gen_random_mac(),
             ip: None,
             swtpm: None,
+            deploy_seed: None,
+            ssh_host_key: None,
         })
     }
 
@@ -798,6 +841,69 @@ StandardError=journal
         Ok((ssh, cancel_token))
     }
 
+    /// Public half of this machine's SSH host key, if the guest uses a per-VM one.
+    ///
+    /// Windows guests get a fresh host keypair per VM; the public half is returned
+    /// here so the transport can pin it instead of trusting an unseen key.
+    pub fn ssh_host_key(&self) -> Option<&str> {
+        self.ssh_host_key.as_deref()
+    }
+
+    /// Wait for a Windows guest's first-boot deployment, then drop the seed medium.
+    ///
+    /// The guest-side marker is only observable over an established session, so this
+    /// is a no-op for Linux guests and for Windows guests that have not connected
+    /// yet. On success the seed ISO and its staged directory are deleted, so later
+    /// boots can never re-read the client public key.
+    pub(crate) async fn confirm_deployment(&mut self) -> Result<()> {
+        if self.image.guest_os != GuestOs::Windows || self.deploy_seed.is_none() {
+            return Ok(());
+        }
+
+        let timeout = windows::deploy_timeout(&self.config);
+        let start = std::time::Instant::now();
+        loop {
+            if self.deploy_marker_present().await {
+                break;
+            }
+            if start.elapsed() >= timeout {
+                bail!("{}", windows::deploy_timeout_message(timeout));
+            }
+            tokio::time::sleep(windows::DEPLOY_POLL_INTERVAL).await;
+        }
+
+        if let Some(seed) = self.deploy_seed.take() {
+            let iso = seed.iso_path().to_path_buf();
+            seed.remove()
+                .await
+                .with_context(|| format!("failed to delete the deployed seed medium {iso:?}"))?;
+            debug!("VM-{} deployed; seed medium removed", self.id);
+        }
+        Ok(())
+    }
+
+    /// Whether the guest reports that its first-boot deployment finished.
+    ///
+    /// Requires a session; without one the deployment state is simply unknown.
+    async fn deploy_marker_present(&mut self) -> bool {
+        let Some(cancel_token) = self.ssh_cancel_token.clone() else {
+            return false;
+        };
+        let Some(ssh) = self.ssh.as_mut() else {
+            return false;
+        };
+        let cmd = format!(
+            "cmd /c if exist {} echo deployed",
+            windows::GUEST_DEPLOY_MARKER
+        );
+        match ssh.call_with_output(&cmd, cancel_token).await {
+            Ok((code, stdout, _)) => {
+                code == 0 && String::from_utf8_lossy(&stdout).contains("deployed")
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Guest operating system family of this machine's image.
     ///
     /// This is the single source of truth for OS-dependent behavior (deployment,
@@ -932,6 +1038,32 @@ StandardError=journal
             self.mac_address.to_owned(),
         ));
 
+        if self.image.guest_os == GuestOs::Windows {
+            // Windows guests have no vsock: the TCP transport (TRN-01) establishes the
+            // session and confirms the first-boot deployment. Until then `init`/`spawn`
+            // only guarantee that QEMU is up and that `is_running` reflects it.
+            //
+            // Give QEMU a moment to fail on invalid firmware or TPM configuration so a
+            // process that already exited is never reported as a successful start.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if !Path::new(&format!("/proc/{pid}")).exists() {
+                if let Some(mut swtpm) = self.swtpm.take() {
+                    swtpm.stop().await;
+                }
+                self.pid = None;
+                match qemu_handle.await {
+                    Ok(Ok(())) => bail!("QEMU exited unexpectedly during Windows guest start"),
+                    Ok(Err(e)) => bail!(e),
+                    Err(e) => bail!("QEMU task error: {e}"),
+                }
+            }
+            info!(
+                "💻 VM-{} started; first-boot deployment is confirmed on the first transport connect",
+                self.id
+            );
+            return Ok(());
+        }
+
         let ssh_result = tokio::select! {
             result = &mut ssh_handle => {
                 result.map_err(|e| anyhow::anyhow!("SSH task panicked: {e}"))?
@@ -951,6 +1083,9 @@ StandardError=journal
             Ok(session) => {
                 // SSH completed, QEMU continues running
                 self.ssh = Some(session);
+                // Windows guests confirm their first-boot deployment on the first
+                // session and drop the seed medium afterwards; no-op for Linux.
+                self.confirm_deployment().await?;
                 Ok(())
             }
             Err(e) => {
