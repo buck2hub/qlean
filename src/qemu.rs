@@ -315,7 +315,11 @@ pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> 
         .args(["-serial", "chardev:char0"])
         .args(["-mon", "chardev=char0,mode=readline"]);
 
-    // Seed ISO is only used for initial boot with cloud-init.
+    // The seed medium is a first-boot artifact, and what it carries depends on the guest: a
+    // cloud-init NoCloud volume for Linux, the Windows deployment contract (`deploy.json`, the
+    // client public key and the per-VM host key) for Windows. `spawn` must never attach either
+    // one: a second boot that re-attached the seed would re-run the first-boot task against an
+    // image that is already deployed.
     if params.is_init {
         qemu_cmd.args(["-drive", &seed_drive_option(&params.image.seed)?]);
     }
@@ -992,6 +996,60 @@ mod tests {
     }
 
     ///
+    /// The seed medium is attached on the first boot and on nothing else.
+    ///
+    /// `Machine::spawn` calls the same launcher, and the only thing that keeps a deployed Windows
+    /// guest from re-running its first-boot task (or a Linux guest from re-running cloud-init) is
+    /// this conditional. The comment above it used to call the medium a cloud-init artifact,
+    /// which is only true for half the guests, so the one place that decides the whole seed
+    /// lifecycle also mis-described it.
+    #[test]
+    fn the_seed_medium_is_attached_only_on_the_first_boot() {
+        let source = include_str!("qemu.rs");
+        // Assembled from two halves so that this guard's own text is not a call site: the
+        // count below is the number of places that attach the medium, and a guard that
+        // quotes the expression it counts would count itself.
+        let call = ["seed_drive_option(&params", ".image.seed)"].concat();
+        let attach_sites: Vec<&str> = source
+            .lines()
+            .filter(|line| line.contains(&call) && line.trim_start().starts_with("qemu_cmd"))
+            .collect();
+        assert_eq!(
+            attach_sites.len(),
+            1,
+            "the launcher attaches the seed medium in {} places: {attach_sites:?}",
+            attach_sites.len()
+        );
+
+        let guard = source
+            .find("if params.is_init {")
+            .expect("the launcher no longer gates the seed medium on `is_init`");
+        let attach = source
+            .find(&call)
+            .expect("the launcher no longer attaches the seed medium");
+        assert!(
+            attach > guard,
+            "the seed medium is attached before the `if params.is_init` guard"
+        );
+        assert!(
+            source[guard..attach].lines().count() <= 2,
+            "the seed medium is attached {} lines after the guard that is supposed to hold it",
+            source[guard..attach].lines().count()
+        );
+        // The comment immediately above the guard is the only place that says what the medium
+        // carries; a reader debugging a Windows boot starts there. Assert the sentence that
+        // names Windows, not a phrase that also lives in the function it describes.
+        let comment_start = source[..guard]
+            .rfind("// The seed medium is a first-boot artifact")
+            .expect("the launcher no longer comments the seed medium before the guard");
+        let comment = &source[comment_start..guard];
+        assert!(
+            comment.contains("deploy.json") && comment.contains("for Windows"),
+            "the comment above the seed guard must say what the medium carries for Windows: \
+             {comment}"
+        );
+    }
+
     /// The deployment depends on the guest finding the seed ISO on a bus its early boot
     /// scans. QEMU accepts almost any `-drive` line, so a device that ends up unattached,
     /// on a bus the firmware never probes, or not read-only still yields a running VM and a
