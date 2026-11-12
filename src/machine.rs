@@ -987,9 +987,29 @@ StandardError=journal
 
         let timeout = windows::deploy_timeout(&self.config);
         let start = std::time::Instant::now();
+        // A marker poll that cannot reach the guest says nothing about deployment: the
+        // session may have died because the guest rebooted. Retrying that for the whole
+        // budget would report "deployment did not finish" 15 minutes later, so give up
+        // after a few consecutive transport failures with an actionable message.
+        const MAX_CONSECUTIVE_TRANSPORT_ERRORS: u32 = 3;
+        let mut transport_errors = 0;
         loop {
-            if self.deploy_marker_present().await {
-                break;
+            match self.deploy_marker_present().await {
+                Ok(true) => break,
+                Ok(false) => transport_errors = 0,
+                Err(e) => {
+                    transport_errors += 1;
+                    if transport_errors >= MAX_CONSECUTIVE_TRANSPORT_ERRORS {
+                        return Err(e).with_context(|| {
+                            format!(
+                                "lost the SSH session to VM-{} while waiting for the Windows \
+                                 deployment marker; the guest probably rebooted or stopped sshd. \
+                                 Retry with `spawn` once the guest is reachable again",
+                                self.id
+                            )
+                        });
+                    }
+                }
             }
             if start.elapsed() >= timeout {
                 bail!("{}", windows::deploy_timeout_message(timeout));
@@ -1009,24 +1029,27 @@ StandardError=journal
 
     /// Whether the guest reports that its first-boot deployment finished.
     ///
-    /// Requires a session; without one the deployment state is simply unknown.
-    async fn deploy_marker_present(&mut self) -> bool {
+    /// `Ok(false)` means the guest answered and the marker is absent; `Err` means the
+    /// question could not be asked, which must not be mistaken for "not deployed yet".
+    async fn deploy_marker_present(&mut self) -> Result<bool> {
         let Some(cancel_token) = self.ssh_cancel_token.clone() else {
-            return false;
+            return Ok(false);
         };
         let Some(ssh) = self.ssh.as_mut() else {
-            return false;
+            return Ok(false);
         };
         let cmd = format!(
             "cmd /c if exist {} echo deployed",
             windows::GUEST_DEPLOY_MARKER
         );
-        match ssh.call_with_output(&cmd, cancel_token).await {
-            Ok((code, stdout, _)) => {
-                code == 0 && String::from_utf8_lossy(&stdout).contains("deployed")
-            }
-            Err(_) => false,
+        let (code, stdout, stderr) = ssh.call_with_output(&cmd, cancel_token).await?;
+        if code != 0 {
+            bail!(
+                "deployment marker probe `{cmd}` exited with {code}: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            );
         }
+        Ok(String::from_utf8_lossy(&stdout).contains("deployed"))
     }
 
     /// Guest operating system family of this machine's image.
