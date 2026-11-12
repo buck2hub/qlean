@@ -172,22 +172,86 @@ fn ensure_secure_boot_pair(code: &Path, vars_template: &Path, secure_boot: bool)
     }
 }
 
-/// Resolve firmware using an injectable existence probe.
-fn resolve_ovmf_with(exists: &dyn Fn(&Path) -> bool) -> Option<FirmwarePaths> {
-    OVMF_CANDIDATES.iter().find_map(|(code, vars, secure)| {
+/// What firmware resolution found, and why the rest was rejected.
+#[derive(Debug, Default)]
+struct ResolvedFirmware {
+    /// The first pair that is present *and* usable.
+    paths: Option<FirmwarePaths>,
+    /// One sentence per present-but-unusable pair, in candidate order.
+    skipped: Vec<String>,
+}
+
+/// Resolve firmware using injectable probes for presence and Secure Boot enrollment.
+///
+/// A candidate whose code image is present but whose vars template carries no Microsoft
+/// keys is *skipped*, not returned: returning it makes the caller fail even when a plain
+/// (Secure Boot disabled) candidate is available, which is the common layout on a host
+/// whose distro ships only `OVMF_VARS.4m.fd` next to `OVMF_CODE.secboot.4m.fd`.
+fn resolve_ovmf_with(
+    exists: &dyn Fn(&Path) -> bool,
+    enrolls_microsoft_keys: &dyn Fn(&Path) -> std::io::Result<bool>,
+) -> ResolvedFirmware {
+    let mut resolved = ResolvedFirmware::default();
+    for (code, vars, secure) in OVMF_CANDIDATES {
         let code = Path::new(code);
         if !exists(code) {
-            return None;
+            continue;
         }
-        vars.iter()
-            .map(Path::new)
-            .find(|vars| exists(vars))
-            .map(|vars| FirmwarePaths {
-                code: code.to_path_buf(),
-                vars_template: vars.to_path_buf(),
-                secure_boot: *secure,
-            })
-    })
+        let Some(vars) = vars.iter().map(Path::new).find(|vars| exists(vars)) else {
+            continue;
+        };
+        if *secure {
+            let enrolled = match enrolls_microsoft_keys(vars) {
+                Ok(true) => true,
+                Ok(false) => false,
+                Err(error) => {
+                    // Unreadable template: treat it like a missing enrollment and keep
+                    // looking, but say so instead of hiding the I/O problem.
+                    resolved.skipped.push(format!(
+                        "skipped {} with {}: the vars template could not be read ({error})",
+                        code.display(),
+                        vars.display()
+                    ));
+                    continue;
+                }
+            };
+            if !enrolled {
+                resolved.skipped.push(format!(
+                    "skipped Secure Boot pair {} with {}: the vars template carries no \
+                     Microsoft Secure Boot keys, so the guest would boot in setup mode",
+                    code.display(),
+                    vars.display()
+                ));
+                continue;
+            }
+        }
+        resolved.paths = Some(FirmwarePaths {
+            code: code.to_path_buf(),
+            vars_template: vars.to_path_buf(),
+            secure_boot: *secure,
+        });
+        break;
+    }
+    resolved
+}
+
+/// Report why every present candidate was skipped, when none is usable.
+fn no_usable_firmware_message(resolved: &ResolvedFirmware) -> String {
+    let mut message = format!(
+        "no usable OVMF firmware found (looked for {} known layouts under /usr/share); {INSTALL_HINT}",
+        OVMF_CANDIDATES.len()
+    );
+    for reason in &resolved.skipped {
+        message.push_str("\n- ");
+        message.push_str(reason);
+    }
+    if !resolved.skipped.is_empty() {
+        message.push_str(&format!(
+            "\nSet {ENV_OVMF_CODE} and {ENV_OVMF_VARS} to the pair you want, or pair a code image \
+             without `secboot` to run with Secure Boot disabled."
+        ));
+    }
+    message
 }
 
 /// Resolve the host OVMF firmware pair, honoring the environment overrides.
@@ -220,14 +284,18 @@ pub(crate) fn resolve_ovmf() -> Result<FirmwarePaths> {
             bail!("{ENV_OVMF_CODE} and {ENV_OVMF_VARS} must be set together; {INSTALL_HINT}")
         }
         (None, None) => {
-            let paths = resolve_ovmf_with(&|path| path.is_file()).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no OVMF firmware found (looked for {} known layouts under /usr/share); {INSTALL_HINT}",
-                    OVMF_CANDIDATES.len()
-                )
-            })?;
-            ensure_secure_boot_pair(&paths.code, &paths.vars_template, paths.secure_boot)?;
-            Ok(paths)
+            let resolved = resolve_ovmf_with(&|path| path.is_file(), &|path| {
+                vars_template_enrolls_microsoft_keys(path)
+            });
+            match resolved.paths {
+                Some(paths) => {
+                    // Re-check through the shared entry point: it also reports a template
+                    // that cannot be read, which the probe above turned into "skipped".
+                    ensure_secure_boot_pair(&paths.code, &paths.vars_template, paths.secure_boot)?;
+                    Ok(paths)
+                }
+                None => Err(anyhow::anyhow!(no_usable_firmware_message(&resolved))),
+            }
         }
     }
 }
@@ -638,12 +706,22 @@ mod tests {
         ensure_secure_boot_pair(&code, &plain, false).expect("no Secure Boot, no key check");
     }
 
+    /// Enrollment probe for the resolver tests: only templates named `*.ms.fd` count.
+    fn ms_only(path: &Path) -> std::io::Result<bool> {
+        Ok(path
+            .file_name()
+            .map(|name| name.to_string_lossy().ends_with(".ms.fd"))
+            .unwrap_or(false))
+    }
+
     #[test]
     fn test_resolve_ovmf_with_probe_picks_first_existing_pair() {
         let code = Path::new("/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd");
-        let vars = Path::new("/usr/share/edk2/x64/OVMF_VARS.4m.fd");
+        let vars = Path::new("/usr/share/edk2/x64/OVMF_VARS.4m.ms.fd");
         let probe = |path: &Path| path == code || path == vars;
-        let resolved = resolve_ovmf_with(&probe).expect("candidate matched");
+        let resolved = resolve_ovmf_with(&probe, &ms_only)
+            .paths
+            .expect("candidate");
         assert_eq!(resolved.code, code);
         assert_eq!(resolved.vars_template, vars);
         assert!(resolved.secure_boot);
@@ -652,7 +730,9 @@ mod tests {
         let plain_code = Path::new("/usr/share/OVMF/OVMF_CODE_4M.fd");
         let plain_vars = Path::new("/usr/share/OVMF/OVMF_VARS_4M.fd");
         let probe = |path: &Path| path == plain_code || path == plain_vars;
-        let resolved = resolve_ovmf_with(&probe).expect("candidate matched");
+        let resolved = resolve_ovmf_with(&probe, &ms_only)
+            .paths
+            .expect("candidate");
         assert_eq!(resolved.code, plain_code);
         assert!(!resolved.secure_boot);
     }
@@ -665,20 +745,73 @@ mod tests {
         let ms_vars = Path::new("/usr/share/OVMF/OVMF_VARS_4M.ms.fd");
         let plain_vars = Path::new("/usr/share/OVMF/OVMF_VARS_4M.fd");
         let probe = |path: &Path| path == code || path == ms_vars || path == plain_vars;
-        let resolved = resolve_ovmf_with(&probe).expect("secure pair matched");
+        let resolved = resolve_ovmf_with(&probe, &ms_only)
+            .paths
+            .expect("secure pair");
         assert_eq!(resolved.vars_template, ms_vars, "the .ms template wins");
-        assert!(resolved.secure_boot);
-
-        // Without the .ms template the plain one is still usable (setup mode).
-        let probe = |path: &Path| path == code || path == plain_vars;
-        let resolved = resolve_ovmf_with(&probe).expect("fallback matched");
-        assert_eq!(resolved.vars_template, plain_vars);
         assert!(resolved.secure_boot);
     }
 
     #[test]
+    fn test_a_secboot_pair_without_keys_does_not_hide_a_plain_candidate() {
+        // The layout that broke: the distro ships `OVMF_CODE.secboot.4m.fd` next to the
+        // *plain* vars template, and also a usable non-Secure-Boot code image. Refusing
+        // the pair must fall through to the plain candidate instead of failing the host.
+        let secboot_code = Path::new("/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd");
+        let plain_vars = Path::new("/usr/share/edk2/x64/OVMF_VARS.4m.fd");
+        let plain_code = Path::new("/usr/share/edk2/x64/OVMF_CODE.4m.fd");
+        let probe = |path: &Path| path == secboot_code || path == plain_vars || path == plain_code;
+
+        let resolved = resolve_ovmf_with(&probe, &ms_only);
+        let paths = resolved.paths.expect("the plain candidate is usable");
+        assert_eq!(paths.code, plain_code);
+        assert_eq!(paths.vars_template, plain_vars);
+        assert!(!paths.secure_boot, "Secure Boot must be disabled here");
+        assert_eq!(resolved.skipped.len(), 1, "{:?}", resolved.skipped);
+        assert!(
+            resolved.skipped[0].contains("setup mode"),
+            "{:?}",
+            resolved.skipped
+        );
+    }
+
+    #[test]
+    fn test_no_usable_firmware_explains_every_skipped_pair() {
+        // Only the unusable pair exists: the error has to say why, and how to override.
+        let secboot_code = Path::new("/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd");
+        let plain_vars = Path::new("/usr/share/edk2/ovmf/OVMF_VARS.fd");
+        let probe = |path: &Path| path == secboot_code || path == plain_vars;
+
+        let resolved = resolve_ovmf_with(&probe, &ms_only);
+        assert!(resolved.paths.is_none());
+        let message = no_usable_firmware_message(&resolved);
+        assert!(message.contains("no usable OVMF firmware"), "{message}");
+        assert!(message.contains("setup mode"), "{message}");
+        assert!(message.contains(ENV_OVMF_CODE), "{message}");
+    }
+
+    #[test]
+    fn test_an_unreadable_vars_template_is_reported_and_skipped() {
+        let secboot_code = Path::new("/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd");
+        let vars = Path::new("/usr/share/edk2/x64/OVMF_VARS.4m.fd");
+        let probe = |path: &Path| path == secboot_code || path == vars;
+        let unreadable = |_: &Path| Err(std::io::Error::other("permission denied"));
+
+        let resolved = resolve_ovmf_with(&probe, &unreadable);
+        assert!(resolved.paths.is_none());
+        assert!(
+            resolved.skipped[0].contains("permission denied"),
+            "{:?}",
+            resolved.skipped
+        );
+    }
+
+    #[test]
     fn test_resolve_ovmf_with_probe_reports_nothing_found() {
-        assert!(resolve_ovmf_with(&|_| false).is_none());
+        let resolved = resolve_ovmf_with(&|_| false, &ms_only);
+        assert!(resolved.paths.is_none());
+        assert!(resolved.skipped.is_empty());
+        assert!(no_usable_firmware_message(&resolved).contains("no usable OVMF firmware"));
     }
 
     #[test]
