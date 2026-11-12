@@ -40,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `Machine::copy` wrapped `Copy-Item` in `powershell -Command "..."` inside an already-PowerShell shell, so `$` in a Windows path was expanded and the copy silently targeted a different file
 - The Windows host prerequisite check omitted `xorriso`, so a host without it passed the check and failed later while staging the seed medium
 - Secure Boot paired a `secboot` code image with the plain (empty-key) vars template, which boots in setup mode; the Microsoft-enrolled `.ms`/`.secboot` templates are now preferred
 - Windows guests were launched with `vhost-vsock-pci`, so a Windows VM needed `/dev/vhost-vsock` and the `vhost_vsock` module and failed to start without them; the device is now added only for Linux guests
