@@ -1316,6 +1316,76 @@ mod plan_doc_tests {
         );
     }
 
+    /// The library test count the evidence rows claim only ever grows.
+    ///
+    /// Every round records `cargo test --lib` in its revision-history row. Those numbers are
+    /// copied by hand, and one round quoting an older count reads as a round that *removed*
+    /// tests - the one direction the plan says never happens. The final count is also what a
+    /// reader compares against their own run, so it has to be the newest round's number.
+    #[test]
+    fn the_library_test_counts_in_the_evidence_only_grow() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+
+        let mut claims: Vec<(u32, u32)> = Vec::new();
+        for line in PLAN.lines() {
+            if !line.starts_with("| 2026-") {
+                continue;
+            }
+            let Some(at) = line.find("review R") else {
+                continue;
+            };
+            let round: u32 = line[at + "review R".len()..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .expect("a revision-history row names its round in digits");
+            // The last count in the row is the round's closing number.
+            let mut claimed = None;
+            let mut rest = line;
+            while let Some(hit) = rest.find(" passed / ") {
+                let digits: String = rest[..hit]
+                    .chars()
+                    .rev()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
+                let tail = &rest[hit + " passed / ".len()..];
+                let ignored: String = tail
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>();
+                // Only the documented "N passed / M ignored" shape is a claim about the suite.
+                if !ignored.is_empty()
+                    && tail[ignored.len()..].starts_with(" ignored")
+                    && let Ok(value) = digits.parse::<u32>()
+                {
+                    claimed = Some(value);
+                }
+                rest = tail;
+            }
+            if let Some(value) = claimed {
+                claims.push((round, value));
+            }
+        }
+        claims.sort_unstable();
+        assert!(
+            claims.len() >= 30,
+            "only {} rows quote a test count: the scan is not reading them",
+            claims.len()
+        );
+        for pair in claims.windows(2) {
+            let ((before, smaller), (after, larger)) = (pair[0], pair[1]);
+            assert!(
+                larger >= smaller,
+                "round R{after} claims {larger} passing tests but the older R{before} already \
+                 claimed {smaller}: a round cannot shrink the suite"
+            );
+        }
+    }
+
     /// No document dates an observation later than the clock, not just the plan.
     ///
     /// The plan's dates are checked; the status view was not, and it carried seven timestamps two
