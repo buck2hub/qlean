@@ -432,7 +432,15 @@ of being handed to the wrong guest.
 > supported yet. The `GuestOs` dimension, OVMF/TPM lifecycle, first-boot deployment,
 > transport, `exec`, `get_ip` and file semantics are all in the tree, but the plan's
 > core acceptance needs real Windows KVM smoke evidence that has not been recorded
-> yet, so the support matrix below still lists Linux only and 0.4.0 is unpublished.
+> yet, so the support matrix below still claims Linux only and 0.4.0 is unpublished.
+
+Support matrix — a guest OS is claimed only when its core smoke tests have been recorded
+on a real KVM host:
+
+| Guest OS | Crate state | Claimed support | Missing evidence |
+|---|---|---|---|
+| Linux (built-in catalog) | released (`0.3.1`) | yes | — |
+| Windows 10 / 11 (`GuestOs::Windows`) | on `main`, unreleased | **no** | the seven `windows_*` smoke tests, which need a licensed qcow2 and a KVM host |
 
 ### Image Interface
 
