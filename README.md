@@ -141,8 +141,8 @@ A Windows machine can be initialized only once — after its deployment use `spa
 Windows guests have no vsock, so Qlean reaches them over the libvirt NAT network:
 
 - **Address discovery runs on the host, before SSH.** Qlean polls
-  `virsh net-dhcp-leases qlean` for the MAC address it assigned to that VM and caches the
-  result on the machine, so `Machine::get_ip` never runs a command inside a Windows guest.
+  `virsh net-dhcp-leases qlean` for the MAC address it assigned to that VM and caches it on
+  the machine, so the address Qlean dials never comes from a command run inside the guest.
   Only IPv4 leases are dialled, and when the table holds several rows for that MAC (an
   expiring lease next to the one renewed after it) the newest one wins. Discovery and the
   connection attempt share one bounded budget (`MachineConfig::ssh_timeout`); running out
@@ -160,12 +160,12 @@ Windows guests have no vsock, so Qlean reaches them over the libvirt NAT network
   vhost-vsock can still run Windows guests.
 - **Pool isolation.** Each VM gets its own MAC address, DHCP lease, seed medium and host
   key, so pool members never share an address or a pinned key.
-- **`get_ip` returns the address Qlean actually used.** For Windows guests
-  `Machine::get_ip` returns the address discovered for the transport (cached after the
-  first connection). A re-query runs PowerShell inside the guest and keeps only the
-  address whose MAC matches the VM's own MAC, so it can never return another VM's lease;
-  a missing or ambiguous answer is an error instead of a guess. Linux guests keep the
-  existing in-guest query.
+- **`get_ip` returns the address Qlean actually used.** For Windows guests it normally
+  returns the address discovered for the transport, cached on the machine right after the
+  connection. Only when that address is unknown does it ask the guest (PowerShell
+  `Get-NetIPAddress`), and then it keeps only the address whose MAC matches the VM's own
+  MAC, so it can never return another VM's lease; a missing or ambiguous answer is an
+  error instead of a guess. Linux guests keep the existing in-guest query.
 - **Interactive PTY shells are not supported for Windows guests.**
   `Machine::open_interactive_shell` returns an actionable error instead of opening a
   half-configured session; use `exec` for commands and SFTP for file transfer.
