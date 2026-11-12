@@ -259,6 +259,25 @@ fn resolve_connect_timeout(config: &MachineConfig, guest_os: GuestOs, is_init: b
     resolve_ssh_timeout(config)
 }
 
+/// How long closing the SSH session may take during teardown.
+///
+/// Closing an SSH session is a write to the guest: `eof`/`close`/`disconnect` all wait for
+/// the peer. A guest that has stopped answering (bugcheck, frozen kernel, network gone) can
+/// therefore block teardown *before* it reaches the SIGKILL fallback, which would hang a test
+/// instead of failing it.
+const SSH_CLOSE_BUDGET: Duration = Duration::from_secs(5);
+
+/// Await `future` for at most `budget`, returning `None` when the budget was spent.
+///
+/// Used by teardown paths where a stuck step must not prevent the next (stronger) step from
+/// running: the caller reports the abandonment and then kills QEMU.
+async fn bounded_teardown<F: std::future::Future>(
+    budget: Duration,
+    future: F,
+) -> Option<F::Output> {
+    tokio::time::timeout(budget, future).await.ok()
+}
+
 /// What is left of a shared deadline, or `None` once it has passed.
 fn remaining_budget(deadline: std::time::Instant) -> Option<Duration> {
     let now = std::time::Instant::now();
@@ -759,8 +778,17 @@ StandardError=journal
 
         self.qemu_should_exit.store(true, Ordering::SeqCst);
 
-        if let Some(ssh) = self.ssh.as_mut() {
-            let _ = ssh.close().await;
+        if let Some(mut ssh) = self.ssh.take()
+            && bounded_teardown(SSH_CLOSE_BUDGET, ssh.close())
+                .await
+                .is_none()
+        {
+            warn!(
+                "closing the SSH session for VM-{} did not finish within {}s; the guest stopped \
+                 answering, so teardown continues by killing QEMU",
+                self.id,
+                SSH_CLOSE_BUDGET.as_secs()
+            );
         }
 
         if let Some(pid) = self.pid {
@@ -2265,6 +2293,27 @@ mod timeout_tests {
             b"/usr/bin/qemu-img\0convert\0qemu-system-x86_64\0"
         ));
         assert!(!cmdline_is_qemu(b"/usr/bin/qemu-img\0create\0disk.qcow2\0"));
+    }
+
+    #[tokio::test]
+    async fn a_stuck_teardown_step_is_abandoned_at_its_budget() {
+        // The guest-stopped-answering case: the close future never resolves, so teardown must
+        // give up on it and let the kill path run instead of hanging the caller.
+        let started = std::time::Instant::now();
+        let finished =
+            bounded_teardown(Duration::from_millis(100), std::future::pending::<()>()).await;
+        assert!(finished.is_none(), "a pending step must not finish");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the budget must end the wait, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_teardown_step_that_finishes_keeps_its_result() {
+        let finished = bounded_teardown(Duration::from_secs(5), async { 7u8 }).await;
+        assert_eq!(finished, Some(7));
     }
 
     #[test]
