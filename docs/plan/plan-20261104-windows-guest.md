@@ -191,6 +191,7 @@
 | 2026-11-13 11:40:00 UTC | review R77（给挂住的程序开「重新安装」处方） | F82：R76 给依赖探测加了 10s 预算，但预算超时被归类成 `ProgramProbe::Missing`，于是消息变成「`virsh` is required but was not found (`virsh` did not finish within 10s … the process was killed): install it and try again」——一句话里同时说「找不到」和「跑了 10 秒」，并且**处方是错的**：它明明装着，只是卡住了（等一个陈旧锁、一个不可达的挂载点）。用户照做会重装一个本来就正常的包，然后再次卡住。这是 R74 的同一族缺陷：把「阻塞」说成「不存在」。修：`bounded_output` 拆成 `run_bounded`（返回带类型的 `BoundedFailure::{NotRun, Killed}`）与薄封装 `bounded_output`（拍平成 `anyhow`，既有 8 个调用点一字不改）；探测改用 `run_bounded`，`Killed` 映射到新变体 `ProgramProbe::Unusable`，消息改为「装着但没应答，查它在等什么（陈旧锁 / 不可达挂载），别重装」。新增 2 个单测：`NotRun`/`Killed` 分流、以及 `Unusable` 的消息不得含 `was not found` 或 `install it and try again`。`cargo test --lib` 188 → 190 | 依赖检查（`ensure_prerequisites`）、`TRN-01` | `src/utils.rs`、CHANGELOG、Review log、覆盖矩阵、plan-status |
 | 2026-11-13 12:10:00 UTC | review R78（把文件的状态当成进程的状态） | F83：`is_running` 的文档写着「Only a missing socket is proof that the domain is gone」，但 `running_check` 只看两件事：`self.pid.is_some()` 与 `socket.exists()`。于是「pid 在、socket 不在」被归为 `NoControlSocket` 并返回 `Ok(false)` ——**从未检查过那个 pid 是否还活着、是否还是我们的 QEMU**。socket 只是一个文件；它不在只说明文件不在，不说明进程死了（`tmpfiles` 清理、用户 `rm`、启动瞬间尚未创建都会造成同一现象）。而 `Ok(false)` 的用途恰恰是「可以安全启动」：`pool::init_all`/`spawn_all` 会因此在**活着的 QEMU 的 overlay 上**再起一个 QEMU——正是本仓库反复强调的「不可逆的用户状态」。修：`running_check` 增加第三个事实 `qemu_alive`（`!process_is_gone(pid) && process_is_qemu(pid)`，都是仓库里已有的判据），新增 `RunningCheck::LiveWithoutSocket`，返回 `Err` 而不是 `Ok(false)`，消息明说「socket 没了，不是域没了，先看进程」。新增 1 个单测，并把原来那个两参数表格测试改成三参数。`cargo test --lib` 190 → 191 | `FS-01`/`EXE-01`（池与生命周期）、`TRN-01` | `src/machine.rs`、CHANGELOG、Review log、覆盖矩阵、plan-status |
 | 2026-11-13 12:40:00 UTC | review R79（基线行号在实现后不可复核） | F84：「事实基线」表有一句「行号和源码锚点必须在开工当天刷新」，但 10 张实现卡落地之后，表里 88 个 `src/*.rs:NN` 锚点已经全部指向别的代码（例如 `src/machine.rs:220-399` 现在讲的是 `MachineConfig` 文档而不是 cloud-init seed 构建）。表头写的是「2026-11-04 成稿基线」，读起来像是当前事实，实际既不能按工作区核对、也没有说清该按哪个快照核对——一份不能被复核的「现状」证据等于没有证据。没有出现行号越界（`src/qemu.rs:74-169` 等仍在文件长度内），所以这种漂移不会自己暴露，只能靠人读。修：把整张表的行号锚定到基线提交 `69002eb`（`50c8cff` 之前最后一次计划提交，即尚未落地实现卡的代码），写出核对命令 `libra show 69002eb:src/<file> | sed -n '<range>p'`，并注明「实现落地后这些陈述已不成立，当前状态见实施证据汇总与各卡」。抽样三个锚点核对通过：`machine.rs:220`=cloud-init `MetaData` 起点、`qemu.rs:74`=`launch_qemu` 起点、`ssh.rs:831`=`get_remote_ip` 的 `hostname -I` | N/A（不新增卡；不改变任何 AC 或状态机） | 事实基线、Review log、覆盖矩阵、plan-status |
+| 2026-11-13 13:10:00 UTC | review R80（凭契约写下的介质从没被真工具验过一次） | F85：README 的 “Windows image contract” 与 `OSX-03` 都建立在同一个前提上——seed 介质带卷标 `QLEANSEED`、里面是 `qlean/authorized_keys`、`qlean/ssh_host_ed25519_key`、`qlean/deploy.json`，镜像的首启任务就是照这个前提找盘、找文件的。但仓库里**没有任何测试碰过真实的 `xorriso`**：4 个 seed 单测只检查暂存目录（写出来的三个文件、`0600`、每 VM 密钥不同）和把一份**假文件** `chmod 0600` 的封装函数，`DeploySeed::build` 的参数表（`-V QLEANSEED -J -R -o … -graft-points qlean=<dir>`）从来没被执行过。参数错一位（漏 `-J`、`qlean=` 写成 `qlean`、`-V` 拼错）都会让介质上少一层目录、名字被截成 8.3 或卷标对不上，而三个真实用例全是 `#[ignore]`，所以这个错误要等到 DEP-01/02 齐了才会暴露——那时排查成本最高。修：`src/windows.rs::tests` 新增 `#[ignore]` 用例 `test_windows_seed_medium_has_the_documented_label_and_layout`，用**真实 `xorriso`** 跑 `DeploySeed::build`，然后核对四件事：PVD 里 `Volume Id    : QLEANSEED`、关掉 Rock Ridge 只看 Joliet 时 `/qlean` 下三个文件名齐全（Windows 读的就是这份视图）、把 `/qlean` 解包回来逐字节比对客户端公钥/本 VM host key/`deploy.json` 契约、以及 `xorriso` 产出的 ISO 本身是 `0600`（即 `seal_seed_medium` 在生产路径上真的生效）。`xorriso` 不是 CI 依赖，故 `#[ignore]` 并在注释里写明运行命令；本机 Arch 容器（`xorriso` 1.5.8）实跑通过。`cargo test --lib` 191 不变（新增 1 个 ignored） | `OSX-03`（seed 介质契约）、`SPK-02`（部署方案可行性） | `src/windows.rs`、Review log、覆盖矩阵、plan-status |
 
 ## 已决议设计决策
 
@@ -709,6 +710,7 @@
 - [x] `cargo test --lib windows_deploy_timeout`：2 passed（默认值 + 超时错误路径）
 - [x] `cargo test --lib timeout_tests`：3 passed（Windows `init` 用部署预算、Windows `spawn` 与 Linux 保持连接预算；R8 回归门）
 - [x] `cargo test --no-run`：含 `tests/windows_machine.rs::windows_first_boot` 在内全部 target 编译通过
+- [x] seed 介质契约（真实 `xorriso`，不依赖 Windows 镜像）：`cargo test --lib -- --ignored windows_seed_medium` —— 卷标 `QLEANSEED`、Joliet 视图下 `qlean/{authorized_keys,deploy.json,ssh_host_ed25519_key}` 齐全、解包后三份文件字节与暂存内容一致、ISO 权限 `0600`（R80，`f708b36`；`xorriso` 不是 CI 依赖，故标 `#[ignore]`）
 - [ ] T-1 全量，配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1` —— 环境缺口 `DEFER-04`
 - [ ] 满足 DEP-01/02 且 `TRN-01` 已落地：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine windows_first_boot -- --ignored --exact --test-threads=1` —— `blocked`
 - [ ] 首启后关机、`spawn` 与 host-key seed 清理的 sanitized 证据 —— `blocked`（无 Windows 镜像与 KVM 宿主）
@@ -728,6 +730,7 @@
 | 失败启动可重试 | `init`/`spawn` 在启动失败时取消并清除 cancel token（`abandon_launch`），仅在 `pid`/`ssh` 存在时拒绝重复启动；首启超时拆除后可在同一机器上重试（R11，`src/machine.rs`） |
 | 启动失败收尾 | QEMU 在 SSH 阶段退出或 SSH 任务 panic 时清 `pid`、停 `swtpm`、终止 QEMU，不再遗留 TPM 进程或分离的 QEMU（R14，`src/machine.rs`） |
 | 部署标记探测 | `deploy_marker_present` 返回 `Result<bool>`，传输失败与「标记不存在」分列；连续 3 次传输错误报「会话丢失 + spawn 重试」（R15，`src/machine.rs`） |
+| seed 介质真实构建 | `#[ignore]` 用例 `windows::tests::test_windows_seed_medium_has_the_documented_label_and_layout`：真实 `xorriso` 1.5.8 跑 `DeploySeed::build`，核对 PVD 卷标 `QLEANSEED`、Joliet 视图 `/qlean` 三件套、解包字节一致、ISO `0600`（R80，`f708b36`） |
 | 提交 | `8812fb4` |
 
 **Full-suite trigger:** `T-1: 共享 seed 与 Machine 初始化路径`
@@ -793,6 +796,7 @@
 | 集成测试（`#[ignore]`） | `tests/windows_machine.rs`：`windows_transport`（地址、pin、unsupported、shutdown→spawn 重连）、`windows_pool`（双机地址/host key/会话隔离） |
 | README/CHANGELOG | README「Windows transport and security」；CHANGELOG Added ×4 / Changed ×1 |
 | 地址发现与 QEMU 退出 race | `launch` 把 DHCP lease 轮询与 `qemu_handle`、cancel token 一起 `select!`，QEMU 启动即退出时立即返回其真实错误并停 `swtpm`（R12，`src/machine.rs`） |
+| 契约要拿真工具验一次 | 只要契约由外部工具产出（`xorriso` 的卷标与目录布局、`virsh` 的输出格式），就必须有一条真跑该工具的用例，否则契约只是一句承诺（R80，`f708b36`） |
 | 证据要能被复核 | 指向源码的证据必须写成「可重放的命令 + 快照」，否则它描述的只是写它那天的代码（R79，`6283a6e`） |
 | 文件的状态不是进程的状态 | 判定「谁还活着」必须看进程，不能看它留下的文件（R78，`faf4c9e`） |
 | 处方要跟着诊断走 | 报错里的下一步必须对得上真实原因：卡住 ≠ 没装，缺依赖 ≠ 配置错（R74/R77，`48fc514`） |
@@ -1233,6 +1237,7 @@
 | Windows 传输/池 `(new)` | host key、重连、双机端点与 readiness | `cargo test --test windows_machine windows_transport -- --ignored --exact --test-threads=1`；`windows_pool` 同理 |
 | Windows 语义 `(new)` | exec/get_ip/文件与目录往返/unsupported | `cargo test --test windows_machine windows_exec -- --ignored --exact --test-threads=1`；`windows_get_ip`、`windows_files` 同理 |
 | Windows 全量核心门 | 上述所有 Windows 用例，每个支持版本 | 设置镜像 env 后：`cargo test --test windows_machine -- --ignored --test-threads=1` |
+| seed 介质契约 `(new)` | 真实 `xorriso` 产出的卷标 `QLEANSEED`、Joliet 目录布局、解包字节、ISO `0600` | 有 `xorriso` 的机器：`cargo test --lib -- --ignored windows_seed_medium`（CI 不装 `xorriso`，故 `#[ignore]`） |
 | 编译门槛 | CI 编译所有 target，包括 ignored Windows 测试 | `cargo test --no-run --all-targets` |
 | 性能 | hash 流式无回归 | `cargo bench --bench hash_benchmark` |
 
@@ -1244,7 +1249,7 @@
 | SPK-02 | `src/qemu.rs:74-169` | 无生产代码 | ADR-WIN-03 | 手工首启/重启证据 |
 | OSX-01 | `src/image.rs:68-81,645-717` | image/lib/machine | README API/Migration、CHANGELOG | `guest_os_default`、`guest_os_legacy_json`、`guest_os_cache_mismatch` |
 | OSX-02 | `src/qemu.rs:74-169`、`src/machine.rs:63-68,156-157` | qemu/machine/utils | README Host Setup（含 Windows 最低/推荐资源）、CHANGELOG | `windows_firmware_lifecycle` |
-| OSX-03 | `src/machine.rs:181-464` | machine/windows | README 部署、CHANGELOG | `windows_first_boot`、`windows_deploy_timeout` |
+| OSX-03 | `src/machine.rs:181-464` | machine/windows | README 部署、CHANGELOG | `windows_first_boot`、`windows_deploy_timeout`、`windows_seed_medium` |
 | TRN-01 | `src/ssh.rs:89-104,571-630` | ssh/machine/utils | README 传输/限制、CHANGELOG | `windows_transport`、`windows_pool` |
 | EXE-01 | `src/machine.rs:495-516` | machine/ssh/exec（新 `src/exec.rs`） | README exec、CHANGELOG | `windows_exec` |
 | IP-01 | `src/ssh.rs:831-841` | windows/machine | README get_ip、CHANGELOG | `windows_get_ip` |
@@ -1411,6 +1416,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R77 | 处方要跟着诊断走 | PASS | 宿主工具链（DEP-02）仍是外部阻塞 | F82：探测超时被归类为「未安装」，给出错误的重装建议 | `BoundedFailure` 类型化 + `ProgramProbe::Unusable`，2 新单测（`48fc514`） |
 | R78 | 文件的状态不是进程的状态 | PASS | 真实 Windows KVM 冒烟（DEP-01/02）仍阻塞 | F83：socket 缺失被当成域已退出，可能在活 VM 的盘上再起一个 QEMU | `running_check` 增加 `qemu_alive` 事实 + `LiveWithoutSocket` 报错，1 新单测（`faf4c9e`） |
 | R79 | 证据要能被复核 | PASS | 真实 Windows KVM 冒烟（DEP-01/02）仍阻塞 | F84：事实基线的 88 个行号锚点在实现后全部漂移且未锚定到快照 | 全表锚定基线提交 `69002eb` + 核对命令 + 3 处抽样核对（`6283a6e`） |
+| R80 | 契约要拿真工具验一次 | PASS | 真实 Windows KVM 首启（DEP-01/02）仍阻塞 | F85：seed 介质的卷标与目录布局只有 README 的承诺，没有任何测试跑过真实 `xorriso` | 新增 `#[ignore]` 用例用真实 `xorriso` 构建并核对卷标/Joliet 布局/解包字节/`0600`，Arch 容器实跑通过（`f708b36`） |
 
 ### R1 findings 与修订对照
 
