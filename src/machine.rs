@@ -1090,11 +1090,21 @@ StandardError=journal
     /// `Ok(false)` means the guest answered and the marker is absent; `Err` means the
     /// question could not be asked, which must not be mistaken for "not deployed yet".
     async fn deploy_marker_present(&mut self) -> Result<bool> {
+        marker_probe_guard(
+            self.ssh.is_some() && self.ssh_cancel_token.is_some(),
+            &self.id,
+        )?;
         let Some(cancel_token) = self.ssh_cancel_token.clone() else {
-            return Ok(false);
+            bail!(
+                "internal inconsistency: VM-{} has a session but no cancellation token",
+                self.id
+            );
         };
         let Some(ssh) = self.ssh.as_mut() else {
-            return Ok(false);
+            bail!(
+                "internal inconsistency: VM-{} was reported reachable without a session",
+                self.id
+            );
         };
         let cmd = format!(
             "cmd /c if exist {} echo deployed",
@@ -1156,12 +1166,23 @@ StandardError=journal
     }
 
     /// Check if the machine is currently running.
+    ///
+    /// A failed QMP query is reported instead of being folded into `false`: the callers use
+    /// `false` to decide that a launch is safe, and starting a second QEMU on a live domain's
+    /// disk would corrupt it. Only a missing socket is proof that the domain is gone.
     pub async fn is_running(&self) -> Result<bool> {
-        if self.pid.is_none() {
-            return Ok(false);
-        }
         let socket_path = qmp::qmp_socket_path(&self.id)?;
-        Ok(qmp::query_running(&socket_path).await.unwrap_or(false))
+        match running_check(self.pid.is_some(), socket_path.exists()) {
+            RunningCheck::NotRunning => Ok(false),
+            RunningCheck::NoControlSocket => Ok(false),
+            RunningCheck::AskQmp => qmp::query_running(&socket_path).await.with_context(|| {
+                format!(
+                    "VM-{} has a QEMU pid and a QMP socket at {} but the control socket did not                      answer; check whether the process is still alive before starting it again",
+                    self.id,
+                    socket_path.display()
+                )
+            }),
+        }
     }
 
     /// Launch QEMU and connect SSH concurrently.
@@ -1816,6 +1837,41 @@ impl Drop for Machine {
     }
 }
 
+/// What `is_running` can conclude from the host-side facts alone.
+#[derive(Debug, PartialEq, Eq)]
+enum RunningCheck {
+    /// No QEMU pid was recorded, so nothing was launched.
+    NotRunning,
+    /// A pid exists but the QMP socket is gone: the domain exited and left a stale pid.
+    NoControlSocket,
+    /// Both exist, so only QMP can answer.
+    AskQmp,
+}
+
+fn running_check(pid_present: bool, socket_present: bool) -> RunningCheck {
+    match (pid_present, socket_present) {
+        (false, _) => RunningCheck::NotRunning,
+        (true, false) => RunningCheck::NoControlSocket,
+        (true, true) => RunningCheck::AskQmp,
+    }
+}
+
+/// Refuse to probe the deployment marker without a session.
+///
+/// A missing session is not evidence that the deployment has not finished: reporting
+/// `Ok(false)` there made [`Machine::confirm_deployment`] poll for the whole budget and then
+/// claim the deployment timed out. The distinction is the entire contract of
+/// [`Machine::deploy_marker_present`], so it lives in one testable place.
+fn marker_probe_guard(session_present: bool, machine_id: &str) -> Result<()> {
+    if session_present {
+        return Ok(());
+    }
+    Err(not_running_error(
+        "check the Windows deployment marker",
+        machine_id,
+    ))
+}
+
 /// Why a session-scoped operation cannot run: the machine is not up.
 ///
 /// Every `Machine` operation that talks to the guest goes through this one message, so a
@@ -1932,6 +1988,31 @@ mod timeout_tests {
         // recycled pid never gets SIGKILLed.
         assert!(!process_is_qemu(std::process::id()));
         assert!(!process_is_qemu(u32::MAX));
+    }
+
+    #[test]
+    fn running_check_only_asks_qmp_when_both_facts_are_present() {
+        assert_eq!(running_check(false, false), RunningCheck::NotRunning);
+        // A stale pid without a socket is still "not running".
+        assert_eq!(running_check(false, true), RunningCheck::NotRunning);
+        assert_eq!(running_check(true, false), RunningCheck::NoControlSocket);
+        // Only here may a QMP failure be reported instead of "not running".
+        assert_eq!(running_check(true, true), RunningCheck::AskQmp);
+    }
+
+    #[test]
+    fn marker_probe_without_a_session_is_an_error_not_a_missing_marker() {
+        // `Ok(false)` here would make a deployment wait the full budget and then blame the
+        // guest for a host-side problem.
+        let error = marker_probe_guard(false, "abc123")
+            .expect_err("no session must be an error")
+            .to_string();
+        assert!(
+            error.contains("check the Windows deployment marker"),
+            "{error}"
+        );
+        assert!(error.contains("VM-abc123"), "{error}");
+        assert!(marker_probe_guard(true, "abc123").is_ok());
     }
 
     #[test]
