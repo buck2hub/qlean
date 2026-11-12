@@ -62,6 +62,8 @@
 | CI | 仅 `pull_request`；clippy 命令未包含 `--all-targets --all-features` | `.github/workflows/check-and-test.yml:1-7,76-100` |
 | 版本 | `Cargo.toml version = "0.3.1"` | `Cargo.toml:1-4` |
 | 本地 VCS | 当前 checkout 使用 Libra；`git status` 在此 checkout 不可用，`libra status --short --branch` 可用 | 2026-11-04 成稿核对 |
+| 首启部署超时 | `MachineConfig.ssh_timeout` 默认 KVM 180s / TCG 300s，只覆盖 SSH 连接等待维度 | `src/machine.rs:72,165-167` |
+| VM 资源默认值 | 默认 core=2、mem=4096MB；未对 Windows 10/11 最低资源做评估 | `src/machine.rs:63-68,156-157` |
 
 ### 当前缺口
 
@@ -74,6 +76,8 @@
 | GAP-05 | shell、IP、路径与部分文件操作硬编码 POSIX | Windows 命令和文件语义不兼容 | `src/machine.rs:495-516,922-1137`、`src/ssh.rs:831-841` | `EXE-01`/`IP-01`/`FS-01` |
 | GAP-06 | spawn/池/InteractiveShell 的支持边界未定义 | 首启成功仍可能在重启、双机或第二会话失败 | `src/machine.rs:451-493`、`src/pool.rs` | `OSX-03`/`TRN-01` |
 | GAP-07 | CI 无 push 触发，发布远端门不可执行 | 发布后无法按模板取得指定 ref 的 CI 证据 | `.github/workflows/check-and-test.yml:1-7` | `REL-01` |
+| GAP-08 | 无 Windows 首启部署超时维度（Linux `ssh_timeout` 默认 180/300s 不覆盖部署时长） | 首启部署可能超时失败，核心证据难以取得 | `src/machine.rs:72,165-167` | `OSX-03` |
+| GAP-09 | 无 Windows VM 资源默认值讨论 | 支持矩阵可能声明默认资源下不满足最低要求的版本 | `src/machine.rs:63-68,156-157` | `OSX-02` |
 
 ## 与其它计划的关系
 
@@ -108,6 +112,8 @@
 | 2026-11-04 03:54:17 UTC | review R1 | 修正 API/SemVer、验收状态机、外部依赖、核心测试门、传输安全、生命周期与文件边界；全串行化；合并文档碎片卡；补 CI 发布门和逐卡状态时间 | `DOC-01` → `REL-01`；其余卡保留编号并修订 | 实施顺序、依赖表、任务卡、状态视图、测试矩阵、追溯表、里程碑、风险表、Review log |
 | 2026-11-04 04:10:47 UTC | review R2 | 所有 T-1 卡补 Linux 全量门；明确 host-key seed 权限与清理；增加逐卡实现 review 证据；精确 Windows 版本发布范围；模板补状态同步完成门 | `OSX-01`/`OSX-02`/`OSX-03`/`TRN-01`/`EXE-01`/`FS-01` 修订，编号不变 | Verification、粒度审计、实施证据、模板完成判据、Review log、状态视图 |
 | 2026-11-04 04:19:20 UTC | review R3 | 关闭 R2 全部 P1；结构、依赖、计数、全量门、表格、链接和现有锚点复核通过；无新增 P0/P1，计划文档最终 PASS | N/A（仅评审记录与状态快照） | Review log、plan-status 计划一览 |
+| 2026-11-12 07:20:33 UTC | review R4 | P2 缺口修复：新增 GAP-08（Windows 首启部署超时维度）与 GAP-09（Windows 资源默认值未讨论），`OSX-03`/`OSX-02` 各补一条 AC（两卡均达 8/8 上限）；事实基线、性能摘要、风险表同步；plan-status 同步 | `OSX-02`/`OSX-03` 修订，编号不变 | 事实基线、当前缺口、任务卡、粒度审计表、性能与容量摘要、风险登记、Review log、plan-status |
+| 2026-11-12 07:45:12 UTC | review R5（环境消歧） | `DEP-01`/`DEP-02` 审计为不可用，`SPK-01`/`SPK-02` 置 `blocked`；`ADR-WIN-02`/`ADR-WIN-03` 改为临时接受并写入选定方案；取消 `SPK-02 -> OSX-01` 边，实施顺序改为以 `OSX-01` 为起点的串行链；新增环境消歧结论段落；`REL-01` 明确阻塞 | N/A（无拆合卡；仅依赖边与 ADR 状态） | 实施顺序、依赖登记表、ADR-WIN-02/03、粒度审计表 deps 列、Risk log、实施证据汇总、plan-status |
 
 ## 已决议设计决策
 
@@ -123,23 +129,23 @@
 - **Compatibility window/evidence:** 当前仓库已发现字面量构造 `src/image.rs:855-869`，实现时必须迁移并保留一个旧 JSON 反序列化测试。README 和 `0.4.0` CHANGELOG 必须单列 Migration；没有可消除外部字面量破坏的 deprecation 窗口，因此不得标为 non-breaking。
 - **Revisit when:** 出现第三种客户机 OS 或准备 1.0 API 冻结时。
 
-### ADR-WIN-02: Windows 传输方案（待 SPK-01 决议）
+### ADR-WIN-02: Windows 传输方案（临时接受 TCP；实测回写待 SPK-01）
 
-- **Status:** Proposed
+- **Status:** Accepted (provisional) —— 方案已选定以解除实现阻塞；真实 Windows 实测回写仍属 `SPK-01`，该 spike 当前 `blocked`（`DEP-01`/`DEP-02`）。
 - **Context:** Windows OpenSSH 不监听当前 Linux 路径使用的 AF_VSOCK；现有客户端还固定 root/`true` probe 并无条件接受服务端密钥。
-- **Decision:** 候选为 Windows-only TCP、Hyper-V socket↔sshd 桥、WinRM、qemu-guest-agent。`SPK-01` 必须选定一条并回写本 ADR 与 `TRN-01`。
+- **Decision:** 本期选定 **Windows-only TCP**：`GuestOs::Windows` 为显式 opt-in，Linux 保持 vsock-only；地址来自宿主 libvirt DHCP lease 并按本 VM MAC 绑定（不得调用 `Machine::get_ip` 形成循环）；客户端仅公钥认证，服务端主机密钥必须 pinning，密码禁用。Hyper-V socket↔sshd 桥、WinRM、qemu-guest-agent 作为备选保留但本期不实现。
 - **Required invariants:** 首次 SSH 前的地址/端点发现不得调用 `Machine::get_ip` 形成循环；客户端公钥认证与服务端主机密钥校验都必须存在；密码认证禁用；Linux 保持 vsock-only。若选 TCP，设置 `GuestOs::Windows` 就是显式 opt-in，默认 Linux 不开启 TCP，监听/转发只能暴露到文档批准的网络边界。
-- **Consequences:** 方案必须覆盖用户名、readiness probe、SFTP、第二会话策略、双机端点隔离、超时清理和重启重连。若需新增公开配置，必须同步修订 ADR-WIN-01、版本说明和 `OSX-01`，不得在实现卡中临时增加。
-- **Revisit when:** `SPK-01` 完成时。
+- **Consequences:** 方案必须覆盖用户名、readiness probe、SFTP、第二会话策略、双机端点隔离、超时清理和重启重连。若需新增公开配置，必须同步修订 ADR-WIN-01、版本说明和 `OSX-01`，不得在实现卡中临时增加。TCP 方案相对 vsock 缩小了隔离面，因此必须同时满足 pinning、MAC 绑定和网络边界三条不变量。
+- **Revisit when:** `SPK-01` 取得真实 Windows 实测证据并回写本 ADR 时；或实测证明 TCP 不可行时改选备选方案并重审 `TRN-01`。
 
-### ADR-WIN-03: Windows 部署方案（待 SPK-02 决议）
+### ADR-WIN-03: Windows 部署方案（临时接受“预配置镜像 + 首启 seed 盘”；实测回写待 SPK-02）
 
-- **Status:** Proposed
-- **Context:** cloud-init NoCloud 不适用于 Windows，部署方式会决定 seed、用户、主机密钥和首次启动验证。
-- **Decision:** 候选为 autounattend、Cloudbase-init、预 sysprep 镜像。`SPK-02` 必须选择并回写本 ADR 与 `OSX-02`/`OSX-03` 的具体参数、文件落点和验证命令。
-- **Required invariants:** VirtIO 存储/网络驱动可用；部署后可通过公钥 SSH；管理员 key 的文件位置和 ACL 符合 Windows OpenSSH 规则；不禁用密码、不生成可 pinning 的主机密钥或依赖静态明文密码的方案不得选为 go。
-- **Consequences:** 预 sysprep 方案也不能跳过凭据注入与部署验收；若需要新增公开驱动/固件配置，先回到 `OSX-01` 修订 API。
-- **Revisit when:** `SPK-02` 完成时。
+- **Status:** Accepted (provisional) —— 方案已选定以解除实现阻塞；真实 Windows 实测回写仍属 `SPK-02`，该 spike 当前 `blocked`（`DEP-01`/`DEP-02`）。
+- **Context:** cloud-init NoCloud 不适用于 Windows，部署方式会决定 seed、用户、主机密钥和首次启动验证。已安装好的 Windows qcow2 不会自动消费 `autounattend.xml`（该机制仅对安装介质生效），因此不能把 autounattend 当作对既有镜像的通用部署手段。
+- **Decision:** 选定 **预配置镜像 + 每 VM 首启 seed 盘**：镜像提供方交付已通用化（sysprep/generalize 完成）且已烘焙首启任务的 Windows qcow2；Qlean 首启附加一块只读 seed 介质（ISO9660，内容为客户端公钥、随机生成的每 VM SSH host 私钥、首启脚本约定参数），由镜像内首启任务读取并落盘，部署成功后删除 seed 并清理首启标记。autounattend 与 Cloudbase-init 仅在镜像制作方重新安装系统时使用，不作为 Qlean 运行时部署机制。
+- **Required invariants:** VirtIO 存储/网络驱动可用；部署后可通过公钥 SSH；管理员 key 的文件位置和 ACL 符合 Windows OpenSSH 规则；不禁用密码、不生成可 pinning 的主机密钥或依赖静态明文密码的方案不得选为 go。首启任务读取 seed 的路径与校验方式必须由 README 镜像制作契约明确规定，镜像缺失该契约时必须返回可操作错误而非静默继续。
+- **Consequences:** 预 sysprep 方案也不能跳过凭据注入与部署验收；若需要新增公开驱动/固件配置，先回到 `OSX-01` 修订 API。镜像制作责任明确划归镜像提供方，README 必须写出该契约与自检命令。
+- **Revisit when:** `SPK-02` 取得真实首启/重启证据并回写本 ADR 时；或实测证明首启 seed 契约不可行时改选 autounattend/Cloudbase-init 并重审 `OSX-03`。
 
 ### ADR-WIN-04: Windows 固件基线统一为 UEFI + TPM 2.0
 
@@ -181,16 +187,25 @@
 
 依赖边（`A -> B` 表示 A 先于 B）。顺序边同时解决共享计划、状态、源码与文档写集冲突：
 
-- `SPK-01 -> SPK-02 -> OSX-01 -> OSX-02 -> OSX-03 -> TRN-01 -> EXE-01 -> IP-01 -> FS-01 -> REL-01`
-- `SPK-01 -> TRN-01`（ADR-WIN-02 输入）
-- `SPK-02 -> OSX-02`（ADR-WIN-03 与固件输入）
+- `OSX-01 -> OSX-02 -> OSX-03 -> TRN-01 -> EXE-01 -> IP-01 -> FS-01 -> REL-01`
+- `SPK-02 -> OSX-02`（固件/Secure Boot 实测回写；在 `SPK-02` 解除前以 ADR-WIN-03/04 的临时接受值为准）
+- `SPK-01 -> TRN-01`（传输实测回写；在 `SPK-01` 解除前以 ADR-WIN-02 的临时接受值为准）
+- `SPK-01 -> SPK-02`
+
+**环境消歧结论（R5, 2026-11-12）：** `DEP-01`（合法 Windows qcow2 + sha256）与 `DEP-02`（Linux KVM Windows 验证宿主机）经审计不可用：本 checkout 环境下 `qemu-system-x86_64`、`qemu-img`、`swtpm`、`xorriso`、`virsh`、`qemu-bridge-helper` 与 OVMF 均缺失，且无免密 `sudo` 安装通道、无合法 Windows 镜像。因此：
+
+- `SPK-01`/`SPK-02` 置 `blocked`，其真实 Windows 实测 AC 不视为通过；
+- `ADR-WIN-02`/`ADR-WIN-03` 以 **临时接受（provisional）** 方式选定方案，解除实现卡阻塞，使不依赖 Phase 0 实测证据的代码可以落地；
+- 原 `SPK-02 -> OSX-01` 边取消：`OSX-01` 只新增 OS 维度与镜像校验，不消费任何 Phase 0 产物；
+- 任何需要真实 Windows KVM 的冒烟项（`OSX-02` 生命周期、`OSX-03` 首启、`TRN-01` 连接与池、`IP-01`/`FS-01` 真实往返、`EXE-01` PowerShell 冒烟）只能记为 `blocked` 环境缺口，不得声称通过；
+- `REL-01` 在 `DEP-01`/`DEP-02` 与两个 spike 解除前不得发布。
 
 ### 依赖登记表
 
 | ID | direction | 类型 | 对象 | Owner | 产物与可用性判据 | 证据 | 超时与失败策略 |
 |---|---|---|---|---|---|---|---|
-| DEP-01 | incoming | 外部前置 | 每个拟声明支持的 Windows 版本的合法 qcow2 + sha256 | 计划 Owner | 镜像版本明确、可合法使用、digest 核对通过；至少覆盖最终支持矩阵每一行 | sanitized 镜像标识 + 核对日期 | 未提供则 `SPK-01`/`SPK-02` 阻塞；未测版本从支持矩阵移除；不得延后核心验收后发布 |
-| DEP-02 | incoming | 外部前置 | Linux KVM Windows 验证宿主机 | 计划 Owner | QEMU/OVMF/swtpm/libvirt/xorriso/bridge-helper 可用，KVM 与 qlbr0 网络实测可用 | sanitized 命令摘要 + 核对日期 | 不可用则相关 spike/Windows 门与发布阻塞；TCG 或 CI `--no-run` 不能替代 |
+| DEP-01 | incoming | 外部前置 | 每个拟声明支持的 Windows 版本的合法 qcow2 + sha256 | 计划 Owner | 镜像版本明确、可合法使用、digest 核对通过；至少覆盖最终支持矩阵每一行 | 2026-11-12 审计：未提供（无任何 Windows qcow2 或 digest 可用） | 未提供则 `SPK-01`/`SPK-02` 阻塞；未测版本从支持矩阵移除；不得延后核心验收后发布 |
+| DEP-02 | incoming | 外部前置 | Linux KVM Windows 验证宿主机 | 计划 Owner | QEMU/OVMF/swtpm/libvirt/xorriso/bridge-helper 可用，KVM 与 qlbr0 网络实测可用 | 2026-11-12 审计：`/dev/kvm` 存在但 `qemu-system-x86_64`/`qemu-img`/`swtpm`/`xorriso`/`virsh`/`qemu-bridge-helper`/OVMF 全部缺失，`sudo` 需密码（无安装通道） | 不可用则相关 spike/Windows 门与发布阻塞；TCG 或 CI `--no-run` 不能替代 |
 
 ### 发布分组与并发窗口
 
@@ -270,9 +285,9 @@
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | SPK-01 | spike | Windows 传输可行性 | 无生产改动 | yes | yes | 6/8 | 2/8 | 0/0 | M | DEP-01,DEP-02 | no-overlap（串行起点） | no-release | N/A | N/A |
 | SPK-02 | spike | Windows 固件/部署可行性 | 无生产改动 | yes | yes | 6/8 | 2/8 | 0/0 | M | SPK-01,DEP-01,DEP-02 | 序列化于 SPK-01 | no-release | N/A | N/A |
-| OSX-01 | implementation | GuestOs 与镜像校验 | revert | yes | yes | 7/8 | 5/8 | 3/3 | M | SPK-02 | 序列化于 SPK-02 | family child | N/A | N/A |
-| OSX-02 | implementation | Windows 固件与 QEMU 生命周期 | revert | yes | yes | 7/8 | 5/8 | 3/3 | M | SPK-02,OSX-01 | 序列化于 OSX-01 | family child | N/A | N/A |
-| OSX-03 | implementation | Windows 首次部署 | revert | yes | yes | 7/8 | 6/8 | 2/2 | M | OSX-02 | 序列化于 OSX-02 | family child | N/A | N/A |
+| OSX-01 | implementation | GuestOs 与镜像校验 | revert | yes | yes | 7/8 | 5/8 | 3/3 | M | none | no-overlap（串行起点） | family child | N/A | N/A |
+| OSX-02 | implementation | Windows 固件与 QEMU 生命周期 | revert | yes | yes | 8/8 | 5/8 | 3/3 | M | SPK-02,OSX-01 | 序列化于 OSX-01 | family child | N/A | N/A |
+| OSX-03 | implementation | Windows 首次部署 | revert | yes | yes | 8/8 | 7/8 | 2/2 | M | OSX-02 | 序列化于 OSX-02 | family child | N/A | N/A |
 | TRN-01 | implementation | Windows 安全传输 | revert | yes | yes | 8/8 | 7/8 | 4/3 | M | SPK-01,OSX-03 | 序列化于 OSX-03 | family child | N/A | N/A |
 | EXE-01 | implementation | PowerShell exec 语义 | revert | yes | yes | 5/8 | 5/8 | 2/2 | S | TRN-01 | 序列化于 TRN-01 | family child | N/A | N/A |
 | IP-01 | implementation | get_ip 语义 | revert | yes | yes | 4/8 | 5/8 | 2/2 | S | EXE-01 | 序列化于 EXE-01 | family child | N/A | N/A |
@@ -373,7 +388,7 @@
 - [ ] 对比 autounattend、Cloudbase-init、预 sysprep，选定一种并说明镜像制作责任。
 - [ ] 手工完成首启部署、关机、重启，验证 OVMF vars、TPM 状态和部署结果持久化。
 - [ ] 验证管理员公钥文件/ACL、禁密码、PowerShell 默认 shell 和可供客户端 pinning 的主机公钥，不依赖静态明文密码。
-- [ ] 产出 go/no-go；go 时回写 ADR-WIN-03 及 `OSX-02`/`OSX-03` 具体参数和命令，no-go 时阻塞计划。
+- [ ] 产出 go/no-go；go 时回写 ADR-WIN-03 及 `OSX-02`/`OSX-03` 具体参数和命令（含实测首启部署时长与推荐部署超时值），no-go 时阻塞计划。
 
 **Verification:**
 
@@ -450,7 +465,7 @@
 
 **Full-suite trigger:** `T-1: 公开 API 与镜像缓存单一事实源`
 
-**Dependencies:** `SPK-02`（Phase 0 go 与共享计划/文档写集串行）
+**Dependencies:** 无（R5 取消 `SPK-02 -> OSX-01` 边：本卡不消费任何 Phase 0 产物；串行写集起点）
 
 **Deliverables:** `N/A`
 
@@ -476,7 +491,7 @@
 
 **C/D coverage from:** `REL-01`
 
-**Granularity:** `type=implementation; axis=GuestOs 与镜像校验; recovery=一次 revert; complete=yes; self-contained=yes; AC=7/8; VER=5/8; landing=3; prod-files=3; scope=M; deps=SPK-02; writeset=序列化于 SPK-02; release=family child; split-from=N/A; exception=N/A`
+**Granularity:** `type=implementation; axis=GuestOs 与镜像校验; recovery=一次 revert; complete=yes; self-contained=yes; AC=7/8; VER=5/8; landing=3; prod-files=3; scope=M; deps=none; writeset=no-overlap（串行起点）; release=family child; split-from=N/A; exception=N/A`
 
 ### Task OSX-02: Windows 固件与 QEMU 生命周期
 
@@ -496,6 +511,7 @@
 |---|---|
 | 当前 QEMU 无 pflash/vTPM，KVM 不可用时回退 TCG | `src/qemu.rs:74-169` |
 | QMP powerdown 与 running 查询 | `src/machine.rs:518-576,803-810` |
+| VM 资源默认 core=2 / mem=4096MB，未对 Windows 最低资源做评估 | `src/machine.rs:63-68,156-157` |
 
 **Acceptance criteria:**
 
@@ -506,6 +522,7 @@
 - [ ] QMP/ACPI `shutdown`、`is_running`、shutdown 后 `spawn` 在 Windows 生命周期中工作，重启保留固件/TPM/overlay 状态。
 - [ ] `(new)` 单测/集成测试覆盖参数、缺依赖、状态隔离、关机与重启；资源无泄漏。
 - [ ] README Host Setup/固件矩阵与 CHANGELOG Added 同卡更新。
+- [ ] Windows VM 资源默认值（core=2、mem=4096MB）对照 Windows 10/11 最低要求评估；README Host Setup 写明 Windows 最低与推荐资源值，默认不足时收缩支持矩阵或显式调整 Windows 默认值，不得静默降级。
 
 **Verification:**
 
@@ -543,7 +560,7 @@
 
 **C/D coverage from:** `REL-01`
 
-**Granularity:** `type=implementation; axis=Windows 固件与 QEMU 生命周期; recovery=一次 revert; complete=yes; self-contained=yes; AC=7/8; VER=5/8; landing=3; prod-files=3; scope=M; deps=SPK-02,OSX-01; writeset=序列化于 OSX-01; release=family child; split-from=N/A; exception=N/A`
+**Granularity:** `type=implementation; axis=Windows 固件与 QEMU 生命周期; recovery=一次 revert; complete=yes; self-contained=yes; AC=8/8; VER=5/8; landing=3; prod-files=3; scope=M; deps=SPK-02,OSX-01; writeset=序列化于 OSX-01; release=family child; split-from=N/A; exception=N/A`
 
 ### Task OSX-03: Windows 首次部署
 
@@ -563,6 +580,7 @@
 |---|---|
 | Linux seed 生成与 `Machine::new` | `src/machine.rs:181-414` |
 | `Machine::init`/`spawn` | `src/machine.rs:416-464` |
+| `ssh_timeout` 默认 KVM 180s / TCG 300s，仅覆盖连接等待 | `src/machine.rs:72,165-167` |
 
 **Acceptance criteria:**
 
@@ -573,6 +591,7 @@
 - [ ] `init` 首启部署及后续 `spawn` 可用；test-only 连接助手取得真实首启证据，不把该助手当作生产传输完成。
 - [ ] `(new)` 单测覆盖 seed/配置内容、敏感信息不落日志、首次/普通启动差异及 host-key seed 清理。
 - [ ] README 镜像制作/部署/账号要求与 CHANGELOG Added 同卡更新。
+- [ ] Windows 首启部署超时参数化：部署等待维度（autounattend/sysprep/sshd ready）独立于 Linux 默认 180s/300s，默认值按 `SPK-02` 实测首启时长推荐并写入 README；超时必须返回可操作错误，残留状态按故障恢复矩阵处理。
 
 **Verification:**
 
@@ -582,6 +601,7 @@
 - [ ] T-1 全量，配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1`
 - [ ] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine windows_first_boot -- --ignored --exact --test-threads=1`
 - [ ] 首启后关机、spawn 与 host-key seed 清理的 sanitized 手工/测试证据写入「实施证据汇总」。
+- [ ] `cargo test --lib windows_deploy_timeout`（新增超时维度单测：默认值与超时错误路径）。
 
 **Full-suite trigger:** `T-1: 共享 seed 与 Machine 初始化路径`
 
@@ -611,7 +631,7 @@
 
 **C/D coverage from:** `REL-01`
 
-**Granularity:** `type=implementation; axis=Windows 首次部署; recovery=一次 revert; complete=yes; self-contained=yes; AC=7/8; VER=6/8; landing=2; prod-files=2; scope=M; deps=OSX-02; writeset=序列化于 OSX-02; release=family child; split-from=N/A; exception=N/A`
+**Granularity:** `type=implementation; axis=Windows 首次部署; recovery=一次 revert; complete=yes; self-contained=yes; AC=8/8; VER=7/8; landing=2; prod-files=2; scope=M; deps=OSX-02; writeset=序列化于 OSX-02; release=family child; split-from=N/A; exception=N/A`
 
 ### Task TRN-01: Windows 安全传输实现
 
@@ -972,8 +992,8 @@
 | SPK-01 | `src/ssh.rs:89-104,571-630` | 无生产代码 | ADR-WIN-02 | 手工连接/SFTP 证据 |
 | SPK-02 | `src/qemu.rs:74-169` | 无生产代码 | ADR-WIN-03 | 手工首启/重启证据 |
 | OSX-01 | `src/image.rs:68-81,645-717` | image/lib/machine | README API/Migration、CHANGELOG | `guest_os_default`、`guest_os_legacy_json`、`guest_os_cache_mismatch` |
-| OSX-02 | `src/qemu.rs:74-169` | qemu/machine/utils | README Host Setup、CHANGELOG | `windows_firmware_lifecycle` |
-| OSX-03 | `src/machine.rs:181-464` | machine/windows | README 部署、CHANGELOG | `windows_first_boot` |
+| OSX-02 | `src/qemu.rs:74-169`、`src/machine.rs:63-68,156-157` | qemu/machine/utils | README Host Setup（含 Windows 最低/推荐资源）、CHANGELOG | `windows_firmware_lifecycle` |
+| OSX-03 | `src/machine.rs:181-464` | machine/windows | README 部署、CHANGELOG | `windows_first_boot`、`windows_deploy_timeout` |
 | TRN-01 | `src/ssh.rs:89-104,571-630` | ssh/machine/utils | README 传输/限制、CHANGELOG | `windows_transport`、`windows_pool` |
 | EXE-01 | `src/machine.rs:495-516` | machine/ssh | README exec、CHANGELOG | `windows_exec` |
 | IP-01 | `src/ssh.rs:831-841` | ssh/machine | README get_ip、CHANGELOG | `windows_get_ip` |
@@ -1011,12 +1031,14 @@
 | 命令/路径与 POSIX 专属接口静默失败 | 高 | 明确支持矩阵、unsupported 错误、真实往返测试 | EXE-01/FS-01 |
 | 共享文件并发冲突 | 中 | 全串行、逐卡状态时间与写集序列化 | 全部 |
 | Linux 回归 | 高 | 默认 Linux、focused + 全量回归 | 全部实现卡/REL-01 |
+| Windows 首启部署超过默认超时，部署证据取不到 | 高 | SPK-02 实测首启时长；OSX-03 参数化部署超时并在 README 写明推荐值，超时返回可操作错误 | SPK-02/OSX-03 |
+| Windows 客户机最低资源与默认资源冲突 | 中 | OSX-02 评估默认资源、README 写最低/推荐值，不足时收缩矩阵或调整默认 | OSX-02 |
 
 ## 性能与容量摘要
 
 | 操作 | 单次成本 | 累积成本 | 预算/上限 | 验证 |
 |---|---|---|---|---|
-| Windows 首启 | O(overlay + seed + 实际部署)，仅 KVM 计时 | 每 VM 独立固件/TPM 状态 | ssh_timeout 有界；记录实测，不设未验证阈值 | firmware/first_boot 冒烟 |
+| Windows 首启 | O(overlay + seed + 实际部署)，仅 KVM 计时 | 每 VM 独立固件/TPM 状态 | 部署等待超时参数化（OSX-03）；记录实测，不设未验证阈值 | firmware/first_boot 冒烟 |
 | 地址发现/连接 | 有界轮询，O(实际 lease/端点数) | 双机不共享重试状态 | 总耗时 ≤ ssh_timeout | transport/pool 与超时负测试 |
 | 文件递归 | O(实际目录项 + 文件字节) | 不重复扫描 | cancel 可中断，无额外全树扫描 | windows_files |
 | hash 流式校验 | O(n) | O(n) | 无回归 | `cargo bench --bench hash_benchmark` |
@@ -1037,8 +1059,8 @@
 
 | 任务 | UTC 时间 | 环境与 sanitized 输入 | 命令/检查与结果 | Review | 发布/远端证据 |
 |---|---|---|---|---|---|
-| SPK-01 | pending | pending | pending | pending | N/A |
-| SPK-02 | pending | pending | pending | pending | N/A |
+| SPK-01 | 2026-11-12 07:45:12 UTC | 宿主机审计：Linux x86_64、`/dev/kvm` 存在；`qemu-system-x86_64`/`qemu-img`/`swtpm`/`xorriso`/`virsh`/`qemu-bridge-helper`/OVMF 均缺失；`sudo -n` 需密码；无 Windows qcow2（DEP-01/02 均不可用） | 未执行：无可用 Windows VM，无法取得连接/鉴权/SFTP 证据 | `blocked`（DEP-01/DEP-02） | N/A |
+| SPK-02 | 2026-11-12 07:45:12 UTC | 同上（无 QEMU/OVMF/swtpm，无 Windows 镜像） | 未执行：无可用 Windows VM，无法取得首启/重启证据 | `blocked`（DEP-01/DEP-02） | N/A |
 | OSX-01 | pending | pending | pending | pending | 继承 REL-01 |
 | OSX-02 | pending | pending | pending | pending | 继承 REL-01 |
 | OSX-03 | pending | pending | pending | pending | 继承 REL-01 |
@@ -1057,6 +1079,8 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R1 | 三份文件、全部任务卡与当前源码 | FAIL | P1-01~P1-10；R2 已复核关闭 | 无 residual risk | 当前源码锚点、R1 修订历史 |
 | R2 | R1 修订、执行门与安全路径 | FAIL | P1-11~P1-14；R3 已复核关闭 | 无 residual risk | 逐卡 T-1/AC-VER 复核、host-key provisioning 检查 |
 | R3 | 三份文件最终一致性复审 | PASS | 无开放项；P1-01~P1-14 全部关闭 | 无 residual risk | 自动校验 PASS：10 任务/10 状态行、依赖无环、AC/VER 与审计一致、T-1/T-2 全量门齐全、表格/链接/现有锚点有效；人工语义复核通过 |
+| R4 | P2 缺口修订（OSX-02 资源默认值、OSX-03 部署超时） | PASS | 无开放项；GAP-08/09 已修复 | 无 residual risk | 审计表重算：`OSX-02` AC=8/8、VER=5/8；`OSX-03` AC=8/8、VER=7/8（均在上限内）；追溯表补 `windows_deploy_timeout`；风险表新增两行；事实基线/性能摘要同步；plan-status 状态与时间戳同步；新增 AC 不扩大行为轴、不引入新依赖 |
+| R5 | 环境消歧（DEP-01/DEP-02 不可用）与依赖边重排 | PASS | 无开放项；spike 阻塞已登记，ADR 临时接受已写明 revisit 条件 | 残余风险：Windows 实测证据缺失（由 `SPK-01`/`SPK-02` 与 `REL-01` 阻塞承载），具名接受人=计划 Owner | 审计命令输出（`command -v` 全缺、`sudo -n` 需密码、`/dev/kvm` 存在）；依赖图无环复核；`SPK-02 -> OSX-01` 取消理由=OSX-01 无 Phase 0 输入；粒度审计表 deps 列同步 |
 
 ### R1 findings 与修订对照
 
