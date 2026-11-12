@@ -132,6 +132,7 @@
 | 2026-11-12 21:45:00 UTC | review R20（一次性部署的可观测性） | F26：`windows_transport` 只断言 `spawn` 后能执行命令，未验证「部署后 seed 介质已删除」「host key 跨重启不变」「二次 `init` 被拒绝」这三条 OSX-03 AC；其中「seed 已删除」此前只有宿主私有路径可查、无公开可观测面。利用 `init` 对已部署 Windows 的拒绝（`deploy_seed.is_none()` 即 seed 已被 take+remove）作为公开观测量，补 3 条断言（`aa7fc0e`） | N/A（不新增卡、不加公开 API） | `OSX-03`/`TRN-01` 实现证据、Review log、`tests/windows_machine.rs` |
 | 2026-11-12 22:15:00 UTC | review R21（迁移说明与 CHANGELOG 一致性） | F27：README「0.3.x → 0.4.0」写着「Linux runtime behavior are unchanged」，但 CHANGELOG `Fixed` 已记录两处 Linux 运行时行为变化（`exec` 退出码换算修复、空命令拒绝），迁移说明与事实矛盾。改为「破坏仅源码级」并新增「两处 Linux 运行时行为变化」小节，写明需要调用方适配的内容（`943daa0`）；随后自查发现初稿多写了一条第 `upload`/`download` 绝对目的地的断言，但该路径走 `guest_path_from` 而非 `join`，不是错误，已撤回该句（`8365972`） | N/A（不新增卡） | `REL-01` Current evidence、Review log、`README.md`、`CHANGELOG.md` |
 | 2026-11-12 10:20:00 UTC | review R22（CI 门实际执行与远端证据） | F28（R18 登记项落地）：`.github/workflows/check-and-test.yml` 的 test job 只有 `cargo test --no-run`（单测从未在 CI 执行）、clippy 缺 `--all-targets --all-features`（测试与 bench 不被 lint）、workflow 只在 `pull_request` 触发且 `paths-ignore` 忽略自身，故直推 `main` 的 57 个提交一次 CI 都没有。改为 `push`（`main`）+ `pull_request` 双触发、clippy 全 target/all features、新增 `cargo test --lib` 与 rustdoc 门、不再忽略 `.github/**`（`4d4d1e9`）；推后取得真实远端运行证据：run `43197579979`、event=`push`、ref=`refs/heads/main`、commit=`4d4d1e9`，4 个 job 全绿，CI 日志中 `running 85 tests` / `test result: ok. 85 passed` 证明单测确实被执行 | N/A（不新增卡；落地 `REL-01` AC-04 的 CI 部分，发布动作仍阻塞） | 事实基线 CI 行、门禁说明、`REL-01` Current evidence/AC-04、Review log、实施证据汇总、`.github/workflows/check-and-test.yml`、plan-status |
+| 2026-11-12 10:35:00 UTC | review R23（发布打包前置检查） | F29：`cargo package --allow-dirty --no-verify` 打包成功但警告 `crypto-bigint v0.7.5`（经 russh→rsa→crypto-primes 间接依赖）在 crates.io 已 yanked；发布点留下的锁文件会带着被撤回的依赖，接手者安装时只能看到警告。patch 级更新锁文件 `crypto-bigint 0.7.5 → 0.7.11`（连带 `ctutils 0.4.2 → 0.4.8`），无 manifest/API 变更（`bf83b3c`）；CI run `43198568379`（push/`main`）四 job 全绿；`cargo package` 现打包 27 个文件、598.4KiB，无 yanked 警告。同时勾选「兼容与文档收口」的 CI 项（R22 已落地） | N/A（不新增卡；`Cargo.lock` 属 `REL-01` write set，但为发布前置的依赖卫生，非发布动作） | `REL-01` Current evidence、Review log、实施证据汇总、兼容与文档收口、`Cargo.lock`、plan-status |
 
 ## 已决议设计决策
 
@@ -1047,6 +1048,7 @@
 | CI 已对齐静态门并双触发（R22）：run `43197579979`，event=`push`，ref=`refs/heads/main`，commit=`4d4d1e9`，`Setup and Cache`/`Rustfmt Check`/`Clippy Check`/`Cargo Test` 4 job 全绿；`Cargo Test` 日志 `running 85 tests` → `test result: ok. 85 passed` | `https://github.com/buck2hub/qlean/actions/runs/43197579979`；`.github/workflows/check-and-test.yml:1-8,78-83,106-112` |
 | CHANGELOG Unreleased/0.3.1 | `CHANGELOG.md:8-24` |
 | README 迁移节已按 CHANGELOG 校正（源码级破坏 + 两处 Linux 运行时变化，R21） | `README.md:503-536` |
+| 打包前置：`cargo package --allow-dirty --no-verify` 通过，27 个文件 / 598.4KiB；锁文件已脱离 yanked 的 `crypto-bigint`（R23，`Cargo.lock`） | `Cargo.lock`；run `43198568379`（push/`main`/`bf83b3c`，全绿） |
 
 
 | 发布前阻塞项（2026-11-12） | 状态 |
@@ -1190,7 +1192,7 @@
 
 - [ ] README Host Setup/API/Migration/示例/支持矩阵与各 unsupported 接口已同步。
 - [ ] CHANGELOG 按 Keep a Changelog 写入 `[0.4.0]` Added/Changed/Migration。
-- [ ] CI push/PR 触发与 format/clippy/test 命令已同步。
+- [x] CI push/PR 触发与 format/clippy/test 命令已同步（R22：`push`(main)+`pull_request` 双触发、clippy `--all-targets --all-features`、`cargo test --lib`、`cargo test --no-run --all-targets`、rustdoc 门；run `43197579979` 全绿）。
 - [ ] `tests/INDEX.md` 当前不存在，`N/A`。
 - [ ] LICENSE 未改动。
 
@@ -1211,7 +1213,7 @@
 | EXE-01 | 2026-11-12 12:10:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_exec`（5 passed）、`cargo test --no-run` 全绿 | `windows_exec` 真实 PowerShell 冒烟未取得（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | R6 PASS：核对 `exit_status_from_code` 高位映射、`0..=255` 外拒绝、空命令拒绝、README 契约与 CHANGELOG `Fixed`；R7 修掉空命令错误文案里的多余空格（`c14b915`） | `64b1046` |
 | IP-01 | 2026-11-12 12:50:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_ip`（6 passed）、`cargo test --no-run` 全绿 | `windows_get_ip` 与双机一致性未取得（DEP-01/02 不可用） | `in-progress` / `locally-accepted` | R6 PASS：核对缓存优先、按本 VM MAC 精确选择、0/多结果报错不回落到他机 lease；无遗留问题 | `eb8fd90` |
 | FS-01 | 2026-11-12 13:20:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_path`（10 passed）、`cargo test --lib windows`（39 passed）、`cargo test --lib`（79 passed）、`cargo test --no-run` 全绿 | `windows_files` 与 Linux 文件回归未取得（DEP-01/02、DEFER-04） | `in-progress` / `locally-accepted` | R6 PASS：核对 `GuestPath` 校验/规范化/`join`/`ancestors`/`strip_prefix`、所有 SFTP 入口改造、`copy` 去 POSIX `cp`、unsupported 分支；F2（Review 列语义）与 F3（`join` 不可达分支）本轮修复；R10 修复 `copy` 的 PowerShell 二次解析（`ec6a9a1`） | `443ec5d` |
-| REL-01 | 2026-11-12 10:20:00 UTC | 未执行发布动作；仅完成 CI 静态门对齐（R22） | `SPK-01`/`SPK-02` 与全部真实 Windows KVM 冒烟 `blocked`（DEP-01/02）；Linux 全量门 `blocked`（DEFER-04）；CI 门已对齐并取得真实运行：run `43197579979`（event=`push`, ref=`refs/heads/main`, commit=`4d4d1e9`）4 job 全绿，`cargo test --lib` 85 passed、`cargo test --no-run --all-targets` 通过、clippy `--all-targets --all-features` 0 告警、rustdoc `-D warnings` 通过 | `blocked` / 空 | blocked（发布 review 未开始；AC-04 的 CI 部分已在 R22 关闭） | run `43197579979`（push/`main`/`4d4d1e9`，全绿） |
+| REL-01 | 2026-11-12 10:20:00 UTC | 未执行发布动作；仅完成 CI 静态门对齐（R22） | `SPK-01`/`SPK-02` 与全部真实 Windows KVM 冒烟 `blocked`（DEP-01/02）；Linux 全量门 `blocked`（DEFER-04）；CI 门已对齐并取得真实运行：run `43197579979`（event=`push`, ref=`refs/heads/main`, commit=`4d4d1e9`）4 job 全绿，`cargo test --lib` 85 passed、`cargo test --no-run --all-targets` 通过、clippy `--all-targets --all-features` 0 告警、rustdoc `-D warnings` 通过 | `blocked` / 空 | blocked（发布 review 未开始；AC-04 的 CI 部分已在 R22 关闭） | run `43197579979`（push/`main`/`4d4d1e9`）与 run `43198568379`（push/`main`/`bf83b3c`）均四 job 全绿；`cargo package` 通过（27 文件/598.4KiB，无 yanked 警告） |
 
 ## Review log
 
@@ -1241,6 +1243,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R20 | 一次性部署的可观测性 | PASS | 无开放项 | `windows_transport` 的 `spawn` 段只证明「能连上并执行」，而 OSX-03 还要求部署后 seed 清理、host key 跨重启保持、二次 `init` 拒绝；seed 删除本身没有公开访问器，直接查宿主 run 目录会侵入私有实现 | 用公开行为观测：`spawn` 后 `ssh_host_key()` 仍等于首次 pin 的 key；随后 `init()` 必须报 `already completed its Windows first-boot deployment`（该错误仅在 `deploy_seed` 被 take+remove 后出现，且 `init` 在改动任何状态前返回）（`aa7fc0e`）；门禁 fmt/clippy/`cargo test --lib` 85 passed/`--no-run --all-targets` 全绿 |
 | R21 | 迁移说明与 CHANGELOG 一致性 | PASS | 无开放项 | README 迁移节声称 Linux 运行时行为未变，与 CHANGELOG `Fixed` 的两条（`Machine::exec` 退出码换算、空命令拒绝）直接矛盾；首次修订又多写了「绝对 `upload`/`download` 目的地报错」，该路径实际走 `guest_path_from`，`GuestPath::join` 的绝对子路径修复只影响内部调用（`local_basename`/`rel` 永远相对），故用户可见影响为零 | README 改写为「源码级破坏 + 两处运行时行为变化」并列出适配动作（`943daa0`），撤回不准确的第三条（`8365972`）；核对后 CHANGELOG `Added`/`Changed`/`Fixed` 三类 40+ 条与本轮实现一一对应，无失实条目 |
 | R22 | CI 门实际执行与远端证据 | PASS | 无开放项 | R18 登记的缺口：CI 只编译不运行（85 个单测从不在 CI 执行）、clippy 未覆盖测试/bench 代码、workflow 只在 PR 触发而本仓库直推 `main`（57 个提交零 CI 记录），且 `paths-ignore` 忽略 `.github/**` 使 workflow 改动无法自证 | workflow 改为 push(main)+PR 双触发、clippy `--all-targets --all-features`、新增 `cargo test --lib` 与 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、去掉对 `.github/**` 的忽略（`4d4d1e9`）；推后真实运行 run `43197579979`（event=`push`, ref=`refs/heads/main`, commit=`4d4d1e9`）4 job 全绿，日志含 `running 85 tests` → `test result: ok. 85 passed` |
+| R23 | 发布打包前置检查 | PASS | 无开放项 | 发布点从未验证过打包产物：`cargo package` 暴露锁文件含已 yanked 的 `crypto-bigint v0.7.5`（russh→rsa→crypto-primes 传递依赖），而仓库其它门（fmt/clippy/rustdoc/单测）都不会报出这一点 | `cargo update -p crypto-bigint` 升到 0.7.11（连带 ctutils 0.4.8），本地全门重跑（fmt/clippy/rustdoc/`cargo test --lib` 85 passed/`--no-run --all-targets`）全绿，`cargo package` 不再有 yanked 警告；CI run `43198568379`（push/`main`/`bf83b3c`）四 job 全绿 |
 
 ### R1 findings 与修订对照
 
