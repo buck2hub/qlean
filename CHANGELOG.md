@@ -36,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A DHCP lease lookup where `virsh net-dhcp-leases` never succeeded was reported as "the guest may still be booting", so an unreachable or unreadable libvirt sent the reader to the wrong machine after the full budget; the timeout now says the lease table could not be read, keeps `virsh`'s own message, and only speculates about the guest when a listing actually succeeded
 - Each `virsh net-dhcp-leases` call in the lease poll is now capped by what is left of the lookup budget, so a wedged libvirtd can no longer outlive the deadline by hanging inside one call; the bounded-run helper is shared with the seed ISO build instead of existing twice
 - Every external command on the launch, network and prerequisite paths (`qemu-img`, `xorriso`, all `virsh` calls, `--version` probes) is now bounded and killed at its budget, so a wedged host tool fails the launch instead of hanging it; a source guard keeps new unbounded `.output().await` calls out
+- A prerequisite that hangs is now reported as installed-but-blocked instead of missing, so the advice that comes with a failed probe matches what actually went wrong
 
 ### Changed
 

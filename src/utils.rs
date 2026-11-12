@@ -50,25 +50,80 @@ const VIRSH_CALL_BUDGET: std::time::Duration = std::time::Duration::from_secs(60
 /// How long a prerequisite probe (`<program> --version`) may take.
 const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Why a bounded run produced no output.
+///
+/// Kept as a type rather than a string so callers can tell the two failures apart: "could not
+/// start it" is a missing dependency, while "killed it at the deadline" is a blocked one, and
+/// the two need opposite advice.
+pub(crate) enum BoundedFailure {
+    /// The program never started.
+    NotRun(anyhow::Error),
+    /// The program was still running at the deadline and was killed.
+    Killed {
+        /// Name of the program that was killed.
+        program: String,
+        /// The budget it exceeded.
+        budget: std::time::Duration,
+        /// What the caller was trying to do.
+        what: String,
+    },
+}
+
+impl std::fmt::Display for BoundedFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotRun(error) => write!(formatter, "{error}"),
+            Self::Killed {
+                program,
+                budget,
+                what,
+            } => write!(
+                formatter,
+                "`{program}` did not finish within {budget:?} while trying to {what}; \
+                 the process was killed"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Debug for BoundedFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, formatter)
+    }
+}
+
 /// Run `cmd` and collect its output, but never wait longer than `budget`.
 ///
 /// A budget that does not also end the child process is not a budget: `kill_on_drop`
 /// kills it when the output future is dropped at the deadline, so nothing keeps running
 /// (and writing the file it was told to write) after the caller gave up.
-pub(crate) async fn bounded_output(
+pub(crate) async fn run_bounded(
     mut cmd: tokio::process::Command,
     budget: std::time::Duration,
     what: &str,
-) -> Result<std::process::Output> {
+) -> std::result::Result<std::process::Output, BoundedFailure> {
     let program = cmd.as_std().get_program().to_string_lossy().into_owned();
     cmd.kill_on_drop(true);
     match tokio::time::timeout(budget, cmd.output()).await {
-        Ok(output) => Ok(output?),
-        Err(_) => bail!(
-            "`{program}` did not finish within {budget:?} while trying to {what}; \
-             the process was killed"
-        ),
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => Err(BoundedFailure::NotRun(error.into())),
+        Err(_) => Err(BoundedFailure::Killed {
+            program,
+            budget,
+            what: what.to_string(),
+        }),
     }
+}
+
+/// `run_bounded`, flattened into `anyhow` for the callers that only report the failure.
+pub(crate) async fn bounded_output(
+    cmd: tokio::process::Command,
+    budget: std::time::Duration,
+    what: &str,
+) -> Result<std::process::Output> {
+    run_bounded(cmd, budget, what)
+        .await
+        .map_err(|failure| anyhow::anyhow!("{failure}"))
 }
 
 /// Normalize a MAC address for comparison (`-`, `:` and case are not significant).
@@ -570,6 +625,8 @@ enum ProgramProbe {
     Missing(String),
     /// The program exists but `--version` failed, so the installation is broken.
     Broken(String),
+    /// The program exists but did not answer `--version` inside the probe budget.
+    Unusable(String),
 }
 
 /// Turn probe results into the lines of a single aggregated error.
@@ -587,6 +644,13 @@ fn program_problems(probes: &[(&str, ProgramProbe)]) -> Vec<String> {
             ProgramProbe::Broken(status) => Some(format!(
                 "`{program}` is installed but `{program} --version` failed ({status}): the installation looks broken"
             )),
+            // A program that hangs is installed: telling the user to install it sends them
+            // to the wrong problem, and the missing/broken cases above already cover the
+            // reasons it would genuinely be absent.
+            ProgramProbe::Unusable(reason) => Some(format!(
+                "`{program}` did not answer `{program} --version` ({reason}): it is installed but blocked, so \
+                 check what it is waiting on (a stale lock, an unreachable mount) instead of reinstalling it"
+            )),
         })
         .collect()
 }
@@ -597,11 +661,14 @@ async fn check_commands_available(programs: &[&'static str]) -> Vec<String> {
     for program in programs {
         let mut probe_command = tokio::process::Command::new(program);
         probe_command.arg("--version");
-        let probe = match bounded_output(probe_command, PROBE_BUDGET, "probe the program").await {
+        let probe = match run_bounded(probe_command, PROBE_BUDGET, "probe the program").await {
             Ok(output) if output.status.success() => ProgramProbe::Available,
             // A program that cannot run `--version` is not usable, even if it exists.
             Ok(output) => ProgramProbe::Broken(output.status.to_string()),
-            Err(error) => ProgramProbe::Missing(error.to_string()),
+            Err(failure @ BoundedFailure::Killed { .. }) => {
+                ProgramProbe::Unusable(failure.to_string())
+            }
+            Err(BoundedFailure::NotRun(error)) => ProgramProbe::Missing(error.to_string()),
         };
         probes.push((*program, probe));
     }
@@ -997,6 +1064,54 @@ mod tests {
                 "src/{name} awaits a child process without a budget; use `bounded_output`"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_run_bounded_separates_a_missing_program_from_a_hung_one() {
+        // These two failures need opposite advice, so they must not arrive as one variant:
+        // a missing program is installed, a hung one is waiting on something.
+        let missing = run_bounded(
+            tokio::process::Command::new("/nonexistent/qlean-probe"),
+            std::time::Duration::from_secs(1),
+            "probe",
+        )
+        .await
+        .expect_err("a program that is not on PATH cannot produce output");
+        assert!(
+            matches!(missing, BoundedFailure::NotRun(_)),
+            "expected NotRun, got {missing}"
+        );
+
+        let mut hung = tokio::process::Command::new("/bin/sleep");
+        hung.arg("30");
+        let killed = run_bounded(hung, std::time::Duration::from_millis(150), "probe")
+            .await
+            .expect_err("sleep 30 cannot answer inside 150ms");
+        assert!(
+            matches!(killed, BoundedFailure::Killed { .. }),
+            "expected Killed, got {killed}"
+        );
+        assert!(killed.to_string().contains("/bin/sleep"), "{killed}");
+    }
+
+    #[test]
+    fn test_program_problems_does_not_tell_the_user_to_reinstall_a_hung_program() {
+        let probes = [(
+            "virsh",
+            ProgramProbe::Unusable(
+                "`virsh` did not finish within 10s while trying to probe the program".to_string(),
+            ),
+        )];
+        let problems = program_problems(&probes);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        let message = &problems[0];
+        assert!(message.contains("`virsh`"), "{message}");
+        assert!(message.contains("blocked"), "{message}");
+        assert!(!message.contains("was not found"), "{message}");
+        assert!(
+            !message.contains("install it and try again"),
+            "a hung program is already installed: {message}"
+        );
     }
 
     #[tokio::test]
