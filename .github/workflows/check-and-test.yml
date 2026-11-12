@@ -1,7 +1,9 @@
 on:
+  push:
+    branches:
+      - main
   pull_request:
     paths-ignore:
-      - '.github/**'
       - 'docs/**'
       - 'README.md'
 
@@ -74,7 +76,12 @@ jobs:
           cache-directories: ./target
 
       - name: Run cargo clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Check rustdoc
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   test:
     name: Cargo Test
@@ -96,5 +103,10 @@ jobs:
           cache-workspaces: .
           cache-directories: ./target
 
-      - name: Run tests
-        run: cargo test --no-run
+      - name: Run unit tests
+        run: cargo test --lib
+
+      # Integration tests need a KVM host, so CI only proves they compile; the
+      # Windows ones are additionally #[ignore]d and need a licensed qcow2.
+      - name: Compile all targets
+        run: cargo test --no-run --all-targets
