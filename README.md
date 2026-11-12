@@ -138,6 +138,12 @@ Windows guests have no vsock, so Qlean reaches them over the libvirt NAT network
   vhost-vsock can still run Windows guests.
 - **Pool isolation.** Each VM gets its own MAC address, DHCP lease, seed medium and host
   key, so pool members never share an address or a pinned key.
+- **`get_ip` returns the address Qlean actually used.** For Windows guests
+  `Machine::get_ip` returns the address discovered for the transport (cached after the
+  first connection). A re-query runs PowerShell inside the guest and keeps only the
+  address whose MAC matches the VM's own MAC, so it can never return another VM's lease;
+  a missing or ambiguous answer is an error instead of a guess. Linux guests keep the
+  existing in-guest query.
 - **Interactive PTY shells are not supported for Windows guests.**
   `Machine::open_interactive_shell` returns an actionable error instead of opening a
   half-configured session; use `exec` for commands and SFTP for file transfer.

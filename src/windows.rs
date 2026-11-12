@@ -58,6 +58,80 @@ pub(crate) const SSH_PORT: u16 = 22;
 /// (those arrive with the `exec` shell abstraction).
 pub(crate) const READINESS_COMMAND: &str = "cmd /c ver";
 
+/// PowerShell query returning `<mac> <address>` pairs for the guest's adapters.
+///
+/// Only IPv4 addresses of adapters that are actually up are reported, and loopback and
+/// APIPA (`169.254.0.0/16`) addresses are excluded so a link-local address cannot be
+/// mistaken for the leased one.
+pub(crate) const GUEST_IP_QUERY: &str = "%ErrorActionPreference='Stop'; Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | ForEach-Object { $mac = $_.MacAddress; Get-NetIPAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } | ForEach-Object { '{0} {1}' -f $mac, $_.IPAddress } }";
+
+/// Normalize a MAC address for comparison (`-`, `:` and case are not significant).
+pub(crate) fn normalize_mac(mac: &str) -> String {
+    mac.chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// Parse `<mac> <address>` lines reported by [`GUEST_IP_QUERY`].
+///
+/// Unparseable lines are skipped instead of failing the whole query: PowerShell may
+/// emit warnings or blank lines alongside the pairs.
+pub(crate) fn parse_adapter_addresses(output: &str) -> Vec<(String, std::net::IpAddr)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let mac = parts.next()?;
+            let addr = parts.next()?;
+            let ip = addr.parse::<std::net::IpAddr>().ok()?;
+            Some((normalize_mac(mac), ip))
+        })
+        .collect()
+}
+
+/// Pick the address that belongs to `mac`, refusing to guess.
+///
+/// Qlean assigns one MAC per VM, so a Windows guest must report exactly one address for
+/// its own MAC. Zero matches means the guest has no usable IPv4 address; more than one is
+/// ambiguous (multiple NICs, or a stale address). Neither case may silently fall back to
+/// another VM's lease.
+pub(crate) fn select_guest_address(
+    addresses: &[(String, std::net::IpAddr)],
+    mac: &str,
+) -> Result<std::net::IpAddr> {
+    let expected = normalize_mac(mac);
+    let mut matches = addresses
+        .iter()
+        .filter(|(reported_mac, _)| *reported_mac == expected)
+        .map(|(_, ip)| *ip);
+
+    let Some(first) = matches.next() else {
+        let seen = addresses
+            .iter()
+            .map(|(reported_mac, ip)| format!("{reported_mac}={ip}"))
+            .collect::<Vec<_>>();
+        anyhow::bail!(
+            "Windows guest did not report an IPv4 address for MAC {mac} (reported: {seen:?}).\n\
+             Check that the guest brought up its virtio network adapter and received a lease."
+        );
+    };
+
+    if matches.next().is_some() {
+        let candidates = addresses
+            .iter()
+            .filter(|(reported_mac, _)| *reported_mac == expected)
+            .map(|(_, ip)| ip.to_string())
+            .collect::<Vec<_>>();
+        anyhow::bail!(
+            "Windows guest reported several IPv4 addresses for MAC {mac} ({candidates:?}); \
+             cannot decide which one is the leased address."
+        );
+    }
+
+    Ok(first)
+}
+
 /// Default budget for the first-boot deployment.
 ///
 /// This is deliberately independent of the Linux SSH connect budget (180s on KVM,
@@ -400,6 +474,70 @@ mod tests {
             ..MachineConfig::default()
         };
         assert_eq!(deploy_timeout(&overridden), Duration::from_secs(45));
+    }
+
+    #[test]
+    fn windows_ip_parses_adapter_pairs() {
+        let output = "52-54-00-AA-BB-CC 192.168.221.42\r\n52-54-00-11-22-33 192.168.221.43\n";
+        let addresses = parse_adapter_addresses(output);
+        assert_eq!(addresses.len(), 2);
+        assert_eq!(addresses[0].0, "525400aabbcc");
+        assert_eq!(addresses[0].1.to_string(), "192.168.221.42");
+        assert_eq!(addresses[1].0, "525400112233");
+    }
+
+    #[test]
+    fn windows_ip_parser_skips_noise_and_unparseable_lines() {
+        let output = "WARNING: something\n\nnot-an-address\n52:54:00:aa:bb:cc 192.168.221.42\n";
+        let addresses = parse_adapter_addresses(output);
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(addresses[0].0, "525400aabbcc");
+        assert_eq!(addresses[0].1.to_string(), "192.168.221.42");
+    }
+
+    #[test]
+    fn windows_ip_selects_only_the_matching_mac() {
+        let output = "52-54-00-11-22-33 192.168.221.43\n52-54-00-AA-BB-CC 192.168.221.42\n";
+        let addresses = parse_adapter_addresses(output);
+        let selected = select_guest_address(&addresses, "52:54:00:aa:bb:cc").unwrap();
+        assert_eq!(selected.to_string(), "192.168.221.42");
+    }
+
+    #[test]
+    fn windows_ip_without_own_address_is_an_actionable_error() {
+        // Only another VM's address was reported: never fall back to it.
+        let output = "52-54-00-11-22-33 192.168.221.43\n";
+        let addresses = parse_adapter_addresses(output);
+        let err = select_guest_address(&addresses, "52:54:00:aa:bb:cc")
+            .expect_err("another VM's address must not be reused")
+            .to_string();
+        assert!(err.contains("52:54:00:aa:bb:cc"), "{err}");
+        assert!(err.contains("did not report an IPv4 address"), "{err}");
+        // The leases that were seen are listed to make the failure debuggable, but they
+        // are never returned as this VM's address.
+        assert!(err.contains("525400112233=192.168.221.43"), "{err}");
+        assert!(err.contains("virtio network adapter"), "{err}");
+    }
+
+    #[test]
+    fn windows_ip_multiple_addresses_for_one_mac_are_ambiguous() {
+        let output = "52-54-00-AA-BB-CC 192.168.221.42\n52-54-00-AA-BB-CC 169.254.10.20\n";
+        let addresses = parse_adapter_addresses(output);
+        let err = select_guest_address(&addresses, "52:54:00:aa:bb:cc")
+            .expect_err("multiple addresses must not be resolved by guessing")
+            .to_string();
+        assert!(err.contains("several IPv4 addresses"), "{err}");
+        assert!(err.contains("192.168.221.42"), "{err}");
+        assert!(err.contains("169.254.10.20"), "{err}");
+    }
+
+    #[test]
+    fn windows_ip_query_excludes_loopback_and_apipa() {
+        // The PowerShell query itself must not offer loopback/link-local candidates.
+        assert!(GUEST_IP_QUERY.contains("127.*"));
+        assert!(GUEST_IP_QUERY.contains("169.254.*"));
+        assert!(GUEST_IP_QUERY.contains("Get-NetIPAddress"));
+        assert!(!GUEST_IP_QUERY.contains("hostname -I"));
     }
 
     #[test]

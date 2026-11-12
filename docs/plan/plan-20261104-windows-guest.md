@@ -836,7 +836,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（A 实现与 B 本地门已过；C 真实 `windows_get_ip` 与双机一致性需 DEP-01/02，`blocked`）
 
 **Description:** 复用传输期发现的可信地址并提供 Windows 查询/校验路径，替换 Linux-only 硬编码。
 
@@ -848,20 +848,31 @@
 |---|---|
 | Linux 命令与 Machine IP 缓存 | `src/ssh.rs:831-841`、`src/machine.rs:791-800` |
 
+| 项 | 证据 |
+|---|---|
+| 缓存优先 | `Machine::get_ip` 先返回 `self.ip`（`TRN-01` 在连接成功后写入传输实际使用的 lease 地址），Windows 与 Linux 共用该快路径 |
+| Windows 重新查询 | `Machine::query_windows_ip` 通过 `windows::GUEST_IP_QUERY` 在 guest 内用 PowerShell 枚举 `Get-NetAdapter`（仅 `Status -eq 'Up'`）与 `Get-NetIPAddress -AddressFamily IPv4`，排除 `127.*` 与 `169.254.*`，绝不使用 `hostname -I` |
+| MAC 绑定与消歧 | `windows::normalize_mac` / `parse_adapter_addresses` / `select_guest_address`：只接受与本 VM MAC 精确匹配的单一地址；0 个结果报错并列出已见地址，多个结果报歧义错误，绝不回落到其它 VM 的 lease |
+| 错误路径 | PowerShell 退出码非 0 时返回含 `stderr` 的可操作错误；解析层丢弃告警/空行，不因噪声失败 |
+| 单测 | `src/windows.rs`：解析 MAC/地址对、噪声与非 IP 行、按 MAC 精确选择、无自身地址报错、同 MAC 多地址歧义、查询语句排除 loopback/APIPA（6 个，`cargo test --lib windows_ip` 可过滤） |
+| 集成测试（`#[ignore]`） | `tests/windows_machine.rs::windows_get_ip`：首查、缓存复读一致、双机地址互异 |
+| README/CHANGELOG | README「Windows transport and security」补 `get_ip` 语义；CHANGELOG Added |
+| 提交 | `COMMITHASH` |
+
 **Acceptance criteria:**
 
-- [ ] Windows 优先返回 `TRN-01` 已发现并与本 VM MAC/端点绑定的 DHCP 地址；需查询时使用 PowerShell 解析并校验结果，不能使用 `hostname -I`。
-- [ ] Linux 路径不变；无地址、多个地址无法消歧或查询失败时返回可操作错误，不能选其它 VM 的 lease。
-- [ ] `(new)` parser/选择单测与 Windows `get_ip` 冒烟覆盖缓存和重新查询；README 与 CHANGELOG 同卡更新。
-- [ ] 双机 `get_ip` 结果各自唯一且与传输实际使用地址一致。
+- [x] Windows 优先返回 `TRN-01` 已发现并与本 VM MAC/端点绑定的 DHCP 地址；需查询时使用 PowerShell 解析并校验结果，不能使用 `hostname -I`。——缓存命中直接返回；未命中走 `GUEST_IP_QUERY` 并按 MAC 校验。
+- [x] Linux 路径不变；无地址、多个地址无法消歧或查询失败时返回可操作错误，不能选其它 VM 的 lease。——Linux 分支仍用 `get_remote_ip`；Windows 的 0 结果/多结果/非 0 退出码均有专门错误（单测 3 个）。
+- [x] `(new)` parser/选择单测与 Windows `get_ip` 冒烟覆盖缓存和重新查询；README 与 CHANGELOG 同卡更新。——单测 6 个可执行；`windows_get_ip` 已编写但需 DEP-01/02，`blocked`。
+- [ ] 双机 `get_ip` 结果各自唯一且与传输实际使用地址一致。——`windows_get_ip` 已断言互异，执行需 DEP-01/02，`blocked`。
 
 **Verification:**
 
-- [ ] `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings`
-- [ ] `cargo test --lib windows_ip`
-- [ ] `cargo test --no-run`
-- [ ] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine windows_get_ip -- --ignored --exact --test-threads=1`
-- [ ] 双机地址一致性结果写入「实施证据汇总」。
+- [x] `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings`
+- [x] `cargo test --lib windows_ip`（6 passed）
+- [x] `cargo test --no-run`
+- [ ] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine windows_get_ip -- --ignored --exact --test-threads=1` —— `blocked`
+- [ ] 双机地址一致性结果写入「实施证据汇总」。——`blocked`
 
 **Full-suite trigger:** `none`（共享 helper 若改变则升级为 T-1 并重审）
 
@@ -869,11 +880,11 @@
 
 **Deliverables:** `N/A`
 
-**Implementation write set:** `src/ssh.rs`、`src/machine.rs`、`tests/windows_machine.rs`、`README.md`、`CHANGELOG.md`、本计划、`plan-status.md`
+**Implementation write set:** `src/windows.rs`、`src/machine.rs`、`tests/windows_machine.rs`、`README.md`、`CHANGELOG.md`、本计划、`plan-status.md`
 
 **Release write set:** `N/A`
 
-**Files likely touched:** `src/ssh.rs`, `src/machine.rs`, `tests/windows_machine.rs`, `README.md`, `CHANGELOG.md`
+**Files likely touched:** `src/windows.rs`, `src/machine.rs`, `tests/windows_machine.rs`, `README.md`, `CHANGELOG.md`
 
 **Docs and compatibility impact:** README `get_ip` Windows 语义；CHANGELOG Added。
 
@@ -1059,7 +1070,7 @@
 | OSX-03 | `src/machine.rs:181-464` | machine/windows | README 部署、CHANGELOG | `windows_first_boot`、`windows_deploy_timeout` |
 | TRN-01 | `src/ssh.rs:89-104,571-630` | ssh/machine/utils | README 传输/限制、CHANGELOG | `windows_transport`、`windows_pool` |
 | EXE-01 | `src/machine.rs:495-516` | machine/ssh/exec（新 `src/exec.rs`） | README exec、CHANGELOG | `windows_exec` |
-| IP-01 | `src/ssh.rs:831-841` | ssh/machine | README get_ip、CHANGELOG | `windows_get_ip` |
+| IP-01 | `src/ssh.rs:831-841` | windows/machine | README get_ip、CHANGELOG | `windows_get_ip` |
 | FS-01 | `src/machine.rs:578-775,922-1137` | machine/ssh/windows | README 文件矩阵、CHANGELOG | `windows_files` |
 | REL-01 | Cargo/CHANGELOG/CI | 版本与 CI | CHANGELOG 0.4.0/Release | 全量与远端门 |
 
@@ -1129,7 +1140,7 @@
 | OSX-03 | 2026-11-12 10:20:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_deploy`（7 passed）、`cargo test --lib windows_deploy_timeout`（2 passed）、`cargo test --no-run` 全绿 | `windows_first_boot` 与首启/重启 seed 清理证据未取得（需 `TRN-01` + DEP-01/02），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `8812fb4` |
 | TRN-01 | 2026-11-12 11:40:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib ssh`（5 passed）、`cargo test --lib utils`（4 passed）、`cargo test --no-run`（含 `windows_transport`/`windows_pool`）全绿 | `windows_transport`/`windows_pool` 与真实 spawn 重连证据未取得（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `64b1046` |
 | EXE-01 | 2026-11-12 12:10:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_exec`（5 passed）、`cargo test --no-run` 全绿 | `windows_exec` 真实 PowerShell 冒烟未取得（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | `64b1046` |
-| IP-01 | pending | pending | pending | pending | 继承 REL-01 |
+| IP-01 | 2026-11-12 12:50:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_ip`（6 passed）、`cargo test --no-run` 全绿 | `windows_get_ip` 与双机一致性未取得（DEP-01/02 不可用） | `in-progress` / `locally-accepted` | `COMMITHASH` |
 | FS-01 | pending | pending | pending | pending | 继承 REL-01 |
 | REL-01 | pending | pending | pending | pending | pending |
 

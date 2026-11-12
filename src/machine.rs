@@ -950,13 +950,38 @@ StandardError=journal
     /// Get the IP address of the machine.
     pub async fn get_ip(&mut self) -> Result<String> {
         if let Some(ip) = &self.ip {
-            Ok(ip.to_owned())
+            return Ok(ip.to_owned());
+        }
+
+        let ip = if self.image.guest_os == GuestOs::Windows {
+            // Windows guests are reached over the NAT network: the address Qlean used for
+            // the transport is the authoritative one, and a re-query must confirm the same
+            // MAC instead of falling back to `hostname -I` or another VM's lease.
+            self.query_windows_ip().await?
         } else {
             let (ssh, _) = self.get_ssh()?;
-            let ip = ssh.get_remote_ip().await?;
-            self.ip = Some(ip.to_owned());
-            Ok(ip)
+            ssh.get_remote_ip().await?
+        };
+        self.ip = Some(ip.to_owned());
+        Ok(ip)
+    }
+
+    /// Ask a Windows guest for its own address and match it against this VM's MAC.
+    async fn query_windows_ip(&mut self) -> Result<String> {
+        let (ssh, cancel_token) = self.get_ssh()?;
+        let (code, stdout, stderr) = ssh
+            .call_with_output(windows::GUEST_IP_QUERY, cancel_token)
+            .await?;
+        if code != 0 {
+            bail!(
+                "failed to query the Windows guest address (exit code {code}): {}",
+                String::from_utf8_lossy(&stderr).trim()
+            );
         }
+
+        let addresses = windows::parse_adapter_addresses(&String::from_utf8_lossy(&stdout));
+        let ip = windows::select_guest_address(&addresses, &self.mac_address)?;
+        Ok(ip.to_string())
     }
 
     /// Check if the machine is currently running.

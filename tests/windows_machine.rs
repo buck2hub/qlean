@@ -251,3 +251,34 @@ async fn windows_exec() -> Result<()> {
     vm.shutdown().await?;
     Ok(())
 }
+
+/// `get_ip` for Windows guests: the transport's address is cached, and a fresh query must
+/// match this VM's own MAC rather than another pool member's lease.
+#[tokio::test]
+#[ignore = "needs a licensed Windows image (DEP-01) and a Windows KVM host (DEP-02)"]
+#[serial]
+async fn windows_get_ip() -> Result<()> {
+    tracing_subscriber_init();
+
+    let image = Image::new(windows_image_config()?).await?;
+    let mut vm = Machine::new(&image, &MachineConfig::default()).await?;
+    vm.init().await?;
+
+    let ip = vm.get_ip().await?;
+    assert!(
+        ip.parse::<std::net::IpAddr>().is_ok(),
+        "unexpected ip: {ip}"
+    );
+    // A second call is served from the cache and must report the same address.
+    assert_eq!(vm.get_ip().await?, ip);
+
+    // Two machines on the same network keep distinct addresses.
+    let mut other = Machine::new(&image, &MachineConfig::default()).await?;
+    other.init().await?;
+    let other_ip = other.get_ip().await?;
+    assert_ne!(ip, other_ip, "pool members share an address");
+
+    vm.shutdown().await?;
+    other.shutdown().await?;
+    Ok(())
+}
