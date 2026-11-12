@@ -404,6 +404,13 @@ impl Machine {
         // Before anything is written: a config QEMU cannot interpret must not leave a run
         // directory (or a half-created overlay) behind.
         config.validate()?;
+        // A host that cannot run the guest must say so before it writes anything. This used to
+        // run after the overlay was created, so a bare host failed on `qemu-img` (a program
+        // that was not even part of the prerequisite list) and learned about OVMF, the TPM and
+        // the seed builder one package at a time.
+        if image.guest_os() == GuestOs::Windows {
+            firmware::ensure_host_support()?;
+        }
         // Prepare run directory
         let dirs = QleanDirs::new()?;
         let machine_id = nanoid!(12, &HEX_ALPHABET);
@@ -456,9 +463,8 @@ impl Machine {
         // Windows guests follow ADR-WIN-03: a pre-generalized image plus a per-VM
         // seed medium, instead of cloud-init NoCloud user-data.
         if image.guest_os() == GuestOs::Windows {
-            // Fail before generating keys or building the seed medium: a host that cannot
-            // run the guest must not leave seed material or an ISO behind.
-            firmware::ensure_host_support()?;
+            // The host prerequisites were already checked at the top of this function, before
+            // the run directory existed; nothing below can make them pass again.
             let host_key = windows::generate_host_key(&run_dir)?;
             let seed =
                 DeploySeed::stage(&run_dir, ssh_keypair.pubkey_str.trim(), &host_key).await?;

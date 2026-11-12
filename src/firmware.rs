@@ -343,6 +343,12 @@ pub(crate) const SEED_ISO_BUILDER: &str = "xorriso";
 /// Program that answers "which address does this MAC have on Qlean's network?".
 const LEASE_TOOL: &str = "virsh";
 
+/// Program that creates the per-VM disk overlay, run before QEMU itself.
+const QEMU_IMG: &str = "qemu-img";
+
+/// The QEMU binary a Windows guest runs under (Windows guests are amd64 only).
+const QEMU_SYSTEM: &str = "qemu-system-x86_64";
+
 /// Program used to run the software TPM.
 fn swtpm_program() -> PathBuf {
     env_nonempty(ENV_SWTPM)
@@ -363,21 +369,54 @@ fn command_available(program: &Path) -> bool {
     })
 }
 
-/// Collect every missing Windows host prerequisite, in one pass.
+/// Everything the Windows guest path needs from the host, probed once.
 ///
-/// Taking the probe results as arguments keeps the aggregation testable: a user whose
-/// host lacks several pieces must learn about all of them from one run instead of
-/// reinstalling one package per attempt.
-fn host_support_problems(
+/// Taking the probe results as fields keeps the aggregation testable: a user whose host
+/// lacks several pieces must learn about all of them from one run instead of reinstalling
+/// one package per attempt.
+struct HostProbes<'a> {
+    qemu_img_available: bool,
+    qemu_system_available: bool,
     kvm_available: bool,
     ovmf: Result<FirmwarePaths>,
-    swtpm: &Path,
+    swtpm: &'a Path,
     swtpm_available: bool,
     seed_iso_builder_available: bool,
     virsh_available: bool,
-) -> Vec<String> {
+}
+
+/// Collect every missing Windows host prerequisite, in one pass.
+///
+/// The programs come first because they are what the machine hits first: `qemu-img` runs
+/// before QEMU and before OVMF or the TPM are touched. Leaving them out made the "all gaps
+/// at once" check useless on a bare host: the first error was an unrelated `qemu-img`
+/// failure, and the missing `qemu-system-x86_64` appeared only after that was installed.
+fn host_support_problems(probes: HostProbes<'_>) -> Vec<String> {
+    let HostProbes {
+        qemu_img_available,
+        qemu_system_available,
+        kvm_available,
+        ovmf,
+        swtpm,
+        swtpm_available,
+        seed_iso_builder_available,
+        virsh_available,
+    } = probes;
+
     let mut problems: Vec<String> = Vec::new();
 
+    if !qemu_img_available {
+        problems.push(format!(
+            "`{QEMU_IMG}` was not found: it creates the per-VM disk overlay from the Windows \
+             image, so install the `qemu-img` package (part of `qemu-base`)"
+        ));
+    }
+    if !qemu_system_available {
+        problems.push(format!(
+            "`{QEMU_SYSTEM}` was not found: it is the program the Windows guest runs under, so \
+             install the `qemu-system-x86` package"
+        ));
+    }
     if !kvm_available {
         problems.push(
             "KVM acceleration is unavailable: Windows guests require KVM and never fall back to TCG"
@@ -411,14 +450,16 @@ fn host_support_problems(
 /// Check every host prerequisite for a Windows guest, reporting all gaps at once.
 pub(crate) fn ensure_host_support() -> Result<()> {
     let swtpm = swtpm_program();
-    let problems = host_support_problems(
-        is_kvm_available(),
-        resolve_ovmf(),
-        &swtpm,
-        command_available(&swtpm),
-        command_available(Path::new(SEED_ISO_BUILDER)),
-        command_available(Path::new(LEASE_TOOL)),
-    );
+    let problems = host_support_problems(HostProbes {
+        qemu_img_available: command_available(Path::new(QEMU_IMG)),
+        qemu_system_available: command_available(Path::new(QEMU_SYSTEM)),
+        kvm_available: is_kvm_available(),
+        ovmf: resolve_ovmf(),
+        swtpm_available: command_available(&swtpm),
+        seed_iso_builder_available: command_available(Path::new(SEED_ISO_BUILDER)),
+        virsh_available: command_available(Path::new(LEASE_TOOL)),
+        swtpm: &swtpm,
+    });
 
     anyhow::ensure!(
         problems.is_empty(),
@@ -1241,93 +1282,133 @@ mod tests {
         }
     }
 
+    /// A host with nothing installed: every gap is reported, in the order the machine hits it.
+    fn bare_host_fixture() -> HostProbes<'static> {
+        HostProbes {
+            qemu_img_available: false,
+            qemu_system_available: false,
+            kvm_available: false,
+            ovmf: Err(anyhow::anyhow!("no OVMF firmware found")),
+            swtpm: Path::new("swtpm"),
+            swtpm_available: false,
+            seed_iso_builder_available: false,
+            virsh_available: false,
+        }
+    }
+
+    /// A host that provides everything the Windows guest path needs.
+    fn complete_host_fixture() -> HostProbes<'static> {
+        HostProbes {
+            qemu_img_available: true,
+            qemu_system_available: true,
+            kvm_available: true,
+            ovmf: Ok(firmware_fixture()),
+            swtpm: Path::new("swtpm"),
+            swtpm_available: true,
+            seed_iso_builder_available: true,
+            virsh_available: true,
+        }
+    }
+
+    /// Find the one gap that mentions `needle`, failing loudly if it is absent.
+    fn gap<'a>(problems: &'a [String], needle: &str) -> &'a str {
+        problems
+            .iter()
+            .find(|problem| problem.contains(needle))
+            .unwrap_or_else(|| panic!("no gap mentions {needle:?}: {problems:?}"))
+    }
+
     #[test]
     fn test_host_support_reports_every_gap_at_once() {
-        let problems = host_support_problems(
-            false,
-            Err(anyhow::anyhow!("no OVMF firmware found")),
-            Path::new("swtpm"),
-            false,
-            false,
-            false,
-        );
+        let problems = host_support_problems(bare_host_fixture());
 
-        assert_eq!(problems.len(), 5, "gaps: {problems:?}");
-        assert!(problems[0].contains("never fall back to TCG"));
-        assert!(problems[1].contains("no OVMF firmware found"));
-        assert!(problems[2].contains("install the `swtpm` package"));
-        assert!(problems[2].contains(ENV_SWTPM));
-        assert!(problems[3].contains("install the `xorriso` package"));
+        // Every missing piece, including the two programs that run before QEMU: a bare host
+        // must not learn about `qemu-img` from an unrelated failure first and about
+        // `qemu-system-x86_64` only after reinstalling.
+        assert_eq!(problems.len(), 7, "gaps: {problems:?}");
         assert!(
-            problems[4].contains("install the `libvirt` package"),
-            "{problems:?}"
+            gap(&problems, "`qemu-img` was not found").contains("overlay"),
+            "the qemu-img gap must say what it is for: {problems:?}"
         );
         assert!(
-            problems[4].contains("net-dhcp-leases"),
-            "the virsh gap must say what the tool is for: {problems:?}"
+            gap(&problems, "`qemu-system-x86_64` was not found").contains("runs under"),
+            "the qemu-system gap must say what it is for: {problems:?}"
         );
+        assert_eq!(
+            problems[2],
+            "KVM acceleration is unavailable: Windows guests require KVM and never fall back to TCG"
+        );
+        assert!(gap(&problems, "no OVMF firmware found") == problems[3]);
+        let swtpm = gap(&problems, "install the `swtpm` package");
+        assert!(swtpm.contains(ENV_SWTPM), "{swtpm}");
+        assert!(gap(&problems, "install the `xorriso` package").contains("seed medium"));
+        let virsh = gap(&problems, "install the `libvirt` package");
+        assert!(virsh.contains("net-dhcp-leases"), "{virsh}");
 
-        // The aggregated error keeps every line, so one run lists all five gaps.
+        // The aggregated error keeps every line, so one run lists all seven gaps.
         let message = format!(
             "Windows guest prerequisites are missing:\n- {}",
             problems.join("\n- ")
         );
-        assert_eq!(message.lines().count(), 6, "{message}");
+        assert_eq!(message.lines().count(), 8, "{message}");
     }
 
     #[test]
     fn test_host_support_is_quiet_when_everything_is_present() {
-        let problems = host_support_problems(
-            true,
-            Ok(firmware_fixture()),
-            Path::new("swtpm"),
-            true,
-            true,
-            true,
-        );
+        let problems = host_support_problems(complete_host_fixture());
 
         assert!(problems.is_empty(), "unexpected gaps: {problems:?}");
     }
 
     #[test]
     fn test_host_support_reports_only_the_missing_piece() {
-        let problems = host_support_problems(
-            true,
-            Ok(firmware_fixture()),
-            Path::new("/opt/swtpm"),
-            true,
-            false,
-            true,
-        );
-
+        let problems = host_support_problems(HostProbes {
+            seed_iso_builder_available: false,
+            ..complete_host_fixture()
+        });
         assert_eq!(problems.len(), 1, "gaps: {problems:?}");
         assert!(
             problems[0].contains("`xorriso` was not found"),
             "{problems:?}"
         );
 
-        let problems = host_support_problems(
-            true,
-            Ok(firmware_fixture()),
-            Path::new("/opt/swtpm"),
-            false,
-            true,
-            true,
-        );
+        let problems = host_support_problems(HostProbes {
+            swtpm_available: false,
+            swtpm: Path::new("/opt/swtpm"),
+            ..complete_host_fixture()
+        });
         assert_eq!(problems.len(), 1, "gaps: {problems:?}");
         assert!(problems[0].contains("/opt/swtpm"), "{problems:?}");
 
-        let problems = host_support_problems(
-            true,
-            Ok(firmware_fixture()),
-            Path::new("/opt/swtpm"),
-            true,
-            true,
-            false,
-        );
+        let problems = host_support_problems(HostProbes {
+            virsh_available: false,
+            ..complete_host_fixture()
+        });
         assert_eq!(problems.len(), 1, "gaps: {problems:?}");
         assert!(
             problems[0].contains("`virsh` was not found"),
+            "{problems:?}"
+        );
+
+        // The two programs the machine runs first are reported on their own as well, so a
+        // host that only lacks one of them still gets that one sentence.
+        let problems = host_support_problems(HostProbes {
+            qemu_img_available: false,
+            ..complete_host_fixture()
+        });
+        assert_eq!(problems.len(), 1, "gaps: {problems:?}");
+        assert!(
+            problems[0].contains("`qemu-img` was not found"),
+            "{problems:?}"
+        );
+
+        let problems = host_support_problems(HostProbes {
+            qemu_system_available: false,
+            ..complete_host_fixture()
+        });
+        assert_eq!(problems.len(), 1, "gaps: {problems:?}");
+        assert!(
+            problems[0].contains("`qemu-system-x86_64` was not found"),
             "{problems:?}"
         );
         assert!(INSTALL_HINT.contains("edk2-ovmf"));
