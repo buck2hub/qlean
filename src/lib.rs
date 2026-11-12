@@ -969,7 +969,19 @@ mod plan_doc_tests {
             while let Some(at) = rest.find("\"QLEAN_") {
                 let after = &rest[at + 1..];
                 let end = after.find('"').expect("an override name is not closed");
-                read.push(&after[..end]);
+                // Only a bare name counts. A string literal that merely starts with the prefix -
+                // prose handed to a user, a message quoted from a test - is not an override, and
+                // counting it turned the failure message into nonsense.
+                let name = &after[..end];
+                let shaped = name.strip_prefix("QLEAN_").is_some_and(|tail| {
+                    !tail.is_empty()
+                        && tail
+                            .chars()
+                            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                });
+                if shaped {
+                    read.push(name);
+                }
                 rest = &after[end..];
             }
         }
@@ -1173,6 +1185,56 @@ mod plan_doc_tests {
                 "card {id} declares {declared} acceptance criteria but its evidence row claims {claimed}"
             );
         }
+    }
+
+    /// The seven ignored Windows smoke tests all stop at the precondition the plan describes.
+    ///
+    /// The plan says every ignored Windows test halts on the DEP-01 message, and that is only true
+    /// while each of them goes through the shared `windows_image_config()` gate before touching a
+    /// disk or a hypervisor. A new ignored test that reads the environment itself would make the
+    /// sentence false without anything noticing - and the sentence is what a reader relies on to
+    /// know these tests cost nothing on a host without a licensed image.
+    #[test]
+    fn the_windows_smoke_tests_all_gate_on_the_documented_precondition() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        const SUITE: &str = include_str!("../tests/windows_machine.rs");
+        // The fragment both sides must agree on; the suite adds "to run this test" after it.
+        const FRAGMENT: &str = "must point at a licensed Windows qcow2 (DEP-01)";
+
+        assert_eq!(
+            SUITE.matches(FRAGMENT).count(),
+            1,
+            "the DEP-01 message is not stated exactly once in the suite"
+        );
+        assert!(
+            PLAN.contains(FRAGMENT),
+            "the plan does not quote the message the suite prints"
+        );
+
+        let mut checked = 0_usize;
+        for block in SUITE.split("#[tokio::test]").skip(1) {
+            if !block.contains("#[ignore") {
+                continue;
+            }
+            let name = block
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("async fn "))
+                .and_then(|rest| rest.split('(').next())
+                .unwrap_or_else(|| panic!("an ignored test has no name: {block}"));
+            assert!(
+                block.contains("windows_image_config()?"),
+                "ignored test {name} does not gate on windows_image_config()"
+            );
+            checked += 1;
+        }
+        assert_eq!(
+            checked, 7,
+            "the suite has {checked} ignored Windows tests, the plan says 7"
+        );
+        assert!(
+            PLAN.contains(&format!("{checked} 个 `#[ignore]` 用例")),
+            "the plan does not state that {checked} tests are ignored"
+        );
     }
 
     /// A card past the local gate records the documentation gate the plan requires of every card.
@@ -1608,7 +1670,17 @@ mod plan_doc_tests {
                     .take_while(|c| !matches!(c, '`' | '；' | '）' | '('))
                     .collect();
                 let integration_target = command.contains("--test windows_machine");
+                // `--test-threads 1` (without the `=`) hands the next token to a flag, not to
+                // the filter; reading `1` as a filter turned a correct command into a failure.
+                let mut skip_value = false;
                 let filter = command.split_whitespace().skip(2).find(|token| {
+                    if std::mem::take(&mut skip_value) {
+                        return false;
+                    }
+                    if *token == "--test-threads" {
+                        skip_value = true;
+                        return false;
+                    }
                     !token.starts_with('-')
                         && !matches!(*token, "lib" | "windows_machine" | "test")
                         && token
