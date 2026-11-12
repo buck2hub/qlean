@@ -176,6 +176,7 @@
 | 2026-11-13 05:10:00 UTC | review R64（枚举失败不等于不存在） | F69：`ensure_network` 完全不看 `virsh net-list` 的退出码——**只要 stdout 里没有 `qlean` 就当网络不存在**。于是 libvirtd 没起/连不上（`virsh` 退出 1、stderr 说 `Failed to connect socket to '/run/libvirt/libvirt-sock'`）时，Qlean 会去**创建**一个可能已经存在的网络，最后只报一句 `failed to define qlean network`，真正的病因（libvirt 不可达）用户看不到。这正是本项目反复出现的「判据放错层」：**列举失败 ≠ 集合为空**。顺带发现同函数里那条「读不到 bridge 就假定是 qlbr0」的 warn **中间有一长串空格**（`\` 续行丢了），而专治这类问题的 `user_facing_messages_have_no_runs_of_spaces` 只覆盖了两条机器消息，没覆盖它。修：新增 `listed_networks(output, what)`——非零退出直接报错并带上 libvirt 原文与连接 URI（「is libvirtd running and reachable?」），空行不计入集合；`virsh_reason(output)` 统一把 stderr 带进 define/autostart/start 的失败消息（`status()` 改 `output()`）；空格串收敛进 `bridge_assumed_message()`。新增 3 个单测（失败列举必须报错且含 `libvirtd`/URI/`libvirt-sock`、成功列举忽略空行、三条网络消息都不许有句中空格串）。`cargo test --lib` 171 → 174 | N/A（`OSX-02` 既有 AC：宿主前置条件失败必须指向真正原因；无卡拆合） | `OSX-02` 实现证据、Review log、`src/utils.rs`、CHANGELOG、plan-status |
 | 2026-11-13 05:40:00 UTC | review R65（声明值必须来自真实来源） | F70：`qlean_user_agent()` 返回**写死的** `"qlean/0.3.0"`，而 `Cargo.toml` 早就是 `0.3.1`——下载 guest 镜像时发给镜像站的 `User-Agent` 已经少报了一个版本，而且每次发布都会继续漂移，没有任何门禁会提醒。这正是本项目记过的「声明值必须来自真实来源」：版本号只有一个真相（`Cargo.toml`），不该在代码里再抄一份。修：改成 `concat!("qlean/", env!("CARGO_PKG_VERSION"))`，编译期取自 crate 版本；新增 1 个单测断言它与 `env!("CARGO_PKG_VERSION")` 相等且以 `qlean/` 开头。`cargo test --lib` 174 → 175 | N/A（`IP-01`/`OSX-02` 既有 AC：对外声明必须与实际一致；无卡拆合） | `OSX-02` 实现证据、Review log、`src/utils.rs`、CHANGELOG、plan-status |
 | 2026-11-13 06:10:00 UTC | review R66（同一节里两句话不能互相打脸） | F71：README 的 Windows 传输一节**自相矛盾**——第一条断言「所以 `Machine::get_ip` **绝不会**在 Windows guest 里跑命令」，倒数第二条又说「重新查询会在 guest 内跑 PowerShell 并只保留本机 MAC 的地址」。两句都是我们写的，读者无法判断哪句是真的。代码的真实行为是：`launch` 连接成功后就把发现到的地址缓存进 `self.ip`，`get_ip` 走的正是这份缓存；`query_windows_ip`（guest 内 PowerShell + MAC 匹配）只在地址未知时才是唯一出路。也就是说第一条把「通常路径」说成了「永远」，第二句才是完整语义。这类漂移比代码 bug 更伤：文档是外部使用者唯一的验收面，而本节正是他们核对 `get_ip` 语义的地方。修：把第一条改成「Qlean 拨号的地址从不来自 guest 内命令」，`get_ip` 那条改写成「通常返回缓存地址；**只有地址未知时**才去 guest 里查」。无代码改动、无行为变化，因此不动 CHANGELOG（ER-06 只约束公开行为变化）| `IP-01`（`get_ip` 语义文档）、`TRN-01`（传输与安全文档）| README、Review log、覆盖矩阵、plan-status |
+| 2026-11-13 06:40:00 UTC | review R67（形状不对的输入要在门口就拦下） | F72：两处「形状不对但没有形状检查」——(1) `parse_prefixed_digest` 只校验「是十六进制」，**不校验长度**：`sha256:abc` 能通过解析，之后必然与算出来的 64 位摘要不等，用户看到的却是「digest mismatch」，指向**镜像损坏**而不是自己截断了的摘要；(2) `tests/windows_machine.rs` 的 `QLEAN_WINDOWS_IMAGE` 护栏只判断 `is_file()`，把 Linux 磁盘或随便一个文本文件指进去也能通过，随后 QEMU 用 OVMF 引导它、烧掉整段部署预算，最后报「没拿到 guest 地址」——离真正的错误变量十万八千里。这正是本项目反复记的「失败要出现在看得见错误的地方」。修：(1) 按算法校验长度（sha256=64、sha512=128），错误消息带算法、期望长度、实际长度与摘要前缀；(2) 护栏改读 4 字节 qcow2 魔数 `QFI\xfb`，不符就报出实际首字节与期望魔数。新增 1 个单测（三种长度错误 + 两种正确长度）；另把 `test_parse_prefixed_digest_case_insensitive` 的样例摘要改成真实长度。`cargo test --lib` 175 → 176。**本地实跑验证**（无需 KVM）：文本文件 → `is not a qcow2 image: it starts with [6e, 6f, 74, 20]`；qcow2 魔数 + `sha256:abc` → `sha256 digest must be 64 hexadecimal characters, got 3 (\`abc\`)` | `OSX-01`（镜像与摘要校验）、`OSX-03`/`IP-01`（冒烟护栏的可诊断性）| `src/image.rs`、`tests/windows_machine.rs`、Review log、CHANGELOG、plan-status |
 
 ## 已决议设计决策
 
@@ -778,6 +779,7 @@
 | 集成测试（`#[ignore]`） | `tests/windows_machine.rs`：`windows_transport`（地址、pin、unsupported、shutdown→spawn 重连）、`windows_pool`（双机地址/host key/会话隔离） |
 | README/CHANGELOG | README「Windows transport and security」；CHANGELOG Added ×4 / Changed ×1 |
 | 地址发现与 QEMU 退出 race | `launch` 把 DHCP lease 轮询与 `qemu_handle`、cancel token 一起 `select!`，QEMU 启动即退出时立即返回其真实错误并停 `swtpm`（R12，`src/machine.rs`） |
+| 输入形状在门口校验 | 长度/魔数这类形状错误必须在入口报出真实病因，不能等到下游以别的形式失败（R67，`c01ea1a`） |
 | 文档自洽 | 同一节内不得出现互相否定的两句；描述按代码真实路径写（R66） |
 | 声明值来自真实来源 | 版本号只认 `Cargo.toml`，代码里不抄第二份（R65，`d6573e1`） |
 | 失败不等于空集 | 命令失败与「结果为空」必须区分，报错要带工具原文（R64，`933563f`） |
@@ -1370,6 +1372,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R64 | 枚举失败不是空集 | PASS | 无开放项 | F69：`virsh net-list` 的退出码被忽略，libvirt 不可达被读成「网络不存在」，病因不可见；bridge 警告含空格串 | `listed_networks`/`virsh_reason`/`bridge_assumed_message`（`933563f`）；新增 3 个单测；`cargo test --lib` 174 passed |
 | R65 | 声明值来自真实来源 | PASS | 无开放项 | F70：`User-Agent` 写死 `0.3.0`，crate 已是 `0.3.1`，发布后继续漂移且无门禁提醒 | `concat!("qlean/", env!("CARGO_PKG_VERSION"))`（`d6573e1`）；新增 1 个单测；`cargo test --lib` 175 passed |
 | R66 | 文档自身不自相矛盾 | PASS | 无开放项 | F71：同一节里「`get_ip` 绝不会在 guest 里跑命令」与「重新查询会跑 PowerShell」互相打脸 | 两条都按代码实际行为改写（修正与本节同一提交 `docs(readme): stop claiming get_ip ...`，纯文档、无代码改动、无行为变化） |
+| R67 | 输入形状在门口校验 | PASS | 无开放项 | F72：摘要不校验长度、镜像护栏不校验魔数，两种情况都把用户指向错误的病因 | 长度按算法校验 + qcow2 魔数检查（`c01ea1a`）；新增 1 个单测；本地实跑两条错误消息；`cargo test --lib` 176 passed |
 
 ### R1 findings 与修订对照
 
