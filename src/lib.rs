@@ -2122,6 +2122,72 @@ mod plan_doc_tests {
     }
 
     #[test]
+    fn the_knob_that_keeps_a_run_directory_says_what_it_keeps() {
+        const MACHINE: &str = include_str!("../src/machine.rs");
+        const README: &str = include_str!("../README.md");
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        // The failure-recovery matrix sends a reader to `clear = false` to keep a failed run
+        // directory "for diagnosis". Nothing said that the directory holds the seed medium and
+        // with it the per-VM SSH host private key, and nothing said Qlean never removes it
+        // afterwards - so the documented diagnostic knob also documented nothing about the key
+        // material it keeps on disk (F177).
+        // The rustdoc block directly above the field, collected upwards: a field has no body
+        // for `function_body` to scan, and the nearby `{`-blocks belong to other items.
+        let lines: Vec<&str> = MACHINE.lines().collect();
+        let field_line = lines
+            .iter()
+            .position(|line| line.trim() == "pub clear: bool,")
+            .expect("`MachineConfig::clear` is gone");
+        let mut field = String::new();
+        for above in lines[..field_line].iter().rev() {
+            let above = above.trim();
+            if !above.starts_with("///") {
+                break;
+            }
+            field = format!("{above}\n{field}");
+        }
+        assert!(
+            !field.is_empty(),
+            "`MachineConfig::clear` has no rustdoc left"
+        );
+        for fact in ["seed medium", "private key", "caller's job"] {
+            assert!(
+                field.contains(fact),
+                "`MachineConfig::clear` no longer says `{fact}` about the directory it keeps"
+            );
+        }
+        // The README is what a user reads before writing code; the code block alone (a struct
+        // with a `clear: bool`) never explained the trade-off.
+        let readme_section = README
+            .split("### Diagnostics: keeping the run directory")
+            .nth(1)
+            .expect("the README has no section about keeping the run directory");
+        let readme_section = readme_section
+            .split("\n### ")
+            .next()
+            .expect("the section runs to the next heading");
+        for fact in [
+            "MachineConfig::with_clear(false)",
+            "host private key",
+            "never cleaned up",
+        ] {
+            assert!(
+                readme_section.contains(fact),
+                "the README section about keeping the run directory no longer says `{fact}`"
+            );
+        }
+        // And the matrix row that recommends it has to name the actual API, not a bare `clear=false`.
+        let row = PLAN
+            .lines()
+            .find(|line| line.starts_with("| Windows 首启后重启失败 |"))
+            .expect("the recovery matrix lost its failed-restart row");
+        assert!(
+            row.contains("MachineConfig::with_clear(false)"),
+            "the matrix row recommends keeping the run directory without naming the API: {row}"
+        );
+    }
+
+    #[test]
     fn the_failed_launch_teardown_is_written_once_and_is_bounded() {
         const MACHINE: &str = include_str!("../src/machine.rs");
         const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");

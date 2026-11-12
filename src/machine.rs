@@ -130,7 +130,14 @@ pub struct MachineConfig {
     pub mem: u32,
     /// Disk size in GB, defaults to `None`. If provided, the image will be resized to the specified size.
     pub disk: Option<u32>,
-    /// Whether to clear the runtime directory after use, defaults to `true`.
+    /// Whether to clear the runtime directory when the machine is dropped, defaults to `true`.
+    ///
+    /// The run directory holds the disk overlay, the OVMF vars image, the vTPM state and - on
+    /// a Windows guest whose first boot has not finished - the seed medium, which carries the
+    /// per-VM SSH *host* private key and the client public key. Setting this to `false` keeps
+    /// all of it for diagnosis, and Qlean never removes it afterwards: nothing does, so
+    /// removing it is the caller's job, and until then the deploy-time key material stays on
+    /// disk (owner-only, but on disk).
     pub clear: bool,
     /// Launch timeout in seconds.
     ///
@@ -168,7 +175,10 @@ impl MachineConfig {
         }
     }
 
-    /// Set whether to clear the runtime directory after use.
+    /// Set whether to clear the runtime directory when the machine is dropped.
+    ///
+    /// `false` keeps the run directory - and with it the seed medium and its SSH host private
+    /// key - after the machine is dropped, for diagnosis. It is not cleaned up later.
     pub fn with_clear(self, clear: bool) -> Self {
         Self { clear, ..self }
     }

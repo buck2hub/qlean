@@ -1527,7 +1527,7 @@ libra commit -m "revert: <card>"
 | 首启部署期间会话断开（guest 重启） | seed 仍在 run 目录，可重试 | 连续 3 次探测失败即报错并提示 `spawn` 重试，不再等满部署预算 | 15 分钟后误报「部署未完成」 |
 | 池内 Windows VM 二次启停 | 无运行 VM | `init_all` 对已部署的 VM 走 `spawn`，`spawn_all` 对未部署的 VM 走 `init` | `already completed its Windows first-boot deployment` 或启动成不可达 guest |
 | host key 不匹配 | 无会话 | 立即失败并清理，不自动接受新 key | 静默信任任意 key |
-| Windows 首启后重启失败 | 可保留失败 run dir 供排查（clear=false） | 终止进程、记录状态；修复后新建干净 VM 验证 | 删除证据后宣称成功或复用半部署状态 |
+| Windows 首启后重启失败 | 可保留失败 run dir 供排查（`MachineConfig::with_clear(false)`；目录里有 seed 介质与 per-VM host 私钥，Qlean 不会自动删除） | 终止进程、记录状态；修复后新建干净 VM 验证 | 删除证据后宣称成功或复用半部署状态 |
 | `init`/`spawn` 启动失败（含首启超时、`read_pid` 失败） | 无运行 VM、无残留会话 | 取消并清除 cancel token（判决唯一实现在 `already_started`）、停 `swtpm`、必要时终止 QEMU 后可在同一 `Machine` 上重试 | 遗留 `already initialized` 之类的误导报错或无法重试 |
 | crates.io 发布失败 | 本地/远端 tag 可能已建 | 按 ER-09 记录，下窗口处理 | 伪造发布证据或撤回已发布 crate |
 

@@ -533,6 +533,22 @@ writer.close(reader).await?;
 
 By default, Qlean waits for the QEMU process until it exits (no wall-clock limit), so keep-alive workloads are not cut off after a fixed duration. Optional `QLEAN_QEMU_TIMEOUT_SECS` (positive integer) enables a bounded wait for tests; on timeout QEMU is killed before SSH operations are cancelled.
 
+### Diagnostics: keeping the run directory
+
+`MachineConfig::with_clear(false)` keeps a machine's run directory when the machine is
+dropped instead of removing it. The directory holds the disk overlay, the OVMF vars image,
+the vTPM state and - for a Windows guest whose first boot did not finish - the seed medium,
+which carries the per-VM SSH **host private key** and the client public key. It is useful
+after a failed first boot, and it is never cleaned up afterwards: delete it by hand, and
+remember it holds deploy-time key material until you do.
+
+```rust
+let config = MachineConfig::default().with_clear(false);
+let mut machine = Machine::new(&image, &config).await?;
+// ... a launch that fails ...
+drop(machine); // the run directory survives, for inspection
+```
+
 ### Machine Pool Interface
 
 - `MachinePool::new()` - Create a new, empty machine pool.
