@@ -237,15 +237,26 @@ pub(crate) fn prepare_vars(run_dir: &Path, firmware: &FirmwarePaths) -> Result<P
             )
         })?
         .len();
+    // The two pflash files are mapped independently, so their sizes do not have to
+    // match: every stock pair (Debian/Ubuntu/Fedora/Arch) ships a vars template that
+    // is much smaller than the code image. Only a vars template *larger* than the code
+    // image means the pair is mixed up, which is worth failing on.
     anyhow::ensure!(
-        code_len == vars_len,
-        "OVMF code image {} is {} bytes but vars template {} is {} bytes: \
-         pair the 4M code image with the 4M vars template (or both 2M); {INSTALL_HINT}",
-        firmware.code.display(),
-        code_len,
+        vars_len <= code_len,
+        "OVMF vars template {} is {} bytes but the code image {} is only {} bytes: \
+         the firmware pair looks mixed up; {INSTALL_HINT}",
         firmware.vars_template.display(),
-        vars_len
+        vars_len,
+        firmware.code.display(),
+        code_len
     );
+    if vars_len != code_len {
+        debug!(
+            "OVMF code image is {} bytes and vars template is {} bytes; sizes differ in \
+             stock firmware pairs and QEMU maps each pflash file on its own",
+            code_len, vars_len
+        );
+    }
 
     std::fs::copy(&firmware.vars_template, &dest).with_context(|| {
         format!(
@@ -453,14 +464,37 @@ mod tests {
     }
 
     #[test]
-    fn test_prepare_vars_rejects_size_mismatch() {
+    fn test_prepare_vars_accepts_a_smaller_vars_template() {
+        // Stock pairs look like this: a multi-megabyte code image with a ~528 KiB
+        // vars template. Rejecting that shape would block every real host.
+        let root = temp_dir("small-vars");
+        let run_dir = root.join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let code = root.join("code.fd");
+        let vars_template = root.join("vars.fd");
+        write_file(&code, 4096);
+        write_file(&vars_template, 540);
+        let firmware = FirmwarePaths {
+            code,
+            vars_template,
+            secure_boot: false,
+        };
+
+        let dest = prepare_vars(&run_dir, &firmware).expect("a smaller vars template is normal");
+        assert_eq!(std::fs::read(&dest).unwrap().len(), 540);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_prepare_vars_rejects_a_vars_template_larger_than_the_code_image() {
         let root = temp_dir("mismatch");
         let run_dir = root.join("run");
         std::fs::create_dir_all(&run_dir).unwrap();
         let code = root.join("code.fd");
         let vars_template = root.join("vars.fd");
         write_file(&code, 64);
-        write_file(&vars_template, 32);
+        write_file(&vars_template, 128);
         let firmware = FirmwarePaths {
             code,
             vars_template,
@@ -468,7 +502,7 @@ mod tests {
         };
 
         let err = prepare_vars(&run_dir, &firmware).unwrap_err().to_string();
-        assert!(err.contains("pair the 4M code image"), "{err}");
+        assert!(err.contains("pair looks mixed up"), "{err}");
         assert!(!run_dir.join("ovmf_vars.fd").exists());
 
         let _ = std::fs::remove_dir_all(&root);
