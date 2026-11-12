@@ -141,28 +141,82 @@ mod plan_doc_tests {
         ),
     ];
 
-    /// The test function names declared in `sources`, and the module names they live under.
+    /// The `<n>` of the first `<n> passed` in `text`, if the text carries one.
+    fn claimed_passes(text: &str) -> Option<usize> {
+        let marker = " passed";
+        let mut search = 0;
+        while let Some(found) = text[search..].find(marker) {
+            let at = search + found;
+            let digits: String = text[..at]
+                .chars()
+                .rev()
+                .take_while(char::is_ascii_digit)
+                .collect::<Vec<char>>()
+                .into_iter()
+                .rev()
+                .collect();
+            if !digits.is_empty() {
+                return digits.parse().ok();
+            }
+            search = at + marker.len();
+        }
+        None
+    }
+
+    /// The tests declared in `sources`, as full paths such as `image::tests::test_the_guard`.
     ///
     /// A test is a `fn`/`async fn` whose four preceding lines hold `#[test]`, `#[tokio::test…]`
     /// or `#[ignore…]`. Reading the sources (rather than a hand-kept list) is the point: the plan
-    /// quotes test names, and a quote that no longer resolves is a promise to a reader.
-    fn test_names_in(sources: &[(&str, &str)]) -> (Vec<String>, Vec<String>) {
-        let mut names = Vec::new();
-        let mut modules = Vec::new();
+    /// quotes test names, and a quote that no longer resolves is a promise to a reader. Module
+    /// paths come from indentation, which is what `cargo fmt` keeps stable.
+    fn test_names_in(sources: &[(&str, &str)]) -> Vec<String> {
+        let mut tests = Vec::new();
         for (path, source) in sources {
+            assert!(
+                !path.is_empty(),
+                "a crate source is registered without a path"
+            );
+            // cargo names a test after the module the file is in, so `src/image.rs` contributes
+            // `image::` and the crate root contributes nothing.
+            let file_module = path
+                .strip_prefix("src/")
+                .and_then(|rest| rest.strip_suffix(".rs"))
+                .filter(|rest| *rest != "lib")
+                .map(|rest| rest.replace('/', "::"));
             let lines: Vec<&str> = source.lines().collect();
+            let mut modules: Vec<(usize, String)> = Vec::new();
             for (index, line) in lines.iter().enumerate() {
                 let trimmed = line.trim();
+                let indent = line.len() - line.trim_start().len();
+                if trimmed == "}" {
+                    while modules.last().is_some_and(|(inner, _)| *inner >= indent) {
+                        modules.pop();
+                    }
+                    continue;
+                }
+                if let Some(rest) = trimmed
+                    .strip_prefix("pub mod ")
+                    .or_else(|| trimmed.strip_prefix("pub(crate) mod "))
+                    .or_else(|| trimmed.strip_prefix("mod "))
+                {
+                    let name: String = rest
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    if !name.is_empty() && trimmed.ends_with('{') {
+                        while modules.last().is_some_and(|(inner, _)| *inner >= indent) {
+                            modules.pop();
+                        }
+                        modules.push((indent, name));
+                    }
+                    continue;
+                }
                 let Some(rest) = trimmed
                     .strip_prefix("fn ")
                     .or_else(|| trimmed.strip_prefix("async fn "))
                 else {
                     continue;
                 };
-                assert!(
-                    !path.is_empty(),
-                    "a crate source is registered without a path"
-                );
                 let name: String = rest
                     .chars()
                     .take_while(|c| c.is_alphanumeric() || *c == '_')
@@ -174,23 +228,21 @@ mod plan_doc_tests {
                         || above.starts_with("#[ignore")
                 });
                 if attributed {
-                    names.push(name);
-                }
-            }
-            for line in &lines {
-                let trimmed = line.trim();
-                if let Some(rest) = trimmed.strip_prefix("mod ") {
-                    let name: String = rest
-                        .chars()
-                        .take_while(|c| c.is_alphanumeric() || *c == '_')
-                        .collect();
-                    if !name.is_empty() {
-                        modules.push(name);
+                    let mut full = String::new();
+                    if let Some(module) = &file_module {
+                        full.push_str(module);
+                        full.push_str("::");
                     }
+                    for (_, module) in &modules {
+                        full.push_str(module);
+                        full.push_str("::");
+                    }
+                    full.push_str(&name);
+                    tests.push(full);
                 }
             }
         }
-        (names, modules)
+        tests
     }
 
     /// The revision history is one timeline, newest first.
@@ -386,7 +438,7 @@ mod plan_doc_tests {
     fn the_plan_points_at_tests_that_can_be_run() {
         const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
 
-        let (tests, _modules) = test_names_in(CRATE_SOURCES);
+        let tests = test_names_in(CRATE_SOURCES);
         assert!(
             tests.len() >= 200,
             "the test-name scan found only {} tests: it is scanning the wrong thing",
@@ -467,6 +519,68 @@ mod plan_doc_tests {
             "the trace table's 指定测试 column yielded only {checked} labels"
         );
     }
+    /// No line of the plan claims a filter passed more tests than the filter now selects.
+    ///
+    /// The evidence rows record counts ("18 passed") so a later reviewer can tell whether the
+    /// suite still covers what the row claims. A count that has since fallen is not an accounting
+    /// detail: either a test was removed or renamed and the row kept its old number, and both
+    /// mean the row is no longer evidence of anything. Counts may grow freely; they may not
+    /// shrink. The revision history is exempt: it records what a count was at the time.
+    #[test]
+    fn the_plan_never_claims_more_tests_than_the_filter_selects() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+
+        let unit = test_names_in(
+            &CRATE_SOURCES
+                .iter()
+                .filter(|(path, _)| path.starts_with("src/"))
+                .copied()
+                .collect::<Vec<_>>(),
+        );
+        let lines: Vec<&str> = PLAN.lines().collect();
+        let history_start = lines
+            .iter()
+            .position(|line| line.trim_end() == "### 修订历史")
+            .expect("the plan has no 修订历史 section");
+        let history_end = lines[history_start + 1..]
+            .iter()
+            .position(|line| line.starts_with("## ") || line.starts_with("### "))
+            .map_or(lines.len(), |offset| history_start + 1 + offset);
+
+        let mut claims = 0;
+        for line in lines[..history_start].iter().chain(&lines[history_end..]) {
+            let starts: Vec<usize> = line
+                .match_indices("cargo test --lib ")
+                .map(|(at, _)| at)
+                .collect();
+            for (position, start) in starts.iter().enumerate() {
+                let end = starts.get(position + 1).copied().unwrap_or(line.len());
+                let segment = &line[start + "cargo test --lib ".len()..end];
+                let filter: String = segment
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
+                    .collect();
+                if filter.is_empty() {
+                    continue;
+                }
+                let Some(claim) = claimed_passes(segment) else {
+                    continue;
+                };
+                let selected = unit.iter().filter(|name| name.contains(&filter)).count();
+                claims += 1;
+                assert!(
+                    selected >= claim,
+                    "the plan says `cargo test --lib {filter}` passed {claim} tests, but the filter \
+                     now selects {selected}: a row that outlives its tests is not evidence"
+                );
+            }
+        }
+        assert!(
+            claims >= 5,
+            "only {claims} rows carry a test count: the scan is not reading the evidence rows"
+        );
+    }
+
     /// Every `cargo test` line the plan prints selects something.
     ///
     /// The plan asks reviewers to re-run named tests in almost every evidence row. A filter that
@@ -477,14 +591,14 @@ mod plan_doc_tests {
     fn the_plan_prints_only_filters_that_select_a_test() {
         const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
 
-        let (unit, unit_modules) = test_names_in(
+        let unit = test_names_in(
             &CRATE_SOURCES
                 .iter()
                 .filter(|(path, _)| path.starts_with("src/"))
                 .copied()
                 .collect::<Vec<_>>(),
         );
-        let (integration, _integration_modules) = test_names_in(
+        let integration = test_names_in(
             &CRATE_SOURCES
                 .iter()
                 .filter(|(path, _)| path.starts_with("tests/"))
@@ -536,12 +650,8 @@ mod plan_doc_tests {
                     (&unit, "the lib tests")
                 };
                 checked += 1;
-                let last = filter.rsplit("::").next().unwrap_or(filter);
-                let segments_are_modules = filter
-                    .split("::")
-                    .all(|segment| unit_modules.iter().any(|module| module == segment));
                 assert!(
-                    names.iter().any(|name| name.contains(last)) || segments_are_modules,
+                    names.iter().any(|name| name.contains(filter)),
                     "the plan prints `{command}`, whose filter `{filter}` matches no test in \
                      {where_}: cargo would print `0 passed` and the reader would call it green"
                 );

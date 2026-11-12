@@ -576,7 +576,7 @@
 **Verification:**
 
 - [x] `cargo fmt --check` 与 `cargo clippy --all-targets --all-features -- -D warnings` 均通过（0 warning）
-- [x] `cargo test --lib guest_os`：4 passed（默认值/旧 JSON/builder/缓存 OS 不匹配）
+- [x] `cargo test --lib guest_os`：3 passed（默认值/builder/缓存 OS 不匹配；旧 JSON 兼容是同一条默认值用例里的断言，不是独立用例——R115 更正：原先写「4 passed」，这个过滤串从来没有选中过 4 个测试）
 - [x] `cargo test --lib image::tests`：18 passed, 0 failed
 - [x] `cargo test --no-run`：全部 test target 编译通过
 - [ ] T-1 全量，配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1` —— 本机无 QEMU/libvirt/xorriso（DEP-02 不可用），登记为 `DEFER-04`；卡内已用 `cargo test --lib` + `cargo test --no-run` 覆盖 ER-14 的替代门。
