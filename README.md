@@ -240,10 +240,14 @@ Path rules for Windows guests:
 - UNC (`\\server\share`) and device (`\\?\`, `\\.\`) paths are rejected rather
   than guessed at.
 - Nothing is silently skipped: uploading a tree that contains a symlink, or downloading
-  one, fails with an error naming the path; so does any entry the walk cannot read or stat,
-  such as a directory it is not allowed to list or a symlink whose target is gone. A
-  `download` either copies the whole tree or returns an error. This applies to Linux guests
-  too, where the link is recreated and a failure is reported.
+  one, fails with an error naming the path; so does any entry the walk cannot read, such as
+  a directory it is not allowed to list. A `download` either copies the whole tree or
+  returns an error. This applies to Linux guests too, where the link is recreated and a
+  failure is reported.
+- The walk never follows a link on its own: it asks for each entry's own attributes, so a
+  link is reported as a link. A link to a directory is not folded into the copy as if it
+  were a directory, and a broken link can still be seen - and still be deleted by
+  `remove_dir_all`, which unlinks it instead of recursing.
 
 ### Getting Started
 

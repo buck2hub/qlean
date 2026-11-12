@@ -1316,6 +1316,33 @@ mod plan_doc_tests {
         );
     }
 
+    /// The body of the function whose signature starts at `signature`, brace-matched.
+    fn function_body(source: &'static str, signature: &str) -> &'static str {
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("`{signature}` must still exist"));
+        let mut depth = 0usize;
+        let mut started = false;
+        let mut end = source.len();
+        for (offset, ch) in source[start..].char_indices() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    started = true;
+                }
+                '}' => {
+                    depth -= 1;
+                    if started && depth == 0 {
+                        end = start + offset;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        &source[start..end]
+    }
+
     /// A tree walk that cannot read an entry fails instead of skipping it.
     ///
     /// `walk_remote_dir` backs `Machine::download` and `remove_dir_all`. It used to log a
@@ -1327,32 +1354,10 @@ mod plan_doc_tests {
     /// path, and rejects the debug-and-continue shape coming back.
     #[test]
     fn the_remote_walk_reports_entries_it_cannot_read() {
-        let source = include_str!("ssh.rs");
-        let start = source
-            .find("pub(crate) async fn walk_remote_dir(")
-            .expect("`walk_remote_dir` must still exist");
-        let body = {
-            let mut depth = 0usize;
-            let mut started = false;
-            let mut end = source.len();
-            for (offset, ch) in source[start..].char_indices() {
-                match ch {
-                    '{' => {
-                        depth += 1;
-                        started = true;
-                    }
-                    '}' => {
-                        depth -= 1;
-                        if started && depth == 0 {
-                            end = start + offset;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            &source[start..end]
-        };
+        let body = function_body(
+            include_str!("ssh.rs"),
+            "pub(crate) async fn walk_remote_dir(",
+        );
 
         assert!(
             !body.contains("debug!"),
@@ -1371,6 +1376,36 @@ mod plan_doc_tests {
         assert!(
             !body.contains("best-effort"),
             "best-effort traversal is exactly what the documented contract forbids"
+        );
+    }
+
+    /// The walk classifies each entry as itself, not as whatever it points at.
+    ///
+    /// `walk_remote_dir` used `metadata` (SSH_FXP_STAT), which follows links. Measured
+    /// against OpenSSH's own `sftp-server`: STAT on a link to a directory answers with the
+    /// directory's mode, and STAT on a broken link answers `NO_SUCH_FILE` while LSTAT
+    /// answers `0120777`. A walk built on STAT therefore cannot see links at all - so a
+    /// downloaded tree silently folded a linked directory's contents into the copy instead
+    /// of failing on the link, and a tree holding a broken link could not even be collected
+    /// (R142) or removed, although removing the link is a single request.
+    #[test]
+    fn the_remote_walk_stats_the_entry_not_its_target() {
+        let body = function_body(
+            include_str!("ssh.rs"),
+            "pub(crate) async fn walk_remote_dir(",
+        );
+
+        // Two calls: the root and each visited child. The single following stat left in the
+        // function is the `follow_links` branch, which dereferences on purpose.
+        assert_eq!(
+            body.matches("symlink_metadata").count(),
+            2,
+            "the walk must ask for the entry's own attributes for the root and for each child"
+        );
+        assert_eq!(
+            body.matches("sftp.metadata(").count(),
+            1,
+            "a following stat hides links and cannot answer for a broken one outside `follow_links`"
         );
     }
 

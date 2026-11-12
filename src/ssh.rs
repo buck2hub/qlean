@@ -1343,10 +1343,11 @@ impl Session {
     ) -> Result<Vec<RemoteDirEntry>> {
         let mut out = Vec::new();
 
-        // Stat root
+        // Stat the root itself, not what it points at: a walk that follows links cannot
+        // tell a link from its target, and a broken link is not stat-able at all.
         let root_meta = {
             let sftp = self.get_sftp().await?;
-            sftp.metadata(root.as_str()).await?
+            sftp.symlink_metadata(root.as_str()).await?
         };
         let root_type = RemoteFileType::from_attrs(&root_meta);
         out.push(RemoteDirEntry::new(root.clone(), root_type));
@@ -1389,7 +1390,7 @@ impl Session {
                 let child_path = dir.join(&name)?;
                 let attrs = {
                     let sftp = self.get_sftp().await?;
-                    match sftp.metadata(child_path.as_str()).await {
+                    match sftp.symlink_metadata(child_path.as_str()).await {
                         Ok(a) => a,
                         Err(e) => {
                             // An entry that cannot be stat'ed is either a broken symlink or

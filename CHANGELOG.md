@@ -48,6 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `is_running` no longer reports a live QEMU as stopped just because its control socket is missing: a live process without a socket is an error, so a second QEMU cannot be started on the same disk
 
 ### Fixed
+- Downloading a tree followed symbolic links while walking it: the walk asked for each entry's target attributes, so a link to a directory was copied as a directory (its contents folded into the local tree instead of the documented error naming the link) and a broken link could not be classified at all, which also made `remove_dir_all` unable to remove a tree that contained one. The walk now asks for the entry's own attributes
+
 - Downloading a tree logged an entry it could not read or stat at debug level and skipped it, so a broken symlink or a directory the guest would not list came back as a successful, incomplete copy; the walk now fails with the path and the walk root
 
 - Uploading a directory tree that contains a symbolic link to a Linux guest created the link at the *target's* path: `SSH_FXP_SYMLINK` carries two strings, the client fills the draft's `linkpath` field first, and OpenSSH reads the first string as the link's target. A link whose target was writable was silently created in the wrong place, and one whose target already existed failed with "failed to recreate the symbolic link". The request is now sent in the order OpenSSH reads it, from `ssh::symlink_arguments`
