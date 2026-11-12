@@ -8,7 +8,7 @@
 
 | 计划 | 主题 | 状态 | 目标分支 | 目标版本 | 最近更新时间 |
 |---|---|---|---|---|---|
-| [`plan-20261104-windows-guest.md`](plan-20261104-windows-guest.md) | Windows 客户机支持 | `in-progress`（R5 环境消歧：`SPK-01`/`SPK-02` 因 DEP-01/02 不可用而 `blocked`；实现卡在临时接受的 ADR 上推进，`OSX-01` 完成、`OSX-02`/`OSX-03`/`TRN-01`/`EXE-01`/`IP-01`/`FS-01` 本地验收，`REL-01` 阻塞；R6 实施后逐卡 review PASS；R7 结构/状态一致性复核 PASS；R8 修复首启连接预算与首启失败清理；R9 修复 vsock 设备分派/OVMF 配对规则/swtpm socket 权限/Secure Boot vars 模板/xorriso 前置；R10 修复 `copy` 的 PowerShell 二次解析；R11 修复失败启动无法重试；R12 让 lease 发现与 QEMU 退出 race、跳过盘根创建；R13 仅接受 IPv4 lease、拒绝绝对子路径；R14 启动失败统一收尾 QEMU/swtpm/pid；R15 部署标记探测与池化启停分流；R16 rustdoc 门禁与私有类型链接修复；R17 宿主前置聚合真实单测；R18 CI 覆盖面审计（缺口归 REL-01）；R19 验收项到断言的追溯；R20 一次性部署的可观测性；R21 迁移说明校正） | `main` | 0.4.0（minor；公开结构体字面量构造的源码兼容破坏） | 2026-11-12 22:15:00 UTC |
+| [`plan-20261104-windows-guest.md`](plan-20261104-windows-guest.md) | Windows 客户机支持 | `in-progress`（R5 环境消歧：`SPK-01`/`SPK-02` 因 DEP-01/02 不可用而 `blocked`；实现卡在临时接受的 ADR 上推进，`OSX-01` 完成、`OSX-02`/`OSX-03`/`TRN-01`/`EXE-01`/`IP-01`/`FS-01` 本地验收，`REL-01` 阻塞；R6 实施后逐卡 review PASS；R7 结构/状态一致性复核 PASS；R8 修复首启连接预算与首启失败清理；R9 修复 vsock 设备分派/OVMF 配对规则/swtpm socket 权限/Secure Boot vars 模板/xorriso 前置；R10 修复 `copy` 的 PowerShell 二次解析；R11 修复失败启动无法重试；R12 让 lease 发现与 QEMU 退出 race、跳过盘根创建；R13 仅接受 IPv4 lease、拒绝绝对子路径；R14 启动失败统一收尾 QEMU/swtpm/pid；R15 部署标记探测与池化启停分流；R16 rustdoc 门禁与私有类型链接修复；R17 宿主前置聚合真实单测；R18 CI 覆盖面审计（缺口归 REL-01）；R19 验收项到断言的追溯；R20 一次性部署的可观测性；R21 迁移说明校正；R22 CI 门对齐并取得 push 运行证据） | `main` | 0.4.0（minor；公开结构体字面量构造的源码兼容破坏） | 2026-11-12 10:20:00 UTC |
 
 ## 任务卡状态
 
@@ -25,7 +25,7 @@
 | EXE-01 | implementation | in-progress | locally-accepted | TRN-01 | 继承 REL-01 / `64b1046`（DEFER-04） | 2026-11-12 12:10:00 UTC | PowerShell 原文 + 退出码契约（`src/exec.rs`）；顺带修正非 0 退出被报为 success 的既有缺陷；真实 `windows_exec` 冒烟 `blocked`（DEP-01/02） |
 | IP-01 | implementation | in-progress | locally-accepted | EXE-01 | 继承 REL-01 / `eb8fd90`（DEFER-04） | 2026-11-12 12:50:00 UTC | 缓存优先 + PowerShell 查询按本 VM MAC 消歧；真实 `windows_get_ip`/双机一致性 `blocked`（DEP-01/02） |
 | FS-01 | implementation | in-progress | locally-accepted | IP-01 | 继承 REL-01 / `443ec5d`（DEFER-04） | 2026-11-12 21:20:00 UTC | `GuestPath` 唯一转换层 + Windows 文件语义与 unsupported 分支；真实 `windows_files`/Linux 回归 `blocked`；R13 拒绝绝对子路径；R19 三个 POSIX-only 入口断言 |
-| REL-01 | release | blocked | 空 | SPK-01, SPK-02, OSX-01, OSX-02, OSX-03, TRN-01, EXE-01, IP-01, FS-01 | 0.4.0 / — | 2026-11-12 22:15:00 UTC | 唯一发布点；`SPK-01`/`SPK-02` 与全部真实 Windows KVM 冒烟 `blocked`（DEP-01/02），Linux 全量门 `blocked`（DEFER-04），故不 bump/tag/发布；R18 CI 只编译不运行单测，clippy 未对齐 --all-targets，归本卡 AC-04；R21 README 迁移节校正 |
+| REL-01 | release | blocked | 空 | SPK-01, SPK-02, OSX-01, OSX-02, OSX-03, TRN-01, EXE-01, IP-01, FS-01 | 0.4.0 / — | 2026-11-12 10:20:00 UTC | 唯一发布点；`SPK-01`/`SPK-02` 与全部真实 Windows KVM 冒烟 `blocked`（DEP-01/02），Linux 全量门 `blocked`（DEFER-04），故不 bump/tag/发布；R18 CI 只编译不运行单测，clippy 未对齐 --all-targets，归本卡 AC-04；R21 README 迁移节校正；R22 CI 静态门对齐（run 43197579979 全绿），发布仍阻塞 |
 
 ## 延后项与外部/跨计划依赖
 

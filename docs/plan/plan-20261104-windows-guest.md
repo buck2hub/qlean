@@ -59,7 +59,7 @@
 | 文件语义 | SFTP 加宿主 `PathBuf` 拼接；`copy` 使用 POSIX `cp`，`set_permissions` 使用 Unix mode | `src/machine.rs:578-775,922-1137` |
 | 其它运行接口 | `open_interactive_shell` 另开 vsock；池支持 init/spawn/shutdown；关机走 QMP powerdown | `src/machine.rs:466-493,518-576`、`src/pool.rs` |
 | 网络 | libvirt NAT 网络 `qlean`、桥 `qlbr0`、192.168.221.0/24 + DHCP | `src/utils.rs:161-227`、`README.md:170-190` |
-| CI | 仅 `pull_request`；clippy 命令未包含 `--all-targets --all-features` | `.github/workflows/check-and-test.yml:1-7,76-100` |
+| CI | `push`（`main`）与 `pull_request` 均触发；clippy 带 `--all-targets --all-features`，另跑 `cargo test --lib`、`cargo test --no-run --all-targets` 与 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`（R22 实测 run 全绿） | `.github/workflows/check-and-test.yml:1-8,78-83,106-112` |
 | 版本 | `Cargo.toml version = "0.3.1"` | `Cargo.toml:1-4` |
 | 本地 VCS | 当前 checkout 使用 Libra；`git status` 在此 checkout 不可用，`libra status --short --branch` 可用 | 2026-11-04 成稿核对 |
 | 首启部署超时 | `MachineConfig.ssh_timeout` 默认 KVM 180s / TCG 300s，只覆盖 SSH 连接等待维度 | `src/machine.rs:72,165-167` |
@@ -131,6 +131,7 @@
 | 2026-11-12 21:20:00 UTC | review R19（验收项到断言的追溯） | F25：`windows_files` 只断言 `read_link` 报错，而 FS-01 的 AC 要求 `hard_link`/`read_link`/`set_permissions` 三个 POSIX-only 入口都明确报错；单测覆盖了 `ensure_supported` 层，但一次昂贵的硬件冒烟跑完仍不能证明后两个入口的接线正确。补两条断言（`daa6f19`） | N/A（不新增卡；补齐 `FS-01` 既有 AC 的硬件证据面） | `FS-01` 实现证据、Review log、`tests/windows_machine.rs` |
 | 2026-11-12 21:45:00 UTC | review R20（一次性部署的可观测性） | F26：`windows_transport` 只断言 `spawn` 后能执行命令，未验证「部署后 seed 介质已删除」「host key 跨重启不变」「二次 `init` 被拒绝」这三条 OSX-03 AC；其中「seed 已删除」此前只有宿主私有路径可查、无公开可观测面。利用 `init` 对已部署 Windows 的拒绝（`deploy_seed.is_none()` 即 seed 已被 take+remove）作为公开观测量，补 3 条断言（`aa7fc0e`） | N/A（不新增卡、不加公开 API） | `OSX-03`/`TRN-01` 实现证据、Review log、`tests/windows_machine.rs` |
 | 2026-11-12 22:15:00 UTC | review R21（迁移说明与 CHANGELOG 一致性） | F27：README「0.3.x → 0.4.0」写着「Linux runtime behavior are unchanged」，但 CHANGELOG `Fixed` 已记录两处 Linux 运行时行为变化（`exec` 退出码换算修复、空命令拒绝），迁移说明与事实矛盾。改为「破坏仅源码级」并新增「两处 Linux 运行时行为变化」小节，写明需要调用方适配的内容（`943daa0`）；随后自查发现初稿多写了一条第 `upload`/`download` 绝对目的地的断言，但该路径走 `guest_path_from` 而非 `join`，不是错误，已撤回该句（`8365972`） | N/A（不新增卡） | `REL-01` Current evidence、Review log、`README.md`、`CHANGELOG.md` |
+| 2026-11-12 10:20:00 UTC | review R22（CI 门实际执行与远端证据） | F28（R18 登记项落地）：`.github/workflows/check-and-test.yml` 的 test job 只有 `cargo test --no-run`（单测从未在 CI 执行）、clippy 缺 `--all-targets --all-features`（测试与 bench 不被 lint）、workflow 只在 `pull_request` 触发且 `paths-ignore` 忽略自身，故直推 `main` 的 57 个提交一次 CI 都没有。改为 `push`（`main`）+ `pull_request` 双触发、clippy 全 target/all features、新增 `cargo test --lib` 与 rustdoc 门、不再忽略 `.github/**`（`4d4d1e9`）；推后取得真实远端运行证据：run `43197579979`、event=`push`、ref=`refs/heads/main`、commit=`4d4d1e9`，4 个 job 全绿，CI 日志中 `running 85 tests` / `test result: ok. 85 passed` 证明单测确实被执行 | N/A（不新增卡；落地 `REL-01` AC-04 的 CI 部分，发布动作仍阻塞） | 事实基线 CI 行、门禁说明、`REL-01` Current evidence/AC-04、Review log、实施证据汇总、`.github/workflows/check-and-test.yml`、plan-status |
 
 ## 已决议设计决策
 
@@ -313,7 +314,7 @@
 
 #### Verification 判定口径
 
-按 `plan-template.md` 生效。本地每卡门禁：`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、相关 `cargo test --lib <filter>` 与 `cargo test --lib`、`cargo test --no-run`（含 benches）。所有 `tests/windows_machine.rs` 用例均为 `(new)`、默认 `#[ignore]` 并由 `serial_test` 串行；CI 用 `cargo test --no-run` 编译。实际运行必须显式 `--ignored --test-threads=1`，并满足 `DEP-01`/`DEP-02`。命令中的 `/path/to/windows.qcow2` 与 digest 是执行者替换的参数，证据只记录 sanitized 标识，不记录私有绝对路径。
+按 `plan-template.md` 生效。本地每卡门禁：`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、相关 `cargo test --lib <filter>` 与 `cargo test --lib`、`cargo test --no-run`（含 benches）。所有 `tests/windows_machine.rs` 用例均为 `(new)`、默认 `#[ignore]` 并由 `serial_test` 串行。CI（R22 起）在 `push` 到 `main` 与 PR 上执行同一组静态门：`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、`cargo test --lib`（真实运行单测）与 `cargo test --no-run --all-targets`（含 `benches` 与 ignored 硬件测试的编译）；集成测试仍需 KVM 宿主，CI 只证明其可编译。实际运行必须显式 `--ignored --test-threads=1`，并满足 `DEP-01`/`DEP-02`。命令中的 `/path/to/windows.qcow2` 与 digest 是执行者替换的参数，证据只记录 sanitized 标识，不记录私有绝对路径。
 
 ### Task SPK-01: Windows 传输可行性 spike
 
@@ -584,7 +585,7 @@
 
 **Deliverables:** `N/A`
 
-**Implementation write set:** `src/qemu.rs`、`src/machine.rs`、`src/utils.rs`、`tests/windows_machine.rs`、`README.md`、`CHANGELOG.md`、本计划、`plan-status.md`（现有 CI `cargo test --no-run` 自动编译新 target，无需改 workflow）
+**Implementation write set:** `src/qemu.rs`、`src/machine.rs`、`src/utils.rs`、`tests/windows_machine.rs`、`README.md`、`CHANGELOG.md`、本计划、`plan-status.md`（现有 CI 的 `cargo test --no-run --all-targets` 自动编译新 target，无需改 workflow）
 
 **Release write set:** `N/A`
 
@@ -1043,10 +1044,10 @@
 | 事实 | 证据 |
 |---|---|
 | 当前版本 0.3.1 | `Cargo.toml:1-4` |
-| CI 仅 pull_request，clippy 命令与模板不一致 | `.github/workflows/check-and-test.yml:1-7,76-100` |
+| CI 已对齐静态门并双触发（R22）：run `43197579979`，event=`push`，ref=`refs/heads/main`，commit=`4d4d1e9`，`Setup and Cache`/`Rustfmt Check`/`Clippy Check`/`Cargo Test` 4 job 全绿；`Cargo Test` 日志 `running 85 tests` → `test result: ok. 85 passed` | `https://github.com/buck2hub/qlean/actions/runs/43197579979`；`.github/workflows/check-and-test.yml:1-8,78-83,106-112` |
 | CHANGELOG Unreleased/0.3.1 | `CHANGELOG.md:8-24` |
 | README 迁移节已按 CHANGELOG 校正（源码级破坏 + 两处 Linux 运行时变化，R21） | `README.md:503-536` |
-| CI `test` job 只编译（`cargo test --no-run`），从不运行单测；clippy 未带 `--all-targets --all-features`（R18） | `.github/workflows/check-and-test.yml:76-100,70-77` |
+
 
 | 发布前阻塞项（2026-11-12） | 状态 |
 |---|---|
@@ -1061,7 +1062,7 @@
 - [ ] 全部任务卡 `Lifecycle=done` 且 `Acceptance=complete`，最终 code review PASS，P0/P1 关闭。
 - [ ] `Cargo.toml` 从 0.3.1 bump 到 0.4.0，`Cargo.lock` 仅由 Cargo 工具链刷新，版本与迁移理由符合 ADR-WIN-01。
 - [ ] README 支持矩阵只包含实际通过核心冒烟的 Windows 版本；CHANGELOG `[0.4.0]` 含 Added/Changed/Migration 与发布日期，链接可解析。
-- [ ] CI 对目标分支 push 和 PR 均触发 format/clippy/test job，clippy 使用 `--all-targets --all-features -- -D warnings`，Windows target 至少 `--no-run` 编译。
+- [x] CI 对目标分支 push 和 PR 均触发 format/clippy/test job，clippy 使用 `--all-targets --all-features -- -D warnings`，Windows target 至少 `--no-run` 编译。（R22 完成并取得真实 push 运行证据：run `43197579979` 四 job 全绿，含 `cargo test --lib` 的 85 passed 与 `cargo test --no-run --all-targets`；PR 侧沿用既有触发配置）
 - [ ] Linux 全量、每个支持版本的 Windows KVM 核心冒烟与 release build 全绿；核心 Windows 证据无开放 DEFER。
 - [ ] 所有适用 Rollback mode 已验证或记录不可验证原因；发布前工作区只剩本计划声明的改动。
 - [ ] tag `v0.4.0`、GitHub Release、按需 crates.io publish 完成；不可撤回动作之后只前滚修复。
@@ -1210,7 +1211,7 @@
 | EXE-01 | 2026-11-12 12:10:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_exec`（5 passed）、`cargo test --no-run` 全绿 | `windows_exec` 真实 PowerShell 冒烟未取得（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | R6 PASS：核对 `exit_status_from_code` 高位映射、`0..=255` 外拒绝、空命令拒绝、README 契约与 CHANGELOG `Fixed`；R7 修掉空命令错误文案里的多余空格（`c14b915`） | `64b1046` |
 | IP-01 | 2026-11-12 12:50:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_ip`（6 passed）、`cargo test --no-run` 全绿 | `windows_get_ip` 与双机一致性未取得（DEP-01/02 不可用） | `in-progress` / `locally-accepted` | R6 PASS：核对缓存优先、按本 VM MAC 精确选择、0/多结果报错不回落到他机 lease；无遗留问题 | `eb8fd90` |
 | FS-01 | 2026-11-12 13:20:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_path`（10 passed）、`cargo test --lib windows`（39 passed）、`cargo test --lib`（79 passed）、`cargo test --no-run` 全绿 | `windows_files` 与 Linux 文件回归未取得（DEP-01/02、DEFER-04） | `in-progress` / `locally-accepted` | R6 PASS：核对 `GuestPath` 校验/规范化/`join`/`ancestors`/`strip_prefix`、所有 SFTP 入口改造、`copy` 去 POSIX `cp`、unsupported 分支；F2（Review 列语义）与 F3（`join` 不可达分支）本轮修复；R10 修复 `copy` 的 PowerShell 二次解析（`ec6a9a1`） | `443ec5d` |
-| REL-01 | 2026-11-12 13:30:00 UTC | 未执行发布动作 | `SPK-01`/`SPK-02` 与全部真实 Windows KVM 冒烟 `blocked`（DEP-01/02）；Linux 全量门 `blocked`（DEFER-04） | `blocked` / 空 | blocked（未进入发布 review） | — |
+| REL-01 | 2026-11-12 10:20:00 UTC | 未执行发布动作；仅完成 CI 静态门对齐（R22） | `SPK-01`/`SPK-02` 与全部真实 Windows KVM 冒烟 `blocked`（DEP-01/02）；Linux 全量门 `blocked`（DEFER-04）；CI 门已对齐并取得真实运行：run `43197579979`（event=`push`, ref=`refs/heads/main`, commit=`4d4d1e9`）4 job 全绿，`cargo test --lib` 85 passed、`cargo test --no-run --all-targets` 通过、clippy `--all-targets --all-features` 0 告警、rustdoc `-D warnings` 通过 | `blocked` / 空 | blocked（发布 review 未开始；AC-04 的 CI 部分已在 R22 关闭） | run `43197579979`（push/`main`/`4d4d1e9`，全绿） |
 
 ## Review log
 
@@ -1239,6 +1240,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 | R19 | 验收项到断言的追溯 | PASS | 无开放项 | 逐条比对 7 个 `windows_*` 冒烟的断言与卡片 AC：`windows_files` 只验证 `read_link`，缺 `hard_link`/`set_permissions` 两处接线证明；其余 6 个测试的断言与 AC 一一对应（固件生命周期、首启 marker 与 authorized_keys、pinned host key 与 PTY 拒绝、池内地址/host key 互异、PowerShell 引号/流分离/退出码、`get_ip` 缓存与双机互异） | 补两条断言，复用宿主临时文件的 `Permissions` 避免引入 unix-only 依赖（`daa6f19`）；`cargo fmt --check`、clippy `-D warnings`、`cargo test --lib` 85 passed、`cargo test --no-run --all-targets` 全绿，`--ignored` 仍为 7 failed（DEP-01 门未绕过） |
 | R20 | 一次性部署的可观测性 | PASS | 无开放项 | `windows_transport` 的 `spawn` 段只证明「能连上并执行」，而 OSX-03 还要求部署后 seed 清理、host key 跨重启保持、二次 `init` 拒绝；seed 删除本身没有公开访问器，直接查宿主 run 目录会侵入私有实现 | 用公开行为观测：`spawn` 后 `ssh_host_key()` 仍等于首次 pin 的 key；随后 `init()` 必须报 `already completed its Windows first-boot deployment`（该错误仅在 `deploy_seed` 被 take+remove 后出现，且 `init` 在改动任何状态前返回）（`aa7fc0e`）；门禁 fmt/clippy/`cargo test --lib` 85 passed/`--no-run --all-targets` 全绿 |
 | R21 | 迁移说明与 CHANGELOG 一致性 | PASS | 无开放项 | README 迁移节声称 Linux 运行时行为未变，与 CHANGELOG `Fixed` 的两条（`Machine::exec` 退出码换算、空命令拒绝）直接矛盾；首次修订又多写了「绝对 `upload`/`download` 目的地报错」，该路径实际走 `guest_path_from`，`GuestPath::join` 的绝对子路径修复只影响内部调用（`local_basename`/`rel` 永远相对），故用户可见影响为零 | README 改写为「源码级破坏 + 两处运行时行为变化」并列出适配动作（`943daa0`），撤回不准确的第三条（`8365972`）；核对后 CHANGELOG `Added`/`Changed`/`Fixed` 三类 40+ 条与本轮实现一一对应，无失实条目 |
+| R22 | CI 门实际执行与远端证据 | PASS | 无开放项 | R18 登记的缺口：CI 只编译不运行（85 个单测从不在 CI 执行）、clippy 未覆盖测试/bench 代码、workflow 只在 PR 触发而本仓库直推 `main`（57 个提交零 CI 记录），且 `paths-ignore` 忽略 `.github/**` 使 workflow 改动无法自证 | workflow 改为 push(main)+PR 双触发、clippy `--all-targets --all-features`、新增 `cargo test --lib` 与 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、去掉对 `.github/**` 的忽略（`4d4d1e9`）；推后真实运行 run `43197579979`（event=`push`, ref=`refs/heads/main`, commit=`4d4d1e9`）4 job 全绿，日志含 `running 85 tests` → `test result: ok. 85 passed` |
 
 ### R1 findings 与修订对照
 
