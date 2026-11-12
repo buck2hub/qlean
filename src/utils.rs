@@ -36,13 +36,37 @@ pub(crate) struct DhcpLease {
     pub expiry: String,
 }
 
+/// Normalize a MAC address for comparison (`-`, `:` and case are not significant).
+///
+/// One implementation, used by both the DHCP lease path and the in-guest address query:
+/// two normalizers would eventually disagree about what "the same MAC" means.
+pub(crate) fn normalize_mac(mac: &str) -> String {
+    mac.chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
 /// Parse `virsh net-dhcp-leases` tabular output.
 ///
 /// Example row:
 /// ` 2026-11-12 09:35:00   52:54:00:aa:bb:cc   ipv4       192.168.221.42/24    *  -`
 pub(crate) fn parse_dhcp_leases(output: &str) -> Vec<DhcpLease> {
+    /// A MAC token is six hex pairs, separated by `:` or by `-`.
+    ///
+    /// Both spellings are accepted because the same address is printed differently by
+    /// the tools involved (`virsh` uses `:`, Windows reports `-`). Rejecting one spelling
+    /// would silently skip the row and surface as "no lease ever appeared", which points
+    /// at DHCP instead of at the parser.
     fn looks_like_mac(token: &str) -> bool {
-        let parts = token.split(':').collect::<Vec<_>>();
+        let separator = if token.contains(':') {
+            ':'
+        } else if token.contains('-') {
+            '-'
+        } else {
+            return false;
+        };
+        let parts = token.split(separator).collect::<Vec<_>>();
         parts.len() == 6
             && parts
                 .iter()
@@ -115,9 +139,12 @@ fn parse_lease_expiry(line: &str) -> String {
 /// newest row (latest expiry) is the address the guest is actually using; taking the
 /// first row instead dials the address it has already abandoned.
 fn lease_address_for(leases: &[DhcpLease], mac: &str) -> Option<std::net::IpAddr> {
+    // Compare the addresses, not the strings: the caller's MAC and the lease column may
+    // differ in separator and case without being different addresses.
+    let expected = normalize_mac(mac);
     leases
         .iter()
-        .filter(|lease| lease.mac == mac && lease.ip.is_ipv4())
+        .filter(|lease| normalize_mac(&lease.mac) == expected && lease.ip.is_ipv4())
         .max_by(|a, b| a.expiry.cmp(&b.expiry))
         .map(|lease| lease.ip)
 }
@@ -734,6 +761,29 @@ mod tests {
         assert_eq!(leases[0].ip.to_string(), "192.168.221.42");
         assert_eq!(leases[1].mac, "52:54:00:11:22:33");
         assert_eq!(leases[1].ip.to_string(), "192.168.221.43");
+    }
+
+    #[test]
+    fn test_looks_like_mac_accepts_both_separators_and_nothing_looser() {
+        // Rows are matched by a scanner, so anything that merely looks MAC-ish must not be
+        // picked up: a bare 12-hex-digit token or a mixed separator is not an address.
+        let output = format!(
+            "{LEASES_HEADER} 2026-11-12 09:35:00   52-54-00-AA-BB-CC   ipv4       192.168.221.42/24    *  -\n\
+             2026-11-12 09:35:00   525400112233            ipv4       192.168.221.43/24    *  -\n\
+             2026-11-12 09:35:00   52-54:00-aa:bb:cc       ipv4       192.168.221.44/24    *  -\n"
+        );
+        let leases = parse_dhcp_leases(&output);
+        assert_eq!(leases.len(), 1, "only the dashed MAC is a MAC: {leases:?}");
+        assert_eq!(leases[0].ip.to_string(), "192.168.221.42");
+        // A dashed lease matches a colon-shaped query: same address, different spelling.
+        assert_eq!(
+            lease_address_for(&leases, "52:54:00:aa:bb:cc").map(|ip| ip.to_string()),
+            Some("192.168.221.42".to_string())
+        );
+        assert_eq!(
+            lease_address_for(&leases, "52-54-00-AA-BB-CC").map(|ip| ip.to_string()),
+            Some("192.168.221.42".to_string())
+        );
     }
 
     #[test]

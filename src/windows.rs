@@ -80,10 +80,7 @@ pub(crate) const GUEST_IP_QUERY: &str = "%ErrorActionPreference='Stop'; Get-NetA
 
 /// Normalize a MAC address for comparison (`-`, `:` and case are not significant).
 pub(crate) fn normalize_mac(mac: &str) -> String {
-    mac.chars()
-        .filter(|c| c.is_ascii_hexdigit())
-        .collect::<String>()
-        .to_ascii_lowercase()
+    crate::utils::normalize_mac(mac)
 }
 
 /// Parse `<mac> <address>` lines reported by [`GUEST_IP_QUERY`].

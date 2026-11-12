@@ -58,6 +58,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Windows guests were launched with `vhost-vsock-pci`, so a Windows VM needed `/dev/vhost-vsock` and the `vhost_vsock` module and failed to start without them; the device is now added only for Linux guests
 - OVMF setup required the code image and vars template to be exactly the same size, which no stock firmware pair satisfies (a ~528 KiB vars template ships next to a multi-megabyte code image); only a vars template larger than the code image is now rejected
 - The `swtpm` control socket was created with default permissions; it is now owner-only (`mode=0600`)
+- DHCP leases are matched by the MAC address itself, so a dashed MAC column or an
+  uppercase query still finds the lease instead of reporting that no lease ever appeared
 - `MachineConfig` rejects values that cannot describe a machine (zero cores, zero memory, a
   0 GB disk, a zero `ssh_timeout`) by field name before anything is written to disk, instead
   of letting QEMU report it later as "QEMU exited unexpectedly"
