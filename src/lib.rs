@@ -303,6 +303,143 @@ mod plan_doc_tests {
             deferred.len()
         );
     }
+    /// Every test the plan points at can be selected by the filter the plan prints.
+    ///
+    /// The trace table and the `cargo test -- --ignored <label>` hints in the sources name tests
+    /// by label, and a label that selects nothing is worse than a stale one: cargo prints
+    /// `0 passed` and exits successfully, so a reviewer re-running "the specified test" gets a
+    /// green result from a test that never ran. This test reads the test names out of the
+    /// sources and requires every label to match at least one of them.
+    #[test]
+    fn the_plan_points_at_tests_that_can_be_run() {
+        const CRATE_SOURCES: &[(&str, &str)] = &[
+            ("src/exec.rs", include_str!("../src/exec.rs")),
+            ("src/firmware.rs", include_str!("../src/firmware.rs")),
+            ("src/guest_path.rs", include_str!("../src/guest_path.rs")),
+            ("src/image.rs", include_str!("../src/image.rs")),
+            ("src/lib.rs", include_str!("../src/lib.rs")),
+            ("src/machine.rs", include_str!("../src/machine.rs")),
+            ("src/pool.rs", include_str!("../src/pool.rs")),
+            ("src/qemu.rs", include_str!("../src/qemu.rs")),
+            ("src/qmp.rs", include_str!("../src/qmp.rs")),
+            ("src/ssh.rs", include_str!("../src/ssh.rs")),
+            ("src/utils.rs", include_str!("../src/utils.rs")),
+            ("src/windows.rs", include_str!("../src/windows.rs")),
+            (
+                "tests/windows_machine.rs",
+                include_str!("../tests/windows_machine.rs"),
+            ),
+        ];
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+
+        let mut tests: Vec<String> = Vec::new();
+        for (path, source) in CRATE_SOURCES {
+            let lines: Vec<&str> = source.lines().collect();
+            for (index, line) in lines.iter().enumerate() {
+                let trimmed = line.trim();
+                let Some(rest) = trimmed
+                    .strip_prefix("fn ")
+                    .or_else(|| trimmed.strip_prefix("async fn "))
+                else {
+                    continue;
+                };
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                let attributes = lines[index.saturating_sub(4)..index].iter().any(|above| {
+                    let above = above.trim();
+                    above.starts_with("#[test]")
+                        || above.starts_with("#[tokio::test")
+                        || above.starts_with("#[ignore")
+                });
+                if attributes {
+                    tests.push(name);
+                } else if path.is_empty() {
+                    unreachable!();
+                }
+            }
+        }
+        assert!(
+            tests.len() >= 200,
+            "the test-name scan found only {} tests: it is scanning the wrong thing",
+            tests.len()
+        );
+        let selects = |label: &str| tests.iter().any(|name| name.contains(label));
+
+        // The print-the-filter hints inside the crate must print a filter that selects something.
+        // The marker is assembled at runtime so that this test's own source does not look like a
+        // hint that advertises an empty filter.
+        let marker = ["cargo", "test", "--lib", "--", "--ignored", ""].join(" ");
+        let mut hints = 0;
+        for (path, source) in CRATE_SOURCES {
+            for line in source.lines() {
+                let Some(rest) = line.split(marker.as_str()).nth(1) else {
+                    continue;
+                };
+                let label: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                assert!(
+                    !label.is_empty(),
+                    "{path} advertises an empty `--ignored` filter"
+                );
+                hints += 1;
+                assert!(
+                    selects(&label),
+                    "{path} tells the reader to run `--ignored {label}`, which selects no test: \
+                     cargo would report `0 passed` and the reviewer would call it green"
+                );
+            }
+        }
+        assert!(
+            hints >= 5,
+            "the sources advertise only {hints} runnable test filters"
+        );
+
+        // The trace table's `指定测试` column must name tests that exist.
+        // Anchor on a heading that stands alone on its line: the revision history quotes this
+        // heading by name, and a substring search would start the scan inside that row.
+        let lines: Vec<&str> = PLAN.lines().collect();
+        let heading = lines
+            .iter()
+            .position(|line| line.trim_end() == "## 追溯表")
+            .expect("the plan has no 追溯表 section");
+        let section: Vec<&str> = lines[heading..]
+            .iter()
+            .take_while(|line| !(line.starts_with("## ") && !line.starts_with("## 追溯表")))
+            .copied()
+            .collect();
+        let mut checked = 0;
+        for row in section.iter().filter(|line| line.starts_with('|')) {
+            let cells: Vec<&str> = row.split('|').collect();
+            if cells.len() < 7 {
+                continue;
+            }
+            let task = cells[1].trim();
+            let last = cells[cells.len() - 2];
+            for label in last.split('`').skip(1).step_by(2) {
+                if !label.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    continue;
+                }
+                // Commit hashes live in the same column; they are evidence, not filters.
+                if label.chars().all(|c| c.is_ascii_hexdigit()) && (7..=40).contains(&label.len()) {
+                    continue;
+                }
+                checked += 1;
+                assert!(
+                    selects(label),
+                    "the trace table says `{task}` is covered by `{label}`, which matches no test \
+                     name: `cargo test {label}` would run nothing and still succeed"
+                );
+            }
+        }
+        assert!(
+            checked >= 10,
+            "the trace table's 指定测试 column yielded only {checked} labels"
+        );
+    }
 }
 
 #[cfg(test)]

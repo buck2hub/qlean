@@ -702,7 +702,7 @@ mod tests {
     /// Run it where `qemu-system-x86_64`, `swtpm` and the distro OVMF package are installed:
     ///
     /// ```text
-    /// cargo test --lib -- --ignored qemu_firmware_contract
+    /// cargo test --lib -- --ignored firmware_arguments_are_accepted_by_real_qemu
     /// ```
     #[tokio::test]
     #[ignore = "needs qemu-system-x86_64 + swtpm + OVMF; run with --ignored on a real host"]
