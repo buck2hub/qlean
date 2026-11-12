@@ -2122,6 +2122,69 @@ mod plan_doc_tests {
     }
 
     #[test]
+    fn the_retry_rule_for_a_failed_launch_is_stated_once_and_has_a_test() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        // "A failed launch can be retried" was a rule written twice inline - once in `init` and
+        // once in `spawn` - and described in the card as if a test covered it. Two copies of one
+        // rule drift, and the recovery action the failure matrix promises had no test at all
+        // (F174).
+        let source = CRATE_SOURCES
+            .iter()
+            .find(|(path, _)| *path == "src/machine.rs")
+            .map(|(_, source)| *source)
+            .expect("src/machine.rs is not in CRATE_SOURCES");
+        let inline =
+            "self.ssh_cancel_token.is_some() && (self.pid.is_some() || self.ssh.is_some())";
+        // The one allowed copy is inside the predicate itself, so count outside its body.
+        let helper_body = body_of(source, "fn already_started(&self)");
+        let outside = source.replace(&helper_body, "");
+        assert_eq!(
+            outside.matches(inline).count(),
+            0,
+            "the retry rule is inline again: a second copy drifts from `already_started`"
+        );
+        assert_eq!(
+            source.matches("fn already_started(&self)").count(),
+            1,
+            "the retry rule needs exactly one implementation"
+        );
+        assert!(
+            source.matches("self.already_started()").count() >= 2,
+            "`init` and `spawn` both have to ask the same predicate"
+        );
+        let retried = body_of(
+            source,
+            "async fn a_failed_launch_leaves_a_machine_that_can_be_started_again",
+        );
+        assert!(
+            retried.contains("abandon_launch()") && retried.contains("!machine.already_started()"),
+            "the test no longer walks the failed launch into a retryable machine"
+        );
+
+        // The promise in the plan has to name the predicate, so a reader can find the code.
+        for phrase in [
+            "失败启动可重试",
+            "`init`/`spawn` 在启动失败时取消并清除 cancel token",
+        ] {
+            assert!(
+                PLAN.lines()
+                    .any(|line| line.contains(phrase) && line.contains("already_started")),
+                "the plan no longer names `already_started` where it promises `{phrase}`"
+            );
+        }
+        let recovery = PLAN
+            .lines()
+            .find(|line| {
+                line.starts_with("| `init`/`spawn` 启动失败（含首启超时、`read_pid` 失败）")
+            })
+            .expect("the failure matrix no longer has the failed-launch row");
+        assert!(
+            recovery.contains("`already_started`"),
+            "the failure matrix promises a retry without naming the rule that allows it: {recovery}"
+        );
+    }
+
+    #[test]
     fn the_two_matrix_rows_about_the_revision_history_agree_about_its_time_column() {
         const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
         // Two rows of the test matrix describe the same guard. R161 taught the time column to say

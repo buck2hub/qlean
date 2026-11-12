@@ -757,7 +757,7 @@ StandardError=journal
         }
 
         // Same rule as `spawn`: a leftover token from a failed launch must not block a retry.
-        if self.ssh_cancel_token.is_some() && (self.pid.is_some() || self.ssh.is_some()) {
+        if self.already_started() {
             bail!("Machine already initialized");
         }
         self.ssh_cancel_token = Some(CancellationToken::new());
@@ -789,7 +789,7 @@ StandardError=journal
 
         // Only a machine that is actually up counts as spawned: a failed launch leaves
         // the token behind, and refusing to retry would make the error unrecoverable.
-        if self.ssh_cancel_token.is_some() && (self.pid.is_some() || self.ssh.is_some()) {
+        if self.already_started() {
             bail!("Machine already spawned");
         }
         spawn_guard(self.needs_first_boot(), &self.id)?;
@@ -801,6 +801,16 @@ StandardError=journal
         }
 
         Ok(())
+    }
+
+    /// Whether this machine already holds a launch that the caller started.
+    ///
+    /// The cancel token marks "a launch was begun"; it stays behind when that launch fails, so
+    /// on its own it is not proof of a running machine. A pid or a live session is. The two
+    /// callers (`init` and `spawn`) have to answer this the same way, otherwise one of them
+    /// refuses a retry after a failed start while the other allows it.
+    fn already_started(&self) -> bool {
+        self.ssh_cancel_token.is_some() && (self.pid.is_some() || self.ssh.is_some())
     }
 
     /// Drop the cancel token of a launch that failed, so the machine can be retried.
@@ -2556,6 +2566,40 @@ fn session_or_operation_error<'a>(
 #[cfg(test)]
 mod shutdown_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_failed_launch_leaves_a_machine_that_can_be_started_again() {
+        // A launch that fails leaves the cancel token behind - it is the "a launch was begun"
+        // marker. Reading it as "this machine is up" is what turned a failed start into one
+        // that could never be retried (F174).
+        let mut machine = Machine::for_tests_with_pid(None);
+        machine.ssh_cancel_token = Some(CancellationToken::new());
+        assert!(
+            !machine.already_started(),
+            "a leftover token with no pid and no session was read as a running machine"
+        );
+
+        machine.abandon_launch();
+        assert!(
+            machine.ssh_cancel_token.is_none(),
+            "the retry still carries the token of the launch that failed"
+        );
+        assert!(!machine.already_started());
+    }
+
+    #[test]
+    fn a_machine_with_a_pid_or_a_session_is_already_started() {
+        let mut machine = Machine::for_tests_with_pid(Some(4242));
+        assert!(
+            !machine.already_started(),
+            "a pid without the launch token cannot come from `init` or `spawn`"
+        );
+        machine.ssh_cancel_token = Some(CancellationToken::new());
+        assert!(
+            machine.already_started(),
+            "a machine with a launch token and a live pid was reported as not started"
+        );
+    }
 
     #[tokio::test]
     async fn shutting_down_a_machine_that_never_started_is_not_an_error() {
