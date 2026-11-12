@@ -2060,10 +2060,18 @@ mod plan_doc_tests {
         for line in PLAN.lines() {
             let mut rest = line;
             while let Some(at) = rest.find("连续 ") {
+                let before = rest[..at].chars().next_back();
                 let after = &rest[at + "连续 ".len()..];
                 let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+                let quoted = after[digits.len()..].starts_with(" 次」");
                 rest = after;
-                if digits.is_empty() || !after[digits.len()..].starts_with(" 次") {
+                // This document quotes its own mutations (`「连续 5 次」`) when it describes them;
+                // a quotation is not a promise about the code.
+                if digits.is_empty()
+                    || !after[digits.len()..].starts_with(" 次")
+                    || quoted
+                    || before == Some('「')
+                {
                     continue;
                 }
                 checked += 1;
