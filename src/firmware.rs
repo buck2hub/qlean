@@ -185,6 +185,9 @@ pub(crate) fn resolve_ovmf() -> Result<FirmwarePaths> {
     }
 }
 
+/// Program that builds the Windows seed ISO medium.
+const SEED_ISO_BUILDER: &str = "xorriso";
+
 /// Program used to run the software TPM.
 fn swtpm_program() -> PathBuf {
     env_nonempty(ENV_SWTPM)
@@ -223,6 +226,12 @@ pub(crate) fn ensure_host_support() -> Result<()> {
         problems.push(format!(
             "`{}` was not found: install the `swtpm` package or set {ENV_SWTPM}",
             swtpm.display()
+        ));
+    }
+    let iso_builder = Path::new(SEED_ISO_BUILDER);
+    if !command_available(iso_builder) {
+        problems.push(format!(
+            "`{SEED_ISO_BUILDER}` was not found: it builds the Windows seed medium, so install the `{SEED_ISO_BUILDER}` package"
         ));
     }
 
@@ -586,9 +595,13 @@ mod tests {
     fn test_explicit_gaps_error_is_actionable() {
         let swtpm_gap =
             format!("`swtpm` was not found: install the `swtpm` package or set {ENV_SWTPM}");
+        let xorriso_gap = format!(
+            "`{SEED_ISO_BUILDER}` was not found: it builds the Windows seed medium, so install the `{SEED_ISO_BUILDER}` package"
+        );
         let gaps = [
             "KVM acceleration is unavailable: Windows guests require KVM and never fall back to TCG",
             swtpm_gap.as_str(),
+            xorriso_gap.as_str(),
         ];
         let message = format!(
             "Windows guest prerequisites are missing:\n- {}",
@@ -596,6 +609,7 @@ mod tests {
         );
         assert!(message.contains("never fall back to TCG"));
         assert!(message.contains("install the `swtpm` package"));
+        assert!(message.contains("install the `xorriso` package"));
         assert!(INSTALL_HINT.contains("edk2-ovmf"));
         assert!(INSTALL_HINT.contains("QLEAN_OVMF_CODE"));
     }
