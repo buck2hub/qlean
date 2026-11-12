@@ -1529,6 +1529,12 @@ impl Drop for Machine {
                 .arg(pid.to_string())
                 .output();
         }
+        // Stop swtpm before the run dir disappears underneath its control socket; the
+        // explicit take() makes the ordering deterministic instead of relying on field
+        // drop order.
+        if let Some(mut swtpm) = self.swtpm.take() {
+            swtpm.stop_now();
+        }
         // Clean up runtime files if configured to do so
         if self.config.clear {
             let dirs = QleanDirs::new().expect("Failed to get QleanDirs in Drop");

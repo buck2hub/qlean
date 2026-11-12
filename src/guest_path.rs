@@ -124,12 +124,10 @@ impl GuestPath {
             return Ok(self.clone());
         }
 
+        // A Windows root is spelled "C:", so only the POSIX root trims down to an empty
+        // base; that one needs its leading separator restored.
         let base = self.text.trim_end_matches('/');
         let text = if base.is_empty() {
-            // Linux root is spelled "/", a Windows root is spelled "C:".
-            if self.guest_os == GuestOs::Windows {
-                return Self::new(self.guest_os, relative);
-            }
             format!("/{relative}")
         } else {
             format!("{base}/{relative}")

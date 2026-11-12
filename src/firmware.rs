@@ -353,6 +353,14 @@ impl Swtpm {
         let _ = self.child.start_kill();
         let _ = tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await;
     }
+
+    /// Stop the process from synchronous code (for example `Drop`), without waiting.
+    ///
+    /// `Drop` cannot await, so this only signals the child; the reaper still runs when the
+    /// runtime next polls the process handle.
+    pub(crate) fn stop_now(&mut self) {
+        let _ = self.child.start_kill();
+    }
 }
 
 impl Drop for Swtpm {
