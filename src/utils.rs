@@ -355,9 +355,65 @@ impl CommandExt for tokio::process::Command {
 /// Programs Qlean shells out to, whatever the guest OS is.
 const REQUIRED_PROGRAMS: [&str; 4] = ["qemu-system-x86_64", "qemu-img", "xorriso", "virsh"];
 
-/// Ensure the guest-independent host prerequisites (CLI tools and the Qlean network).
+/// Helper QEMU execs to attach a VM to the host bridge.
+///
+/// `-netdev bridge,br=...` does not open the tap itself: QEMU runs this helper, which every
+/// distro installs outside `PATH` (in `libexec`), so it needs its own probe instead of the
+/// `PATH` lookup the CLI programs above get.
+const BRIDGE_HELPER_PROGRAM: &str = "qemu-bridge-helper";
+
+/// Where a distro may put [`BRIDGE_HELPER_PROGRAM`], most specific first.
+const BRIDGE_HELPER_CANDIDATES: [&str; 3] = [
+    "/usr/lib/qemu/qemu-bridge-helper",
+    "/usr/libexec/qemu-bridge-helper",
+    "/usr/local/libexec/qemu-bridge-helper",
+];
+
+/// Locate the bridge helper, preferring a known install path over one on `PATH`.
+fn bridge_helper_path(exists: impl Fn(&Path) -> bool, on_path: bool) -> Option<PathBuf> {
+    BRIDGE_HELPER_CANDIDATES
+        .iter()
+        .map(Path::new)
+        .find(|candidate| exists(candidate))
+        .map(Path::to_path_buf)
+        .or_else(|| on_path.then(|| PathBuf::from(BRIDGE_HELPER_PROGRAM)))
+}
+
+/// Explain a missing bridge helper, including the second thing that breaks bridging.
+fn bridge_helper_problem(found: Option<&Path>) -> Option<String> {
+    found.is_none().then(|| {
+        format!(
+            "`{BRIDGE_HELPER_PROGRAM}` was not found in {} or on `PATH`: QEMU runs it to attach a VM to \
+             the `qlbr0` bridge. Install the QEMU package that ships it, and make sure \
+             `/etc/qemu/bridge.conf` contains `allow qlbr0`",
+            BRIDGE_HELPER_CANDIDATES.join(", ")
+        )
+    })
+}
+
+/// Whether `program` is found by a bare-name lookup, as `Command::new` would run it.
+fn program_on_path(program: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| dir.join(program).is_file())
+}
+
+/// Ensure the guest-independent host prerequisites (CLI tools, bridge helper, network).
 pub(crate) async fn ensure_host_prerequisites() -> Result<()> {
-    check_commands_available(&REQUIRED_PROGRAMS).await?;
+    let mut problems = check_commands_available(&REQUIRED_PROGRAMS).await;
+    let helper = bridge_helper_path(
+        |path| path.is_file(),
+        program_on_path(BRIDGE_HELPER_PROGRAM),
+    );
+    problems.extend(bridge_helper_problem(helper.as_deref()));
+
+    anyhow::ensure!(
+        problems.is_empty(),
+        "required host programs are missing:\n- {}",
+        problems.join("\n- ")
+    );
+
     ensure_network().await?;
     Ok(())
 }
@@ -404,7 +460,8 @@ fn program_problems(probes: &[(&str, ProgramProbe)]) -> Vec<String> {
         .collect()
 }
 
-async fn check_commands_available(programs: &[&'static str]) -> Result<()> {
+/// Probe every program, returning the aggregated problem lines (empty when all are usable).
+async fn check_commands_available(programs: &[&'static str]) -> Vec<String> {
     let mut probes = Vec::with_capacity(programs.len());
     for program in programs {
         let probe = match tokio::process::Command::new(program)
@@ -420,13 +477,7 @@ async fn check_commands_available(programs: &[&'static str]) -> Result<()> {
         probes.push((*program, probe));
     }
 
-    let problems = program_problems(&probes);
-    anyhow::ensure!(
-        problems.is_empty(),
-        "required host programs are missing:\n- {}",
-        problems.join("\n- ")
-    );
-    Ok(())
+    program_problems(&probes)
 }
 
 fn ensure_vsock() -> Result<()> {
@@ -744,14 +795,50 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_commands_available_names_the_missing_program() {
-        let err = check_commands_available(&["qlean-definitely-not-installed"])
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("qlean-definitely-not-installed"), "{err}");
-        assert!(err.contains("was not found"), "{err}");
-        // All four real programs being present must not be required for this assertion.
-        assert!(!err.contains("`virsh`"), "{err}");
+        let problems = check_commands_available(&["qlean-definitely-not-installed"]).await;
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("qlean-definitely-not-installed"),
+            "{problems:?}"
+        );
+        assert!(problems[0].contains("was not found"), "{problems:?}");
+    }
+
+    #[test]
+    fn test_bridge_helper_path_prefers_a_known_install_path() {
+        let found = bridge_helper_path(
+            |candidate| candidate == Path::new("/usr/libexec/qemu-bridge-helper"),
+            true,
+        );
+        assert_eq!(
+            found.as_deref(),
+            Some(Path::new("/usr/libexec/qemu-bridge-helper"))
+        );
+    }
+
+    #[test]
+    fn test_bridge_helper_path_falls_back_to_path_lookup() {
+        assert_eq!(
+            bridge_helper_path(|_| false, true).as_deref(),
+            Some(Path::new("qemu-bridge-helper"))
+        );
+        assert_eq!(bridge_helper_path(|_| false, false), None);
+    }
+
+    #[test]
+    fn test_bridge_helper_problem_explains_both_requirements() {
+        assert!(
+            bridge_helper_problem(Some(Path::new("/usr/lib/qemu/qemu-bridge-helper"))).is_none()
+        );
+
+        let problem = bridge_helper_problem(None).expect("a problem");
+        // The binary is only half of it: the helper also needs the bridge allowlist.
+        assert!(problem.contains("`qemu-bridge-helper`"), "{problem}");
+        assert!(problem.contains("/etc/qemu/bridge.conf"), "{problem}");
+        assert!(problem.contains("allow qlbr0"), "{problem}");
+        // A `\`-continued literal swallows the newline but not stray indentation: keep the
+        // message single-spaced so it reads as one paragraph.
+        assert!(!problem.contains("  "), "{problem}");
     }
 
     #[test]
