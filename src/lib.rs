@@ -484,6 +484,13 @@ mod plan_doc_tests {
         tests
     }
 
+    /// The marker a revision history row carries when nobody wrote its moment down.
+    ///
+    /// Fifty-three rows were dated two days ahead of the clock instead (F170): the ladder in the
+    /// first column was reconstructed from round order, not observed, and the section was exempt
+    /// from the no-future-dates guard, so nothing ever compared it to a clock.
+    const HISTORY_UNRECORDED: &str = "不可回溯";
+
     /// The revision history is one timeline, newest first.
     ///
     /// Half of it used to grow downwards (R1 at the top, appended after the header) and the
@@ -516,17 +523,43 @@ mod plan_doc_tests {
 
         let mut last: Option<u32> = None;
         let mut seen: Vec<u32> = Vec::new();
+        let mut timestamped = 0usize;
+        let mut unrecorded = 0usize;
+        let mut unrecorded_blocks = 0usize;
+        let mut previous_was_unrecorded = false;
         for row in body {
             let cells: Vec<&str> = row.split('|').map(str::trim).collect();
             let (time, trigger) = (cells[1], cells[2]);
+            // A row whose moment cannot be reconstructed says so; inventing a timestamp for it
+            // is how fifty-three rows came to be dated after the clock (F170).
+            let marker = time == HISTORY_UNRECORDED;
             assert!(
-                time.len() == 23 && time.ends_with(" UTC"),
-                "a revision history row has no `YYYY-MM-DD HH:MM:SS UTC` timestamp: {row}"
+                marker || (time.len() == 23 && time.ends_with(" UTC")),
+                "a revision history row has neither a `YYYY-MM-DD HH:MM:SS UTC` timestamp nor the \
+                 `{HISTORY_UNRECORDED}` marker: {row}"
             );
-            if let Some(number) = trigger.strip_prefix("review R").and_then(|rest| {
+            if marker {
+                if !previous_was_unrecorded {
+                    unrecorded_blocks += 1;
+                }
+                unrecorded += 1;
+            } else {
+                timestamped += 1;
+            }
+            previous_was_unrecorded = marker;
+            let parsed = trigger.strip_prefix("review R").and_then(|rest| {
                 let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
                 digits.parse::<u32>().ok()
-            }) {
+            });
+            // A shifted column is the failure this catches: when the first cell of fifty-three rows
+            // was replaced, one leftover time fragment stayed in the trigger column, `strip_prefix`
+            // returned `None`, and the ordering check skipped those rows in silence (F170).
+            assert!(
+                parsed.is_some() || trigger == "成稿",
+                "a revision history row does not name its round in the trigger cell, so its \
+                 position is unchecked: {row}"
+            );
+            if let Some(number) = parsed {
                 if let Some(previous) = last {
                     assert!(
                         number <= previous,
@@ -551,6 +584,17 @@ mod plan_doc_tests {
         assert!(
             seen.windows(2).all(|pair| pair[0] > pair[1]),
             "the review numbers in the table are not strictly descending: {seen:?}"
+        );
+        assert!(
+            timestamped >= 50 && unrecorded >= 50,
+            "the table yielded {timestamped} timestamps and {unrecorded} unrecorded rows: the \
+             scan is not reading both kinds"
+        );
+        assert_eq!(
+            unrecorded_blocks, 1,
+            "the {unrecorded} unrecorded rows form {unrecorded_blocks} separate blocks: they are \
+             one stretch of rounds whose moments were never written down, not a hole punched into \
+             rows that do have times"
         );
     }
 
@@ -2405,10 +2449,25 @@ mod plan_doc_tests {
             if trimmed.starts_with("## ") || trimmed.starts_with("### ") {
                 in_history = trimmed == "### 修订历史";
             }
-            if in_history || line.contains("不可回溯") {
+            // In the history table only the first cell is a date claim; the other cells recount
+            // older rounds and quote the dates they were about. Outside it, a date inside backticks
+            // is a quotation too - the prose explaining the fabricated ladder quotes it.
+            let owned: String;
+            let scanned: &str = if in_history && line.starts_with('|') {
+                line.split('|').nth(1).unwrap_or("")
+            } else {
+                owned = line
+                    .split('`')
+                    .enumerate()
+                    .filter(|(index, _)| index % 2 == 0)
+                    .map(|(_, text)| text)
+                    .collect();
+                owned.as_str()
+            };
+            if scanned.contains(HISTORY_UNRECORDED) {
                 continue;
             }
-            let bytes = line.as_bytes();
+            let bytes = scanned.as_bytes();
             for at in 0..bytes.len().saturating_sub(9) {
                 let window = &bytes[at..at + 10];
                 let shaped = window[..4].iter().all(u8::is_ascii_digit)
@@ -2424,14 +2483,13 @@ mod plan_doc_tests {
                 assert!(
                     date <= today.as_str(),
                     "the plan dates evidence {date}, but the clock says {today}: nothing can \
-                     have been observed on that day yet"
+                     have been observed on that day yet: {scanned}"
                 );
             }
         }
         assert!(
-            checked >= 5,
-            "the plan yielded only {checked} dates outside the revision history: the scan is not \
-             looking at them"
+            checked >= 50,
+            "the plan yielded only {checked} dates: the scan is not looking at them"
         );
     }
 
