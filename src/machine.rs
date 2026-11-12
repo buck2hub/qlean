@@ -178,6 +178,25 @@ impl Default for MachineConfig {
     }
 }
 
+/// Resolve a Windows guest's SSH endpoint from its DHCP lease.
+///
+/// The address comes from the libvirt DHCP lease for this VM's MAC, so it never relies on
+/// running a command inside the guest. Owned inputs keep the returned future free of a
+/// borrow on `Machine`, which the caller needs for cleanup in the racing branches.
+async fn discover_windows_endpoint(
+    mac_address: String,
+    ssh_host_key: Option<String>,
+    timeout: Duration,
+) -> Result<(std::net::SocketAddr, String)> {
+    let host_key = ssh_host_key.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Windows guest is missing its per-VM SSH host key; the deployment seed was not staged"
+        )
+    })?;
+    let ip = crate::utils::find_lease_address(&mac_address, timeout).await?;
+    Ok((std::net::SocketAddr::new(ip, windows::SSH_PORT), host_key))
+}
+
 /// Connection budget for `Machine::launch`.
 ///
 /// A Windows guest's first boot must also finish its deployment before `sshd`
@@ -947,20 +966,6 @@ StandardError=journal
         Ok((ssh, cancel_token))
     }
 
-    /// TCP endpoint and pinned host key for a Windows guest.
-    ///
-    /// The address is resolved from the libvirt DHCP lease for this VM's MAC, so it
-    /// never relies on running a command inside the guest.
-    async fn windows_endpoint(&self, timeout: Duration) -> Result<(std::net::SocketAddr, String)> {
-        let host_key = self.ssh_host_key.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Windows guest is missing its per-VM SSH host key; the deployment seed was not staged"
-            )
-        })?;
-        let ip = crate::utils::find_lease_address(&self.mac_address, timeout).await?;
-        Ok((std::net::SocketAddr::new(ip, windows::SSH_PORT), host_key))
-    }
-
     /// Public half of this machine's SSH host key, if the guest uses a per-VM one.
     ///
     /// Windows guests get a fresh host keypair per VM; the public half is returned
@@ -1200,7 +1205,48 @@ StandardError=journal
         // bounded by the same timeout as the connection attempt.
         let mut windows_endpoint: Option<(std::net::SocketAddr, String)> = None;
         if self.image.guest_os == GuestOs::Windows {
-            match self.windows_endpoint(ssh_timeout).await {
+            // Discovery polls `virsh` for up to `ssh_timeout`, which on a first boot is
+            // the 900s deployment budget. Race it against QEMU and cancellation so a VM
+            // that died right after starting reports why, instead of waiting out the
+            // whole budget and blaming the (absent) DHCP lease.
+            let discovery = discover_windows_endpoint(
+                self.mac_address.clone(),
+                self.ssh_host_key.clone(),
+                ssh_timeout,
+            );
+            tokio::pin!(discovery);
+            let discovered = tokio::select! {
+                result = &mut discovery => result,
+                result = &mut qemu_handle => {
+                    cancel_token.cancel();
+                    self.pid = None;
+                    if let Some(mut swtpm) = self.swtpm.take() {
+                        swtpm.stop().await;
+                    }
+                    return Err(match result {
+                        Ok(Ok(())) => anyhow::anyhow!(
+                            "QEMU exited before the Windows guest obtained a DHCP lease"
+                        ),
+                        Ok(Err(e)) => anyhow::anyhow!(
+                            "QEMU failed before the Windows guest obtained a DHCP lease: {e}"
+                        ),
+                        Err(e) => anyhow::anyhow!(
+                            "QEMU task error before the Windows guest obtained a DHCP lease: {e}"
+                        ),
+                    });
+                }
+                _ = cancel_token.cancelled() => {
+                    self.pid = None;
+                    if let Some(mut swtpm) = self.swtpm.take() {
+                        swtpm.stop().await;
+                    }
+                    return Err(anyhow::anyhow!(
+                        "VM-{} launch was cancelled before the guest obtained a DHCP lease",
+                        self.id
+                    ));
+                }
+            };
+            match discovered {
                 Ok(endpoint) => windows_endpoint = Some(endpoint),
                 Err(e) => {
                     if let Some(pid) = self.pid.take() {
