@@ -460,6 +460,54 @@ pub(crate) fn path_argument(prefix: &str, path: &Path) -> std::ffi::OsString {
     argument
 }
 
+/// Create `path` with owner-only permission **at creation time**.
+///
+/// `chmod` after the write is a different program: between the two calls the file exists on
+/// disk with the umask's permissions (0644 under the usual 022), and a crash or a failed
+/// `chmod` leaves it that way for good. Creating it with `0600` means no umask can widen it
+/// and no window exists at all.
+pub(crate) fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Write `contents` to `path` owner-only and atomically.
+///
+/// The file is created with [`create_owner_only`] and renamed into place, so a crash leaves
+/// either the previous file or a complete one — never a partial credential that still parses
+/// as "some file", and never a complete one that others can read.
+pub(crate) fn write_owner_only_atomically(path: &Path, contents: &str) -> Result<()> {
+    let tmp_path = path.with_extension("tmp");
+    let _ = std::fs::remove_file(&tmp_path);
+    let mut tmp = create_owner_only(&tmp_path).with_context(|| {
+        format!(
+            "failed to create the temporary file {} with owner-only permissions",
+            tmp_path.display()
+        )
+    })?;
+    let written = std::io::Write::write_all(&mut tmp, contents.as_bytes())
+        .and_then(|()| std::io::Write::flush(&mut tmp))
+        .with_context(|| format!("failed to write {}", tmp_path.display()));
+    drop(tmp);
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+    std::fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "failed to install {} (the complete file is left at {})",
+            path.display(),
+            tmp_path.display()
+        )
+    })?;
+    Ok(())
+}
+
 /// Make a file owner-only and owner-writable (`0600`).
 ///
 /// Files Qlean generates hold secrets (client keys, seeds) or firmware state, and a copy of
@@ -1600,5 +1648,112 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod owner_only_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).expect("stat").permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn test_the_file_is_owner_only_from_the_moment_it_exists() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("secret");
+        write_owner_only_atomically(&path, "material").expect("written");
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "material");
+        // No temporary file survives a successful install.
+        assert!(!path.with_extension("tmp").exists());
+    }
+
+    #[test]
+    fn test_the_contents_replace_the_previous_file_only_when_complete() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("secret");
+        write_owner_only_atomically(&path, "old").expect("written");
+        write_owner_only_atomically(&path, "new").expect("rewritten");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "new");
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    /// A directory that cannot be written is the cheapest way to reach the failure path: the
+    /// temporary file must not survive it.
+    #[test]
+    fn test_a_failed_write_leaves_no_temporary_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing = dir.path().join("absent").join("secret");
+        assert!(write_owner_only_atomically(&missing, "material").is_err());
+        assert!(!missing.with_extension("tmp").exists());
+    }
+
+    /// `chmod` after the write is a different program: the mode has to come from creation,
+    /// and the write has to be atomic, or a crash leaves a readable or truncated credential.
+    #[test]
+    fn test_owner_only_files_are_created_that_way_and_never_chmoded() {
+        fn region<'a>(source: &'a str, from: &str, to: &str) -> &'a str {
+            let start = source.find(from).expect("region start");
+            let rest = &source[start..];
+            let end = rest.find(to).expect("region end");
+            &rest[..end]
+        }
+
+        let source = include_str!("utils.rs");
+        let writer = region(
+            source,
+            "pub(crate) fn create_owner_only",
+            "pub(crate) fn restrict_file",
+        );
+        assert!(
+            !writer.contains("set_permissions") && !writer.contains("set_mode"),
+            "the mode must come from `OpenOptions::mode`, not from a `chmod` that leaves a \
+             window (and a crash) with the umask's permissions"
+        );
+        assert_eq!(
+            writer.matches("0o600").count(),
+            1,
+            "`0o600` must appear exactly once in the writer, in the file creation call"
+        );
+        assert!(
+            writer.contains(".mode(0o600)"),
+            "the file must be created with `OpenOptionsExt::mode(0o600)`"
+        );
+        assert!(
+            writer.contains("std::fs::rename(&tmp_path, path)"),
+            "the file must be installed by a rename so a crash cannot leave a partial file"
+        );
+
+        // Every credential Qlean writes has to go through it.
+        let ssh = include_str!("ssh.rs");
+        let generator = region(
+            ssh,
+            "pub(crate) fn generate_keypair",
+            "#[derive(Debug, Clone, Default)]",
+        );
+        assert!(
+            generator.contains("write_owner_only_atomically(privkey_path"),
+            "`generate_keypair` must write the private key through `write_owner_only_atomically`"
+        );
+        let windows = include_str!("windows.rs");
+        let staging = region(
+            windows,
+            "pub(crate) async fn stage",
+            "pub(crate) async fn build",
+        );
+        assert!(
+            staging.contains("write_owner_only_atomically(&host_key_path"),
+            "the staged host private key must be written through `write_owner_only_atomically`"
+        );
+        assert!(
+            staging
+                .split("ssh_host_ed25519_key")
+                .nth(1)
+                .is_some_and(|after| after.contains("write_owner_only_atomically")),
+            "the staged host private key must not be written with a plain write plus `chmod`"
+        );
     }
 }

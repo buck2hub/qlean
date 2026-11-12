@@ -1,6 +1,5 @@
 use std::{
     io::ErrorKind,
-    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -242,51 +241,6 @@ pub(crate) fn get_ssh_key(dir: &Path) -> Result<PersistedSshKeypair> {
     generate_keypair(&privkey_path)
 }
 
-/// Create `path` with owner-only permission *at creation time*.
-///
-/// `chmod` after the write is a different program: between the two calls the private key
-/// exists on disk with the umask's permissions (0644 under the usual 022), and a crash or a
-/// failed chmod leaves it that way for good. Creating it with `0600` means no umask can
-/// widen it and no window exists.
-fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-}
-
-/// Write the private key atomically: a crash leaves either the old file or a complete one.
-///
-/// `std::fs::write` truncates the target in place, so a crash mid-write leaves a partial
-/// key that still parses as "some file" and would be used as the identity.
-fn write_private_key(path: &Path, contents: &str) -> Result<()> {
-    let tmp_path = path.with_extension("tmp");
-    let _ = std::fs::remove_file(&tmp_path);
-    let mut tmp = create_private_file(&tmp_path).with_context(|| {
-        format!(
-            "failed to create the temporary SSH private key {} with owner-only permissions",
-            tmp_path.display()
-        )
-    })?;
-    let written = std::io::Write::write_all(&mut tmp, contents.as_bytes())
-        .and_then(|()| std::io::Write::flush(&mut tmp))
-        .with_context(|| format!("failed to write the SSH private key {}", tmp_path.display()));
-    drop(tmp);
-    if let Err(error) = written {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(error);
-    }
-    std::fs::rename(&tmp_path, path).with_context(|| {
-        format!(
-            "failed to install the SSH private key {} (the complete key is left at {})",
-            path.display(),
-            tmp_path.display()
-        )
-    })?;
-    Ok(())
-}
-
 /// Generate a fresh ed25519 keypair at `privkey_path` (private key) and
 /// `<privkey_path>.pub` (OpenSSH public key), both owned by the caller.
 ///
@@ -306,7 +260,7 @@ pub(crate) fn generate_keypair(privkey_path: &Path) -> Result<PersistedSshKeypai
     let pubkey_openssh = privkey.public_key().to_openssh()?;
     let privkey_openssh = privkey.to_openssh(LineEnding::default())?.to_string();
     debug!("Writing SSH private key to {privkey_path:?}");
-    write_private_key(privkey_path, &privkey_openssh)?;
+    crate::utils::write_owner_only_atomically(privkey_path, &privkey_openssh)?;
     debug!("Writing SSH public key to {pubkey_path:?}");
     std::fs::write(&pubkey_path, &pubkey_openssh)?;
 
@@ -1786,56 +1740,5 @@ mod tests {
             & 0o777;
         assert_eq!(mode, 0o600, "a reused private key must be owner-only");
         assert_eq!(reused.privkey_str, keypair.privkey_str);
-    }
-
-    /// `chmod` after the write is a different program: the mode has to come from creation,
-    /// and the write has to be atomic, or a crash leaves a readable or truncated credential.
-    #[test]
-    fn test_the_private_key_is_created_owner_only_and_never_chmoded() {
-        fn region<'a>(source: &'a str, from: &str, to: &str) -> &'a str {
-            let start = source.find(from).expect("region start");
-            let rest = &source[start..];
-            let end = rest.find(to).expect("region end");
-            &rest[..end]
-        }
-
-        let source = include_str!("ssh.rs");
-        let writer = region(
-            source,
-            "fn create_private_file",
-            "/// Generate a fresh ed25519 keypair",
-        );
-        assert!(
-            !writer.contains("set_permissions") && !writer.contains("set_mode"),
-            "the private key mode must come from `OpenOptions::mode`, not from a `chmod` that \
-             leaves a window (and a crash) with the umask's permissions"
-        );
-        assert_eq!(
-            writer.matches("0o600").count(),
-            1,
-            "`0o600` must appear exactly once in the key writer, in the file creation call"
-        );
-        assert!(
-            writer.contains(".mode(0o600)"),
-            "the private key must be created with `OpenOptionsExt::mode(0o600)`"
-        );
-        assert!(
-            writer.contains("std::fs::rename(&tmp_path, path)"),
-            "the private key must be installed by a rename so a crash cannot leave a partial file"
-        );
-
-        let generator = region(
-            source,
-            "pub(crate) fn generate_keypair",
-            "#[derive(Debug, Clone, Default)]",
-        );
-        assert!(
-            !generator.contains("set_permissions") && !generator.contains("set_mode"),
-            "`generate_keypair` must not re-introduce a `chmod` after the write"
-        );
-        assert!(
-            generator.contains("write_private_key(privkey_path"),
-            "`generate_keypair` must write the private key through `write_private_key`"
-        );
     }
 }

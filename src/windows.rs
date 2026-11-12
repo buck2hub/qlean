@@ -252,15 +252,16 @@ impl DeploySeed {
             })?;
 
         let host_key_path = root.join("ssh_host_ed25519_key");
-        tokio::fs::write(&host_key_path, &host_key.privkey_str)
-            .await
+        // This is a private key: it must be owner-only from the moment it exists, not
+        // `chmod`ed afterwards — the seed directory's 0700 is a second line of defence, not
+        // the guarantee (the guarantee has to hold for this file on its own).
+        crate::utils::write_owner_only_atomically(&host_key_path, &host_key.privkey_str)
             .with_context(|| {
                 format!(
                     "failed to write Windows seed host key at {}",
                     host_key_path.display()
                 )
             })?;
-        set_owner_only(&host_key_path).await?;
 
         debug!(
             "Staged Windows seed medium in {} (authorized_keys, deploy.json, ssh_host_ed25519_key)",
@@ -294,6 +295,17 @@ impl DeploySeed {
                 &format!("{SEED_ROOT}="),
                 &self.dir.join(SEED_ROOT),
             ));
+        // `xorriso -o` truncates an existing file and keeps its mode, so creating the medium
+        // owner-only *first* is what makes the guarantee hold: a file `xorriso` creates
+        // itself comes out with the process umask (0644), and the medium carries this VM's
+        // host private key.
+        let _ = std::fs::remove_file(&self.iso);
+        crate::utils::create_owner_only(&self.iso).with_context(|| {
+            format!(
+                "failed to create the Windows seed ISO {} with owner-only permissions",
+                self.iso.display()
+            )
+        })?;
         debug!("Creating Windows seed ISO with command:\n{:?}", cmd);
 
         let output = crate::utils::bounded_output(cmd, SEED_BUILD_BUDGET, "build the Windows seed ISO")
@@ -307,9 +319,11 @@ impl DeploySeed {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        // `xorriso` creates the file with the process umask (typically world-readable),
-        // and the medium carries the guest host private key: seal it before QEMU attaches it.
-        seal_seed_medium(&self.iso).await?;
+        // The medium carries this VM's host private key, so the mode created above has to
+        // survive `xorriso`. Check it here rather than `chmod` it: a `chmod` would hide the
+        // fact that the guarantee stopped holding (a future `xorriso` writing through a
+        // temporary file and renaming would defeat the pre-creation silently).
+        ensure_seed_medium_is_sealed(&self.iso)?;
         Ok(())
     }
 
@@ -390,17 +404,25 @@ fn ensure_trailing_newline(content: &str) -> String {
     format!("{trimmed}\n")
 }
 
-/// Seal the built seed medium so only the owning user can read it.
+/// Refuse a seed medium that others can read.
 ///
-/// Split out of [`DeploySeed::build`] because `build` needs `xorriso`: the permission
-/// change is the part that must not regress, and it can be exercised on any file.
-async fn seal_seed_medium(path: &Path) -> Result<()> {
-    set_owner_only(path).await.with_context(|| {
-        format!(
-            "failed to restrict the Windows seed medium {} to 0600",
-            path.display()
-        )
-    })
+/// Split out of [`DeploySeed::build`] because `build` needs `xorriso`: the check is the part
+/// that must not regress, and it can be exercised on any file.
+fn ensure_seed_medium_is_sealed(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = std::fs::metadata(path)
+        .with_context(|| format!("failed to stat the Windows seed medium {}", path.display()))?
+        .permissions()
+        .mode()
+        & 0o777;
+    anyhow::ensure!(
+        mode == 0o600,
+        "the Windows seed medium {} is {mode:o}, not 0600: it carries this VM's SSH host \
+         private key, so it must be created owner-only before `xorriso` writes into it",
+        path.display()
+    );
+    Ok(())
 }
 
 async fn set_owner_only(path: &Path) -> Result<()> {
@@ -609,19 +631,26 @@ mod tests {
         Ok(())
     }
 
+    /// A medium that others can read carries this VM's host private key: refuse it instead
+    /// of `chmod`ing it, because the `chmod` would only hide that the pre-creation stopped
+    /// holding.
     #[tokio::test]
-    async fn test_seed_medium_is_sealed_after_the_build() -> Result<()> {
+    async fn test_a_seed_medium_that_others_can_read_is_refused() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir()?;
         let iso = tmp.path().join("seed.iso");
-        // `xorriso` leaves the medium with the process umask.
+        // What `xorriso` leaves behind when it creates the file itself (umask 022).
         std::fs::write(&iso, b"seed")?;
         std::fs::set_permissions(&iso, std::fs::Permissions::from_mode(0o644))?;
 
-        seal_seed_medium(&iso).await?;
-        let mode = std::fs::metadata(&iso)?.permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "seed medium should be 0600, got {mode:o}");
+        let error = ensure_seed_medium_is_sealed(&iso)
+            .expect_err("a world-readable seed medium must not be handed to QEMU")
+            .to_string();
+        assert!(error.contains("644"), "{error}");
+        assert!(error.contains("0600"), "{error}");
+        std::fs::set_permissions(&iso, std::fs::Permissions::from_mode(0o600))?;
+        ensure_seed_medium_is_sealed(&iso).expect("an owner-only seed medium is fine");
         Ok(())
     }
 
