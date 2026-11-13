@@ -40,6 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `with_pool` no longer requires `/dev/vhost-vsock`, and `with_machine` requires it only for `GuestOs::Linux`
 
 ### Fixed
+- The Windows seed medium's stale copy was removed with `let _ = std::fs::remove_file(..)`, so a
+  name taken by a directory (or a file that could not be unlinked) failed later as
+  "failed to create the Windows seed ISO ... with owner-only permissions" - `EEXIST` blamed on
+  its own permissions. A medium that cannot be replaced is now reported as exactly that; a
+  medium that is simply absent is still a new medium.
 - Two directories that receive secrets were created with the umask's permissions and then
   `chmod`ed: the Windows seed root (which receives the guest's SSH host private key) and the
   Windows run directory on the launch path (which receives the TPM state). Under `umask 000`

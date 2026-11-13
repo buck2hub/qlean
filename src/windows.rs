@@ -303,8 +303,24 @@ impl DeploySeed {
         // `xorriso -o` truncates an existing file and keeps its mode, so creating the medium
         // owner-only *first* is what makes the guarantee hold: a file `xorriso` creates
         // itself comes out with the process umask (0644), and the medium carries this VM's
-        // host private key.
-        let _ = std::fs::remove_file(&self.iso);
+        // host private key. Measured against xorriso 1.5.8: a pre-created `0600` output file
+        // is truncated in place and stays `0600`.
+        //
+        // A leftover from a failed build has to go, but a name that cannot be removed is a
+        // reason of its own: swallowing it made `create_owner_only` fail with `EEXIST` and
+        // blame its own permissions for a directory (or an unlinkable file) left behind.
+        match std::fs::remove_file(&self.iso) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to remove the stale Windows seed ISO {}",
+                        self.iso.display()
+                    )
+                });
+            }
+        }
         crate::utils::create_owner_only(&self.iso).with_context(|| {
             format!(
                 "failed to create the Windows seed ISO {} with owner-only permissions",
@@ -512,6 +528,89 @@ pub(crate) fn copy_file_command(from: &str, to: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A medium that cannot be replaced is named as such, not blamed on its own permissions.
+    ///
+    /// `build` removes a leftover from a failed build and used to ignore the outcome: when the
+    /// name was taken by a directory (or a file the process could not unlink), `create_owner_only`
+    /// failed with `EEXIST` and the message read "failed to create ... with owner-only
+    /// permissions", which is the one thing that was not wrong.
+    #[tokio::test]
+    async fn a_leftover_medium_that_cannot_be_removed_is_named() {
+        let parent = tempfile::tempdir().expect("temp dir");
+        let dir = parent.path().join("seed");
+        std::fs::create_dir_all(dir.join(SEED_ROOT)).expect("seed root");
+        let iso = parent.path().join("seed.iso");
+        // A directory where the medium belongs: `remove_file` fails with `EISDIR`/`EPERM`,
+        // exactly the leftover a crashed build can leave.
+        std::fs::create_dir(&iso).expect("a directory in the medium's place");
+        let seed = DeploySeed {
+            dir,
+            iso: iso.clone(),
+        };
+
+        let error = seed
+            .build()
+            .await
+            .expect_err("a medium that cannot be replaced must be reported");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("failed to remove the stale Windows seed ISO"),
+            "the reason has to name the removal, not the creation: {message}"
+        );
+        assert!(
+            !message.contains("failed to create the Windows seed ISO"),
+            "the creation never ran, so it cannot be the reason: {message}"
+        );
+        assert!(
+            message.contains(&iso.display().to_string()),
+            "the path has to be in the message: {message}"
+        );
+    }
+
+    /// A medium that is simply not there is a new medium, not a failure.
+    ///
+    /// The stale-removal branch must not turn the ordinary case - no `seed.iso` yet - into an
+    /// error. The build then reaches `xorriso`, which is what the message has to be about when
+    /// the host does not have it.
+    #[tokio::test]
+    async fn an_absent_medium_is_a_new_medium_and_not_a_removal_failure() {
+        let parent = tempfile::tempdir().expect("temp dir");
+        let dir = parent.path().join("seed");
+        std::fs::create_dir_all(dir.join(SEED_ROOT)).expect("seed root");
+        std::fs::write(
+            dir.join(SEED_ROOT).join("authorized_keys"),
+            "ssh-ed25519 AAAATEST\n",
+        )
+        .expect("contents");
+        let seed = DeploySeed {
+            dir,
+            iso: parent.path().join("seed.iso"),
+        };
+
+        match seed.build().await {
+            // No `xorriso` on this host: the failure is about running it, not about a leftover.
+            Err(error) => {
+                let message = format!("{error:#}");
+                assert!(
+                    !message.contains("stale Windows seed ISO"),
+                    "an absent medium is not a stale medium: {message}"
+                );
+                assert!(
+                    message.contains("xorriso"),
+                    "the failure has to name what it could not run: {message}"
+                );
+            }
+            // A host with `xorriso`: the medium is there, `0600`, and not empty.
+            Ok(()) => {
+                use std::os::unix::fs::PermissionsExt;
+                let iso = parent.path().join("seed.iso");
+                let meta = std::fs::metadata(&iso).expect("the built medium");
+                assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+                assert!(meta.len() > 0, "an empty medium carries nothing");
+            }
+        }
+    }
 
     /// The staged seed is owner-only, and it is that from the moment each piece exists.
     ///
