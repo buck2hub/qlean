@@ -586,6 +586,35 @@ fn swtpm_args(state_dir: &Path, socket: &Path, log: &Path) -> Vec<String> {
 /// How long `swtpm` gets to flush its state before it is killed.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
+/// What one bounded wait for a child told us.
+///
+/// The timeout wrapper's own `is_err` answers only "did the grace period expire", so
+/// `Ok(Err(_))` - `wait` itself failing - used to fall through the same branch as an exit:
+/// `stop` returned as if the TPM had shut down while nobody had confirmed it, and the caller
+/// carried on to reuse the state directory that a still-running `swtpm` may own.
+#[derive(Debug, PartialEq, Eq)]
+enum WaitOutcome {
+    /// The child exited.
+    Exited,
+    /// The grace period expired with the child still running.
+    TimedOut,
+    /// `wait` failed, so the child's fate is unknown.
+    Failed(String),
+}
+
+fn wait_outcome(
+    waited: std::result::Result<
+        std::io::Result<std::process::ExitStatus>,
+        tokio::time::error::Elapsed,
+    >,
+) -> WaitOutcome {
+    match waited {
+        Ok(Ok(_)) => WaitOutcome::Exited,
+        Ok(Err(error)) => WaitOutcome::Failed(error.to_string()),
+        Err(_) => WaitOutcome::TimedOut,
+    }
+}
+
 /// Ask a child process to terminate, so it can flush its state first.
 ///
 /// `Child::start_kill` only sends `SIGKILL`, which gives `swtpm` no chance to write the TPM
@@ -692,16 +721,34 @@ impl Swtpm {
     /// half-written state file behind and the guest then loses the TPM identity it sealed
     /// secrets against (on Windows: BitLocker recovery). Ask it to terminate, wait, and only
     /// kill if it does not.
-    pub(crate) async fn stop(&mut self) {
+    ///
+    /// Returns whether the process is *confirmed* gone. A `wait` that itself failed is not
+    /// confirmation: the caller is about to rebuild this machine's TPM state directory, and
+    /// nobody has vouched that its owner is still there.
+    pub(crate) async fn stop(&mut self) -> bool {
         signal_terminate(&mut self.child);
-        if tokio::time::timeout(SHUTDOWN_GRACE, self.child.wait())
-            .await
-            .is_err()
-        {
-            warn!("swtpm did not exit within {SHUTDOWN_GRACE:?}; killing it");
-            let _ = self.child.start_kill();
-            let _ = tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await;
+        match wait_outcome(tokio::time::timeout(SHUTDOWN_GRACE, self.child.wait()).await) {
+            WaitOutcome::Exited => true,
+            WaitOutcome::TimedOut => {
+                warn!("swtpm did not exit within {SHUTDOWN_GRACE:?}; killing it");
+                self.kill_and_reap().await;
+                self.child.try_wait().is_ok_and(|status| status.is_some())
+            }
+            WaitOutcome::Failed(error) => {
+                warn!(
+                    "could not wait for swtpm to exit ({error}); it may still be running, so its \
+                     TPM state directory is not vouched for"
+                );
+                self.kill_and_reap().await;
+                self.child.try_wait().is_ok_and(|status| status.is_some())
+            }
         }
+    }
+
+    /// Kill the child and wait a bounded time for it to leave.
+    async fn kill_and_reap(&mut self) {
+        let _ = self.child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await;
     }
 
     /// Stop the process from synchronous code (for example `Drop`).
@@ -1176,7 +1223,7 @@ mod tests {
             )
         });
 
-        tpm.stop().await;
+        assert!(tpm.stop().await, "swtpm must confirm its exit");
         let after_stop = std::fs::read(&state).unwrap_or_else(|error| {
             panic!("swtpm left no state file at {}: {error}", state.display())
         });
@@ -1190,6 +1237,82 @@ mod tests {
             after_stop.len()
         );
         let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    /// Kill `pid` and reap it behind its handle's back, so the handle's own `wait` gets
+    /// `ECHILD` - the one `Ok(Err(_))` a test can induce for real.
+    fn reap_behind_the_handles_back(pid: u32) {
+        let mut status = 0_i32;
+        // SAFETY: a positive pid that this process owns; `SIGKILL` and `waitpid` only touch
+        // that process's state, and the blocking wait returns as soon as it is gone.
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            let reaped = libc::waitpid(pid as libc::pid_t, &mut status, 0);
+            assert_eq!(reaped, pid as libc::pid_t, "the child was not reaped");
+        }
+    }
+
+    /// A `wait` that fails is not an exit: it says nothing about the child.
+    #[tokio::test]
+    async fn test_a_wait_that_fails_is_not_reported_as_an_exit() {
+        let mut child = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg("sleep 60")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("bash must be on PATH");
+        let pid = child.id().expect("a spawned child has a pid");
+        reap_behind_the_handles_back(pid);
+
+        let waited = tokio::time::timeout(SHUTDOWN_GRACE, child.wait()).await;
+        match wait_outcome(waited) {
+            WaitOutcome::Failed(error) => assert!(
+                error.contains("No child processes"),
+                "the refusal is kept as it arrived: {error}"
+            ),
+            other => panic!("a failed wait must not be reported as {other:?}"),
+        }
+    }
+
+    /// The other two answers: a real exit, and a real grace expiry.
+    #[tokio::test]
+    async fn test_the_wait_outcome_names_the_exit_the_timeout_and_the_failure() {
+        let mut quick = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg("exit 3")
+            .spawn()
+            .expect("bash must be on PATH");
+        let status = quick.wait().await.expect("a plain exit");
+        assert_eq!(wait_outcome(Ok(Ok(status))), WaitOutcome::Exited);
+
+        let expired = tokio::time::timeout(
+            Duration::from_millis(1),
+            std::future::pending::<std::io::Result<std::process::ExitStatus>>(),
+        )
+        .await;
+        assert_eq!(wait_outcome(expired), WaitOutcome::TimedOut);
+    }
+
+    /// A swtpm nobody could wait for is not a stopped swtpm.
+    #[tokio::test]
+    async fn test_a_swtpm_that_cannot_be_waited_for_is_not_reported_stopped() {
+        let child = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg("sleep 60")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("bash must be on PATH");
+        let pid = child.id().expect("a spawned child has a pid");
+        let mut swtpm = Swtpm::from_child(child, PathBuf::from("/nonexistent/swtpm.sock"));
+        // The reaped pid is already gone, so the signal is refused and the wait fails: the
+        // TPM state directory is nobody's to rebuild, and `stop` has to say so.
+        reap_behind_the_handles_back(pid);
+        assert!(
+            !swtpm.stop().await,
+            "a swtpm whose wait failed must not be reported as confirmed stopped"
+        );
     }
 
     #[tokio::test]
@@ -1223,9 +1346,12 @@ mod tests {
         assert!(marker.is_file(), "the shell must install the trap first");
 
         let started = Instant::now();
-        tokio::time::timeout(Duration::from_secs(20), swtpm.stop())
-            .await
-            .expect("stop must finish");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(20), swtpm.stop())
+                .await
+                .expect("stop must finish"),
+            "a killed swtpm is only stopped once it is reaped"
+        );
         assert!(
             started.elapsed() >= SHUTDOWN_GRACE,
             "the grace period must expire before the child is killed"

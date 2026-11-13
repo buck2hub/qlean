@@ -884,6 +884,25 @@ StandardError=journal
         self.ip = None;
     }
 
+    /// Stop this machine's TPM process, and say so when it does not confirm its exit.
+    ///
+    /// Six teardown paths take the swtpm out of `self` - three pool-facing ones and three
+    /// launch-failure ones. Each used to ignore what the stop returned, so a TPM that never
+    /// confirmed its exit was dropped silently while the next start went on to rebuild the
+    /// state directory it may still own.
+    async fn stop_swtpm(&mut self) {
+        let Some(mut swtpm) = self.swtpm.take() else {
+            return;
+        };
+        if !swtpm.stop().await {
+            warn!(
+                "VM-{}: swtpm did not confirm its exit, so its TPM state directory is not \
+                 vouched for; check for a leftover swtpm process before reusing it",
+                self.id
+            );
+        }
+    }
+
     /// Tear down a launch that failed after QEMU was started.
     ///
     /// The three ways out of a launch that already has a live QEMU - the leased address was
@@ -905,9 +924,7 @@ StandardError=journal
             terminate_qemu(pid, identity.as_deref()).await;
         }
         reap_launch_task(qemu_handle, Duration::from_secs(5)).await;
-        if let Some(mut swtpm) = self.swtpm.take() {
-            swtpm.stop().await;
-        }
+        self.stop_swtpm().await;
     }
 
     /// Open a dedicated interactive SSH shell (PTY) over a new vsock session.
@@ -1112,9 +1129,7 @@ StandardError=journal
             }
         }
 
-        if let Some(mut swtpm) = self.swtpm.take() {
-            swtpm.stop().await;
-        }
+        self.stop_swtpm().await;
 
         // The record of this run's QEMU pid is written and read through one function; a
         // removal that spelled the path itself would quietly stop matching the file the
@@ -1658,9 +1673,7 @@ StandardError=journal
                         self.id
                     );
                 }
-                if let Some(mut swtpm) = self.swtpm.take() {
-                    swtpm.stop().await;
-                }
+                self.stop_swtpm().await;
                 return Err(e);
             }
         };
@@ -1691,16 +1704,12 @@ StandardError=journal
                 result = &mut qemu_handle => {
                     cancel_token.cancel();
                     self.pid = None;
-                    if let Some(mut swtpm) = self.swtpm.take() {
-                        swtpm.stop().await;
-                    }
+                    self.stop_swtpm().await;
                     return Err(qemu_exit_before_lease(result));
                 }
                 _ = cancel_token.cancelled() => {
                     self.pid = None;
-                    if let Some(mut swtpm) = self.swtpm.take() {
-                        swtpm.stop().await;
-                    }
+                    self.stop_swtpm().await;
                     // `launch_qemu` cancels this very token as part of reporting its own
                     // exit, so the cancellation can be the *consequence* of the launch
                     // failing. `select!` polls ready branches in random order, which used
@@ -1774,9 +1783,7 @@ StandardError=journal
                 self.pid = None;
                 // The join handle already resolved in this branch; awaiting it again
                 // would panic on a completed task.
-                if let Some(mut swtpm) = self.swtpm.take() {
-                    swtpm.stop().await;
-                }
+                self.stop_swtpm().await;
                 match result {
                     Ok(Ok(())) => bail!("QEMU exited unexpectedly"),
                     Ok(Err(e)) => bail!(e),

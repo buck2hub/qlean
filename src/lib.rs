@@ -2437,6 +2437,57 @@ mod plan_doc_tests {
         );
     }
 
+    /// The TPM stop has to distinguish "it exited" from "we could not tell".
+    ///
+    /// `tokio::time::timeout(..).await.is_err()` answers only "did the grace period expire",
+    /// so a `wait` that itself failed (`Ok(Err(_))`, `ECHILD` after the child was reaped
+    /// elsewhere) took the same branch as a clean exit: `stop` returned as if the TPM had
+    /// flushed its state, and the six teardown paths went on to rebuild the state directory a
+    /// still-running `swtpm` may own.
+    #[test]
+    fn every_swtpm_stop_confirms_the_exit_before_the_state_directory_is_reused() {
+        const FIRMWARE: &str = include_str!("../src/firmware.rs");
+        const MACHINE: &str = include_str!("../src/machine.rs");
+        assert!(
+            FIRMWARE.contains("fn wait_outcome("),
+            "the TPM stop no longer classifies what a bounded wait returned"
+        );
+        let stop = function_body(FIRMWARE, "async fn stop(&mut self) -> bool");
+        for fact in ["match wait_outcome(", "WaitOutcome::Failed(error)"] {
+            assert!(
+                stop.contains(fact),
+                "`Swtpm::stop` no longer says `{fact}` about a failed wait"
+            );
+        }
+        assert!(
+            !FIRMWARE.contains("is_err()"),
+            "the TPM lifecycle asks the timeout wrapper whether it expired instead of what the \
+             wait returned"
+        );
+        // One teardown helper, so the "not vouched for" warning cannot drift between the six
+        // paths that take the swtpm out of `Machine`.
+        let helper = function_body(MACHINE, "async fn stop_swtpm(&mut self)");
+        assert!(
+            helper.contains("swtpm.stop()"),
+            "the shared TPM teardown no longer stops the process"
+        );
+        assert_eq!(
+            MACHINE.matches("swtpm.stop()").count(),
+            1,
+            "a teardown path stops the TPM on its own instead of going through `stop_swtpm`"
+        );
+        let callers = MACHINE.matches("self.stop_swtpm().await").count();
+        assert!(
+            callers >= 6,
+            "only {callers} teardown paths stop the TPM through the shared helper"
+        );
+        assert_eq!(
+            MACHINE.matches("did not confirm its exit").count(),
+            1,
+            "the unconfirmed-TPM warning is written more than once, so the copies can drift"
+        );
+    }
+
     #[test]
     fn the_failed_launch_teardown_is_written_once_and_is_bounded() {
         const MACHINE: &str = include_str!("../src/machine.rs");
@@ -2452,7 +2503,7 @@ mod plan_doc_tests {
         for step in [
             "self.ssh = None;",
             "self.pid.take()",
-            "swtpm.stop()",
+            "self.stop_swtpm().await",
             "terminate_qemu",
         ] {
             assert!(

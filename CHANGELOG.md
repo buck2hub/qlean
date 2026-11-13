@@ -40,6 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `with_pool` no longer requires `/dev/vhost-vsock`, and `with_machine` requires it only for `GuestOs::Linux`
 
 ### Fixed
+- A TPM process whose exit could not be awaited was reported as stopped: a `wait` that itself
+  fails (`ECHILD`, for example after the child was reaped elsewhere) used to take the same
+  branch as a clean exit, so teardown carried on and the next start could rebuild the TPM state
+  directory of a process that still held it. `Swtpm::stop` now answers whether the exit was
+  confirmed, and the shared teardown warns that the directory is not vouched for when it was not
 - Two machines that needed the same image at the same time shared one staging file for it
   (`<image>.part`, named after the destination alone): the second one truncated the file the
   first was streaming into, and because each checksum is computed over its own stream rather
