@@ -40,6 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `with_pool` no longer requires `/dev/vhost-vsock`, and `with_machine` requires it only for `GuestOs::Linux`
 
 ### Fixed
+- The owner-only credential write promised that a crash leaves "either the previous file or a
+  complete one", but nothing was synced: the bytes only reached the page cache and the rename
+  published the name anyway, so a power cut could leave a private key or a deploy seed that is
+  complete by name, `0600` by mode, and empty or half-written by content. The staged file is
+  synced before the rename and the directory after it, and a directory that cannot be flushed
+  is reported instead of assumed durable.
 - A TPM stopped from synchronous code (the `Drop` path, which runs when nothing else could)
   reported nothing: a child that outlived the grace was killed and the call returned as if it
   had left, so the run directory and the TPM state inside it were removed under a process that

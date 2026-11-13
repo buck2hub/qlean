@@ -533,10 +533,14 @@ fn temp_owner_only_path(path: &Path) -> PathBuf {
 
 /// Write `contents` to `path` owner-only and atomically.
 ///
-/// The file is created with [`create_owner_only`] and renamed into place, so a crash leaves
-/// either the previous file or a complete one — never a partial credential that still parses
-/// as "some file", and never a complete one that others can read. Each write stages its bytes
-/// in a temporary file of its own, so two writers can never install each other's half.
+/// The file is created with [`create_owner_only`], its bytes are synced to the disk, and only
+/// then is it renamed into place; the directory is synced afterwards. That is what makes the
+/// promise true: a crash leaves either the previous file or a complete one — never a partial
+/// credential that still parses as "some file", and never a complete one that others can read.
+/// Without the two syncs the claim was about the *name* only: `write_all` hands the bytes to the
+/// page cache, so a power cut between the write and the next write-back could publish a
+/// credential that is complete by name and empty (or half) by content. Each write stages its
+/// bytes in a temporary file of its own, so two writers can never install each other's half.
 pub(crate) fn write_owner_only_atomically(path: &Path, contents: &str) -> Result<()> {
     let tmp_path = temp_owner_only_path(path);
     // A write that was interrupted between the create and the rename leaves this name behind;
@@ -550,6 +554,10 @@ pub(crate) fn write_owner_only_atomically(path: &Path, contents: &str) -> Result
     })?;
     let written = std::io::Write::write_all(&mut tmp, contents.as_bytes())
         .and_then(|()| std::io::Write::flush(&mut tmp))
+        // The bytes have to be on the disk before the name is published: `flush` only pushes
+        // them out of this process, and the rename below makes them reachable under the real
+        // name whether or not they ever left the page cache.
+        .and_then(|()| tmp.sync_all())
         .with_context(|| format!("failed to write {}", tmp_path.display()));
     drop(tmp);
     if let Err(error) = written {
@@ -563,7 +571,25 @@ pub(crate) fn write_owner_only_atomically(path: &Path, contents: &str) -> Result
             tmp_path.display()
         )
     })?;
+    // The rename is a directory entry, and a directory entry is only durable once the
+    // directory is: without this a crash can still find the previous file - or no file - at a
+    // name the caller was told had been written.
+    sync_directory_of(path).with_context(|| {
+        format!(
+            "wrote {} but could not make its directory durable",
+            path.display()
+        )
+    })?;
     Ok(())
+}
+
+/// Flush a directory's entries to the disk, so a rename inside it survives a crash.
+fn sync_directory_of(path: &Path) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let directory = parent.unwrap_or_else(|| Path::new("."));
+    std::fs::File::open(directory)?.sync_all()
 }
 
 /// Make a file owner-only and owner-writable (`0600`).
@@ -1994,6 +2020,63 @@ mod owner_only_tests {
             1,
             "a temporary file survived the concurrent writes"
         );
+    }
+
+    /// The credential is only "complete" once its bytes and its name are on the disk.
+    ///
+    /// The doc comment promised "never a partial credential that still parses as some file"
+    /// while the write only reached the page cache: `write_all` + `flush` say nothing about the
+    /// disk, so a crash between them and the next write-back could publish a file that is
+    /// complete by name and empty by content. The order is the whole contract, so it is checked
+    /// as an order and not as two independent facts.
+    #[test]
+    fn the_credential_reaches_the_disk_before_its_name_is_published() {
+        const SOURCE: &str = include_str!("utils.rs");
+        let start = SOURCE
+            .find("pub(crate) fn write_owner_only_atomically(")
+            .expect("the credential write is gone");
+        let body = &SOURCE[start..];
+        let body = &body[..body.find("\n}\n").expect("the write has no end")];
+
+        let written = body.find("write_all(&mut tmp").expect("no write");
+        let synced = body
+            .find("tmp.sync_all()")
+            .expect("the staged bytes are never synced, so the rename publishes whatever the page cache holds");
+        let renamed = body.find("std::fs::rename(").expect("no rename");
+        // The call has to be propagated, not merely present: an ignored result reports a
+        // durable rename that nobody vouched for (a mutation showed the difference).
+        let directory = body.find("sync_directory_of(path).with_context(").expect(
+            "the rename is never made durable, so a crash can still find the previous file",
+        );
+        assert!(
+            body[directory..].contains("})?;"),
+            "the directory sync reports a durability nobody confirmed"
+        );
+        assert!(
+            written < synced && synced < renamed,
+            "the file must be synced between the write and the rename: write at {written}, \
+             sync at {synced}, rename at {renamed}"
+        );
+        assert!(
+            renamed < directory,
+            "the directory has to be synced after the rename, not before it"
+        );
+        // A staging file that is not synced is not staged: the helper must be the one that
+        // creates it owner-only, and `sync_all` must follow the same handle.
+        assert!(
+            body.contains("create_owner_only(&tmp_path)"),
+            "the staged file is no longer created owner-only"
+        );
+    }
+
+    /// A staging file whose directory cannot be synced is reported, not assumed durable.
+    #[test]
+    fn a_rename_nobody_could_make_durable_is_reported() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // `sync_directory_of` is what the write calls; a path without a parent has to fall back
+        // to the current directory instead of silently skipping the sync.
+        assert!(sync_directory_of(&dir.path().join("secret")).is_ok());
+        assert!(sync_directory_of(Path::new("relative-name")).is_ok());
     }
 
     #[test]
