@@ -2721,10 +2721,80 @@ mod liveness_tests {
         std::fs::create_dir_all(dir).expect("create the lookalike directory");
         let program = dir.join("qemu-system-x86_64");
         std::fs::copy("/bin/sleep", &program).expect("copy a program to the QEMU name");
-        std::process::Command::new(&program)
-            .arg("30")
-            .spawn()
-            .expect("start the lookalike")
+        spawn_beside_a_busy_copy(&program)
+    }
+
+    /// Spawn a just-copied program, retrying while the kernel says `Text file busy`.
+    ///
+    /// `fs::copy` closes the destination before it returns, but every other thread in this
+    /// process can fork in between: the child inherits the still-open write descriptor, and
+    /// Linux refuses to execute a file that any process holds open for writing until that child
+    /// `exec`s (ETXTBSY). `cargo test` runs this module's tests in parallel with every other
+    /// module that spawns a process, so the copy is not always executable the moment it lands -
+    /// measured as one failed full-suite run in six, with `start the lookalike: Os { code: 26,
+    /// kind: ExecutableFileBusy }`.
+    fn spawn_beside_a_busy_copy(program: &std::path::Path) -> std::process::Child {
+        let mut last = None;
+        for _ in 0..200 {
+            match std::process::Command::new(program).arg("30").spawn() {
+                Ok(child) => return child,
+                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                    last = Some(error);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("start the lookalike at {}: {error}", program.display()),
+            }
+        }
+        panic!(
+            "the copy at {} stayed unexecutable for two seconds: {}",
+            program.display(),
+            last.expect("the retry loop only leaves without a child after ETXTBSY")
+        )
+    }
+
+    /// A copy that another process has open for writing is refused until it is closed.
+    ///
+    /// This is the failure the retry exists for, driven on purpose instead of waited for: while
+    /// a write descriptor on the copy is open, `exec` fails with `Text file busy`. The first
+    /// `spawn` therefore has to fail, and `spawn_beside_a_busy_copy` has to succeed once the
+    /// descriptor is closed - which is the whole difference between the flaky test this replaced
+    /// (one failed run in six) and a deterministic one.
+    #[test]
+    fn a_copy_open_for_writing_is_refused_until_it_is_closed() {
+        let dir = std::env::temp_dir().join(format!("qlean-busy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create the busy directory");
+        let program = dir.join("qemu-system-x86_64");
+        std::fs::copy("/bin/sleep", &program).expect("copy a program to the QEMU name");
+
+        // Hold the copy open for writing, the way a forked child of another thread would.
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&program)
+            .expect("open the copy for writing");
+        let refused = std::process::Command::new(&program).arg("30").spawn();
+        let error = refused.expect_err("a program open for writing cannot be executed");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(libc::ETXTBSY),
+            "the kernel must report `Text file busy`: {error}"
+        );
+
+        // Close it from another thread, so the retry sees a moving target rather than a state the
+        // test has already finished with.
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(writer);
+        });
+        let mut child = spawn_beside_a_busy_copy(&program);
+        closer.join().expect("the closing thread");
+        let running = child.try_wait().expect("ask whether the copy is running");
+        assert!(
+            running.is_none(),
+            "the retry must return a running child, not one that already exited"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Wait until `/proc/<pid>/cmdline` names the lookalike.
