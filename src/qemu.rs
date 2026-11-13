@@ -196,7 +196,7 @@ fn vsock_args(guest_os: GuestOs, cid: u32) -> Vec<String> {
 /// Kept separate from [`launch_qemu`] so the exact channel string qlean relies on can be
 /// handed to a real QEMU in a test: a typo here makes every shutdown fall back to SIGKILL
 /// and every `is_running` check report a dead VM.
-fn qmp_chardev_args(socket: &Path) -> anyhow::Result<Vec<String>> {
+pub(crate) fn qmp_chardev_args(socket: &Path) -> anyhow::Result<Vec<String>> {
     Ok(vec![
         "-chardev".to_string(),
         format!(
@@ -206,6 +206,21 @@ fn qmp_chardev_args(socket: &Path) -> anyhow::Result<Vec<String>> {
         "-mon".to_string(),
         "chardev=qmp0,mode=control".to_string(),
     ])
+}
+
+/// The QMP socket Qlean asks QEMU to serve for `vmid`, together with the arguments saying so.
+///
+/// The path comes from [`crate::qmp::qmp_socket_path`], the same function `is_running` and
+/// every teardown step use to find the domain, and it is the only place the socket is named
+/// when a machine is launched. Building it twice - once for the `-chardev` argument and once
+/// for the identity check - is how a signal step silently stops working: a process whose
+/// command line carries a different socket looks like somebody else's QEMU, so `force_kill`
+/// reports nothing left to kill and `shutdown` reports a clean stop while QEMU still owns the
+/// overlay.
+pub(crate) fn qmp_socket_and_args(vmid: &str) -> anyhow::Result<(PathBuf, Vec<String>)> {
+    let socket = crate::qmp::qmp_socket_path(vmid)?;
+    let args = qmp_chardev_args(&socket)?;
+    Ok((socket, args))
 }
 
 /// `-netdev` argument that puts the guest on the network Qlean reads DHCP leases from.
@@ -281,14 +296,15 @@ pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> 
 
     qemu_cmd.args(vsock_args(params.image.guest_os, params.cid));
 
-    let dirs = QleanDirs::new()?;
-    let run_dir = dirs.runs.join(&params.vmid);
-    let qmp_socket = run_dir.join("qmp.sock");
+    let (qmp_socket, qmp_args) = qmp_socket_and_args(&params.vmid)?;
     if qmp_socket.exists() {
         let _ = std::fs::remove_file(&qmp_socket);
     }
 
-    qemu_cmd.args(qmp_chardev_args(&qmp_socket)?);
+    let dirs = QleanDirs::new()?;
+    let run_dir = dirs.runs.join(&params.vmid);
+
+    qemu_cmd.args(qmp_args);
 
     let disk_drive = disk_drive_option(&params.image.overlay)?;
     qemu_cmd

@@ -2090,7 +2090,7 @@ impl Machine {
 /// `socket_path` is `None` when the caller cannot compute it (a `Drop` that runs while the
 /// directories are unavailable). Then only the `argv[0]` rule applies, which is what every
 /// caller had before, so an unavailable identity cannot leave a QEMU running.
-fn cmdline_is_this_machines_qemu(cmdline: &[u8], socket_path: Option<&Path>) -> bool {
+pub(crate) fn cmdline_is_this_machines_qemu(cmdline: &[u8], socket_path: Option<&Path>) -> bool {
     // Only argv[0] names the program: a later argument can mention QEMU without the
     // process being QEMU (`-D /tmp/qemu-system-x86_64.log`), so scanning the whole
     // command line would be a false positive.
@@ -3579,12 +3579,12 @@ mod timeout_tests {
         let theirs = Path::new("/home/me/.qlean/runs/vm-2/qmp.sock");
         // The chardev argument Qlean builds, as QEMU receives it: one NUL-terminated argv entry.
         let chardev = |socket: &Path| {
-            format!(
-                "qemu-system-x86_64\0-machine\0q35,accel=kvm\0-chardev\0socket,path={},\
-                 server=on,wait=off,id=qmp0\0",
-                socket.display()
-            )
-            .into_bytes()
+            let mut cmdline = b"qemu-system-x86_64\0-machine\0q35,accel=kvm\0".to_vec();
+            for arg in crate::qemu::qmp_chardev_args(socket).expect("qmp args") {
+                cmdline.extend_from_slice(arg.as_bytes());
+                cmdline.push(0);
+            }
+            cmdline
         };
 
         // Without an identity, `argv[0]` alone still answers: that is the `Drop` path, where
@@ -3628,6 +3628,43 @@ mod timeout_tests {
             b"/usr/bin/qemu-img\0create\0disk.qcow2\0",
             None
         ));
+    }
+
+    #[test]
+    fn the_kill_check_recognises_the_socket_a_launch_really_passes_to_qemu() {
+        // Two modules own halves of one fact. `launch_qemu` tells QEMU which QMP socket to
+        // serve; `is_running`, `force_kill` and `terminate_qemu` look for that same socket on
+        // the process command line. Each half used to build the path on its own, so nothing
+        // failed when they drifted apart - and the check fails *closed*: a command line that
+        // carries a socket the check does not expect reads as somebody else's QEMU, so a
+        // SIGKILL is skipped, `shutdown` reports a clean stop and the surviving QEMU keeps the
+        // overlay. Ask the real argument builder, not a copy of its strings, and ask it
+        // against the path the teardown paths themselves look up: taking both sides from the
+        // builder would make the assertion tautological.
+        let vmid = "identity-uses-the-launched-socket";
+        let (launched, args) = crate::qemu::qmp_socket_and_args(vmid).expect("qmp arguments");
+        let expected = crate::qmp::qmp_socket_path(vmid).expect("the socket teardown looks for");
+        let mut cmdline = b"qemu-system-x86_64\0-machine\0q35\0".to_vec();
+        for arg in &args {
+            cmdline.extend_from_slice(arg.as_bytes());
+            cmdline.push(0);
+        }
+        assert_eq!(
+            launched, expected,
+            "the launch named a different socket than teardown looks for"
+        );
+        assert!(
+            cmdline_is_this_machines_qemu(&cmdline, Some(&expected)),
+            "QEMU was told to serve {} but the kill check does not recognise it: {args:?}",
+            expected.display()
+        );
+
+        // The same command line must not match a second machine, or the check would accept
+        // any QEMU at all and prove nothing.
+        let other = crate::qmp::qmp_socket_path("identity-uses-another-socket")
+            .expect("another socket path");
+        assert_ne!(other, expected, "two machines must not share a socket path");
+        assert!(!cmdline_is_this_machines_qemu(&cmdline, Some(&other)));
     }
 
     #[tokio::test]
