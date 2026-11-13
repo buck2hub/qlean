@@ -1136,6 +1136,7 @@ impl Drop for Image {
 mod tests {
     use super::*;
     use serial_test::serial;
+    use std::time::Duration;
 
     /// Calculate SHA256 with command line tool `sha256sum`
     async fn get_sha256(path: &PathBuf) -> Result<String> {
@@ -1835,8 +1836,33 @@ dummy
         // The lock lives on the open file, not on the path: once the first writer is finished
         // the next one takes over, and starts from an empty file instead of appending to the
         // leftovers of the attempt before it.
+        //
+        // The takeover is allowed a short, bounded wait. Not for a lock this crate still holds -
+        // that one would never clear, and a retry that outlives it would be hiding exactly the
+        // defect this leg exists to catch - but for the fd that a `fork` elsewhere in the test
+        // process can carry across the moment the first writer closes, until the child `exec`s
+        // and the close-on-exec flag does its job. Without the wait the suite failed this leg
+        // about one run in eight while every fd in every process was already gone (R192).
         drop(first);
-        let taken_over = open_staged_file(&part)?;
+        let mut taken_over = None;
+        for _ in 0..50 {
+            match open_staged_file(&part) {
+                Ok(file) => {
+                    taken_over = Some(file);
+                    break;
+                }
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    assert!(
+                        message.contains("already writing"),
+                        "the takeover failed for a reason other than a held lock: {message}"
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+        let taken_over =
+            taken_over.expect("the next writer never took the file over within a second");
         drop(taken_over);
         assert_eq!(std::fs::metadata(&part)?.len(), 0);
 
