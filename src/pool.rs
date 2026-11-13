@@ -336,11 +336,38 @@ mod tests {
         // socket is gone. `is_running` refuses to answer there (starting a second QEMU would
         // fight this one for the disk), so the pre-fix `shutdown_all` returned that error and
         // left the process running until `Drop` SIGKILLed whatever was left.
+        //
+        // The process also has to be *recognized* as this machine's QEMU: `is_running` matches
+        // the pid's command line against this machine's socket path. A fake QEMU started
+        // without that chardev argument is somebody else's process as far as the liveness rule
+        // is concerned, and `shutdown_all` then skips it - which is right, and is exactly what
+        // this test used to assert against itself (it passed before that rule existed).
+        let socket = crate::qmp::qmp_socket_path("never-started").expect("a QMP socket path");
+        let socket_dir = socket
+            .parent()
+            .expect("the socket has a directory")
+            .to_owned();
+        std::fs::create_dir_all(&socket_dir).expect("the run directory");
+        let _ = std::fs::remove_file(&socket);
         let mut child = std::process::Command::new("qemu-system-x86_64")
             .args(["-machine", "none", "-display", "none", "-nodefaults"])
+            .args(crate::qemu::qmp_chardev_args(&socket).expect("the QMP chardev arguments"))
             .spawn()
             .expect("qemu-system-x86_64 must be on PATH for this test");
         let pid = child.id();
+
+        // Wait for QEMU to serve the socket, then take the file away: a live QEMU with no
+        // control socket is the state a torn-down launch leaves behind.
+        let ready = std::time::Instant::now();
+        while !socket.exists() && ready.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            socket.exists(),
+            "qemu did not serve its control socket at {}",
+            socket.display()
+        );
+        std::fs::remove_file(&socket).expect("the control socket is removed");
 
         let mut pool = MachinePool::new();
         pool.pool.insert(
@@ -354,6 +381,9 @@ mod tests {
             let _ = child.kill();
         }
         let _ = child.wait();
+
+        let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_dir(&socket_dir);
 
         outcome
             .expect("a machine that is still running must be shut down, not reported as unknown");
