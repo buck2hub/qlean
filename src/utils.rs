@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use anyhow::{Context, Result, bail};
@@ -507,13 +508,39 @@ pub(crate) fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
+/// Temporary file one write stages its bytes in before the rename.
+///
+/// The name carries the writing process and a per-write counter, because the destination alone
+/// is not enough to identify a write: two pooled machines initialized at the same time ask for
+/// the same shared client key, and with a temporary name derived from the destination the
+/// second write removed the first one's staging file and installed its own bytes at the final
+/// path. The first machine then held a key in memory whose other half was never on disk, and
+/// the installed credential could be a file that was still being written. The leading dot
+/// keeps a crash's leftover out of the way, and the name stays next to its destination so the
+/// rename never crosses a filesystem.
+fn temp_owner_only_path(path: &Path) -> PathBuf {
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "credential".to_string());
+    path.with_file_name(format!(
+        ".{name}.{}-{}.tmp",
+        std::process::id(),
+        WRITES.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
 /// Write `contents` to `path` owner-only and atomically.
 ///
 /// The file is created with [`create_owner_only`] and renamed into place, so a crash leaves
 /// either the previous file or a complete one — never a partial credential that still parses
-/// as "some file", and never a complete one that others can read.
+/// as "some file", and never a complete one that others can read. Each write stages its bytes
+/// in a temporary file of its own, so two writers can never install each other's half.
 pub(crate) fn write_owner_only_atomically(path: &Path, contents: &str) -> Result<()> {
-    let tmp_path = path.with_extension("tmp");
+    let tmp_path = temp_owner_only_path(path);
+    // A write that was interrupted between the create and the rename leaves this name behind;
+    // the counter makes it unique to that write, so whatever is here is a leftover.
     let _ = std::fs::remove_file(&tmp_path);
     let mut tmp = create_owner_only(&tmp_path).with_context(|| {
         format!(
@@ -1870,7 +1897,103 @@ mod owner_only_tests {
         assert_eq!(mode_of(&path), 0o600);
         assert_eq!(std::fs::read_to_string(&path).expect("read"), "material");
         // No temporary file survives a successful install.
-        assert!(!path.with_extension("tmp").exists());
+        assert_eq!(
+            std::fs::read_dir(dir.path()).expect("read dir").count(),
+            1,
+            "a temporary file survived the install"
+        );
+    }
+
+    /// Each write stages its bytes in a temporary file of its own.
+    ///
+    /// The name used to come from the destination alone (`with_extension("tmp")`), so two
+    /// writers of the same file shared one staging path: the second removed the first's file,
+    /// wrote its own bytes there, and the first then renamed the *second* writer's half-written
+    /// file into place. Two writes must not be able to address the same temporary file, and
+    /// files that only share a stem (`deploy.json`, `deploy.iso`) must not collide either.
+    #[test]
+    fn test_each_write_stages_its_bytes_in_its_own_temporary_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let first = dir.path().join("id_ed25519");
+
+        let one = temp_owner_only_path(&first);
+        let two = temp_owner_only_path(&first);
+        assert_ne!(one, two, "two writes shared one temporary file");
+        for tmp in [&one, &two] {
+            assert_eq!(tmp.parent(), first.parent(), "the rename must stay put");
+            assert_ne!(tmp, &first, "a write must not stage over its destination");
+            let name = tmp
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("the temporary file has a UTF-8 name");
+            let name = name.strip_prefix('.').unwrap_or(name);
+            assert!(
+                name.starts_with("id_ed25519") && name.ends_with(".tmp"),
+                "the temporary file must name the file it belongs to: {tmp:?}"
+            );
+        }
+
+        let json = temp_owner_only_path(&dir.path().join("deploy.json"));
+        let iso = temp_owner_only_path(&dir.path().join("deploy.iso"));
+        assert_ne!(
+            json, iso,
+            "two files that share a stem must not share a temporary file"
+        );
+    }
+
+    /// Concurrent writers of one file never install a partial or mixed file.
+    ///
+    /// This is the race the unique temporary name exists for: every call must succeed, and the
+    /// file that ends up on disk must be exactly one of the contents, complete.
+    #[test]
+    fn test_concurrent_writes_install_one_complete_file() {
+        use std::sync::{Arc, Barrier};
+
+        const WRITERS: usize = 8;
+        const ROUNDS: usize = 20;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = Arc::new(dir.path().join("id_ed25519"));
+        let barrier = Arc::new(Barrier::new(WRITERS));
+        let contents: Vec<String> = (0..WRITERS)
+            .map(|writer| format!("{writer:02}").repeat(4096))
+            .collect();
+
+        let handles: Vec<_> = contents
+            .iter()
+            .cloned()
+            .map(|body| {
+                let path = Arc::clone(&path);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut results = Vec::new();
+                    for _ in 0..ROUNDS {
+                        barrier.wait();
+                        results.push(write_owner_only_atomically(&path, &body));
+                    }
+                    results
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            for result in handle.join().expect("writer thread") {
+                result.expect("a concurrent write must not fail");
+            }
+        }
+
+        let installed = std::fs::read_to_string(path.as_ref()).expect("read");
+        assert!(
+            contents.contains(&installed),
+            "the installed file is not one complete writer's contents: {} bytes",
+            installed.len()
+        );
+        assert_eq!(mode_of(path.as_ref()), 0o600);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).expect("read dir").count(),
+            1,
+            "a temporary file survived the concurrent writes"
+        );
     }
 
     #[test]
@@ -1890,7 +2013,13 @@ mod owner_only_tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let missing = dir.path().join("absent").join("secret");
         assert!(write_owner_only_atomically(&missing, "material").is_err());
-        assert!(!missing.with_extension("tmp").exists());
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("read dir")
+                .next()
+                .is_none(),
+            "a failed write left something behind"
+        );
     }
 
     /// `chmod` after the write is a different program: the mode has to come from creation,

@@ -40,6 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `with_pool` no longer requires `/dev/vhost-vsock`, and `with_machine` requires it only for `GuestOs::Linux`
 
 ### Fixed
+- Two pooled machines initializing at the same time staged their SSH key in one temporary
+  file: the name came from the destination alone, so the second write removed the first one's
+  staging file and the first then renamed the second writer's bytes into place. The installed
+  key could be one a machine never wrote, or a half-written one, and the other start failed
+  with an error about a temporary file that no longer existed. Each write now stages its bytes
+  in a temporary file of its own.
 - A rejected image whose removal failed was reported as removed: the digest mismatch said
   "the file was removed" no matter what the unlink did, so a read-only cache directory or a
   full disk left the corrupt image behind exactly where a later run would pick it up. The
