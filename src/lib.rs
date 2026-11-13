@@ -3379,6 +3379,58 @@ mod plan_doc_tests {
         );
     }
 
+    /// A green ignored test is not a test that ran.
+    ///
+    /// Five paths print `SMOKE-UNAVAILABLE` and return, which std's harness reports as a pass.
+    /// The snapshot row used to say the run had "no `SMOKE-UNAVAILABLE` line at all" while the
+    /// same command in the same image prints two, because the image has no
+    /// `qemu-bridge-helper` and nothing sets `QLEAN_REFUSED_KILL_PID`. The row has to say how
+    /// many of its passes verified nothing, name them, and the number of short-circuit paths in
+    /// the source has to be the number the row states - otherwise a sixth one appears in silence.
+    #[test]
+    fn the_plan_counts_the_ignored_tests_that_are_green_without_running() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        // Spelled in two pieces so this test does not count itself.
+        let marker = concat!("SMOKE", "-UNAVAILABLE:");
+        let sites: usize = CRATE_SOURCES
+            .iter()
+            .map(|(_, source)| source.matches(marker).count())
+            .sum();
+        assert!(
+            sites >= 4,
+            "only {sites} short-circuit paths were found: the scan is not reading the sources"
+        );
+
+        let row = PLAN
+            .lines()
+            .find(|line| line.starts_with("| 真程序证据全量快照 |"))
+            .expect("the test matrix has no container snapshot row");
+        assert!(
+            !row.contains("无一条"),
+            "this image prints two short-circuit lines, so the snapshot cannot claim it has none"
+        );
+        assert!(
+            row.contains(&format!("{sites} 处 `SMOKE-UNAVAILABLE` 短路点")),
+            "the snapshot row does not state that the source has {sites} short-circuit paths"
+        );
+        assert!(
+            row.contains("`11 passed` 只证明 9 条真跑"),
+            "the snapshot row presents `11 passed` as eleven executed tests"
+        );
+        for name in [
+            "QLEAN_REFUSED_KILL_PID",
+            "qemu-bridge-helper",
+            "test_a_refused_kill_is_not_reported_as_a_shutdown",
+            "test_the_guest_nic_carries_the_mac_that_lease_lookup_searches_for",
+        ] {
+            assert!(
+                row.contains(name),
+                "the snapshot row has to name `{name}`, one of the two passes that verified \
+                 nothing in this image"
+            );
+        }
+    }
+
     /// The plan quotes the prerequisite error the Windows gate prints, word for word.
     ///
     /// The plan tells a reader what happens once the image variables are set: the gate hands
