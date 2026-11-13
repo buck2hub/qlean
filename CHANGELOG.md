@@ -40,6 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `with_pool` no longer requires `/dev/vhost-vsock`, and `with_machine` requires it only for `GuestOs::Linux`
 
 ### Fixed
+- A start could adopt the pid of a QEMU that had already died: the pid file was read back
+  before the new QEMU wrote it, so a run directory that outlived a killed Qlean process (or
+  was restored from a copy) made the machine record a foreign pid. Every later signal step
+  then reported "nothing left to kill" while the running guest kept the overlay open. The
+  pid file is now removed before QEMU is spawned, and a file that cannot be removed fails the
+  launch instead of being started over.
 - A pool operation that failed reported only the outermost reason, so the machine's name
   arrived without the cause it was wrapped around: `init_all`, `spawn_all` and `shutdown_all`
   said `alpha: failed to ask the QMP socket whether the machine was running` and dropped the

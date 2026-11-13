@@ -223,6 +223,17 @@ pub(crate) fn qmp_socket_and_args(vmid: &str) -> anyhow::Result<(PathBuf, Vec<St
     Ok((socket, args))
 }
 
+/// Path of the file that records the pid of `vmid`'s QEMU.
+///
+/// Two programs depend on the same file: [`launch_qemu`] writes it right after the spawn, and
+/// `Machine::launch` clears it before starting QEMU and polls it afterwards. Spelled as two
+/// expressions (`dirs.runs.join(vmid).join("qemu.pid")` in each), a drift between them is
+/// silent and expensive: the launch would poll a file nobody writes, and a pid file left by
+/// an earlier run would be the first thing it reads.
+pub(crate) fn pid_file_of(vmid: &str) -> anyhow::Result<PathBuf> {
+    Ok(QleanDirs::new()?.runs.join(vmid).join("qemu.pid"))
+}
+
 /// `-netdev` argument that puts the guest on the network Qlean reads DHCP leases from.
 fn netdev_option() -> String {
     format!("bridge,id=net0,br={QLEAN_BRIDGE_NAME}")
@@ -367,8 +378,7 @@ pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> 
 
     // Store QEMU PID
     let pid = qemu_child.id().expect("failed to get QEMU PID");
-    let pid_file_path = run_dir.join("qemu.pid");
-    tokio::fs::write(pid_file_path, pid.to_string()).await?;
+    tokio::fs::write(pid_file_of(&params.vmid)?, pid.to_string()).await?;
 
     // Capture and log stdout
     let stdout = qemu_child.stdout.take().expect("Failed to capture stdout");

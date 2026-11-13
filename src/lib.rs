@@ -3071,6 +3071,44 @@ mod plan_doc_tests {
         );
     }
 
+    /// The launch clears the pid file *before* it starts QEMU.
+    ///
+    /// `read_pid` returns the first number it can parse, and it cannot tell the pid of the QEMU
+    /// that is starting now from the pid recorded by a run that died. The run directory outlives
+    /// a killed Qlean process and can be copied or restored, so the clear has to happen before
+    /// the spawn; after it, the launch has already adopted whatever was in the file. The order is
+    /// invisible at runtime (both spellings "work" until a stale file exists), which is why it is
+    /// read out of the source here: the unit test can only show what `read_pid` accepts, not that
+    /// the launch asks for the clear first.
+    #[test]
+    fn the_launch_clears_the_pid_file_before_it_starts_qemu() {
+        let source = CRATE_SOURCES
+            .iter()
+            .find(|(path, _)| *path == "src/machine.rs")
+            .map(|(_, source)| *source)
+            .expect("src/machine.rs is in CRATE_SOURCES");
+        let body = function_body(
+            source,
+            "async fn launch(&mut self, is_init: bool) -> Result<()> {",
+        );
+        let cleared = body
+            .find("clear_stale_pid_file(&pid_file)")
+            .expect("`launch` must clear the pid file left by an earlier run");
+        let spawned = body
+            .find("tokio::spawn(launch_qemu(qemu_params))")
+            .expect("`launch` must spawn `launch_qemu`");
+        assert!(
+            cleared < spawned,
+            "`launch` spawns QEMU before it clears the stale pid file, so `read_pid` can adopt \
+             the pid of a run that already died"
+        );
+        assert!(
+            body.contains("qemu::pid_file_of(&self.id)"),
+            "`launch` must take the pid file path from `qemu::pid_file_of`, the same function \
+             `launch_qemu` writes to"
+        );
+    }
+
     /// The number of ignored unit tests the plan runs is the number the crate has.
     ///
     /// The test matrix says the container snapshot runs "all 11" of them; a twelfth `#[ignore]`

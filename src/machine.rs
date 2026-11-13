@@ -410,6 +410,51 @@ fn resolve_ssh_timeout(config: &MachineConfig) -> Duration {
         })
 }
 
+/// Read the pid that `launch_qemu` recorded in `pid_file_path`.
+///
+/// The caller has to have cleared a pid file left by an earlier run first (see
+/// [`clear_stale_pid_file`]), because this function returns the first parseable number it
+/// finds: it cannot tell the pid of the QEMU that is starting now from the pid of the one that
+/// died before it. The polling window exists because QEMU writes the file a moment after the
+/// spawn returns.
+async fn read_pid(pid_file_path: &Path) -> Result<u32> {
+    // QEMU writes pid almost immediately after spawn; wait a short time to make cleanup reliable even on slower filesystems.
+    for _ in 0..50 {
+        if let Ok(pid_str) = tokio::fs::read_to_string(pid_file_path).await
+            && let Ok(pid) = pid_str.trim().parse::<u32>()
+        {
+            return Ok(pid);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    bail!("Failed to read QEMU pid file at {:?}", pid_file_path);
+}
+
+/// Remove a pid file left behind by an earlier run of the same machine.
+///
+/// The run directory outlives a Qlean process that was killed, and it can be copied or
+/// restored from a backup, so a `qemu.pid` naming a dead (or somebody else's) process can be
+/// there *before* the next QEMU is started. [`read_pid`] accepts whatever parses, so without
+/// this step the machine would record that old pid as its own: the identity check then sees a
+/// process that is not this machine's QEMU, every signal step reports "nothing left to kill",
+/// and the guest that is actually running keeps the overlay open.
+///
+/// A file that is already gone is success, and a file that cannot be removed is a failure:
+/// starting QEMU on top of it would record the stale pid again.
+async fn clear_stale_pid_file(pid_file_path: &Path) -> Result<()> {
+    match tokio::fs::remove_file(pid_file_path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to remove the QEMU pid file left by an earlier run at {}; refusing to \
+                 start QEMU because the pid it would record is the stale one",
+                pid_file_path.display()
+            )
+        }),
+    }
+}
+
 /// Whether this machine can still hold resources that need tearing down.
 ///
 /// A QEMU pid or a live SSH session is proof that something started; the run directory alone
@@ -1536,22 +1581,11 @@ StandardError=journal
         self.first_boot_deadline = (is_init && self.image.guest_os == GuestOs::Windows)
             .then(|| std::time::Instant::now() + ssh_timeout);
 
-        // Helper: read pid written by launch_qemu.
-        async fn read_pid(vmid: &str) -> Result<u32> {
-            let dirs = QleanDirs::new()?;
-            let pid_file_path = dirs.runs.join(vmid).join("qemu.pid");
-
-            // QEMU writes pid almost immediately after spawn; wait a short time to make cleanup reliable even on slower filesystems.
-            for _ in 0..50 {
-                if let Ok(pid_str) = tokio::fs::read_to_string(&pid_file_path).await
-                    && let Ok(pid) = pid_str.trim().parse::<u32>()
-                {
-                    return Ok(pid);
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            bail!("Failed to read QEMU pid file at {:?}", pid_file_path);
-        }
+        // The pid file is cleared *before* the spawn: `read_pid` accepts the first number that
+        // parses, so a file left by an earlier run of this machine would be read back as the
+        // pid of the QEMU starting now (see `clear_stale_pid_file`).
+        let pid_file = crate::qemu::pid_file_of(&self.id)?;
+        clear_stale_pid_file(&pid_file).await?;
 
         // `launch` is only reached through `init`/`spawn`, which set the token; check
         // instead of panicking so a future caller cannot turn this into a crash.
@@ -1606,7 +1640,7 @@ StandardError=journal
         };
 
         let mut qemu_handle = tokio::spawn(launch_qemu(qemu_params));
-        let pid = match read_pid(&self.id).await {
+        let pid = match read_pid(&pid_file).await {
             Ok(pid) => pid,
             Err(e) => {
                 // QEMU was spawned but never wrote its pid file, so it cannot be
@@ -2753,6 +2787,80 @@ mod blank_command_tests {
             !error.to_string().contains("requires a non-empty command"),
             "`whoami` must not be refused as blank: {error}"
         );
+    }
+}
+
+#[cfg(test)]
+mod pid_file_tests {
+    use super::*;
+
+    /// The launch must not read back a pid file left by a run that already died.
+    ///
+    /// `read_pid` is a "first number that parses" reader: it has no way to tell the pid of the
+    /// QEMU that is starting now from the pid of the one recorded before it. That is fine as long
+    /// as the caller cleared the file first, and this test pins both halves: the reader really
+    /// does accept the stale value, and clearing first makes the only reachable value the new one.
+    #[tokio::test]
+    async fn a_pid_file_from_an_earlier_run_is_not_read_back_as_this_launch() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pid_file = dir.path().join("qemu.pid");
+        std::fs::write(&pid_file, "4242").expect("write the stale pid");
+
+        // The defect: a launch that does not clear the file records this pid as its own, so the
+        // identity check later refuses to signal the QEMU that is actually running.
+        assert_eq!(
+            read_pid(&pid_file).await.expect("the stale pid parses"),
+            4242
+        );
+
+        clear_stale_pid_file(&pid_file)
+            .await
+            .expect("clearing an existing pid file");
+        assert!(
+            !pid_file.exists(),
+            "the stale pid file survived the clear, so the next read can still adopt it"
+        );
+
+        // What the QEMU of this launch writes once it is spawned.
+        std::fs::write(&pid_file, "5353").expect("write the new pid");
+        assert_eq!(read_pid(&pid_file).await.expect("the new pid parses"), 5353);
+    }
+
+    #[tokio::test]
+    async fn clearing_a_pid_file_that_was_never_written_is_not_a_failure() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        clear_stale_pid_file(&dir.path().join("qemu.pid"))
+            .await
+            .expect("a missing pid file is success");
+    }
+
+    /// A pid file that cannot be removed must fail the launch, not be launched over.
+    ///
+    /// Reading a stale pid is the failure this guards; if the clear fails and the launch
+    /// continues, the machine records the old pid and every later signal step reports "nothing
+    /// left to kill" while the new QEMU keeps the overlay.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pid_file_that_cannot_be_removed_fails_the_launch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).expect("create the locked directory");
+        let pid_file = locked.join("qemu.pid");
+        std::fs::write(&pid_file, "4242").expect("write the stale pid");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500))
+            .expect("lock the directory");
+
+        let error = clear_stale_pid_file(&pid_file)
+            .await
+            .expect_err("a pid file that cannot be removed must not be ignored")
+            .to_string();
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700))
+            .expect("unlock the directory");
+        assert!(error.contains("qemu.pid"), "{error}");
+        assert!(error.contains("refusing to start"), "{error}");
     }
 }
 
