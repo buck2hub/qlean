@@ -211,6 +211,9 @@ which is what makes Windows results meaningful:
 - stdout and stderr are kept in separate buffers as raw bytes.
 - An empty or whitespace-only command is rejected with an error before any SSH request is
   sent.
+- A command the guest killed with a signal has no exit code at all: the SSH server sends an exit
+  signal instead of a status. The error names the signal (`SIGKILL`, for example), whether the
+  guest dumped core, and the guest's own message, instead of reporting a closed channel.
 
 #### Windows file operations
 

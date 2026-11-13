@@ -456,6 +456,169 @@ const PINNED_KEY_REJECTED: &str = "presented an SSH host key that is not the one
 /// install is a legitimate silent command.
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
 
+#[cfg(test)]
+mod exit_signal_tests {
+    use super::*;
+
+    /// Every match block in this file that waits for an exit status, by brace matching.
+    ///
+    /// A text search would answer "does the file mention it" - which one loop can satisfy while
+    /// the other keeps dropping the message. These are the two loops that wait for a command.
+    fn match_blocks(source: &str) -> Vec<&str> {
+        let opener = concat!("match ", "msg {");
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(at) = source[from..].find(opener) {
+            let start = from + at + opener.len() - 1;
+            let mut depth = 0usize;
+            let mut end = source.len();
+            for (offset, ch) in source[start..].char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            end = start + offset + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out.push(&source[start..end]);
+            from = end;
+        }
+        out
+    }
+
+    /// Both command loops turn an `exit-signal` into the reason, not into a dropped connection.
+    ///
+    /// `call` (which streams to the host's stdout) and `run_command` (which collects) each wait
+    /// for the same messages, and each dropped `exit-signal` the same way: the channel closed and
+    /// the caller was told "SSH channel closed before exit status", which is also what a pulled
+    /// cable says. Fixing one loop and not the other is exactly the drift this catches.
+    ///
+    /// The two interactive-shell readers end on `exit-status`, `eof` or `close` and return
+    /// `Ok(None)`, so a signal-killed shell is already finished for them - `eof` follows the
+    /// signal. They pass the same check because they name a terminator that does arrive.
+    #[test]
+    fn both_command_loops_report_a_signal_killed_command() {
+        const SOURCE: &str = include_str!("ssh.rs");
+        let waits_for_status = concat!("ChannelMsg::", "ExitStatus");
+        let signal_arm = concat!("ChannelMsg::", "ExitSignal");
+        let ends_anyway = concat!("ChannelMsg::", "Eof");
+
+        let blocks = match_blocks(SOURCE);
+        let loops: Vec<&str> = blocks
+            .iter()
+            .copied()
+            .filter(|block| block.contains(waits_for_status))
+            .collect();
+        assert!(
+            loops.len() >= 2,
+            "the file has {} loops waiting for an exit status, not 2: the scan is looking at the \
+             wrong blocks",
+            loops.len()
+        );
+        let mut reporting = 0;
+        for (index, block) in loops.iter().enumerate() {
+            if block.contains(signal_arm) {
+                reporting += 1;
+                continue;
+            }
+            assert!(
+                block.contains(ends_anyway),
+                "command loop {} waits for `exit-status`, ignores `exit-signal` and does not end on \
+                 `eof` either: a command the guest killed is reported as a dropped \
+                 connection:\n{block}",
+                index + 1
+            );
+        }
+        assert!(
+            reporting >= 2,
+            "only {reporting} loops report an exit signal: `call` and `run_command` both must"
+        );
+    }
+
+    #[test]
+    fn a_killed_command_names_the_signal_and_not_the_channel() {
+        let message = killed_by_signal(
+            "powershell -Command Deploy-Marker",
+            &russh::Sig::KILL,
+            false,
+            "",
+        );
+        assert!(message.contains("SIGKILL"), "{message}");
+        assert!(
+            message.contains("powershell -Command Deploy-Marker"),
+            "the message must name the command: {message}"
+        );
+        assert!(
+            message.contains("instead of an exit status"),
+            "the message must say why there is no code: {message}"
+        );
+        assert!(
+            !message.contains("closed before exit status"),
+            "the old sentence blamed the channel: {message}"
+        );
+        assert!(
+            !message.contains("the guest said"),
+            "an empty report adds nothing to say: {message}"
+        );
+    }
+
+    #[test]
+    fn the_guest_report_and_core_dump_are_kept_verbatim() {
+        let message = killed_by_signal(
+            "ql-deploy.ps1",
+            &russh::Sig::SEGV,
+            true,
+            "  Segmentation fault (core dumped)\n",
+        );
+        assert!(message.contains("SIGSEGV"), "{message}");
+        assert!(message.contains("dumped core"), "{message}");
+        assert!(
+            message.contains("the guest said: Segmentation fault (core dumped)"),
+            "the guest's own words are trimmed, not dropped or doubled: {message}"
+        );
+    }
+
+    #[test]
+    fn a_server_specific_signal_keeps_its_own_name() {
+        let custom = russh::Sig::Custom("SIGSYS".to_string());
+        assert_eq!(signal_name(&custom), "SIGSYS");
+        assert!(
+            killed_by_signal("cmd", &custom, false, " ").contains("SIGSYS"),
+            "a signal outside the RFC list is reported by the name the server sent"
+        );
+    }
+
+    /// The twelve names RFC 4254 section 6.10 lists, each spelled the way a shell prints it.
+    #[test]
+    fn every_rfc_signal_has_a_distinct_name() {
+        let listed = [
+            (russh::Sig::ABRT, "SIGABRT"),
+            (russh::Sig::ALRM, "SIGALRM"),
+            (russh::Sig::FPE, "SIGFPE"),
+            (russh::Sig::HUP, "SIGHUP"),
+            (russh::Sig::ILL, "SIGILL"),
+            (russh::Sig::INT, "SIGINT"),
+            (russh::Sig::KILL, "SIGKILL"),
+            (russh::Sig::PIPE, "SIGPIPE"),
+            (russh::Sig::QUIT, "SIGQUIT"),
+            (russh::Sig::SEGV, "SIGSEGV"),
+            (russh::Sig::TERM, "SIGTERM"),
+            (russh::Sig::USR1, "SIGUSR1"),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for (signal, expected) in listed {
+            assert_eq!(signal_name(&signal), expected);
+            assert!(seen.insert(expected), "{expected} is reported twice");
+        }
+        assert_eq!(seen.len(), 12, "twelve signals, twelve names");
+    }
+}
+
 /// Run `operation` with a budget, naming it as Qlean's own limit rather than the guest's.
 async fn bounded<T>(
     budget: Duration,
@@ -471,6 +634,60 @@ async fn bounded<T>(
             budget.as_secs()
         ),
     }
+}
+
+/// The signal an SSH `exit-signal` names, in the spelling Qlean reports.
+///
+/// `russh::Sig` carries the twelve names RFC 4254 section 6.10 lists plus whatever else a server
+/// sent (`Custom`), and its own `name` accessor is private, so the mapping lives here. The names
+/// a caller reads are the ones a shell prints and `128 + N` is computed from, not the short form
+/// on the wire.
+fn signal_name(signal: &russh::Sig) -> &str {
+    match signal {
+        russh::Sig::ABRT => "SIGABRT",
+        russh::Sig::ALRM => "SIGALRM",
+        russh::Sig::FPE => "SIGFPE",
+        russh::Sig::HUP => "SIGHUP",
+        russh::Sig::ILL => "SIGILL",
+        russh::Sig::INT => "SIGINT",
+        russh::Sig::KILL => "SIGKILL",
+        russh::Sig::PIPE => "SIGPIPE",
+        russh::Sig::QUIT => "SIGQUIT",
+        russh::Sig::SEGV => "SIGSEGV",
+        russh::Sig::TERM => "SIGTERM",
+        russh::Sig::USR1 => "SIGUSR1",
+        russh::Sig::Custom(name) => name,
+    }
+}
+
+/// What a guest command that was killed by a signal reports.
+///
+/// A server sends `exit-signal` *instead of* `exit-status` when the command it ran died from a
+/// signal (RFC 4254 section 6.10), and then closes the channel: there is no exit code to report,
+/// and never was going to be one. Both command loops used to ignore the message, reach the end
+/// of the channel and answer "SSH channel closed before exit status for command: ..." - the
+/// same sentence a dropped connection produces. So the reason was lost twice over: a command
+/// the guest killed (an OOM-killed package install, a `Stop-Computer` racing the deploy script, a
+/// `kill -9` typo) read as a transport failure, and the signal that would have named it was
+/// printed nowhere. The signal name and the guest's own message are reported instead.
+fn killed_by_signal(
+    command: &str,
+    signal: &russh::Sig,
+    core_dumped: bool,
+    error_message: &str,
+) -> String {
+    let name = signal_name(signal);
+    let core = if core_dumped { " and dumped core" } else { "" };
+    let said = error_message.trim();
+    let extra = if said.is_empty() {
+        String::new()
+    } else {
+        format!("; the guest said: {said}")
+    };
+    format!(
+        "the guest killed `{command}` with {name}{core}: the server sent an exit signal instead \
+         of an exit status, so there is no exit code to report{extra}"
+    )
 }
 
 /// Argument pair for `SFTP symlink`, in the order OpenSSH reads them.
@@ -891,6 +1108,18 @@ impl Session {
                     channel.eof().await?;
                     break;
                 }
+                // A command killed by a signal never gets an exit status: the server sends
+                // `exit-signal` instead and closes. Ignoring it made this loop report a
+                // dropped connection for a guest that killed the command.
+                ChannelMsg::ExitSignal {
+                    signal_name,
+                    core_dumped,
+                    error_message,
+                    ..
+                } => bail!(
+                    "{}",
+                    killed_by_signal(command, &signal_name, core_dumped, &error_message)
+                ),
                 _ => {}
             }
         }
@@ -970,6 +1199,16 @@ impl Session {
                     channel.eof().await?;
                     break;
                 }
+                // Same arm as `call`, for the same reason: no exit status is coming.
+                ChannelMsg::ExitSignal {
+                    signal_name,
+                    core_dumped,
+                    error_message,
+                    ..
+                } => bail!(
+                    "{}",
+                    killed_by_signal(command, &signal_name, core_dumped, &error_message)
+                ),
                 _ => {}
             }
         }

@@ -40,6 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `with_pool` no longer requires `/dev/vhost-vsock`, and `with_machine` requires it only for `GuestOs::Linux`
 
 ### Fixed
+- A command the guest killed with a signal was reported as a dropped connection: both SSH
+  command loops ignored `exit-signal` - which a server sends *instead of* an exit status (RFC
+  4254 section 6.10) - reached the end of the channel and answered "SSH channel closed before
+  exit status", the same sentence a pulled cable produces. The error now names the signal,
+  whether the guest dumped core and the guest's own message, so an OOM-killed deploy script or a
+  `kill -9` typo reads as what it was.
 - The Windows seed medium's stale copy was removed with `let _ = std::fs::remove_file(..)`, so a
   name taken by a directory (or a file that could not be unlinked) failed later as
   "failed to create the Windows seed ISO ... with owner-only permissions" - `EEXIST` blamed on
