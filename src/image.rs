@@ -541,17 +541,68 @@ async fn compute_hash(path: &Path, hash_type: ShaType) -> Result<String> {
     .with_context(|| "hash computation task failed")?
 }
 
-/// Copy a file to `dest` while computing a streaming hash using buffered sync I/O.
-fn copy_with_hash(src: &Path, dest: &Path, hash_type: &ShaType) -> Result<String> {
+/// Open `path` as the one staged file of this download or copy.
+///
+/// The staged name comes from the destination (`<dest>.part`), so two writers of the same
+/// image - two pooled machines initialized at the same time both needing the same Windows
+/// image - would otherwise share one file: the second `File::create` truncates what the first
+/// one is streaming into, the hash of each writer comes from its own *stream* rather than from
+/// the file, so the promotion installs bytes nobody verified, and the file a writer renamed
+/// into place can keep growing afterwards while QEMU reads it. An advisory lock on the open
+/// file makes the second writer fail out loud instead. A crashed run leaves no problem behind:
+/// the kernel drops its lock with the process, and its leftover contents are truncated here.
+///
+/// The file is deliberately not removed and recreated: unlinking it would let a second writer
+/// create a fresh file at the same path and stream into it while the first keeps writing to an
+/// inode that no longer has that name.
+fn open_staged_file(path: &Path) -> Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("failed to open the staged file {}", path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: `flock` only takes a file descriptor this process opened; it touches no
+        // memory and the descriptor stays valid for as long as `file` is owned here.
+        let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if locked != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                bail!(
+                    "another download or copy is already writing {}: wait for it to finish, or \
+                     delete that file if no such run is alive, and retry",
+                    path.display()
+                );
+            }
+            return Err(error)
+                .with_context(|| format!("failed to lock the staged file {}", path.display()));
+        }
+    }
+
+    file.set_len(0)
+        .with_context(|| format!("failed to truncate {}", path.display()))?;
+    Ok(file)
+}
+
+/// Copy a file into `dest` while computing a streaming hash using buffered sync I/O.
+///
+/// `dest` is the already opened (and locked, and truncated) staged file: opening it here would
+/// be the second handle the lock exists to prevent.
+fn copy_with_hash(
+    src: &Path,
+    dest: &Path,
+    staged: std::fs::File,
+    hash_type: &ShaType,
+) -> Result<String> {
     let mut src_f = BufReader::with_capacity(
         1024 * 1024,
         std::fs::File::open(src).with_context(|| format!("failed to open {}", src.display()))?,
     );
-    let mut dst_f = BufWriter::with_capacity(
-        1024 * 1024,
-        std::fs::File::create(dest)
-            .with_context(|| format!("failed to create {}", dest.display()))?,
-    );
+    let mut dst_f = BufWriter::with_capacity(1024 * 1024, staged);
 
     let mut buf = vec![0u8; 64 * 1024];
     let mut hasher = StreamingHasher::new(hash_type);
@@ -600,7 +651,6 @@ async fn download_with_hash(url: &str, dest_path: &PathBuf, hash_type: ShaType) 
             .with_context(|| format!("failed to create dir {}", parent.display()))?;
     }
 
-    let _ = tokio::fs::remove_file(&tmp_path).await;
     let len_sidecar = PathBuf::from(format!("{}.len", tmp_path.display()));
     let _ = tokio::fs::remove_file(&len_sidecar).await;
     if let Some(total) = total_size {
@@ -608,9 +658,9 @@ async fn download_with_hash(url: &str, dest_path: &PathBuf, hash_type: ShaType) 
         let _ = tokio::fs::write(&len_sidecar, total.to_string()).await;
     }
 
-    let mut file = File::create(&tmp_path)
-        .await
-        .with_context(|| format!("failed to create file at {}", tmp_path.display()))?;
+    // One writer per staged file: see `open_staged_file`. `File::create` here truncated
+    // whatever a concurrent download of the same image had already streamed.
+    let mut file = File::from_std(open_staged_file(&tmp_path)?);
 
     let mut stream = response.bytes_stream();
     let idle = std::time::Duration::from_secs(60);
@@ -780,8 +830,8 @@ fn names_the_same_file(a: &Path, b: &Path) -> bool {
 
 /// Refuse a copy whose source is the destination.
 ///
-/// `copy_with_hash` opens the destination for writing (truncating it) before it reads the
-/// source. When both name one file — the same path, a hard link, a symlink — that truncation
+/// The copy stages into the destination's `.part` file, which is opened for writing (and
+/// truncated) before the source is read. When both name one file — the same path, a hard link, a symlink — that truncation
 /// destroys the image it is about to copy: the copy then reads zero bytes, and the digest
 /// check rejects and deletes the emptied file. The user loses their image and the error blames
 /// a hash mismatch. Refusing before anything is opened is the only outcome that keeps the file.
@@ -878,10 +928,12 @@ async fn fetch_from_source(
             // half way must not leave a truncated file at the cache path, where the next run
             // would trust it and `qemu-img` would build an overlay on top of it.
             let part = dest.with_extension("part");
-            let _ = tokio::fs::remove_file(&part).await;
+            // The staged file is opened (and locked) before the blocking copy starts, so a
+            // second copy of the same image is refused instead of truncating this one.
+            let staged = open_staged_file(&part)?;
             let (src_path, part_path) = (src.clone(), part.clone());
             let copied = tokio::task::spawn_blocking(move || {
-                copy_with_hash(&src_path, &part_path, &hash_type)
+                copy_with_hash(&src_path, &part_path, staged, &hash_type)
             })
             .await
             .with_context(|| "copy/hash task failed")?;
@@ -1604,8 +1656,8 @@ dummy
 
     /// A local image kept inside the cache directory is the destination of its own copy.
     ///
-    /// `copy_with_hash` opens the destination for writing before it reads the source, so the
-    /// truncation destroys the very image it is about to copy, the verification then rejects
+    /// The copy stages into the destination's `.part` file, opened for writing before the
+    /// source is read, so the truncation destroys the very image it is about to copy, the verification then rejects
     /// the empty result, and the user's file is gone. Nothing may be written at all here.
     #[tokio::test]
     async fn test_a_local_copy_refuses_to_truncate_its_own_source() -> Result<()> {
@@ -1745,6 +1797,49 @@ dummy
         .expect_err("a hard link to the destination is the same file");
         assert!(error.to_string().contains("same file"), "{error}");
         assert_eq!(tokio::fs::read(&dest).await?, bytes);
+        Ok(())
+    }
+
+    /// Two writers of the same image must not share one staged file.
+    ///
+    /// The staged name is derived from the destination, so two pooled machines that need the
+    /// same image (a pool is initialized concurrently) stage into the same path. A second
+    /// writer would truncate what the first one is streaming into, and each hash is computed
+    /// over its own *stream* rather than over the file, so the promoted file could hold bytes
+    /// nobody verified - and a renamed file could keep growing while QEMU reads it. The second
+    /// writer has to be told before it writes anything.
+    #[cfg(unix)]
+    #[test]
+    fn test_a_second_writer_of_the_same_staged_file_is_refused() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let part = tmp.path().join("image.qcow2.part");
+        let streamed: &[u8] = b"the bytes the first writer streamed";
+
+        let mut first = open_staged_file(&part)?;
+        std::io::Write::write_all(&mut first, streamed)?;
+        std::io::Write::flush(&mut first)?;
+
+        let error = open_staged_file(&part).expect_err("a second writer must be refused");
+        let message = format!("{error:#}");
+        assert!(message.contains("already writing"), "{message}");
+        assert!(
+            message.contains(&part.display().to_string()),
+            "the refusal must name the file: {message}"
+        );
+        assert_eq!(
+            std::fs::read(&part)?,
+            streamed,
+            "the refused writer must not truncate a file it could not lock"
+        );
+
+        // The lock lives on the open file, not on the path: once the first writer is finished
+        // the next one takes over, and starts from an empty file instead of appending to the
+        // leftovers of the attempt before it.
+        drop(first);
+        let taken_over = open_staged_file(&part)?;
+        drop(taken_over);
+        assert_eq!(std::fs::metadata(&part)?.len(), 0);
+
         Ok(())
     }
 

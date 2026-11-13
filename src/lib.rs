@@ -3174,6 +3174,57 @@ mod plan_doc_tests {
         }
     }
 
+    /// Every staged image write goes through the one opener that takes the lock.
+    ///
+    /// The staged file is named after the destination (`<dest>.part`), so two pooled machines
+    /// that need the same image stage into the same path. Opening it with `File::create`
+    /// truncates whatever another writer is streaming into, and because each hash is computed
+    /// over its own *stream* rather than over the file, the promoted file can hold bytes nobody
+    /// verified. `open_staged_file` is the only place allowed to open it, and both the download
+    /// and the local-copy branch have to go through it instead of opening the destination again.
+    #[test]
+    fn every_staged_image_write_goes_through_the_locking_opener() {
+        let image = CRATE_SOURCES
+            .iter()
+            .find(|(path, _)| *path == "src/image.rs")
+            .map(|(_, source)| *source)
+            .expect("src/image.rs is in CRATE_SOURCES");
+        let production = image
+            .split("#[cfg(test)]")
+            .next()
+            .expect("split always yields a first part");
+
+        assert_eq!(
+            production.matches("File::create(").count(),
+            0,
+            "a staged write opened with `File::create` truncates a concurrent writer's file; it \
+             must go through `open_staged_file`, which locks it first"
+        );
+        for snippet in [
+            "open_staged_file(&tmp_path)?",
+            "let staged = open_staged_file(&part)?",
+            "libc::LOCK_EX | libc::LOCK_NB",
+        ] {
+            assert!(
+                production.contains(snippet),
+                "`src/image.rs` must contain {snippet:?}: the download and the local-copy branch \
+                 both stage through `open_staged_file`, and that opener is the one that takes \
+                 the exclusive lock"
+            );
+        }
+
+        let copy = function_body(image, "fn copy_with_hash(");
+        assert!(
+            copy.contains("staged: std::fs::File,"),
+            "`copy_with_hash` must be handed the opened staged file, not open the destination \
+             itself: a second handle is the second writer the lock exists to refuse"
+        );
+        assert!(
+            !copy.contains("File::open(dest)") && !copy.contains("create(dest)"),
+            "`copy_with_hash` opens the staged destination itself"
+        );
+    }
+
     /// The number of ignored unit tests the plan runs is the number the crate has.
     ///
     /// The test matrix says the container snapshot runs "all 11" of them; a twelfth `#[ignore]`

@@ -40,6 +40,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `with_pool` no longer requires `/dev/vhost-vsock`, and `with_machine` requires it only for `GuestOs::Linux`
 
 ### Fixed
+- Two machines that needed the same image at the same time shared one staging file for it
+  (`<image>.part`, named after the destination alone): the second one truncated the file the
+  first was streaming into, and because each checksum is computed over its own stream rather
+  than over the file, the promoted image could hold bytes nobody verified - and a file that
+  had already been moved into the cache could keep growing while QEMU read it. The staged file
+  is now locked while it is written, and a second writer is told which file is already being
+  written instead of corrupting it.
 - Two pooled machines initializing at the same time staged their SSH key in one temporary
   file: the name came from the destination alone, so the second write removed the first one's
   staging file and the first then renamed the second writer's bytes into place. The installed
