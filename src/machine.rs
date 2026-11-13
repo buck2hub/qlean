@@ -466,6 +466,45 @@ fn started(pid_is_some: bool, ssh_is_some: bool) -> bool {
 }
 
 // Core methods for Machine
+/// What an `opendir` answer says about the upload target.
+///
+/// `Ok` means the target is a directory and can be listed. A status the protocol defines as
+/// "there is nothing here" - `NoSuchFile`, or the generic `Failure` a version-3 server sends
+/// when it refuses to list a plain file - means it is not one. Every other outcome is *not an
+/// answer*: a permission error, a dropped connection, a timeout or a packet the server should
+/// not have sent say nothing about whether a directory is there, and the caller has to hear
+/// about them instead of being told "not a directory".
+fn directory_answer(outcome: Result<(), russh_sftp::client::error::Error>) -> Result<bool> {
+    match outcome {
+        Ok(()) => Ok(true),
+        Err(russh_sftp::client::error::Error::Status(status))
+            if matches!(
+                status.status_code,
+                russh_sftp::protocol::StatusCode::NoSuchFile
+                    | russh_sftp::protocol::StatusCode::Failure
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(anyhow::Error::new(error)),
+    }
+}
+
+/// Whether the upload target is an existing directory, or the reason that cannot be told.
+///
+/// The question used to be answered by `read_dir(path).is_ok()`, which asks whether the path can
+/// be *listed*. Those differ exactly where it matters: an unreadable directory, an expired
+/// session or a server that answers `opendir` on a file with a generic status all came back as
+/// "not a directory", and the local file was then aimed at the directory's own path instead of
+/// inside it - on a Windows guest, `C:\out` where `C:\out\file.txt` was meant.
+async fn remote_is_a_directory(ssh: &mut Session, path: &str) -> Result<bool> {
+    let sftp = ssh.get_sftp().await?;
+    let listed = sftp.read_dir(path).await.map(|_| ());
+    directory_answer(listed).with_context(|| {
+        format!("failed to find out whether the upload target {path} is a directory")
+    })
+}
+
 impl Machine {
     /// Create a new Machine instance with specified image and configuration.
     pub async fn new(image: &Image, config: &MachineConfig) -> Result<Self> {
@@ -1175,10 +1214,7 @@ StandardError=journal
         if meta.is_file() || is_link {
             // Decide final remote target path (dir vs file path)
             let remote_target = {
-                let is_dir = {
-                    let sftp = ssh.get_sftp().await?;
-                    sftp.read_dir(remote_path.as_str()).await.is_ok()
-                };
+                let is_dir = remote_is_a_directory(ssh, remote_path.as_str()).await?;
                 if is_dir {
                     remote_path.join(local_basename(local_path)?)?
                 } else {
@@ -3147,6 +3183,95 @@ mod upload_name_tests {
         assert_ne!(
             guest_relative_path(Path::new("dir/f\u{00ff}")).unwrap(),
             guest_relative_path(Path::new("dir/f\u{00fe}")).unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+mod upload_target_tests {
+    use super::*;
+    use russh_sftp::{
+        client::error::Error as SftpError,
+        protocol::{Status, StatusCode},
+    };
+
+    fn status(code: StatusCode) -> SftpError {
+        SftpError::Status(Status {
+            id: 0,
+            status_code: code,
+            error_message: String::new(),
+            language_tag: String::new(),
+        })
+    }
+
+    #[test]
+    fn only_a_definite_no_answers_that_the_target_is_not_a_directory() {
+        // A listing that worked is the yes.
+        assert!(directory_answer(Ok(())).unwrap());
+
+        // `NoSuchFile`: the name is free, so the caller's path is the file to write.
+        // `Failure`: a version-3 server's answer when it will not list a plain file. Both are
+        // the protocol saying there is no directory here, and both keep the old behaviour of
+        // uploading to the path as given.
+        assert!(!directory_answer(Err(status(StatusCode::NoSuchFile))).unwrap());
+        assert!(!directory_answer(Err(status(StatusCode::Failure))).unwrap());
+    }
+
+    #[test]
+    fn an_answer_that_is_not_a_no_is_reported_instead_of_read_as_one() {
+        // A directory the user may not list is still a directory. Read as "not a directory",
+        // the local file was aimed at the directory's own path - on a Windows guest the
+        // difference between `C:\out` and `C:\out\file.txt` - and the upload then failed
+        // against the directory instead of saying why the listing had not worked.
+        let denied = directory_answer(Err(status(StatusCode::PermissionDenied)))
+            .expect_err("a refused listing says nothing about the target");
+        assert!(
+            denied.to_string().contains("Permission denied"),
+            "the server's own words must survive: {denied}"
+        );
+
+        // Nor is a timeout, a dropped connection or a packet the server should not have sent
+        // an answer about the remote file system at all.
+        for error in [
+            SftpError::Timeout,
+            SftpError::IO("connection lost".to_string()),
+            SftpError::UnexpectedBehavior("readdir without a handle".to_string()),
+        ] {
+            let text = error.to_string();
+            let reported = directory_answer(Err(error))
+                .expect_err("an inconclusive answer cannot decide where a file goes");
+            assert!(
+                reported.to_string().contains(&text),
+                "the reported error must be the server's: {reported} vs {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_upload_asks_the_new_question_and_not_can_this_be_listed() {
+        // The call site is the defect this module's helpers exist for: `read_dir(..).is_ok()`
+        // answered "is it a directory" with "can it be listed".
+        let body = include_str!("machine.rs");
+        // The listing call is spelled without its receiver here, so this scan does not find its
+        // own text and report it as a defect.
+        for (at, _) in body.match_indices("sftp.read_dir(") {
+            let statement = &body[at..];
+            let statement = statement
+                .find(';')
+                .map(|end| &statement[..end])
+                .unwrap_or(statement);
+            assert!(
+                !statement.contains(".is_ok()"),
+                "a listing result is folded into a yes/no answer again: {statement}"
+            );
+        }
+        let upload_at = body
+            .find("pub async fn upload<")
+            .expect("machine.rs has no upload");
+        let upload = &body[upload_at..upload_at + 4000];
+        assert!(
+            upload.contains("remote_is_a_directory(ssh, remote_path.as_str()).await?"),
+            "upload no longer asks whether the target is a directory through the checked helper"
         );
     }
 }

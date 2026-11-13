@@ -40,6 +40,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `with_pool` no longer requires `/dev/vhost-vsock`, and `with_machine` requires it only for `GuestOs::Linux`
 
 ### Fixed
+- Whether an upload target was a directory was decided by whether it could be listed: an
+  unreadable directory, an expired session or a server that answers `opendir` on a plain file
+  with a generic status all came back as "not a directory", and the local file was then aimed
+  at the directory's own path instead of inside it - on a Windows guest, `C:\out` where
+  `C:\out\file.txt` was meant. Only the two statuses the protocol defines as "there is
+  nothing here" count as that answer now; every other error says it could not find out, and
+  names the path it was asking about.
 - A TPM process whose exit could not be awaited was reported as stopped: a `wait` that itself
   fails (`ECHILD`, for example after the child was reaped elsewhere) used to take the same
   branch as a clean exit, so teardown carried on and the next start could rebuild the TPM state
