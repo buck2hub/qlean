@@ -225,11 +225,13 @@ pub(crate) fn qmp_socket_and_args(vmid: &str) -> anyhow::Result<(PathBuf, Vec<St
 
 /// Path of the file that records the pid of `vmid`'s QEMU.
 ///
-/// Two programs depend on the same file: [`launch_qemu`] writes it right after the spawn, and
-/// `Machine::launch` clears it before starting QEMU and polls it afterwards. Spelled as two
-/// expressions (`dirs.runs.join(vmid).join("qemu.pid")` in each), a drift between them is
-/// silent and expensive: the launch would poll a file nobody writes, and a pid file left by
-/// an earlier run would be the first thing it reads.
+/// Three call sites depend on the same file: [`launch_qemu`] writes it right after the spawn,
+/// `Machine::launch` clears it before starting QEMU and polls it afterwards, and
+/// `Machine::shutdown` removes it once the guest is gone. Spelled out at each call site (the
+/// run directory, the machine id, the file name), a drift between them is silent and
+/// expensive: the launch would poll a file nobody writes, a pid file left by an earlier run
+/// would be the first thing it reads, and shutdown would leave behind the record of a run
+/// that has already ended.
 pub(crate) fn pid_file_of(vmid: &str) -> anyhow::Result<PathBuf> {
     Ok(QleanDirs::new()?.runs.join(vmid).join("qemu.pid"))
 }

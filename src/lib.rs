@@ -3109,6 +3109,71 @@ mod plan_doc_tests {
         );
     }
 
+    /// Every path to the pid file comes from one function, in every direction.
+    ///
+    /// The file is written by `launch_qemu`, cleared and polled by `launch`, and removed by
+    /// `shutdown`. Each of the three used to spell `runs/<vmid>/qemu.pid` itself, so a change
+    /// to one spelling - a different directory, a suffix, a rename - left the others pointing
+    /// at a file that no longer exists while every test still passed. The literal now lives
+    /// in `qemu::pid_file_of` alone.
+    #[test]
+    fn every_pid_file_path_comes_from_the_one_function() {
+        let qemu = CRATE_SOURCES
+            .iter()
+            .find(|(path, _)| *path == "src/qemu.rs")
+            .map(|(_, source)| *source)
+            .expect("src/qemu.rs is in CRATE_SOURCES");
+        let production = qemu
+            .split("#[cfg(test)]")
+            .next()
+            .expect("split always yields a first part");
+        assert_eq!(
+            production.matches(r#"join("qemu.pid")"#).count(),
+            1,
+            "the pid file path must be spelled exactly once, inside `qemu::pid_file_of`"
+        );
+
+        let machine = CRATE_SOURCES
+            .iter()
+            .find(|(path, _)| *path == "src/machine.rs")
+            .map(|(_, source)| *source)
+            .expect("src/machine.rs is in CRATE_SOURCES");
+        // Naming the shared function is not enough: a body that computes the path and then
+        // throws it away satisfies a "contains" check while nothing touches the file. Each
+        // call site therefore also has to show what it does with the path - and a body that
+        // merely mentions the function without acting on the file fails the second snippet.
+        for (name, signature, uses) in [
+            (
+                "launch",
+                "async fn launch(&mut self, is_init: bool) -> Result<()> {",
+                [
+                    "qemu::pid_file_of(&self.id)",
+                    "clear_stale_pid_file(&pid_file)",
+                ],
+            ),
+            (
+                "shutdown",
+                "pub async fn shutdown(&mut self) -> Result<()> {",
+                ["qemu::pid_file_of(&self.id)", "tokio::fs::remove_file("],
+            ),
+        ] {
+            let body = function_body(machine, signature);
+            for snippet in uses {
+                assert!(
+                    body.contains(snippet),
+                    "`{name}` must contain {snippet:?}: the pid file path comes from \
+                     `qemu::pid_file_of`, the function `launch_qemu` writes to, and the body has \
+                     to act on the file it gets"
+                );
+            }
+            assert!(
+                !body.contains(r#"join("qemu.pid")"#),
+                "`{name}` spells the pid file path itself, so its copy can drift away from the \
+                 one `launch_qemu` writes"
+            );
+        }
+    }
+
     /// The number of ignored unit tests the plan runs is the number the crate has.
     ///
     /// The test matrix says the container snapshot runs "all 11" of them; a twelfth `#[ignore]`

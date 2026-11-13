@@ -1116,9 +1116,12 @@ StandardError=journal
             swtpm.stop().await;
         }
 
-        let dirs = QleanDirs::new()?;
-        let pid_file_path = dirs.runs.join(&self.id).join("qemu.pid");
-        let _ = tokio::fs::remove_file(pid_file_path).await;
+        // The record of this run's QEMU pid is written and read through one function; a
+        // removal that spelled the path itself would quietly stop matching the file the
+        // launch reads as soon as either spelling moved.
+        if let Ok(pid_file_path) = crate::qemu::pid_file_of(&self.id) {
+            let _ = tokio::fs::remove_file(pid_file_path).await;
+        }
         self.ssh = None;
         self.pid = None;
         self.ssh_cancel_token = None;
