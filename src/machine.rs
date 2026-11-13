@@ -503,6 +503,33 @@ fn unconfirmed_swtpm_message(machine_id: &str, when: &str) -> String {
     )
 }
 
+/// Whether the local download target is an existing directory, or the reason nobody can say.
+///
+/// The classification used to be `match metadata(..) { Ok(attr) if attr.is_dir() => .., _ => .. }`,
+/// which answered "is this a directory" with "could I stat it": a permission error on the
+/// parent, a symlink loop, a path whose component is a file (`ENOTDIR`) and a genuine I/O error
+/// all read as "not a directory", so the download wrote to the path as given - and then failed
+/// against a directory with a message about opening it, instead of saying that the host side
+/// could not be inspected. Only the two answers the host filesystem defines as "there is no
+/// directory here" count as a no.
+fn host_target_is_a_directory(meta: std::io::Result<std::fs::Metadata>) -> std::io::Result<bool> {
+    match meta {
+        Ok(attr) => Ok(attr.is_dir()),
+        // `NotFound`: the download creates the file, which is the same decision as before.
+        // `NotADirectory`: a component of the path is a file, so the path itself cannot be a
+        // directory - the answer is definite even though the call failed.
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Whether the upload target is an existing directory, or the reason that cannot be told.
 ///
 /// The question used to be answered by `read_dir(path).is_ok()`, which asks whether the path can
@@ -1335,17 +1362,22 @@ StandardError=journal
 
         if !remote_meta.is_dir() {
             // Decide final local target path (dir vs file path)
-            let local_target = match tokio::fs::metadata(local_path).await {
-                Ok(attr) if attr.is_dir() => {
-                    let name = remote_path.file_name().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "remote path {} has no basename to reuse",
-                            remote_path.as_str()
-                        )
-                    })?;
-                    local_path.join(name)
-                }
-                _ => local_path.to_path_buf(),
+            let local_target = if host_target_is_a_directory(tokio::fs::metadata(local_path).await)
+                .with_context(|| {
+                    format!(
+                        "failed to find out whether the download target {local_path:?} is a \
+                         directory"
+                    )
+                })? {
+                let name = remote_path.file_name().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "remote path {} has no basename to reuse",
+                        remote_path.as_str()
+                    )
+                })?;
+                local_path.join(name)
+            } else {
+                local_path.to_path_buf()
             };
 
             // Ensure local parent directory exists
@@ -3290,6 +3322,89 @@ mod upload_target_tests {
             upload.contains("remote_is_a_directory(ssh, remote_path.as_str()).await?"),
             "upload no longer asks whether the target is a directory through the checked helper"
         );
+    }
+}
+
+#[cfg(test)]
+mod download_target_tests {
+    use super::*;
+
+    /// Real answers from the host filesystem, not constructed ones.
+    #[test]
+    fn only_a_definite_no_answers_that_the_local_target_is_not_a_directory() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let plain = dir.path().join("file.txt");
+        std::fs::write(&plain, b"x").expect("write");
+        let missing = dir.path().join("absent");
+
+        // The two answers the filesystem can give about a directory.
+        assert!(host_target_is_a_directory(std::fs::metadata(dir.path())).unwrap());
+        assert!(!host_target_is_a_directory(std::fs::metadata(&plain)).unwrap());
+
+        // A name that does not exist is not a directory, and the download creates the file
+        // exactly as it did before - the fix must not turn a new filename into an error.
+        assert!(!host_target_is_a_directory(std::fs::metadata(&missing)).unwrap());
+
+        // A path whose component is a file cannot be a directory either: the call fails, the
+        // answer is still definite.
+        let through_a_file = plain.join("child");
+        assert!(!host_target_is_a_directory(std::fs::metadata(&through_a_file)).unwrap());
+    }
+
+    /// An answer that is not a no is reported instead of being read as one.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_path_that_cannot_be_inspected_is_reported() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        // A symlink that points at itself: `metadata` follows links, so the kernel refuses with
+        // `ELOOP` - nobody can say whether the target is a directory, and the download must not
+        // decide on its own that it is a file.
+        let looped = dir.path().join("loop");
+        symlink(&looped, &looped).expect("symlink");
+        let error = host_target_is_a_directory(std::fs::metadata(&looped))
+            .expect_err("a symlink loop says nothing about the target");
+        // `ErrorKind::FilesystemLoop` is still unstable, so the kernel's own number is checked:
+        // ELOOP is the answer that must survive, in place of a fabricated "not a directory".
+        assert_eq!(
+            error.raw_os_error(),
+            Some(libc::ELOOP),
+            "the host's own answer has to survive: {error}"
+        );
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn the_download_asks_the_new_question_and_not_can_this_be_statted() {
+        const SOURCE: &str = include_str!("machine.rs");
+        let at = SOURCE
+            .find("pub async fn download<")
+            .expect("machine.rs has no download");
+        // Stop at the next method, so the scan covers `download` and nothing after it. The
+        // needles are assembled at compile time: a literal here would be found in this file's
+        // own text, which is exactly the trap that made an earlier guard pass on itself.
+        let rest = &SOURCE[at..];
+        let body = match rest[1..].find("\n    pub async fn ") {
+            Some(end) => &rest[..end + 1],
+            None => rest,
+        };
+        assert!(
+            body.contains("host_target_is_a_directory(tokio::fs::metadata(local_path).await)"),
+            "the download no longer asks whether the local target is a directory through the \
+             checked helper"
+        );
+        // The old fold: any error from the host stat became "not a directory".
+        let folds = [
+            concat!("Ok(attr) if attr.is_dir()", " =>"),
+            concat!("match tokio::fs::", "metadata("),
+        ];
+        for fold in folds {
+            assert!(
+                !body.contains(fold),
+                "the local target is classified by whether it could be stated again: {fold}"
+            );
+        }
     }
 }
 

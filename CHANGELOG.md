@@ -40,6 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `with_pool` no longer requires `/dev/vhost-vsock`, and `with_machine` requires it only for `GuestOs::Linux`
 
 ### Fixed
+- `download` decided whether the local target was a directory by whether it could be stated:
+  a permission error, a symlink loop, a path whose component is a file and a genuine I/O error
+  all became "not a directory", and the transfer then wrote to (or failed against) the path as
+  given. Only the answers the host filesystem defines as "there is no directory here" count as
+  a no now; everything else is reported with the path it could not inspect.
 - The owner-only credential write promised that a crash leaves "either the previous file or a
   complete one", but nothing was synced: the bytes only reached the page cache and the rename
   published the name anyway, so a power cut could leave a private key or a deploy seed that is
