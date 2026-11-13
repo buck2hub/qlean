@@ -40,6 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `with_pool` no longer requires `/dev/vhost-vsock`, and `with_machine` requires it only for `GuestOs::Linux`
 
 ### Fixed
+- A download that failed or was cancelled left the half it had received under the target's own
+  name: `download_file` created the local file first, which truncates it, so a broken transfer
+  looked exactly like a complete one - a truncated registry hive or disk image reads as *some*
+  file. The bytes now go to a hidden sibling, are flushed to the disk, and are renamed into place
+  only after the last of them arrived; a failure removes the staged file, so the target keeps the
+  content it had. The rename and the directory sync make the name durable, not just present.
 - A command the guest killed with a signal was reported as a dropped connection: both SSH
   command loops ignored `exit-signal` - which a server sends *instead of* an exit status (RFC
   4254 section 6.10) - reached the end of the channel and answered "SSH channel closed before

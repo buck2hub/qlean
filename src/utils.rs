@@ -584,7 +584,7 @@ pub(crate) fn write_owner_only_atomically(path: &Path, contents: &str) -> Result
 }
 
 /// Flush a directory's entries to the disk, so a rename inside it survives a crash.
-fn sync_directory_of(path: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_directory_of(path: &Path) -> std::io::Result<()> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty());

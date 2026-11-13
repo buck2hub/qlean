@@ -242,6 +242,13 @@ A transfer counts as a success only once it is closed: both the flush and the cl
 receiving file are part of the copy, so a full disk on the other side fails the upload with
 the file named instead of arriving as a truncated file behind a reported success.
 
+A download counts as one only once the file is complete: the bytes are staged in a hidden
+sibling of the target (a dot, the target's name, the process id, a counter, `.part`), flushed
+to the disk and renamed into place after the last one arrives. A transfer that fails or is
+cancelled removes the staged file, so the target keeps the content it had - a download never
+leaves half a registry hive or half a disk image under the name the caller asked for, and an
+empty file is installed as an empty file because that is a complete download.
+
 Path rules for Windows guests:
 
 - A drive letter is required (`C:\Users\qlean`); drive-relative (`C:foo`), root-relative

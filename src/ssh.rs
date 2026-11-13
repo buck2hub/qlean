@@ -1,7 +1,10 @@
 use std::{
     io::ErrorKind,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -619,6 +622,258 @@ mod exit_signal_tests {
     }
 }
 
+#[cfg(test)]
+mod download_staging_tests {
+    use super::*;
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    /// A reader that hands over one chunk and then fails, like a channel that drops mid-file.
+    struct HalfwayThenFails {
+        sent: bool,
+    }
+
+    impl AsyncRead for HalfwayThenFails {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            if this.sent {
+                return Poll::Ready(Err(std::io::Error::other("the connection went away")));
+            }
+            this.sent = true;
+            buf.put_slice(b"first half of the hive");
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A reader that keeps producing and cancels the transfer from underneath it.
+    struct HalfwayThenCancelled {
+        token: CancellationToken,
+        sent: bool,
+    }
+
+    impl AsyncRead for HalfwayThenCancelled {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            if this.sent {
+                this.token.cancel();
+                buf.put_slice(b"and the rest");
+            } else {
+                this.sent = true;
+                buf.put_slice(b"half");
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("qlean-download-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        dir
+    }
+
+    /// Names of the staging files a directory still holds.
+    fn leftovers(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("scratch directory")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.ends_with(".part"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The half that arrived must not be published, and must not survive as a hidden file either.
+    #[tokio::test]
+    async fn a_failed_download_leaves_the_previous_file_alone() {
+        let dir = scratch("failed");
+        let local = dir.join("SYSTEM");
+        std::fs::write(&local, b"the hive that was already there").expect("previous file");
+
+        let error = Session::place_download(
+            &mut HalfwayThenFails { sent: false },
+            &local,
+            &CancellationToken::new(),
+            "the downloaded copy of SYSTEM",
+        )
+        .await
+        .expect_err("a transfer that dies cannot report success");
+
+        assert!(
+            error.to_string().contains("the connection went away"),
+            "the reason has to survive: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&local).expect("previous file"),
+            b"the hive that was already there",
+            "the target was truncated by a download that failed"
+        );
+        assert!(
+            leftovers(&dir).is_empty(),
+            "the staged half was left behind: {:?}",
+            leftovers(&dir)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_download_does_not_publish_the_half_it_has() {
+        let dir = scratch("cancelled");
+        let local = dir.join("SYSTEM");
+        std::fs::write(&local, b"the hive that was already there").expect("previous file");
+        let token = CancellationToken::new();
+
+        let error = Session::place_download(
+            &mut HalfwayThenCancelled {
+                token: token.clone(),
+                sent: false,
+            },
+            &local,
+            &token,
+            "the downloaded copy of SYSTEM",
+        )
+        .await
+        .expect_err("a cancelled transfer cannot report success");
+
+        assert!(error.to_string().contains("Download cancelled"), "{error}");
+        assert_eq!(
+            std::fs::read(&local).expect("previous file"),
+            b"the hive that was already there"
+        );
+        assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+    }
+
+    #[tokio::test]
+    async fn a_complete_download_replaces_the_file_and_leaves_no_staging_file() {
+        let dir = scratch("complete");
+        let local = dir.join("SYSTEM");
+        std::fs::write(&local, b"the hive that was already there").expect("previous file");
+
+        Session::place_download(
+            &mut &b"a whole hive"[..],
+            &local,
+            &CancellationToken::new(),
+            "the downloaded copy of SYSTEM",
+        )
+        .await
+        .expect("a complete download installs");
+
+        assert_eq!(
+            std::fs::read(&local).expect("installed file"),
+            b"a whole hive"
+        );
+        assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+    }
+
+    /// Zero bytes is a complete download of an empty file, not a transfer that never ran.
+    #[tokio::test]
+    async fn an_empty_file_is_a_complete_download_and_does_get_installed() {
+        let dir = scratch("empty");
+        let local = dir.join("empty.txt");
+        std::fs::write(&local, b"stale").expect("previous file");
+
+        Session::place_download(
+            &mut &b""[..],
+            &local,
+            &CancellationToken::new(),
+            "the downloaded copy of empty.txt",
+        )
+        .await
+        .expect("an empty file is a complete download");
+
+        assert_eq!(std::fs::read(&local).expect("installed file"), b"");
+        assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+    }
+
+    /// When the name cannot be taken, the bytes are not thrown away: the error says where they are.
+    #[tokio::test]
+    async fn installing_over_a_directory_fails_and_says_where_the_complete_download_is() {
+        let dir = scratch("install-fails");
+        let local = dir.join("occupied");
+        std::fs::create_dir(&local).expect("a directory in the way");
+
+        let error = Session::place_download(
+            &mut &b"a whole hive"[..],
+            &local,
+            &CancellationToken::new(),
+            "the downloaded copy of occupied",
+        )
+        .await
+        .expect_err("a directory cannot be replaced by a rename");
+
+        let text = error.to_string();
+        assert!(text.contains("the complete download is left at"), "{text}");
+        assert!(leftovers(&dir).len() == 1, "{:?}", leftovers(&dir));
+        assert!(local.is_dir(), "the directory in the way was destroyed");
+    }
+
+    #[test]
+    fn each_download_stages_in_its_own_sibling() {
+        let dir = scratch("staging-names");
+        let local = dir.join("disk.qcow2");
+        let first = staged_download_path(&local);
+        let second = staged_download_path(&local);
+
+        assert_ne!(first, second, "two downloads would share one staged file");
+        assert_ne!(first, local);
+        assert_eq!(
+            first.parent(),
+            local.parent(),
+            "the rename must not cross a directory"
+        );
+        let name = first
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            name.starts_with('.'),
+            "a running download is not listed: {name}"
+        );
+        assert!(name.ends_with(".part"), "{name}");
+        assert!(
+            name.contains("disk.qcow2"),
+            "the staged file names what it is: {name}"
+        );
+    }
+
+    /// `download_file` routes through the staging path, so the tests above speak for it.
+    #[test]
+    fn the_sftp_download_goes_through_the_staging_path() {
+        const SOURCE: &str = include_str!("ssh.rs");
+        let opener = concat!("pub(crate) async fn ", "download_file(");
+        let start = SOURCE.find(opener).expect("download_file is still here");
+        let body = &SOURCE[start..];
+        let end = body.find("\n    /// ").unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains(concat!("place_", "download(")),
+            "download_file no longer stages its bytes:\n{body}"
+        );
+        assert!(
+            !body.contains(concat!("File::", "create(")),
+            "download_file creates its target directly again, which truncates it:\n{body}"
+        );
+    }
+}
+
 /// Run `operation` with a budget, naming it as Qlean's own limit rather than the guest's.
 async fn bounded<T>(
     budget: Duration,
@@ -634,6 +889,46 @@ async fn bounded<T>(
             budget.as_secs()
         ),
     }
+}
+
+/// Where a download stages its bytes before they take the caller's name.
+///
+/// A sibling, so the rename that installs it stays inside one directory (and one filesystem); a
+/// name of its own per download, so two concurrent downloads to the same target cannot install
+/// each other's half. The leading dot keeps a failed transfer out of a `ls` of the output
+/// directory while it is still running.
+fn staged_download_path(local: &Path) -> PathBuf {
+    static DOWNLOADS: AtomicU64 = AtomicU64::new(0);
+    let name = local
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "download".to_string());
+    local.with_file_name(format!(
+        ".{name}.{}-{}.part",
+        std::process::id(),
+        DOWNLOADS.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// Install a fully staged download under `local`, and make the name durable.
+///
+/// The rename is a directory entry, and a directory entry only survives a crash once the
+/// directory does; without the second sync the caller is told a name exists that a power cut can
+/// still take away.
+fn install_download(staged: &Path, local: &Path) -> Result<()> {
+    std::fs::rename(staged, local).with_context(|| {
+        format!(
+            "failed to install {} (the complete download is left at {})",
+            local.display(),
+            staged.display()
+        )
+    })?;
+    crate::utils::sync_directory_of(local).with_context(|| {
+        format!(
+            "wrote {} but could not make its directory durable",
+            local.display()
+        )
+    })
 }
 
 /// The signal an SSH `exit-signal` names, in the spelling Qlean reports.
@@ -1706,16 +2001,65 @@ impl Session {
             let sftp = self.get_sftp().await?;
             sftp.open(remote.as_str()).await?
         };
-        let mut dst = tokio::fs::File::create(local).await?;
 
-        Self::copy_stream(
+        Self::place_download(
             &mut src,
-            &mut dst,
-            &format!("the downloaded copy at {}", local.display()),
+            local,
             &cancel_token,
-            "Download cancelled",
+            &format!("the downloaded copy of {}", local.display()),
         )
         .await
+    }
+
+    /// Copy `src` into `local`, letting the bytes take that name only once all of them are there.
+    ///
+    /// `download_file` used to `File::create(local)` first, which is a truncation: a cancelled or
+    /// failed transfer left the first half of a file under the name the caller asked for, and
+    /// nothing distinguished it from a complete download - a truncated registry hive or disk image
+    /// reads as *some* file. Every other file Qlean writes by name ([`crate::utils::write_owner_only_atomically`])
+    /// stages and renames for exactly this reason; a download is where it matters most, because the
+    /// bytes cross a network.
+    ///
+    /// So the bytes go to a hidden sibling first, are flushed to the disk, and are renamed into
+    /// place only after the last of them arrived. A failure removes the staged file and reports
+    /// the error; the previous file at `local` (or its absence) is left exactly as it was.
+    pub(crate) async fn place_download<R>(
+        src: &mut R,
+        local: &Path,
+        cancel_token: &CancellationToken,
+        what: &str,
+    ) -> Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        let staged = staged_download_path(local);
+        let mut dst = tokio::fs::File::create(&staged).await.with_context(|| {
+            format!(
+                "failed to create the staged download {} (the file {} is left as it was)",
+                staged.display(),
+                local.display()
+            )
+        })?;
+        let mut outcome =
+            Self::copy_stream(src, &mut dst, what, cancel_token, "Download cancelled").await;
+        if outcome.is_ok() {
+            // The rename below publishes the name whether or not the bytes ever left the page
+            // cache, so they have to reach the disk first.
+            outcome = dst.sync_all().await.with_context(|| {
+                format!(
+                    "failed to flush the staged download {} to the disk",
+                    staged.display()
+                )
+            });
+        }
+        drop(dst);
+        match outcome {
+            Ok(()) => install_download(&staged, local),
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&staged).await;
+                Err(error)
+            }
+        }
     }
 
     /// Walk a remote directory tree over SFTP, similar to walkdir.
