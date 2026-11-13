@@ -1156,6 +1156,63 @@ mod plan_doc_tests {
         );
     }
 
+    /// CI executes the integration test that needs no guest.
+    ///
+    /// `tests/windows_machine.rs` holds the seven Windows smoke checks - each `#[ignore]`d, because
+    /// they need a licensed qcow2 and a KVM host - next to the argument parsers those checks
+    /// assert through (`pflash_vars_file`, `overlay_disk_file`, `seed_iso_file`, `has_cdrom`,
+    /// `tpm_state_dir`). The workflow ran `cargo test --lib` and then only *compiled* every
+    /// target, so those parsers were built and never executed: a drift between
+    /// `qemu::windows_firmware_args` and the parser that reads its argv would have shown up on a
+    /// Windows host no runner here has, while CI stayed green. This asserts a step runs that
+    /// target, that the step is not one which would also run the ignored checks, and that the
+    /// file still has something for it to run - a target of nothing but ignored tests prints
+    /// `0 passed` in green.
+    #[test]
+    fn the_ci_executes_the_integration_test_that_needs_no_guest() {
+        const WORKFLOW: &str = include_str!("../.github/workflows/check-and-test.yml");
+        const INTEGRATION: &str = include_str!("../tests/windows_machine.rs");
+
+        let steps: Vec<&str> = WORKFLOW
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("run: "))
+            .map(str::trim)
+            .collect();
+        assert!(
+            steps.contains(&"cargo test --test windows_machine"),
+            "the workflow runs {steps:?}, none of which executes tests/windows_machine.rs: \
+             compiling that target proves the parsers build, not that they still read the argv \
+             the launch writes"
+        );
+
+        let declared = INTEGRATION
+            .lines()
+            .filter(|line| matches!(line.trim(), "#[test]" | "#[tokio::test]"))
+            .count();
+        let ignored = INTEGRATION
+            .lines()
+            .filter(|line| line.trim_start().starts_with("#[ignore"))
+            .count();
+        assert!(
+            declared > ignored,
+            "tests/windows_machine.rs declares {declared} tests and ignores {ignored}: the CI step \
+             that runs that target would execute none of them and still report a green `0 passed`"
+        );
+
+        // The step above is the answer to a claim the workflow used to make in a comment: that
+        // integration tests cannot run here at all. Keep the two from drifting apart again.
+        for stale in [
+            concat!("Integration tests need a KVM", " host"),
+            concat!("CI only proves they ", "compile"),
+        ] {
+            assert!(
+                !WORKFLOW.contains(stale),
+                "the workflow still says `{stale}`, but its `cargo test --test windows_machine` \
+                 step runs the integration test that needs no guest"
+            );
+        }
+    }
+
     /// The push backlog is one number, whichever document states it.
     ///
     /// Two documents describe the same blocked dependency: the plan's dependency registry says how

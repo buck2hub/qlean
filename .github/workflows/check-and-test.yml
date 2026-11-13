@@ -106,7 +106,14 @@ jobs:
       - name: Run unit tests
         run: cargo test --lib
 
-      # Integration tests need a KVM host, so CI only proves they compile; the
-      # Windows ones are additionally #[ignore]d and need a licensed qcow2.
+      # tests/windows_machine.rs holds the seven Windows smoke checks (each #[ignore]d:
+      # they need a licensed qcow2 and a KVM host) next to the argument parsers those
+      # checks assert through. Running the target executes the parsers and skips the
+      # ignored checks; compiling it does neither, so the parsers went unexecuted here.
+      - name: Run the integration tests that need no guest
+        run: cargo test --test windows_machine
+
+      # The ignored Windows checks above still have to compile: they are the ones no
+      # runner here can execute.
       - name: Compile all targets
         run: cargo test --no-run --all-targets
