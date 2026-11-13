@@ -856,7 +856,8 @@ StandardError=journal
         self.ssh = None;
         self.ip = None;
         if let Some(pid) = self.pid.take() {
-            terminate_qemu(pid).await;
+            let identity = qmp::qmp_socket_path(&self.id).ok();
+            terminate_qemu(pid, identity.as_deref()).await;
         }
         reap_launch_task(qemu_handle, Duration::from_secs(5)).await;
         if let Some(mut swtpm) = self.swtpm.take() {
@@ -1016,6 +1017,8 @@ StandardError=journal
 
         if let Some(pid) = self.pid {
             debug!("Waiting for QEMU process {} to exit", pid);
+            let identity = qmp::qmp_socket_path(&self.id).ok();
+            let identity = identity.as_deref();
             let max_wait_time = Duration::from_secs(30);
             let poll_interval = Duration::from_millis(100);
             let start = std::time::Instant::now();
@@ -1036,7 +1039,7 @@ StandardError=journal
                             "QEMU process {} did not exit within timeout, force killing",
                             pid
                         );
-                        match kill_step(&force_kill(pid)) {
+                        match kill_step(&force_kill(pid, identity)) {
                             KillStep::KeepPolling => {
                                 kill_sent = true;
                                 tokio::time::sleep(poll_interval).await;
@@ -1490,9 +1493,11 @@ StandardError=journal
     /// domain, and is reported as such.
     pub async fn is_running(&self) -> Result<bool> {
         let socket_path = qmp::qmp_socket_path(&self.id)?;
-        let qemu_alive = self
-            .pid
-            .is_some_and(|pid| !process_is_gone(pid) && process_is_qemu(pid));
+        let qemu_alive = self.pid.is_some_and(|pid| {
+            // A pid that answers with somebody else's QMP socket is somebody else's QEMU: the
+            // domain this machine recorded is gone, whatever the pid is running now.
+            !process_is_gone(pid) && process_is_this_machines_qemu(pid, Some(socket_path.as_path()))
+        });
         match running_check(self.pid.is_some(), socket_path.exists(), qemu_alive) {
             RunningCheck::NotRunning => Ok(false),
             RunningCheck::NoControlSocket => Ok(false),
@@ -2069,19 +2074,38 @@ impl Machine {
     }
 }
 
-/// Whether a `/proc/<pid>/cmdline` payload belongs to QEMU.
+/// Whether a `/proc/<pid>/cmdline` payload belongs to *this* machine's QEMU.
 ///
 /// Only Qlean's own QEMU process may be signalled. `/proc/<pid>` existing is not proof:
 /// after a crash the kernel can hand the same pid to an unrelated process, and SIGKILLing
 /// that would destroy somebody else's work.
-fn cmdline_is_qemu(cmdline: &[u8]) -> bool {
+///
+/// Naming QEMU is not proof either. Every other QEMU on the host - the user's own VM,
+/// another checkout's guest - names itself `qemu-system-*`, so `argv[0]` alone let a
+/// recycled pid that is running somebody else's VM through the check, which is the one case
+/// the check exists for. The command line must also carry this machine's own QMP socket:
+/// that is the address the process is supposed to serve, it is how `is_running` and teardown
+/// find the domain, and Qlean always passes it as `-chardev socket,...,path=<socket>`.
+///
+/// `socket_path` is `None` when the caller cannot compute it (a `Drop` that runs while the
+/// directories are unavailable). Then only the `argv[0]` rule applies, which is what every
+/// caller had before, so an unavailable identity cannot leave a QEMU running.
+fn cmdline_is_this_machines_qemu(cmdline: &[u8], socket_path: Option<&Path>) -> bool {
     // Only argv[0] names the program: a later argument can mention QEMU without the
     // process being QEMU (`-D /tmp/qemu-system-x86_64.log`), so scanning the whole
     // command line would be a false positive.
-    let program = cmdline.split(|byte| *byte == 0).next().unwrap_or_default();
+    let mut arguments = cmdline.split(|byte| *byte == 0);
+    let program = arguments.next().unwrap_or_default();
     let program = String::from_utf8_lossy(program);
     let program = program.rsplit('/').next().unwrap_or_default();
-    program.starts_with("qemu-system") || program.starts_with("qemu-kvm")
+    if !(program.starts_with("qemu-system") || program.starts_with("qemu-kvm")) {
+        return false;
+    }
+    let Some(socket_path) = socket_path else {
+        return true;
+    };
+    let socket = socket_path.to_string_lossy();
+    arguments.any(|argument| String::from_utf8_lossy(argument).contains(socket.as_ref()))
 }
 
 /// Process state letter from `/proc/<pid>/stat`, if the process still exists.
@@ -2115,10 +2139,10 @@ fn process_is_gone(pid: u32) -> bool {
     }
 }
 
-/// Whether `pid` still looks like the QEMU process Qlean started.
-fn process_is_qemu(pid: u32) -> bool {
+/// Whether `pid` still looks like the QEMU process Qlean started for this machine.
+fn process_is_this_machines_qemu(pid: u32, socket_path: Option<&Path>) -> bool {
     match std::fs::read(format!("/proc/{pid}/cmdline")) {
-        Ok(cmdline) => cmdline_is_qemu(&cmdline),
+        Ok(cmdline) => cmdline_is_this_machines_qemu(&cmdline, socket_path),
         Err(_) => false,
     }
 }
@@ -2171,14 +2195,18 @@ fn kill_not_shut_down_message(pid: u32, reason: &str) -> String {
 ///
 /// The refusal case must stay distinguishable from the gone case: a callback that cannot
 /// tell them apart reports success while the guest keeps its overlay open.
-fn force_kill(pid: u32) -> KillOutcome {
-    force_kill_with(pid, signal_kill)
+fn force_kill(pid: u32, socket_path: Option<&Path>) -> KillOutcome {
+    force_kill_with(pid, socket_path, signal_kill)
 }
 
 /// `force_kill` with an injectable signal delivery, so the refusal path is testable against
 /// a real process instead of a mock pid.
-fn force_kill_with(pid: u32, signal: impl Fn(u32) -> std::io::Result<()>) -> KillOutcome {
-    if !process_is_qemu(pid) {
+fn force_kill_with(
+    pid: u32,
+    socket_path: Option<&Path>,
+    signal: impl Fn(u32) -> std::io::Result<()>,
+) -> KillOutcome {
+    if !process_is_this_machines_qemu(pid, socket_path) {
         warn!(
             "not sending SIGKILL to pid {pid}: it no longer looks like the QEMU process Qlean started (the pid was probably reused)"
         );
@@ -2210,8 +2238,8 @@ fn signal_term(pid: u32) -> std::io::Result<()> {
 /// recycled pid would take an unrelated process down with it. Failures are warnings: this
 /// runs on paths that are already returning an error, and a teardown that cannot finish must
 /// not hide that error.
-async fn terminate_qemu(pid: u32) {
-    if !process_is_qemu(pid) {
+async fn terminate_qemu(pid: u32, socket_path: Option<&Path>) {
+    if !process_is_this_machines_qemu(pid, socket_path) {
         warn!("QEMU pid {pid} is gone; nothing to terminate");
         return;
     }
@@ -2227,7 +2255,7 @@ async fn terminate_qemu(pid: u32) {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    if let KillOutcome::Refused(reason) = force_kill(pid) {
+    if let KillOutcome::Refused(reason) = force_kill(pid, socket_path) {
         warn!("{}", kill_not_shut_down_message(pid, &reason));
     }
 }
@@ -2375,7 +2403,11 @@ impl Drop for Machine {
         // Ensure QEMU process is killed, but only if that pid is still QEMU: killing a
         // recycled pid would take down an unrelated process.
         if let Some(pid) = self.pid {
-            force_kill(pid);
+            // `Drop` cannot report an unavailable identity, so pass what can be computed: with
+            // it, a recycled pid that runs somebody else's VM is left alone; without it the
+            // `argv[0]` rule still applies, so a QEMU of ours is never left running.
+            let identity = qmp::qmp_socket_path(&self.id).ok();
+            force_kill(pid, identity.as_deref());
         }
         // Stop swtpm before the run dir disappears underneath its control socket; the
         // explicit take() makes the ordering deterministic instead of relying on field
@@ -2736,13 +2768,25 @@ mod liveness_tests {
         machine
     }
 
-    /// A live process whose `argv[0]` is QEMU - a copy of `sleep`, so the test needs no QEMU
-    /// on PATH and still looks exactly like a QEMU to `/proc/<pid>/cmdline`.
-    fn spawn_lookalike_qemu(dir: &std::path::Path) -> std::process::Child {
-        std::fs::create_dir_all(dir).expect("create the lookalike directory");
-        let program = dir.join("qemu-system-x86_64");
-        std::fs::copy("/bin/sleep", &program).expect("copy a program to the QEMU name");
-        spawn_beside_a_busy_copy(&program)
+    /// A live process that looks exactly like this machine's QEMU in `/proc/<pid>/cmdline`.
+    ///
+    /// Two things make it *this* machine's QEMU, and they are the two things teardown checks:
+    /// `argv[0]` is the QEMU name, and the argument list carries the machine's own QMP socket.
+    /// `exec -a` sets an `argv[0]` that is not the program path, and the inner `bash` ignores the
+    /// extra argument (it becomes `$0`), so the fixture stays alive for 30s.
+    fn spawn_lookalike_qemu(socket: &std::path::Path) -> std::process::Child {
+        let chardev = format!(
+            "socket,path={},server=on,wait=off,id=qmp0",
+            socket.display()
+        );
+        std::process::Command::new("bash")
+            .arg("-c")
+            // `sleep 30; :` and not `sleep 30`: bash execs a single simple command in place
+            // of itself, which would replace the QEMU name this fixture exists for.
+            .arg("exec -a qemu-system-x86_64 bash -c 'sleep 30; :' \"$0\"")
+            .arg(chardev)
+            .spawn()
+            .expect("start the lookalike")
     }
 
     /// Spawn a just-copied program, retrying while the kernel says `Text file busy`.
@@ -2821,11 +2865,11 @@ mod liveness_tests {
     /// Wait until `/proc/<pid>/cmdline` names the lookalike.
     ///
     /// `spawn` returns as soon as the child is forked; until it `exec`s, its command line is
-    /// still this test binary's, so `process_is_qemu` answers `false` and the first draft of
+    /// still this test binary's, so the `argv[0]` check answers `false` and the first draft of
     /// this test failed about one run in five.
-    fn wait_until_the_child_is_qemu(pid: u32) {
+    fn wait_until_the_child_is_qemu(pid: u32, socket: &std::path::Path) {
         for _ in 0..200 {
-            if process_is_qemu(pid) {
+            if process_is_this_machines_qemu(pid, Some(socket)) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -2838,11 +2882,11 @@ mod liveness_tests {
         // The state a hung or half-torn-down launch leaves behind. `false` here would let a
         // caller start a second QEMU on a disk the first one still owns, so the check has to
         // refuse instead of answering - and nothing but the decision table was tested.
-        let dir = std::env::temp_dir().join(format!("qlean-liveness-{}", std::process::id()));
-        let mut child = spawn_lookalike_qemu(&dir);
-        wait_until_the_child_is_qemu(child.id());
-        let machine = machine_with_pid(Some(child.id()));
+        let machine = machine_with_pid(Some(0));
         let socket = qmp::qmp_socket_path(&machine.id).expect("a socket path");
+        let mut child = spawn_lookalike_qemu(&socket);
+        wait_until_the_child_is_qemu(child.id(), &socket);
+        let machine = machine_with_pid(Some(child.id()));
         assert!(
             !socket.exists(),
             "the test's own run directory must not exist: {}",
@@ -2856,7 +2900,6 @@ mod liveness_tests {
         let text = error.to_string();
         let _ = child.kill();
         let _ = child.wait();
-        let _ = std::fs::remove_dir_all(&dir);
 
         assert!(
             text.contains("still has a live QEMU process"),
@@ -2879,7 +2922,7 @@ mod liveness_tests {
         // proof, and the answer must be `false` rather than an error.
         let machine = machine_with_pid(Some(std::process::id()));
         assert!(
-            !process_is_qemu(std::process::id()),
+            !process_is_this_machines_qemu(std::process::id(), None),
             "the test binary is not QEMU; the case is only meaningful if it says so"
         );
         assert!(
@@ -2889,6 +2932,37 @@ mod liveness_tests {
                 .expect("a reused pid is not an error"),
             "a recorded pid that is not QEMU means the domain is gone"
         );
+    }
+
+    #[test]
+    fn a_qemu_serving_another_machine_is_not_signalled() {
+        // The case the identity check exists for. A recorded pid is reused by a QEMU that is
+        // running somebody else's VM - the user's own guest, another checkout's smoke run.
+        // Naming QEMU in `argv[0]` is true for that process too, so `argv[0]` alone sent it
+        // SIGKILL; only the QMP socket it actually serves says whose QEMU it is.
+        let base = std::env::temp_dir().join(format!("qlean-identity-{}", std::process::id()));
+        let ours = base.join("ours/qmp.sock");
+        let theirs = base.join("theirs/qmp.sock");
+        let mut child = spawn_lookalike_qemu(&theirs);
+        let pid = child.id();
+        wait_until_the_child_is_qemu(pid, &theirs);
+
+        assert_eq!(
+            force_kill(pid, Some(&ours)),
+            KillOutcome::Gone,
+            "a QEMU that serves another machine is not this machine's QEMU"
+        );
+        assert!(
+            !process_is_gone(pid),
+            "the lookalike must still be running: nothing may be signalled"
+        );
+
+        // The control: addressed with the socket it does serve, the same process is killed.
+        // Without this half the assertions above would also pass for a check that always
+        // answers `false`, which would leave every real QEMU running at teardown.
+        assert_eq!(force_kill(pid, Some(&theirs)), KillOutcome::Killed);
+        let _ = child.wait();
+        assert!(process_is_gone(pid), "the lookalike was killed");
     }
 
     #[tokio::test]
@@ -3348,7 +3422,7 @@ mod timeout_tests {
             .ok()?;
         // Wait until the exec has replaced bash, so `/proc/<pid>/cmdline` is the QEMU name.
         for _ in 0..100 {
-            if process_is_qemu(child.id()) {
+            if process_is_this_machines_qemu(child.id(), None) {
                 return Some(child);
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -3363,7 +3437,9 @@ mod timeout_tests {
             return;
         };
         let pid = child.id();
-        let outcome = force_kill_with(pid, |_| Err(std::io::Error::from_raw_os_error(libc::EPERM)));
+        let outcome = force_kill_with(pid, None, |_| {
+            Err(std::io::Error::from_raw_os_error(libc::EPERM))
+        });
         match &outcome {
             KillOutcome::Refused(reason) => {
                 assert!(
@@ -3380,7 +3456,7 @@ mod timeout_tests {
 
         // The real signal path still works on the same process, which is what makes the
         // negative case above meaningful.
-        assert_eq!(force_kill(pid), KillOutcome::Killed);
+        assert_eq!(force_kill(pid, None), KillOutcome::Killed);
         let _ = child.wait();
         for _ in 0..200 {
             if process_is_gone(pid) {
@@ -3408,7 +3484,10 @@ mod timeout_tests {
             eprintln!("SMOKE-UNAVAILABLE: set QLEAN_REFUSED_KILL_PID to an unsignalable qemu pid");
             return;
         };
-        assert!(process_is_qemu(pid), "pid {pid} does not look like QEMU");
+        assert!(
+            process_is_this_machines_qemu(pid, None),
+            "pid {pid} does not look like QEMU"
+        );
         assert!(!process_is_gone(pid), "pid {pid} is already gone");
         // Signal 0 asks the kernel about permission without delivering anything, so this
         // precondition check cannot hide the very refusal the test is about.
@@ -3442,7 +3521,7 @@ mod timeout_tests {
     fn a_pid_that_is_not_qemu_is_reported_as_gone_instead_of_killed() {
         // Our own test process is not QEMU, so nothing may be signalled and teardown has
         // nothing left to wait for.
-        assert_eq!(force_kill(std::process::id()), KillOutcome::Gone);
+        assert_eq!(force_kill(std::process::id(), None), KillOutcome::Gone);
     }
 
     #[test]
@@ -3495,27 +3574,60 @@ mod timeout_tests {
     }
 
     #[test]
-    fn cmdline_is_qemu_only_matches_qemu_programs() {
-        // Real QEMU cmdlines are NUL-separated argv entries.
-        assert!(cmdline_is_qemu(
-            b"qemu-system-x86_64\0-machine\0q35,accel=kvm\0-drive\0file=overlay.img\0"
+    fn cmdline_is_this_machines_qemu_only_matches_this_machines_qemu() {
+        let ours = Path::new("/home/me/.qlean/runs/vm-1/qmp.sock");
+        let theirs = Path::new("/home/me/.qlean/runs/vm-2/qmp.sock");
+        // The chardev argument Qlean builds, as QEMU receives it: one NUL-terminated argv entry.
+        let chardev = |socket: &Path| {
+            format!(
+                "qemu-system-x86_64\0-machine\0q35,accel=kvm\0-chardev\0socket,path={},\
+                 server=on,wait=off,id=qmp0\0",
+                socket.display()
+            )
+            .into_bytes()
+        };
+
+        // Without an identity, `argv[0]` alone still answers: that is the `Drop` path, where
+        // the run directory may be unavailable and a QEMU of ours must not be left running.
+        assert!(cmdline_is_this_machines_qemu(
+            b"qemu-system-x86_64\0-machine\0q35,accel=kvm\0-drive\0file=overlay.img\0",
+            None
         ));
-        assert!(cmdline_is_qemu(
-            b"/usr/bin/qemu-system-aarch64\0-name\0vm\0"
+        assert!(cmdline_is_this_machines_qemu(
+            b"/usr/bin/qemu-system-aarch64\0-name\0vm\0",
+            None
         ));
         // The kernel's qemu-kvm symlink is QEMU as well.
-        assert!(cmdline_is_qemu(b"/usr/bin/qemu-kvm\0-machine\0pc\0"));
+        assert!(cmdline_is_this_machines_qemu(
+            b"/usr/bin/qemu-kvm\0-machine\0pc\0",
+            None
+        ));
 
-        assert!(!cmdline_is_qemu(b""));
-        assert!(!cmdline_is_qemu(b"/usr/bin/bash\0-c\0sleep 30\0"));
-        // A later argument mentioning qemu must not make another program look like QEMU.
-        assert!(!cmdline_is_qemu(
-            b"/usr/bin/tee\0/tmp/qemu-system-x86_64.log\0"
+        // With an identity, the command line must also serve this machine's own QMP socket.
+        assert!(cmdline_is_this_machines_qemu(&chardev(ours), Some(ours)));
+        // The one case the check exists for: a recycled pid that is running somebody else's
+        // QEMU. Naming QEMU is not enough, or the signal would take their VM down.
+        assert!(!cmdline_is_this_machines_qemu(&chardev(theirs), Some(ours)));
+
+        assert!(!cmdline_is_this_machines_qemu(b"", None));
+        assert!(!cmdline_is_this_machines_qemu(
+            b"/usr/bin/bash\0-c\0sleep 30\0",
+            Some(ours)
         ));
-        assert!(!cmdline_is_qemu(
-            b"/usr/bin/qemu-img\0convert\0qemu-system-x86_64\0"
+        // A later argument mentioning qemu must not make another program look like QEMU, even
+        // when that program has our socket path on its command line.
+        assert!(!cmdline_is_this_machines_qemu(
+            b"/usr/bin/tee\0/tmp/qemu-system-x86_64.log\0",
+            None
         ));
-        assert!(!cmdline_is_qemu(b"/usr/bin/qemu-img\0create\0disk.qcow2\0"));
+        assert!(!cmdline_is_this_machines_qemu(
+            b"/usr/bin/qemu-img\0convert\0/home/me/.qlean/runs/vm-1/qmp.sock\0",
+            Some(ours)
+        ));
+        assert!(!cmdline_is_this_machines_qemu(
+            b"/usr/bin/qemu-img\0create\0disk.qcow2\0",
+            None
+        ));
     }
 
     #[tokio::test]
@@ -3577,11 +3689,11 @@ mod timeout_tests {
     }
 
     #[test]
-    fn process_is_qemu_rejects_the_current_test_process() {
+    fn process_is_this_machines_qemu_rejects_the_current_test_process() {
         // Guards the guard: the test binary is not QEMU, and the helper must say so, so a
         // recycled pid never gets SIGKILLed.
-        assert!(!process_is_qemu(std::process::id()));
-        assert!(!process_is_qemu(u32::MAX));
+        assert!(!process_is_this_machines_qemu(std::process::id(), None));
+        assert!(!process_is_this_machines_qemu(u32::MAX, None));
     }
 
     #[test]
