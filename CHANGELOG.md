@@ -40,6 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `with_pool` no longer requires `/dev/vhost-vsock`, and `with_machine` requires it only for `GuestOs::Linux`
 
 ### Fixed
+- A rejected image whose removal failed was reported as removed: the digest mismatch said
+  "the file was removed" no matter what the unlink did, so a read-only cache directory or a
+  full disk left the corrupt image behind exactly where a later run would pick it up. The
+  message now says the file is still on disk, names the path and asks for the delete.
 - A start could adopt the pid of a QEMU that had already died: the pid file was read back
   before the new QEMU wrote it, so a run directory that outlived a killed Qlean process (or
   was restored from a copy) made the machine record a foreign pid. Every later signal step

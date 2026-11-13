@@ -732,18 +732,36 @@ fn truncation_problem(expected: Option<u64>, downloaded: u64) -> Option<String> 
 /// Reject a fetched image whose digest does not match, deleting the unusable file.
 ///
 /// Leaving the file behind wastes a full image on disk and keeps a corrupt artifact in the
-/// cache directory, where a later run could mistake it for a usable image.
+/// cache directory, where a later run could mistake it for a usable image. The removal can
+/// fail on its own - a read-only cache directory, a full disk refusing the unlink - so the
+/// error reports what happened to the file and not what was attempted: a caller told "the file
+/// was removed" looks everywhere for the corrupt image except where it still is.
 async fn verify_fetched(dest: &Path, expected_hash: &str, computed: &str) -> Result<()> {
     if computed.eq_ignore_ascii_case(expected_hash) {
         return Ok(());
     }
-    let _ = tokio::fs::remove_file(dest).await;
-    bail!(
-        "hash mismatch for {}: expected {}, got {}; the file was removed",
-        dest.display(),
-        expected_hash,
-        computed
-    )
+    // No file left behind is the fact the caller needs, whether this call removed it or an
+    // earlier one did; anything else means the corrupt image is still there.
+    let removal_failure = match tokio::fs::remove_file(dest).await {
+        Ok(()) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => Some(error),
+    };
+    match removal_failure {
+        None => bail!(
+            "hash mismatch for {}: expected {}, got {}; the file was removed",
+            dest.display(),
+            expected_hash,
+            computed
+        ),
+        Some(error) => bail!(
+            "hash mismatch for {}: expected {}, got {}; the corrupt file is still on disk \
+             because removing it failed ({error}); delete it before the next run",
+            dest.display(),
+            expected_hash,
+            computed
+        ),
+    }
 }
 
 /// Whether two paths name the same file on disk.
@@ -1529,6 +1547,58 @@ dummy
         tokio::fs::write(&path, b"good").await?;
         verify_fetched(&path, "DEADBEEF", "deadbeef").await?;
         assert!(path.exists(), "case-insensitive match must keep the file");
+        Ok(())
+    }
+
+    /// The rejection message must describe the file that is on disk, not the attempt.
+    ///
+    /// Removing the rejected image can fail on its own (a read-only cache directory, a full
+    /// disk). The first version printed "the file was removed" no matter what happened, which
+    /// sends the caller looking for the corrupt image everywhere except where it still is, in
+    /// the cache a later run reads.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_verify_fetched_does_not_claim_a_removal_that_failed() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir()?;
+        let locked = tmp.path().join("locked");
+        tokio::fs::create_dir(&locked).await?;
+        let path = locked.join("image.qcow2");
+        tokio::fs::write(&path, b"corrupt").await?;
+        tokio::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).await?;
+
+        let err = verify_fetched(&path, "deadbeef", "feedface")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        tokio::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).await?;
+        assert!(err.contains("hash mismatch"), "{err}");
+        assert!(
+            path.exists(),
+            "the setup must make the removal fail, otherwise this test proves nothing"
+        );
+        assert!(
+            !err.contains("was removed"),
+            "the message claims a removal that did not happen: {err}"
+        );
+        assert!(err.contains("still on disk"), "{err}");
+        assert!(err.contains("image.qcow2"), "{err}");
+
+        // ... and with a removable file the same function does say it removed it, which is
+        // the other half of the equation.
+        let removable = tmp.path().join("removable.qcow2");
+        tokio::fs::write(&removable, b"corrupt").await?;
+        let err = verify_fetched(&removable, "deadbeef", "feedface")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!removable.exists(), "a removable rejected image is gone");
+        assert!(
+            err.contains("was removed") && !err.contains("still on disk"),
+            "{err}"
+        );
         Ok(())
     }
 
