@@ -220,7 +220,12 @@ impl DeploySeed {
     ) -> Result<Self> {
         let dir = run_dir.join("seed");
         let root = dir.join(SEED_ROOT);
-        tokio::fs::create_dir_all(&root).await.with_context(|| {
+        // Created owner-only, not `create_dir_all` + `chmod`: the seed root is where the
+        // guest's SSH host private key is written next, and `create_dir_all` gives it the
+        // umask's permissions (0777 under `umask 000`) for as long as the `chmod` has not run.
+        // The two `restrict_dir` calls stay: they tighten a directory a previous attempt (or an
+        // older version) left behind, and they are the only thing that can.
+        crate::utils::create_owner_only_dir_all(&root).with_context(|| {
             format!("failed to create Windows seed directory {}", root.display())
         })?;
         // The seed holds the guest's SSH host private key until deployment finishes, so
@@ -507,6 +512,79 @@ pub(crate) fn copy_file_command(from: &str, to: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The staged seed is owner-only, and it is that from the moment each piece exists.
+    ///
+    /// `stage` used `create_dir_all` and then `chmod`ed: under `umask 000` the seed root
+    /// existed as `0777` until the `chmod` ran, and it is the directory the guest's SSH host
+    /// private key is written into next. The mode is asserted on a run directory that already
+    /// exists with the umask's permissions, because that is the state a previous attempt leaves
+    /// behind and the only state a test can produce without changing the process umask.
+    #[tokio::test]
+    async fn the_staged_seed_is_owner_only_from_the_moment_it_exists() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode_of(path: &Path) -> u32 {
+            std::fs::metadata(path)
+                .unwrap_or_else(|error| panic!("stat {}: {error}", path.display()))
+                .permissions()
+                .mode()
+                & 0o777
+        }
+
+        let parent = tempfile::tempdir().expect("temp dir");
+        let run_dir = parent.path().join("abc123");
+        // A run directory, and a seed root, that a previous attempt left behind with the
+        // umask's permissions: `create_dir_all` leaves existing directories alone, so only the
+        // `restrict_dir` calls can tighten them.
+        let leftover = run_dir.join("seed").join(SEED_ROOT);
+        std::fs::create_dir_all(&leftover).expect("leftover seed root");
+        for path in [&run_dir, &run_dir.join("seed"), &leftover] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))
+                .expect("widen the leftover directories");
+        }
+
+        let host_key = generate_host_key(&run_dir).expect("host key");
+        let seed = DeploySeed::stage(&run_dir, "ssh-ed25519 AAAATEST client\n", &host_key)
+            .await
+            .expect("staged");
+
+        let root = run_dir.join("seed").join(SEED_ROOT);
+        for path in [run_dir.join("seed"), root.clone()] {
+            assert_eq!(
+                mode_of(&path),
+                0o700,
+                "the seed directory {} is not owner-only",
+                path.display()
+            );
+        }
+
+        // The private key and the installed public key are owner-only too; a seed medium that
+        // is world-readable hands this VM's host key to every local user.
+        assert_eq!(mode_of(&root.join("ssh_host_ed25519_key")), 0o600);
+        assert_eq!(mode_of(&root.join("authorized_keys")), 0o600);
+
+        // ... and the guest still gets the three files the image contract names.
+        let installed = std::fs::read_to_string(root.join("authorized_keys")).expect("keys");
+        assert_eq!(
+            installed, "ssh-ed25519 AAAATEST client\n",
+            "a trailing newline is added once and only once"
+        );
+        let contract: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("deploy.json")).expect("contract"))
+                .expect("the staged contract parses");
+        assert_eq!(contract["username"], GUEST_USERNAME);
+        assert_eq!(
+            std::fs::read_to_string(root.join("ssh_host_ed25519_key")).expect("host key"),
+            host_key.privkey_str,
+            "the seed carries the same key the host pins"
+        );
+        assert!(
+            seed.iso_path().ends_with("seed.iso"),
+            "the medium is where the caller expects it: {:?}",
+            seed.iso_path()
+        );
+    }
 
     /// The `deploy.json` schema is the only machine-readable part of the image contract.
     ///

@@ -1720,7 +1720,10 @@ StandardError=journal
             firmware::ensure_host_support()?;
             let dirs = QleanDirs::new()?;
             let run_dir = dirs.runs.join(&self.id);
-            tokio::fs::create_dir_all(&run_dir).await?;
+            // The run directory holds the TPM state and the per-VM host key, so it is created
+            // owner-only even here, where `init` normally made it already: `create_dir_all`
+            // would give it the umask's permissions for as long as a `chmod` had not run.
+            crate::utils::create_owner_only_dir_all(&run_dir)?;
             let resolved = firmware::resolve_ovmf()?;
             let vars = firmware::prepare_vars(&run_dir, &resolved)?;
             if self.swtpm.is_none() {

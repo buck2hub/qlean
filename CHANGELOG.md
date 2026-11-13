@@ -40,6 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `with_pool` no longer requires `/dev/vhost-vsock`, and `with_machine` requires it only for `GuestOs::Linux`
 
 ### Fixed
+- Two directories that receive secrets were created with the umask's permissions and then
+  `chmod`ed: the Windows seed root (which receives the guest's SSH host private key) and the
+  Windows run directory on the launch path (which receives the TPM state). Under `umask 000`
+  that is a `0777` directory for as long as the `chmod` has not run. Both are created owner-only
+  at creation time now, like the run directory and the TPM state directory already were, and the
+  guard that enforces the rule reads these two call sites as well.
 - `copy` decided whether its destination was a directory by "`if let Ok(meta) = ...`": a
   permission error on the parent, an expired session or a dropped connection all read as "not a
   directory", so the copy went ahead toward a destination that may well have been one — and on a

@@ -2247,5 +2247,38 @@ mod owner_only_tests {
             !run_dir.contains("create_dir_all(&run_dir)"),
             "the run directory must not be created with the umask's permissions"
         );
+
+        // The invariant had two more call sites and this guard read neither of them: the
+        // Windows branch of `launch` (which creates the run directory that is about to receive
+        // the TPM state) and the seed root the deployment medium is built from (which receives
+        // the guest's SSH host private key). Same rule, same two assertions.
+        let launch = region(
+            machine,
+            "let run_dir = dirs.runs.join(&self.id);",
+            "let resolved = firmware::resolve_ovmf()?;",
+        );
+        assert!(
+            launch.contains("create_owner_only_dir_all(&run_dir)"),
+            "the Windows launch path must create the run directory owner-only"
+        );
+        assert!(
+            !launch.contains("create_dir_all(&run_dir)"),
+            "the Windows launch path creates the run directory with the umask's permissions"
+        );
+
+        let windows = include_str!("windows.rs");
+        let seed_root = region(
+            windows,
+            "let root = dir.join(SEED_ROOT);",
+            "let authorized_keys =",
+        );
+        assert!(
+            seed_root.contains("create_owner_only_dir_all(&root)"),
+            "the seed root the host private key is written into must be created owner-only"
+        );
+        assert!(
+            !seed_root.contains("create_dir_all(&root)"),
+            "the seed root is created with the umask's permissions before a `chmod` closes them"
+        );
     }
 }
