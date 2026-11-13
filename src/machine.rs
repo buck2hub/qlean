@@ -490,6 +490,24 @@ fn directory_answer(outcome: Result<(), russh_sftp::client::error::Error>) -> Re
     }
 }
 
+/// Whether the copy destination is a directory, or the reason nobody can say.
+///
+/// The question used to be `if let Ok(meta) = metadata(to) && meta.is_dir()`, which read every
+/// failure as "not a directory": a permission error on the parent, an expired session and a
+/// connection that went away all let the copy proceed towards a destination that may well have
+/// been a directory. On a Windows guest that is the difference between replacing a file and
+/// letting `Copy-Item` write *into* a directory. The two statuses that say "there is nothing
+/// here" are decided in one place, by [`directory_answer`], so the upload, the download and the
+/// copy can never disagree about what a definite no is.
+fn destination_is_a_directory(
+    meta: Result<russh_sftp::protocol::FileAttributes, russh_sftp::client::error::Error>,
+) -> Result<bool> {
+    match meta {
+        Ok(attr) => Ok(attr.is_dir()),
+        Err(error) => directory_answer(Err(error)).map(|_| false),
+    }
+}
+
 /// The one sentence for a TPM that could not be confirmed gone.
 ///
 /// Both teardown paths need it - the asynchronous one that stops the TPM before the run
@@ -1929,9 +1947,12 @@ impl Machine {
                 bail!("Source is a directory: {}", from.as_str());
             }
 
-            if let Ok(dst_meta) = sftp.metadata(to.as_str()).await
-                && dst_meta.is_dir()
-            {
+            if destination_is_a_directory(sftp.metadata(to.as_str()).await).with_context(|| {
+                format!(
+                    "failed to find out whether the copy destination {} is a directory",
+                    to.as_str()
+                )
+            })? {
                 bail!("Destination is a directory: {}", to.as_str());
             }
         }
@@ -3321,6 +3342,102 @@ mod upload_target_tests {
         assert!(
             upload.contains("remote_is_a_directory(ssh, remote_path.as_str()).await?"),
             "upload no longer asks whether the target is a directory through the checked helper"
+        );
+    }
+}
+
+#[cfg(test)]
+mod copy_target_tests {
+    use super::*;
+    use russh_sftp::{
+        client::error::Error as SftpError,
+        protocol::{FileAttributes, Status, StatusCode},
+    };
+
+    fn status(code: StatusCode) -> SftpError {
+        SftpError::Status(Status {
+            id: 0,
+            status_code: code,
+            error_message: String::new(),
+            language_tag: String::new(),
+        })
+    }
+
+    fn attributes(mode: u32) -> FileAttributes {
+        FileAttributes {
+            permissions: Some(mode),
+            ..FileAttributes::default()
+        }
+    }
+
+    #[test]
+    fn only_a_definite_no_answers_that_the_copy_destination_is_not_a_directory() {
+        // A destination that says what it is.
+        assert!(destination_is_a_directory(Ok(attributes(0o040_755))).unwrap());
+        assert!(!destination_is_a_directory(Ok(attributes(0o100_644))).unwrap());
+
+        // A destination that is not there yet is the file the copy creates - and a version-3
+        // server's generic `Failure` about a plain file is the same answer as for a listing.
+        assert!(!destination_is_a_directory(Err(status(StatusCode::NoSuchFile))).unwrap());
+        assert!(!destination_is_a_directory(Err(status(StatusCode::Failure))).unwrap());
+    }
+
+    #[test]
+    fn an_answer_that_is_not_a_no_is_reported_instead_of_read_as_one() {
+        // A destination the user may not look at may be a directory, and the copy cannot
+        // assume it is not: `Copy-Item -Destination <dir>` on a Windows guest copies *into*
+        // it, so a folded answer turns one file into two.
+        let denied = destination_is_a_directory(Err(status(StatusCode::PermissionDenied)))
+            .expect_err("a refused stat says nothing about the destination");
+        assert!(
+            denied.to_string().contains("Permission denied"),
+            "the server's own words must survive: {denied}"
+        );
+
+        for error in [
+            SftpError::Timeout,
+            SftpError::IO("connection lost".to_string()),
+            SftpError::UnexpectedBehavior("stat without a filename".to_string()),
+        ] {
+            let text = error.to_string();
+            let reported = destination_is_a_directory(Err(error))
+                .expect_err("an inconclusive answer cannot decide what the copy replaces");
+            assert!(
+                reported.to_string().contains(&text),
+                "the reported error must be the server's: {reported} vs {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_copy_asks_the_new_question_and_not_can_this_be_stated() {
+        const SOURCE: &str = include_str!("machine.rs");
+        let at = SOURCE
+            .find("pub async fn copy<")
+            .expect("machine.rs has no copy");
+        let rest = &SOURCE[at..];
+        let body = &rest[..rest.find("pub async fn create_dir<").unwrap_or(rest.len())];
+        // The shape, not a spelling: any single statement that both states a path and decides
+        // whether it is a directory has to go through the checked helper. Pinning the old
+        // spelling missed a re-spelled fold (that discovery is recorded as R197's negative
+        // result), so the rule is about what the statement does.
+        for (at, _) in body.match_indices("sftp.metadata(") {
+            let start = body[..at].rfind('\n').map_or(0, |newline| newline + 1);
+            let statement = &body[start..];
+            let statement = statement
+                .find(';')
+                .map_or(statement, |end| &statement[..end]);
+            let decides = statement.contains(".is_dir()") || statement.contains("Err(_)");
+            assert!(
+                !decides || statement.contains("destination_is_a_directory("),
+                "the copy destination is classified by whether it could be stated again: \
+                 {statement}"
+            );
+        }
+        assert!(
+            body.contains("destination_is_a_directory(sftp.metadata(to.as_str()).await)"),
+            "the copy no longer asks whether its destination is a directory through the \
+             checked helper"
         );
     }
 }

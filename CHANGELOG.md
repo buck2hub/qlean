@@ -40,6 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `with_pool` no longer requires `/dev/vhost-vsock`, and `with_machine` requires it only for `GuestOs::Linux`
 
 ### Fixed
+- `copy` decided whether its destination was a directory by "`if let Ok(meta) = ...`": a
+  permission error on the parent, an expired session or a dropped connection all read as "not a
+  directory", so the copy went ahead toward a destination that may well have been one — and on a
+  Windows guest `Copy-Item -Destination <dir>` copies *into* the directory instead of replacing
+  a file. The destination now answers through the same checked helper the upload and download
+  use, so the three call sites cannot disagree about what a definite "nothing is there" is.
 - `download` decided whether the local target was a directory by whether it could be stated:
   a permission error, a symlink loop, a path whose component is a file and a genuine I/O error
   all became "not a directory", and the transfer then wrote to (or failed against) the path as
