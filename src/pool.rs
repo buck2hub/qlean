@@ -45,8 +45,18 @@ fn shutdown_step(probe: Result<bool>) -> ShutdownStep {
 /// the next start would then rebuild the overlay under a live guest. One machine's failure
 /// must not decide the fate of the others.
 async fn run_all<'a>(tasks: impl Iterator<Item = (String, PoolTask<'a>)>) -> Result<()> {
-    let labelled = tasks
-        .map(|(name, task)| async move { task.await.map_err(|e| anyhow::anyhow!("{name}: {e}")) });
+    let labelled = tasks.map(|(name, task)| async move {
+        match task.await {
+            Ok(()) => Ok(()),
+            // The label is added as a context layer instead of being formatted into a fresh
+            // error, so the machine's name and the reason survive together. Formatting the
+            // error rendered only its outermost context: a caller told `beta: failed to ask
+            // the QMP socket whether the machine was running` never learned that the socket at
+            // `/run/…/qmp.sock` refused the connection, which is the half that says what to
+            // check.
+            Err(error) => Err(error.context(name)),
+        }
+    });
     let errors = futures::future::join_all(labelled)
         .await
         .into_iter()
@@ -58,7 +68,8 @@ async fn run_all<'a>(tasks: impl Iterator<Item = (String, PoolTask<'a>)>) -> Res
         false => {
             let message = errors
                 .iter()
-                .map(|error| error.to_string())
+                // `{:#}` renders the whole chain, `{}` renders the outermost context only.
+                .map(|error| format!("{error:#}"))
                 .collect::<Vec<_>>()
                 .join("; ");
             Err(anyhow::anyhow!("{message}"))
@@ -216,6 +227,39 @@ mod tests {
             name.to_string(),
             Box::pin(async move { Err(anyhow::anyhow!(message)) }),
         )
+    }
+
+    #[tokio::test]
+    async fn test_run_all_keeps_the_cause_a_machine_failure_carried() {
+        // A pool entry point answers with one message for the whole pool, so the message is the
+        // only thing a caller can act on. `is_running`, `init` and `shutdown` all add context
+        // layers (`failed to ask the QMP socket …` over `failed to connect to the QMP socket at
+        // …`), and formatting the error without `#` printed the label and the outermost layer
+        // only: the socket that refused the connection never reached the caller.
+        let tasks: Vec<(String, PoolTask<'static>)> = vec![(
+            "alpha".to_string(),
+            Box::pin(async {
+                Err(
+                    anyhow::anyhow!("failed to connect to the QMP socket at /run/vm-1/qmp.sock")
+                        .context("failed to ask the QMP socket whether the machine was running"),
+                )
+            }),
+        )];
+
+        let error = run_all(tasks.into_iter()).await.expect_err("a failure");
+        let message = error.to_string();
+        assert!(
+            message.contains("alpha"),
+            "the machine is unnamed: {message}"
+        );
+        assert!(
+            message.contains("failed to ask the QMP socket"),
+            "the context layer is missing: {message}"
+        );
+        assert!(
+            message.contains("/run/vm-1/qmp.sock"),
+            "the cause the caller has to act on is missing: {message}"
+        );
     }
 
     #[tokio::test]

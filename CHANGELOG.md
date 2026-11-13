@@ -40,6 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `with_pool` no longer requires `/dev/vhost-vsock`, and `with_machine` requires it only for `GuestOs::Linux`
 
 ### Fixed
+- A pool operation that failed reported only the outermost reason, so the machine's name
+  arrived without the cause it was wrapped around: `init_all`, `spawn_all` and `shutdown_all`
+  said `alpha: failed to ask the QMP socket whether the machine was running` and dropped the
+  socket path that refused the connection. The machine name is now a context layer and the
+  combined message renders the whole chain.
 - A transfer that failed while flushing or closing was reported as successful: both
   `upload_file` and `download_file` discarded those errors, and a receiving file reports
   success while the data is still buffered, so a full disk showed up as a complete upload or a
