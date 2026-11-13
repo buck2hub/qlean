@@ -490,6 +490,19 @@ fn directory_answer(outcome: Result<(), russh_sftp::client::error::Error>) -> Re
     }
 }
 
+/// The one sentence for a TPM that could not be confirmed gone.
+///
+/// Both teardown paths need it - the asynchronous one that stops the TPM before the run
+/// directory is rebuilt, and the synchronous one in `Drop` - and two copies of a warning are
+/// two chances for the second one to stop naming the directory nobody vouched for. R190 put the
+/// fact in one place; this keeps it there while the drop path stops returning silently.
+fn unconfirmed_swtpm_message(machine_id: &str, when: &str) -> String {
+    format!(
+        "VM-{machine_id}: swtpm did not confirm its exit {when}, so its TPM state directory is \
+         not vouched for; check for a leftover swtpm process before reusing it"
+    )
+}
+
 /// Whether the upload target is an existing directory, or the reason that cannot be told.
 ///
 /// The question used to be answered by `read_dir(path).is_ok()`, which asks whether the path can
@@ -935,9 +948,8 @@ StandardError=journal
         };
         if !swtpm.stop().await {
             warn!(
-                "VM-{}: swtpm did not confirm its exit, so its TPM state directory is not \
-                 vouched for; check for a leftover swtpm process before reusing it",
-                self.id
+                "{}",
+                unconfirmed_swtpm_message(&self.id, "while it was being stopped")
             );
         }
     }
@@ -2493,7 +2505,12 @@ impl Drop for Machine {
         // explicit take() makes the ordering deterministic instead of relying on field
         // drop order.
         if let Some(mut swtpm) = self.swtpm.take() {
-            swtpm.stop_now();
+            // The same promise the asynchronous teardown keeps: a TPM that is not confirmed gone
+            // may still be writing the state directory this drop is about to remove, so it is
+            // reported through the same sentence instead of assumed stopped.
+            if !swtpm.stop_now() {
+                warn!("{}", unconfirmed_swtpm_message(&self.id, "during the drop"));
+            }
         }
         // Clean up runtime files if configured to do so
         if self.config.clear {

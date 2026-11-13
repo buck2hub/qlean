@@ -615,6 +615,48 @@ fn wait_outcome(
     }
 }
 
+/// How often the synchronous stop asks the child whether it has exited.
+const SYNC_STOP_POLL: Duration = Duration::from_millis(20);
+
+/// What the last synchronous probe of the child told us.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum WaitProbe {
+    /// The child has exited and was reaped.
+    Exited,
+    /// The child is still running.
+    StillRunning,
+    /// The probe itself failed, so the child's fate is unknown.
+    Failed,
+}
+
+/// What the synchronous stop does next, given the last probe and the elapsed grace.
+///
+/// Pure for the same reason [`wait_outcome`] is: the three ways out of the loop are the whole
+/// contract, and two of them are hard to reach with a real process - a child the kernel cannot
+/// interrupt, and a probe that fails. The loop used to have one way out (kill it and return),
+/// which reported neither a confirmed exit nor a confirmed failure.
+#[derive(Debug, PartialEq, Eq)]
+enum SyncStopStep {
+    /// Confirmed gone: nothing to kill, nothing to report.
+    Exited,
+    /// Still inside the grace: let it flush its state.
+    KeepWaiting,
+    /// The grace expired, or nobody can say what the child is doing: kill it.
+    Kill,
+}
+
+fn sync_stop_step(probe: WaitProbe, elapsed: Duration, grace: Duration) -> SyncStopStep {
+    match probe {
+        WaitProbe::Exited => SyncStopStep::Exited,
+        WaitProbe::StillRunning if elapsed < grace => SyncStopStep::KeepWaiting,
+        WaitProbe::StillRunning => SyncStopStep::Kill,
+        // A probe that failed is not a child that is alive, but it is certainly not a child
+        // that is confirmed gone, so the kill is the only remaining move - and the caller has
+        // already been told the probe failed.
+        WaitProbe::Failed => SyncStopStep::Kill,
+    }
+}
+
 /// Ask a child process to terminate, so it can flush its state first.
 ///
 /// `Child::start_kill` only sends `SIGKILL`, which gives `swtpm` no chance to write the TPM
@@ -756,20 +798,68 @@ impl Swtpm {
     /// `Drop` cannot await, so this signals the child, waits synchronously for a bounded
     /// time and then kills it. The wait matters: dropping a child configured with
     /// `kill_on_drop` would `SIGKILL` it immediately after the signal.
-    pub(crate) fn stop_now(&mut self) {
+    ///
+    /// Returns whether the process is *confirmed* gone, the same promise [`Swtpm::stop`] makes
+    /// for the asynchronous path. Falling off the end of the wait used to return nothing and say
+    /// nothing, so a `Drop` carried on to remove the run directory - and with it the TPM state
+    /// directory - while the process that owns them might still have been writing to it.
+    pub(crate) fn stop_now(&mut self) -> bool {
+        self.stop_now_within(SHUTDOWN_GRACE)
+    }
+
+    /// [`Swtpm::stop_now`] with the grace as an argument, so the tests drive this exact code.
+    fn stop_now_within(&mut self, grace: Duration) -> bool {
         signal_terminate(&mut self.child);
         let started = Instant::now();
-        while started.elapsed() < SHUTDOWN_GRACE {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+        loop {
+            let probe = match self.child.try_wait() {
+                Ok(Some(_)) => WaitProbe::Exited,
+                Ok(None) => WaitProbe::StillRunning,
                 Err(error) => {
                     warn!("failed to wait for swtpm: {error}");
-                    break;
+                    WaitProbe::Failed
+                }
+            };
+            match sync_stop_step(probe, started.elapsed(), grace) {
+                SyncStopStep::Exited => return true,
+                SyncStopStep::KeepWaiting => std::thread::sleep(SYNC_STOP_POLL),
+                SyncStopStep::Kill => {
+                    if probe == WaitProbe::StillRunning {
+                        warn!("swtpm did not exit within {grace:?}; killing it");
+                    }
+                    return self.kill_now(grace);
                 }
             }
         }
-        let _ = self.child.start_kill();
+    }
+
+    /// `SIGKILL` the child and report whether it is confirmed gone.
+    ///
+    /// `SIGKILL` is not the same as "gone": the signal has to be delivered (`start_kill`) and the
+    /// child has to be reaped (`try_wait`), and a process the kernel cannot interrupt stays
+    /// behind. Both failures are warnings, because this runs from `Drop`, where returning early
+    /// is the only other option - but the return value has to say "not confirmed" so the caller
+    /// does not reuse a directory a live process still holds.
+    fn kill_now(&mut self, grace: Duration) -> bool {
+        if let Err(error) = self.child.start_kill() {
+            warn!("failed to kill swtpm: {error}");
+            return false;
+        }
+        let started = Instant::now();
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) if started.elapsed() < grace => std::thread::sleep(SYNC_STOP_POLL),
+                Ok(None) => {
+                    warn!("swtpm is still running {grace:?} after SIGKILL");
+                    return false;
+                }
+                Err(error) => {
+                    warn!("could not reap swtpm after SIGKILL ({error}); it may still be running");
+                    return false;
+                }
+            }
+        }
     }
 }
 
@@ -1194,6 +1284,111 @@ mod tests {
         assert!(elapsed < SHUTDOWN_GRACE, "took {elapsed:?}");
         let status = swtpm.child.try_wait().expect("try_wait works");
         assert!(status.is_some(), "child must be gone after a graceful stop");
+    }
+
+    /// The three ways out of the synchronous wait, and the one that was missing.
+    #[test]
+    fn test_the_synchronous_stop_names_its_exit_its_wait_and_its_kill() {
+        let grace = Duration::from_millis(100);
+        // A confirmed exit is the end of the wait, whatever the clock says: a child that has
+        // already been reaped must not be signalled.
+        assert_eq!(
+            sync_stop_step(WaitProbe::Exited, Duration::from_secs(60), grace),
+            SyncStopStep::Exited
+        );
+        // Inside the grace the child still gets to flush its state.
+        assert_eq!(
+            sync_stop_step(WaitProbe::StillRunning, Duration::ZERO, grace),
+            SyncStopStep::KeepWaiting
+        );
+        assert_eq!(
+            sync_stop_step(WaitProbe::StillRunning, Duration::from_millis(99), grace),
+            SyncStopStep::KeepWaiting
+        );
+        // At the boundary the grace is over.
+        assert_eq!(
+            sync_stop_step(WaitProbe::StillRunning, grace, grace),
+            SyncStopStep::Kill
+        );
+        // A probe that failed says nothing about the child, so it is not an exit either.
+        assert_eq!(
+            sync_stop_step(WaitProbe::Failed, Duration::ZERO, grace),
+            SyncStopStep::Kill
+        );
+    }
+
+    /// A child that ignores `SIGTERM` is killed, and the kill is confirmed.
+    ///
+    /// The old loop fell out of the wait, sent `SIGKILL` and returned nothing, so `Drop` went on
+    /// to remove the run directory - and the TPM state inside it - with no statement about
+    /// whether the process was gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_the_synchronous_stop_escalates_and_confirms_the_kill() {
+        // The trailing loop keeps `sh` as the surviving process: a bare last command would be
+        // `exec`ed and inherit the default `SIGTERM` disposition instead of the trap, and the
+        // test would then prove the graceful path instead of the escalation.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let marker = dir.path().join("trapped");
+        let child = tokio::process::Command::new("sh")
+            .args([
+                "-c",
+                &format!(
+                    "trap '' TERM; : > {}; while :; do sleep 0.05; done",
+                    marker.display()
+                ),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("sh is available");
+        let mut swtpm = Swtpm::from_child(child, PathBuf::from("/nonexistent/swtpm.sock"));
+        let grace = Duration::from_millis(150);
+        // The marker proves the trap is installed before the signal goes out, otherwise the
+        // test races the shell's startup.
+        for _ in 0..500 {
+            if marker.is_file() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(marker.is_file(), "the trap never got installed");
+
+        let started = Instant::now();
+        assert!(
+            swtpm.stop_now_within(grace),
+            "a killed child is gone, and the stop has to say so"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= grace,
+            "the child ignores SIGTERM, so the grace must have run out first: {elapsed:?}"
+        );
+        assert!(
+            swtpm.child.try_wait().expect("try_wait works").is_some(),
+            "the child must be reaped, not merely signalled"
+        );
+    }
+
+    /// A child somebody else already reaped cannot be confirmed gone, so it is not reported so.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_stop_that_cannot_confirm_the_exit_says_so() {
+        let child = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg("sleep 60")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("bash must be on PATH");
+        let pid = child.id().expect("a spawned child has a pid");
+        let mut swtpm = Swtpm::from_child(child, PathBuf::from("/nonexistent/swtpm.sock"));
+        reap_behind_the_handles_back(pid);
+
+        assert!(
+            !swtpm.stop_now_within(Duration::from_millis(100)),
+            "a child that was reaped behind our back was reported as confirmed stopped"
+        );
     }
 
     /// Name of the state file a real `swtpm` writes its TPM 2.0 state into.

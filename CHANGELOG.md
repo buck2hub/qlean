@@ -40,6 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `with_pool` no longer requires `/dev/vhost-vsock`, and `with_machine` requires it only for `GuestOs::Linux`
 
 ### Fixed
+- A TPM stopped from synchronous code (the `Drop` path, which runs when nothing else could)
+  reported nothing: a child that outlived the grace was killed and the call returned as if it
+  had left, so the run directory and the TPM state inside it were removed under a process that
+  might still have held them. The synchronous stop now answers whether the exit was confirmed,
+  keeps the same sentence as the asynchronous teardown when it was not, and warns about a
+  `SIGKILL` nobody could reap.
 - Whether an upload target was a directory was decided by whether it could be listed: an
   unreadable directory, an expired session or a server that answers `opendir` on a plain file
   with a generic status all came back as "not a directory", and the local file was then aimed

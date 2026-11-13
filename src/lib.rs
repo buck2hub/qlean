@@ -2488,6 +2488,67 @@ mod plan_doc_tests {
         );
     }
 
+    /// The synchronous TPM stop has to report a stop it did not confirm.
+    ///
+    /// `stop_now` signalled the child, waited out the grace and sent `SIGKILL` - and then
+    /// returned nothing and said nothing, so `Machine::drop` went on to remove the run
+    /// directory (and the TPM state inside it) with no statement about whether the process that
+    /// owns it was gone. The asynchronous sibling got this right in R190; the drop path is the
+    /// one that runs when nothing else could.
+    #[test]
+    fn the_synchronous_tpm_stop_reports_a_stop_it_did_not_confirm() {
+        const FIRMWARE: &str = include_str!("../src/firmware.rs");
+        const MACHINE: &str = include_str!("../src/machine.rs");
+
+        // The exit has to be *confirmed*: a bounded wait, a kill, and a reaped child.
+        assert!(
+            FIRMWARE.contains("fn sync_stop_step("),
+            "the synchronous stop no longer names its ways out of the wait"
+        );
+        let stop_now = function_body(FIRMWARE, "fn stop_now(&mut self) -> bool");
+        assert!(
+            stop_now.contains("self.stop_now_within(SHUTDOWN_GRACE)"),
+            "the synchronous stop is no longer bounded by the shared grace"
+        );
+        let within = function_body(
+            FIRMWARE,
+            "fn stop_now_within(&mut self, grace: Duration) -> bool",
+        );
+        for fact in [
+            "sync_stop_step(",
+            "SyncStopStep::Kill",
+            "self.kill_now(grace)",
+        ] {
+            assert!(
+                within.contains(fact),
+                "the synchronous stop no longer does `{fact}`, so the grace can pass unnoticed"
+            );
+        }
+        let kill = function_body(FIRMWARE, "fn kill_now(&mut self, grace: Duration) -> bool");
+        assert!(
+            kill.contains("try_wait()") && kill.contains("return false"),
+            "a SIGKILL that nobody reaped is reported as a stop again"
+        );
+
+        // The drop path asks, and states the same fact in the same words: one sentence, so the
+        // two callers cannot drift.
+        assert!(
+            MACHINE.contains("if !swtpm.stop_now()"),
+            "the drop was silent about a TPM it could not confirm stopped"
+        );
+        assert!(
+            !MACHINE.contains("swtpm.stop_now();"),
+            "a teardown path drops the TPM without asking whether it is gone"
+        );
+        assert_eq!(
+            MACHINE
+                .matches("unconfirmed_swtpm_message(&self.id,")
+                .count(),
+            2,
+            "both teardown paths must state the unconfirmed stop through the one helper"
+        );
+    }
+
     #[test]
     fn the_failed_launch_teardown_is_written_once_and_is_bounded() {
         const MACHINE: &str = include_str!("../src/machine.rs");
