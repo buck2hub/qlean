@@ -13,7 +13,10 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use nanoid::nanoid;
-use russh_sftp::client::fs::{Metadata, ReadDir};
+use russh_sftp::{
+    client::fs::{Metadata, ReadDir},
+    protocol::OpenFlags,
+};
 use serde::{Deserialize, Serialize};
 use shell_escape::unix::escape;
 use tokio_util::sync::CancellationToken;
@@ -2041,8 +2044,26 @@ impl Machine {
         let (ssh, _) = self.get_ssh("write a file")?;
 
         let sftp = ssh.get_sftp().await?;
-        let _ = sftp.create(path.as_str()).await?;
-        sftp.write(path.as_str(), contents).await?;
+        // Open, write and close one handle. The previous shape asked for `create` and threw the
+        // handle away - `russh-sftp` has no `Drop` for `File`, so the guest kept that handle
+        // open for the rest of the session, and on Windows an open handle denies rename and
+        // delete of the file that was just written.
+        let mut file = sftp
+            .open_with_flags(
+                path.as_str(),
+                OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
+            )
+            .await
+            .with_context(|| format!("failed to open {} for writing", path.as_str()))?;
+        tokio::io::AsyncWriteExt::write_all(&mut file, contents)
+            .await
+            .with_context(|| format!("failed to write {}", path.as_str()))?;
+        tokio::io::AsyncWriteExt::flush(&mut file)
+            .await
+            .with_context(|| format!("failed to flush {}", path.as_str()))?;
+        tokio::io::AsyncWriteExt::shutdown(&mut file)
+            .await
+            .with_context(|| format!("failed to close {}", path.as_str()))?;
 
         Ok(())
     }

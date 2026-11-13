@@ -235,6 +235,10 @@ is `b` in `a`.
 | `read_link` | unsupported: returns an error | unchanged |
 | `set_permissions` | unsupported: Windows uses ACLs, not POSIX mode bits | unchanged |
 
+A transfer counts as a success only once it is closed: both the flush and the close of the
+receiving file are part of the copy, so a full disk on the other side fails the upload with
+the file named instead of arriving as a truncated file behind a reported success.
+
 Path rules for Windows guests:
 
 - A drive letter is required (`C:\Users\qlean`); drive-relative (`C:foo`), root-relative

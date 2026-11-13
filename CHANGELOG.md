@@ -40,6 +40,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `with_pool` no longer requires `/dev/vhost-vsock`, and `with_machine` requires it only for `GuestOs::Linux`
 
 ### Fixed
+- A transfer that failed while flushing or closing was reported as successful: both
+  `upload_file` and `download_file` discarded those errors, and a receiving file reports
+  success while the data is still buffered, so a full disk showed up as a complete upload or a
+  download with a missing tail. The end of the copy is now part of the copy, and the error
+  names the file. `Machine::write` also left the guest holding the file open - the SFTP handle
+  from `create` was dropped, not closed - which on Windows denies the rename and delete that
+  the next call performs.
 - The reserved Windows device names were missing the console devices, so `CONIN$`,
   `CONOUT$` and `CLOCK$` were accepted as ordinary file names: SFTP then opened the console
   instead of a file, or failed with a message about a device nobody asked for. Windows guest

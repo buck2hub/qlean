@@ -25,6 +25,120 @@ use tracing::{debug, info};
 use crate::guest_path::GuestPath;
 
 #[cfg(test)]
+mod transfer_tests {
+    use super::*;
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context as TaskContext, Poll},
+    };
+
+    /// A writer that accepts every byte and can be told to fail at the flush or at the close.
+    ///
+    /// The transfers only ever failed here in the wild: a receiving `File` reports success
+    /// while the data is still buffered, so a full disk surfaces at `flush` - exactly the call
+    /// the old code wrapped in `let _ =`.
+    struct PickyWriter {
+        written: Vec<u8>,
+        fail: Option<&'static str>,
+    }
+
+    impl PickyWriter {
+        fn new() -> Self {
+            Self {
+                written: Vec::new(),
+                fail: None,
+            }
+        }
+
+        fn failing_at(step: &'static str) -> Self {
+            Self {
+                written: Vec::new(),
+                fail: Some(step),
+            }
+        }
+
+        fn error(&self, step: &'static str) -> Poll<io::Result<()>> {
+            if self.fail == Some(step) {
+                return Poll::Ready(Err(io::Error::other("no space left on device")));
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl tokio::io::AsyncWrite for PickyWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.written.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            self.error("flush")
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            self.error("close")
+        }
+    }
+
+    /// Transfer `payload` through `copy_stream` and describe what the caller would see.
+    async fn transfer(payload: &[u8], writer: &mut PickyWriter) -> (anyhow::Result<()>, Vec<u8>) {
+        let mut src = payload;
+        let result = Session::copy_stream(
+            &mut src,
+            writer,
+            "the downloaded copy at /tmp/probe",
+            &CancellationToken::new(),
+            "Download cancelled",
+        )
+        .await;
+        (result, writer.written.clone())
+    }
+
+    /// A flush that fails is a failed transfer, not a successful one with a short file.
+    #[tokio::test]
+    async fn a_transfer_whose_flush_fails_is_reported_as_a_failure() {
+        let (result, written) = transfer(b"hello", &mut PickyWriter::failing_at("flush")).await;
+        let error = result.expect_err("a failed flush must not be swallowed");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("failed to flush the downloaded copy at /tmp/probe"),
+            "the failure must name the destination: {message}"
+        );
+        assert_eq!(
+            written, b"hello",
+            "the bytes themselves were accepted - that is why the flush is the only report"
+        );
+    }
+
+    /// A close that fails is a failed transfer too: the guest may not have committed the file.
+    #[tokio::test]
+    async fn a_transfer_whose_close_fails_is_reported_as_a_failure() {
+        let (result, _) = transfer(b"hello", &mut PickyWriter::failing_at("close")).await;
+        let error = result.expect_err("a failed close must not be swallowed");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("failed to close the downloaded copy at /tmp/probe"),
+            "the failure must name the destination: {message}"
+        );
+    }
+
+    /// A healthy transfer still reports success and delivers every byte, in order.
+    #[tokio::test]
+    async fn a_healthy_transfer_reports_success_and_delivers_every_byte() {
+        let payload: Vec<u8> = (0..200_000u32).map(|n| (n % 251) as u8).collect();
+        let (result, written) = transfer(&payload, &mut PickyWriter::new()).await;
+        result.expect("a healthy transfer must succeed");
+        assert_eq!(written.len(), payload.len());
+        assert_eq!(written, payload);
+    }
+}
+
+#[cfg(test)]
 mod host_key_window_tests {
     use super::*;
 
@@ -1271,6 +1385,49 @@ impl Session {
         Ok(())
     }
 
+    /// Copy `src` into `dst` to the end, and treat the flush and the close as part of the copy.
+    ///
+    /// Both transfers used to end with `let _ = flush(...)` and `let _ = shutdown(...)`, so a
+    /// write that only failed when it was flushed - a full disk on the receiving side is the
+    /// ordinary case, because `File::write` reports success while the data is still in the
+    /// buffer - was reported as a successful transfer. A caller then reports an upload that
+    /// never landed, or a download whose tail is missing. The close matters for the same
+    /// reason: a handle that is never closed keeps the file open on the guest (on Windows an
+    /// open handle denies rename and delete), and its error is the only report that the file was
+    /// committed at all.
+    async fn copy_stream<R, W>(
+        src: &mut R,
+        dst: &mut W,
+        what: &str,
+        cancel_token: &CancellationToken,
+        cancelled: &str,
+    ) -> Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        let mut buf = vec![0u8; 128 * 1024];
+        loop {
+            if cancel_token.is_cancelled() {
+                bail!("{cancelled}");
+            }
+            let n = src.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            dst.write_all(&buf[..n])
+                .await
+                .with_context(|| format!("failed to write {what}"))?;
+        }
+        dst.flush()
+            .await
+            .with_context(|| format!("failed to flush {what}"))?;
+        dst.shutdown()
+            .await
+            .with_context(|| format!("failed to close {what}"))?;
+        Ok(())
+    }
+
     /// Upload a single file via SFTP.
     pub(crate) async fn upload_file(
         &mut self,
@@ -1289,20 +1446,14 @@ impl Session {
             .await?
         };
 
-        let mut buf = vec![0u8; 128 * 1024];
-        loop {
-            if cancel_token.is_cancelled() {
-                bail!("Upload cancelled");
-            }
-            let n = AsyncReadExt::read(&mut src, &mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            AsyncWriteExt::write_all(&mut dst, &buf[..n]).await?;
-        }
-        let _ = AsyncWriteExt::flush(&mut dst).await;
-        let _ = AsyncWriteExt::shutdown(&mut dst).await;
-        Ok(())
+        Self::copy_stream(
+            &mut src,
+            &mut dst,
+            &format!("the uploaded file {}", remote.as_str()),
+            &cancel_token,
+            "Upload cancelled",
+        )
+        .await
     }
 
     /// Download a single file via SFTP.
@@ -1318,19 +1469,14 @@ impl Session {
         };
         let mut dst = tokio::fs::File::create(local).await?;
 
-        let mut buf = vec![0u8; 128 * 1024];
-        loop {
-            if cancel_token.is_cancelled() {
-                bail!("Download cancelled");
-            }
-            let n = AsyncReadExt::read(&mut src, &mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            AsyncWriteExt::write_all(&mut dst, &buf[..n]).await?;
-        }
-        let _ = AsyncWriteExt::flush(&mut dst).await;
-        Ok(())
+        Self::copy_stream(
+            &mut src,
+            &mut dst,
+            &format!("the downloaded copy at {}", local.display()),
+            &cancel_token,
+            "Download cancelled",
+        )
+        .await
     }
 
     /// Walk a remote directory tree over SFTP, similar to walkdir.

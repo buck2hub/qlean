@@ -2282,6 +2282,58 @@ mod plan_doc_tests {
         );
     }
 
+    /// The transfers must treat the flush and the close as part of the copy.
+    ///
+    /// Both `upload_file` and `download_file` used to end with `let _ = flush(...)` and
+    /// `let _ = shutdown(...)`. A receiving `File` reports success while the data is still
+    /// buffered, so the flush is where a full disk surfaces - and it was discarded, which turned
+    /// "the last 100 KB never landed" into a successful transfer. `Machine::write` had the same
+    /// shape one level up: it asked for `create`, dropped the handle (this crate's `File` has no
+    /// `Drop`), and left the guest holding the file open - on Windows an open handle denies the
+    /// rename and delete that `rename`/`remove_file` then perform.
+    ///
+    /// This is a source guard, not a behaviour test: the behaviour is pinned by
+    /// `ssh::transfer_tests`, and nothing here can reach a guest without one.
+    #[test]
+    fn the_transfers_do_not_ignore_the_end_of_the_copy() {
+        const SSH: &str = include_str!("../src/ssh.rs");
+        const MACHINE: &str = include_str!("../src/machine.rs");
+        let copy = function_body(SSH, "async fn copy_stream<R, W>(");
+        for step in ["dst.flush()", "dst.shutdown()"] {
+            let call = copy
+                .split(step)
+                .nth(1)
+                .unwrap_or_else(|| panic!("`copy_stream` no longer calls `{step}`"));
+            assert!(
+                !call.trim_start().starts_with(".await;"),
+                "`copy_stream` discards the result of `{step}` again: {call:.60}"
+            );
+        }
+        let write = function_body(
+            MACHINE,
+            "pub async fn write<P: AsRef<Path>, C: AsRef<[u8]>>",
+        );
+        assert!(
+            write.contains("shutdown(&mut file)"),
+            "`Machine::write` no longer closes the handle it opened"
+        );
+        assert!(
+            !write.contains("sftp.write("),
+            "`Machine::write` is back to the crate helper that opens a second handle"
+        );
+        // Nothing in the two transfers may swallow the end of the copy either.
+        for signature in [
+            "pub(crate) async fn upload_file(",
+            "pub(crate) async fn download_file(",
+        ] {
+            let body = function_body(SSH, signature);
+            assert!(
+                !body.contains("let _ ="),
+                "`{signature}` discards a result again: a failed flush reads as a landed file"
+            );
+        }
+    }
+
     #[test]
     fn the_liveness_refusal_is_an_error_in_the_branch_and_in_the_changelog() {
         const MACHINE: &str = include_str!("../src/machine.rs");
