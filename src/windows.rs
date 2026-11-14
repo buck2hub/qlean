@@ -368,44 +368,11 @@ impl DeploySeed {
     /// The seed root is grafted as `qlean/` so the guest sees `D:\qlean\...`
     /// regardless of how the medium is mounted.
     pub(crate) async fn build(&self) -> Result<()> {
+        // The medium carries this VM's host private key, so it has to exist owner-only *before*
+        // `xorriso` opens it, and it has to be *checked* afterwards rather than `chmod`ed.
+        prepare_seed_medium(&self.iso)?;
         let mut cmd = tokio::process::Command::new("xorriso");
-        cmd.args(["-as", "mkisofs"])
-            .args(["-V", SEED_VOLUME_LABEL])
-            .args(["-J", "-R"])
-            .args(["-o"])
-            .arg(&self.iso)
-            .arg("-graft-points")
-            .arg(crate::utils::path_argument(
-                &format!("{SEED_ROOT}="),
-                &self.dir.join(SEED_ROOT),
-            ));
-        // `xorriso -o` truncates an existing file and keeps its mode, so creating the medium
-        // owner-only *first* is what makes the guarantee hold: a file `xorriso` creates
-        // itself comes out with the process umask (0644), and the medium carries this VM's
-        // host private key. Measured against xorriso 1.5.8: a pre-created `0600` output file
-        // is truncated in place and stays `0600`.
-        //
-        // A leftover from a failed build has to go, but a name that cannot be removed is a
-        // reason of its own: swallowing it made `create_owner_only` fail with `EEXIST` and
-        // blame its own permissions for a directory (or an unlinkable file) left behind.
-        match std::fs::remove_file(&self.iso) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to remove the stale Windows seed ISO {}",
-                        self.iso.display()
-                    )
-                });
-            }
-        }
-        crate::utils::create_owner_only(&self.iso).with_context(|| {
-            format!(
-                "failed to create the Windows seed ISO {} with owner-only permissions",
-                self.iso.display()
-            )
-        })?;
+        cmd.args(seed_build_args(&self.dir, &self.iso));
         debug!("Creating Windows seed ISO with command:\n{:?}", cmd);
 
         let output = crate::utils::bounded_output(cmd, SEED_BUILD_BUDGET, "build the Windows seed ISO")
@@ -419,10 +386,10 @@ impl DeploySeed {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        // The medium carries this VM's host private key, so the mode created above has to
-        // survive `xorriso`. Check it here rather than `chmod` it: a `chmod` would hide the
-        // fact that the guarantee stopped holding (a future `xorriso` writing through a
-        // temporary file and renaming would defeat the pre-creation silently).
+        // The mode created above has to survive `xorriso`: it truncates the file in place and
+        // keeps its mode, but a future `xorriso` writing through a temporary file and renaming
+        // would defeat the pre-creation silently. Check it here rather than `chmod` it: a
+        // `chmod` would hide the fact that the guarantee stopped holding.
         ensure_seed_medium_is_sealed(&self.iso)?;
         Ok(())
     }
@@ -497,6 +464,61 @@ pub(crate) fn deploy_timeout_message(timeout: Duration) -> String {
          succeeds.",
         timeout.as_secs()
     )
+}
+
+/// Replace a leftover medium with a fresh, owner-only, sealed one.
+///
+/// Three steps that only work in this order, and each of them was a defect on its own:
+/// `xorriso -o` truncates an existing file and keeps its mode, so the medium has to be created
+/// `0600` *before* it runs (a file `xorriso` creates itself comes out with the process umask,
+/// `0644` under `022`, and it carries this VM's host private key); a leftover from a failed
+/// build has to go first, because the creation refuses to reuse a name and a leftover that is a
+/// directory cannot be unlinked at all; and the mode is *checked* instead of `chmod`ed
+/// afterwards, because a `chmod` would hide the fact that the guarantee stopped holding.
+fn prepare_seed_medium(iso: &Path) -> Result<()> {
+    match std::fs::remove_file(iso) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to remove the stale Windows seed ISO {}",
+                    iso.display()
+                )
+            });
+        }
+    }
+    crate::utils::create_owner_only(iso).with_context(|| {
+        format!(
+            "failed to create the Windows seed ISO {} with owner-only permissions",
+            iso.display()
+        )
+    })?;
+    ensure_seed_medium_is_sealed(iso)
+}
+
+/// The `xorriso` command line for the seed medium, in the order it is handed over.
+///
+/// One definition, because every one of these arguments is a claim the guest's first-boot task
+/// depends on and none of them can be observed without a real `xorriso` (the medium test is
+/// `#[ignore]`d, so CI never runs it): `-V` is the label that task searches for, `-J` is the
+/// only reason Windows can see `authorized_keys` instead of `AUTHORI~1` (`-R` is for the host
+/// side), and the graft point is what puts the three files under `qlean/` instead of anywhere
+/// else. A mistake in any of them surfaces as the same symptom: Qlean spends the whole
+/// deployment budget reporting a marker that was never going to appear.
+fn seed_build_args(dir: &Path, iso: &Path) -> Vec<std::ffi::OsString> {
+    vec![
+        "-as".into(),
+        "mkisofs".into(),
+        "-V".into(),
+        SEED_VOLUME_LABEL.into(),
+        "-J".into(),
+        "-R".into(),
+        "-o".into(),
+        iso.into(),
+        "-graft-points".into(),
+        crate::utils::path_argument(&format!("{SEED_ROOT}="), &dir.join(SEED_ROOT)),
+    ]
 }
 
 fn ensure_trailing_newline(content: &str) -> String {
@@ -685,6 +707,155 @@ mod tests {
                 assert!(meta.len() > 0, "an empty medium carries nothing");
             }
         }
+    }
+
+    /// The `xorriso` command line is the only place the guest's view of the medium is decided.
+    ///
+    /// Every argument is a claim the image's first-boot task depends on, and none of them is
+    /// observable without a real `xorriso` — the one test that runs it is `#[ignore]`d, so CI
+    /// never does. Changing the label, dropping `-J` (Windows reads Joliet, not Rock Ridge), or
+    /// grafting the seed root under another name all end the same way: the task finds no
+    /// `D:\qlean\...`, and Qlean spends the whole deployment budget reporting a marker that was
+    /// never going to appear. The expected vector is spelled out instead of reusing the
+    /// constants, so a changed constant is a failure here too.
+    #[test]
+    fn the_seed_medium_is_built_with_the_argument_list_the_guest_layout_needs() {
+        let arguments: Vec<String> = seed_build_args(
+            Path::new("/run/abc123/seed"),
+            Path::new("/run/abc123/seed.iso"),
+        )
+        .into_iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect();
+        assert_eq!(
+            arguments,
+            [
+                "-as",
+                "mkisofs",
+                "-V",
+                "QLEANSEED",
+                "-J",
+                "-R",
+                "-o",
+                "/run/abc123/seed.iso",
+                "-graft-points",
+                "qlean=/run/abc123/seed/qlean",
+            ],
+            "the argument list is where the medium's label and its `qlean/` layout come from"
+        );
+    }
+
+    /// Compressing nothing still takes a moment, and a busy host is not a broken image.
+    ///
+    /// The budget is what turns "the build was slow" into "the first boot failed", and the
+    /// build is one `xorriso` process writing a whole directory tree.
+    #[test]
+    fn the_seed_build_gets_a_budget_a_slow_disk_can_finish_in() {
+        assert!(
+            SEED_BUILD_BUDGET >= Duration::from_secs(60),
+            "a seed build budget of {SEED_BUILD_BUDGET:?} fails a healthy host under load"
+        );
+    }
+
+    /// A leftover medium is replaced, not reused and not `chmod`ed.
+    ///
+    /// `xorriso -o` truncates the file it is pointed at and keeps its mode, so the only way the
+    /// medium is `0600` when it carries this VM's host private key is that the preparation
+    /// created it that way. A crashed build leaves the previous medium behind with the umask's
+    /// `0644`: that name has to be unlinked, and the new file has to be empty (the old bytes
+    /// must not survive into a medium the guest reads).
+    #[test]
+    fn a_leftover_medium_is_replaced_by_an_empty_sealed_one() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = tempfile::tempdir().expect("temp dir");
+        let iso = parent.path().join("seed.iso");
+        std::fs::write(&iso, b"contents of a medium this VM has already booted").expect("leftover");
+        std::fs::set_permissions(&iso, std::fs::Permissions::from_mode(0o644)).expect("widen");
+
+        prepare_seed_medium(&iso).expect("a leftover medium is replaceable");
+
+        let meta = std::fs::metadata(&iso).expect("the new medium");
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o600,
+            "the medium carries the host private key as soon as `xorriso` opens it"
+        );
+        assert_eq!(
+            meta.len(),
+            0,
+            "the previous medium's bytes must not survive into the next boot"
+        );
+
+        // The ordinary case after a crash is a second attempt with nothing left to remove.
+        prepare_seed_medium(&iso).expect("an absent medium is a new medium");
+    }
+
+    /// The three steps around `xorriso` are wiring, and wiring is what the mutants move.
+    ///
+    /// `build` used to inline the argument list and the preparation, so a deleted `-V`, a
+    /// dropped `-J`, a swallowed stale-removal error, or a missing seal check all left the
+    /// suite green (six of twelve mutants in R257 survived for exactly that reason). The order
+    /// is the part a unit test of the pieces cannot see: the medium has to exist `0600` before
+    /// `xorriso` opens it and the mode has to be *re-checked* after it wrote into it.
+    #[test]
+    fn the_build_prepares_seals_and_builds_the_medium_in_that_order() {
+        let source = include_str!("../src/windows.rs");
+        let build = crate::plan_doc_tests::body_of(
+            source,
+            "pub(crate) async fn build(&self) -> Result<()>",
+        );
+        for (needle, count) in [
+            ("prepare_seed_medium(&self.iso)?", 1),
+            ("seed_build_args(&self.dir, &self.iso)", 1),
+            ("ensure_seed_medium_is_sealed(&self.iso)?", 1),
+        ] {
+            assert_eq!(
+                build.matches(needle).count(),
+                count,
+                "`build` must do `{needle}` exactly {count} time(s):\n{build}"
+            );
+        }
+        let prepared = build
+            .find("prepare_seed_medium(&self.iso)?")
+            .expect("prepare");
+        let spawned = build.find("bounded_output").expect("the xorriso run");
+        let sealed = build
+            .find("ensure_seed_medium_is_sealed(&self.iso)?")
+            .expect("the post-build seal check");
+        assert!(
+            prepared < spawned,
+            "the medium has to be created owner-only before `xorriso` opens it:\n{build}"
+        );
+        assert!(
+            sealed > spawned,
+            "the mode has to be checked after `xorriso` wrote into the medium:\n{build}"
+        );
+        assert!(
+            !build.contains("\"-V\""),
+            "the argument list lives in `seed_build_args` only, so nothing else can drift:\n{build}"
+        );
+        assert!(
+            build.contains("Command::new(\"xorriso\")"),
+            "the medium is built by `xorriso`:\n{build}"
+        );
+
+        let prepare = crate::plan_doc_tests::body_of(
+            source,
+            "fn prepare_seed_medium(iso: &Path) -> Result<()>",
+        );
+        let removed = prepare.find("remove_file(iso)").expect("the stale removal");
+        let created = prepare
+            .find("create_owner_only(iso)")
+            .expect("the creation");
+        let checked = prepare
+            .find("ensure_seed_medium_is_sealed(iso)")
+            .expect("the seal check");
+        assert!(
+            removed < created && created < checked,
+            "a leftover has to go before the new medium is created, and the new mode is checked \
+             before `xorriso` runs:\n{prepare}"
+        );
     }
 
     /// The staged seed is owner-only, and it is that from the moment each piece exists.

@@ -191,7 +191,7 @@ mod plan_doc_tests {
     /// Every guard below that reasons about *where* code lives needs this: a check that a name
     /// is somewhere in a file cannot tell "the gate is in `Machine::new`" from "the gate is in
     /// some other function in the same file", and that difference is the whole point.
-    fn body_of(source: &str, signature: &str) -> String {
+    pub(crate) fn body_of(source: &str, signature: &str) -> String {
         let start = source
             .find(signature)
             .unwrap_or_else(|| panic!("{signature} is gone: the guard would be reading nothing"));
