@@ -141,6 +141,22 @@ mod plan_doc_tests {
         ),
     ];
 
+    /// Every gap the Windows host gate can report, in the order the machine hits them.
+    ///
+    /// One definition, two guards: the plan's evidence rows quote this list, and the README's
+    /// prerequisite table has to spell it out in the same order (R234). Keeping a copy in each
+    /// guard is how the two descriptions drifted apart in the first place - the plan counted
+    /// seven gaps while the README listed three.
+    const WINDOWS_PREREQUISITE_GAPS: [&str; 7] = [
+        "qemu-img",
+        "qemu-system-x86_64",
+        "KVM",
+        "OVMF",
+        "swtpm",
+        "xorriso",
+        "virsh",
+    ];
+
     /// The UTC date of the machine running the tests, as `YYYY-MM-DD`.
     ///
     /// Written out rather than pulled from a crate so the guard below needs no dependency: the
@@ -349,6 +365,43 @@ mod plan_doc_tests {
             .map(|(at, _)| at)
             .unwrap_or(after.len());
         &after[..end]
+    }
+
+    /// The body of the section whose heading line is exactly `heading`, up to the next heading.
+    ///
+    /// [`section`] cuts at the next level-two heading, which is what the plan's sections need.
+    /// The README nests level-four headings under level-three ones, so cutting there would
+    /// swallow whichever unrelated section follows: a guard that then looked for a program name
+    /// would find it in the wrong table. This stops at the first heading of any level.
+    fn up_to_next_heading<'a>(text: &'a str, heading: &str) -> &'a str {
+        let start = text
+            .match_indices(heading)
+            .find(|(at, _)| {
+                let before_ok = *at == 0 || text[..*at].ends_with('\n');
+                let after_ok = text[*at + heading.len()..].starts_with('\n');
+                before_ok && after_ok
+            })
+            .map(|(at, _)| at)
+            .unwrap_or_else(|| panic!("the document has no `{heading}` heading of its own"));
+        let after = &text[start + heading.len()..];
+        let end = after
+            .match_indices("\n#")
+            .next()
+            .map(|(at, _)| at)
+            .unwrap_or(after.len());
+        &after[..end]
+    }
+
+    /// Whether a prerequisite table row's *requirement* is `gap`.
+    ///
+    /// The first cell only: the Check column names the program too, so a row whose requirement
+    /// was renamed to a different program still contains the old name one column over, and this
+    /// guard is about what the table tells a reader to install. A bare substring is not enough
+    /// either - `swtpm2` contains `swtpm` - so the name has to be a whole token: quoted, or
+    /// followed by a space as in `KVM (/dev/kvm)` and `OVMF UEFI firmware`.
+    fn requirement_names(row: &str, gap: &str) -> bool {
+        let cell = row.split('|').nth(1).unwrap_or_default();
+        cell.contains(&format!("`{gap}`")) || cell.contains(&format!("{gap} "))
     }
 
     /// The lines of the plan's dependency registry.
@@ -3783,15 +3836,7 @@ mod plan_doc_tests {
         const FIRMWARE: &str = include_str!("../src/firmware.rs");
 
         // One problem per gap, in the order the machine hits them.
-        let gaps = [
-            "qemu-img",
-            "qemu-system-x86_64",
-            "KVM",
-            "OVMF",
-            "swtpm",
-            "xorriso",
-            "virsh",
-        ];
+        let gaps = WINDOWS_PREREQUISITE_GAPS;
         // A test counts as covering the gate when its body calls it; counting call sites would
         // be wrong, because one test deliberately drives five single-gap hosts.
         let tests = FIRMWARE
@@ -3841,6 +3886,107 @@ mod plan_doc_tests {
             FIRMWARE.contains("assert_eq!(problems.len(), 7")
                 || FIRMWARE.contains("problems.len(),\n            7"),
             "no test pins the number of gaps the gate reports"
+        );
+    }
+
+    /// The README lists every Windows prerequisite the gate checks, in the gate's order.
+    ///
+    /// R234: the prerequisites table named three of the seven gaps - KVM, OVMF and `swtpm` -
+    /// while `host_support_problems` also reports `qemu-img`, `qemu-system-x86_64`, `xorriso`
+    /// and `virsh`. The table is the only place a reader prepares a host from, and the two
+    /// programs it omitted are what the machine hits *first*: `qemu-img` builds the overlay
+    /// before QEMU starts, and `qemu-system-x86_64` is the guest itself. Installing exactly
+    /// what the table listed led to a gate message naming packages the table never mentioned.
+    /// The named programs are read back out of `src/firmware.rs`, so renaming one there breaks
+    /// this equality too instead of leaving the README describing a program nothing looks for.
+    #[test]
+    fn the_readme_lists_every_windows_prerequisite_the_gate_checks() {
+        const README: &str = include_str!("../README.md");
+        const FIRMWARE: &str = include_str!("../src/firmware.rs");
+
+        let section = up_to_next_heading(README, "#### Windows guest prerequisites");
+        let rows: Vec<&str> = section
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| line.starts_with('|'))
+            .filter(|line| !line.contains("---"))
+            .filter(|line| !line.starts_with("| Requirement"))
+            .collect();
+        assert_eq!(
+            rows.len(),
+            WINDOWS_PREREQUISITE_GAPS.len(),
+            "the prerequisites table must have one row per gap the gate reports; it has {}:\n{}",
+            rows.len(),
+            rows.join("\n")
+        );
+
+        // Position, not just presence: the table claims to be in the order of the message, and
+        // a row found somewhere in the section would keep that claim while the order lied.
+        let mut previous: Option<usize> = None;
+        for gap in WINDOWS_PREREQUISITE_GAPS {
+            let named: Vec<usize> = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| requirement_names(row, gap))
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(
+                named.len(),
+                1,
+                "the README's Windows prerequisite table names `{gap}` in {} rows, not one: {:?}",
+                named.len(),
+                named.iter().map(|index| rows[*index]).collect::<Vec<_>>()
+            );
+            let row = named[0];
+            assert!(
+                rows[row].matches('|').count() >= 4,
+                "the `{gap}` row is not a three-column row, so it has no purpose or check: {}",
+                rows[row]
+            );
+            if let Some(previous) = previous {
+                assert!(
+                    row > previous,
+                    "the README lists `{gap}` before the gap the gate reports first"
+                );
+            }
+            previous = Some(row);
+        }
+
+        // The programs are spelled once, in the gate; the README has to use those spellings.
+        for (constant, value) in [
+            ("QEMU_IMG", "qemu-img"),
+            ("QEMU_SYSTEM", "qemu-system-x86_64"),
+            ("SEED_ISO_BUILDER", "xorriso"),
+            ("LEASE_TOOL", "virsh"),
+        ] {
+            let declaration = format!("const {constant}: &str = \"{value}\";");
+            assert!(
+                FIRMWARE.contains(&declaration),
+                "`src/firmware.rs` no longer declares `{declaration}`; the README and the gate \
+                 have to agree on the program's name"
+            );
+        }
+        assert!(
+            FIRMWARE.contains("PathBuf::from(\"swtpm\")"),
+            "`swtpm_program` no longer defaults to `swtpm`, so the README's `swtpm` row names a \
+             program the gate does not look for"
+        );
+
+        // The table's claim about the two causes is the gate's own sentence, not a paraphrase.
+        for fact in ["cannot be executed", "permissions"] {
+            assert!(
+                FIRMWARE.contains(fact),
+                "`not_executable_prefix` no longer says `{fact}`, which the README's note quotes"
+            );
+            assert!(
+                section.contains(fact),
+                "the README's prerequisites section no longer says `{fact}`: a host whose program \
+                 sat on a `noexec` mount is told to install a package it already has"
+            );
+        }
+        assert!(
+            section.contains("every gap in one message") || section.contains("**every** gap"),
+            "the README has to say the gate reports all gaps at once: {section}"
         );
     }
 

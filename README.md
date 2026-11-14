@@ -55,9 +55,19 @@ Windows guests are KVM-only. On a host that will run `GuestOs::Windows`, additio
 
 | Requirement | Purpose | Check |
 |---|---|---|
+| `qemu-img` | Creates the per-VM disk overlay from the Windows image (runs before QEMU) | `command -v qemu-img` |
+| `qemu-system-x86_64` | Runs the guest; Windows guests are amd64 only | `command -v qemu-system-x86_64` |
 | KVM (`/dev/kvm`) | Windows guests never fall back to TCG | `test -w /dev/kvm` |
 | OVMF UEFI firmware | Windows boots only on UEFI | `ls /usr/share/edk2/x64/OVMF_CODE.4m.fd` (Arch), `ls /usr/share/OVMF/OVMF_CODE_4M.fd` (Debian/Ubuntu) |
 | `swtpm` | Per-VM TPM 2.0 device | `command -v swtpm` |
+| `xorriso` | Builds the seed medium the first boot is deployed from | `command -v xorriso` |
+| `virsh` (libvirt client) | Reads the `qlean` network's DHCP lease table: a Windows guest is reached over NAT, so its address comes from there | `command -v virsh` |
+
+The gate runs before a Windows machine is created and reports **every** gap in one message, in
+the order of this table. It also separates a program that is not installed from one that is
+installed but **cannot be executed** (a binary on a `noexec` mount, or one whose unpacking lost
+its mode): that second message names the file and tells you which permissions to fix, because
+reinstalling a package that is already there cannot help.
 
 ```bash
 # Arch
