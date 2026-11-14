@@ -637,6 +637,22 @@ async fn windows_files() -> Result<()> {
     vm.rename(&copied, &renamed).await?;
     assert!(!vm.exists(&copied).await?);
     assert!(vm.exists(&renamed).await?);
+
+    // A rename does not replace an occupied destination: it is refused, and neither file is
+    // touched. The decision is Qlean's, so this is the same assertion on a Linux guest -
+    // `the_machine_rename_cannot_bypass_the_refusal` holds the public method to it, and this is
+    // the only place a real guest could disagree.
+    let occupied = nested.join("occupied.txt");
+    vm.write(&occupied, "keep me").await?;
+    let refusal = format!(
+        "{}",
+        vm.rename(&renamed, &occupied)
+            .await
+            .expect_err("a rename onto an existing file must be refused")
+    );
+    assert!(refusal.contains("already exists"), "{refusal}");
+    assert_eq!(vm.read_to_string(&occupied).await?, "keep me");
+    assert!(vm.exists(&renamed).await?);
     vm.remove_dir_all(root).await?;
     assert!(!vm.exists(root).await?);
 

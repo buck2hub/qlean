@@ -601,6 +601,201 @@ mod exit_signal_tests {
     }
 }
 
+/// What `Machine::rename` promises when the destination already exists, without a guest.
+///
+/// The two guests used to answer that question themselves, so the same call could replace a file
+/// on one and fail on the other; the tests below hold Qlean to the answer it now gives instead.
+#[cfg(test)]
+mod rename_contract_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// A guest's name table that records every request it is sent.
+    #[derive(Default)]
+    struct FakeGuest {
+        files: HashMap<String, Vec<u8>>,
+        ops: Vec<String>,
+        fail_probe: bool,
+        fail_rename: bool,
+    }
+
+    impl FakeGuest {
+        fn with(path: &str, contents: &str) -> Self {
+            let mut guest = Self::default();
+            guest
+                .files
+                .insert(path.to_string(), contents.as_bytes().to_vec());
+            guest
+        }
+    }
+
+    impl RenameSink for FakeGuest {
+        async fn destination_exists(&mut self, at: &str) -> Result<bool> {
+            self.ops.push(format!("exists {at}"));
+            if self.fail_probe {
+                bail!("faked: {at} cannot be read");
+            }
+            Ok(self.files.contains_key(at))
+        }
+
+        async fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+            self.ops.push(format!("rename {from} {to}"));
+            if self.fail_rename {
+                bail!("faked: the guest refuses to rename {from} to {to}");
+            }
+            let bytes = self
+                .files
+                .remove(from)
+                .ok_or_else(|| anyhow::anyhow!("faked: {from} does not exist"))?;
+            self.files.insert(to.to_string(), bytes);
+            Ok(())
+        }
+    }
+
+    /// The defect: the destination was the guest's business, so an occupied name was silently
+    /// replaced on one guest and refused on another.
+    #[tokio::test]
+    async fn a_rename_onto_an_occupied_name_is_refused_before_anything_is_sent() {
+        let mut guest = FakeGuest::with("C:/out/final.txt", "the file that is already there");
+        guest
+            .files
+            .insert("C:/out/staged.txt".to_string(), b"the new one".to_vec());
+
+        let error = install_rename(&mut guest, "C:/out/staged.txt", "C:/out/final.txt")
+            .await
+            .expect_err("an occupied destination must be refused")
+            .to_string();
+
+        assert!(
+            error.contains("C:/out/final.txt already exists"),
+            "the error has to name the destination: {error}"
+        );
+        assert!(
+            error.contains("does not replace it") && error.contains("Remove"),
+            "the error has to say that a rename does not replace, and what to do instead: {error}"
+        );
+        // Nothing was sent: the probe is the last request, and both names still hold what they
+        // held. A rename that reached the guest first would have replaced the file already.
+        assert_eq!(guest.ops, vec!["exists C:/out/final.txt".to_string()]);
+        assert_eq!(
+            guest.files.get("C:/out/final.txt").map(Vec::as_slice),
+            Some(b"the file that is already there".as_slice())
+        );
+        assert_eq!(
+            guest.files.get("C:/out/staged.txt").map(Vec::as_slice),
+            Some(b"the new one".as_slice())
+        );
+    }
+
+    /// A free destination is exactly one rename, with the guest's own answer passed through.
+    #[tokio::test]
+    async fn a_rename_onto_a_free_name_is_sent_once() {
+        let mut guest = FakeGuest::with("C:/out/staged.txt", "the new one");
+
+        install_rename(&mut guest, "C:/out/staged.txt", "C:/out/final.txt")
+            .await
+            .expect("a free destination is renamed");
+
+        assert_eq!(
+            guest.ops,
+            vec![
+                "exists C:/out/final.txt".to_string(),
+                "rename C:/out/staged.txt C:/out/final.txt".to_string()
+            ]
+        );
+        assert_eq!(
+            guest.files.get("C:/out/final.txt").map(Vec::as_slice),
+            Some(b"the new one".as_slice())
+        );
+        assert!(!guest.files.contains_key("C:/out/staged.txt"));
+    }
+
+    /// A probe that fails is not a free destination: guessing would replace a file the caller
+    /// never agreed to lose.
+    #[tokio::test]
+    async fn a_destination_that_cannot_be_read_stops_the_rename() {
+        let mut guest = FakeGuest::with("C:/out/staged.txt", "the new one");
+        guest.fail_probe = true;
+
+        let error = format!(
+            "{:#}",
+            install_rename(&mut guest, "C:/out/staged.txt", "C:/out/final.txt")
+                .await
+                .expect_err("an unreadable destination is not a free one")
+        );
+
+        assert!(
+            error.contains("could replace it"),
+            "the error has to say why the rename was not attempted: {error}"
+        );
+        assert!(
+            error.contains("faked: C:/out/final.txt cannot be read"),
+            "the guest's own reason has to survive: {error}"
+        );
+        assert_eq!(
+            guest.ops,
+            vec!["exists C:/out/final.txt".to_string()],
+            "no rename may be sent when the destination is unknown"
+        );
+    }
+
+    /// A rename the guest refuses is the guest's answer, not a refusal Qlean invented.
+    #[tokio::test]
+    async fn a_rename_the_guest_refuses_is_reported_unchanged() {
+        let mut guest = FakeGuest::with("C:/out/staged.txt", "the new one");
+        guest.fail_rename = true;
+
+        let error = format!(
+            "{:#}",
+            install_rename(&mut guest, "C:/out/staged.txt", "C:/out/final.txt")
+                .await
+                .expect_err("the guest's refusal has to surface")
+        );
+
+        assert!(
+            error.contains("faked: the guest refuses to rename"),
+            "the guest's reason must not be replaced: {error}"
+        );
+        assert!(
+            !error.contains("does not replace it"),
+            "Qlean's own refusal was reported for a rename Qlean did send: {error}"
+        );
+    }
+
+    /// The public `rename` has no way of its own to reach the guest.
+    ///
+    /// `Machine::rename` is the only caller that matters, and it is not covered by the fake: a
+    /// version that called `sftp.rename` directly would restore the very behaviour above - the
+    /// guest deciding - while every test in this module stayed green.
+    #[test]
+    fn the_machine_rename_cannot_bypass_the_refusal() {
+        const MACHINE: &str = include_str!("machine.rs");
+        let start = MACHINE
+            .find("pub async fn rename<P: AsRef<Path>, Q: AsRef<Path>>")
+            .expect("`Machine::rename` is gone");
+        let body = &MACHINE[start..];
+        let body = &body[..body
+            .find("\n    }\n")
+            .expect("`Machine::rename` has no end")];
+
+        assert!(
+            body.contains("install_rename("),
+            "`Machine::rename` no longer goes through the refused-destination contract"
+        );
+        assert!(
+            !body.contains("sftp.rename("),
+            "`Machine::rename` sends the request itself, so an occupied destination is decided \
+             by the guest again"
+        );
+        // The probe has to be the whole check: a `try_exists` here would be a second answer to
+        // the same question, and the one that is compiled into the contract would be dead.
+        assert!(
+            !body.contains("try_exists"),
+            "`Machine::rename` probes the destination itself instead of leaving it to `install_rename`"
+        );
+    }
+}
+
 #[cfg(test)]
 mod upload_staging_tests {
     use super::*;
@@ -1628,6 +1823,73 @@ impl StagedSink for SftpSink<'_> {
 
     async fn remove(&mut self, at: &str) -> Result<()> {
         Ok(self.0.remove_file(at).await?)
+    }
+
+    async fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+        Ok(self.0.rename(from, to).await?)
+    }
+}
+
+/// The guest-side steps a rename needs, so the decision can be tested without a guest.
+///
+/// The same reason [`StagedSink`] exists, one step later. Publishing a name is where the two
+/// guests disagreed without anybody saying so: `Machine::rename` forwards "rename", and each
+/// guest's `sshd` decided what that means when the destination already exists - the SFTP
+/// specification defines the request as an error there, while OpenSSH's `sftp-server` performs
+/// the system's `rename(2)`, which replaces it silently. An API that mirrors `std::fs` - where
+/// `rename` *replaces* the destination - cannot leave that to the server, so Qlean decides it
+/// itself (R208).
+pub(crate) trait RenameSink {
+    fn destination_exists(
+        &mut self,
+        at: &str,
+    ) -> impl std::future::Future<Output = Result<bool>> + Send;
+
+    fn rename(
+        &mut self,
+        from: &str,
+        to: &str,
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
+}
+
+/// Move `from` onto `to`, refusing an occupied destination before anything is sent.
+///
+/// Three outcomes are kept apart on purpose:
+/// - the destination is occupied: nothing is sent, and the error names the destination and the
+///   way out (`remove_file` first), which is what a caller taking a name over has to do anyway;
+/// - the probe itself fails: the rename is not sent. "I could not find out" is not "it is free" -
+///   an unreadable destination treated as absent would turn a refusal into a silent replace;
+/// - the destination is free: one standard rename, and the guest's own error passes through
+///   unchanged (a rename the guest cannot do is the guest's answer, not Qlean's).
+///
+/// The probe is a separate request, so a destination that appears in between still meets the
+/// server's own answer. That window cannot be closed: `russh-sftp` 3.0.0 has no `posix-rename`,
+/// so no request can ask for a replacing rename that is also atomic.
+pub(crate) async fn install_rename<S>(sink: &mut S, from: &str, to: &str) -> Result<()>
+where
+    S: RenameSink,
+{
+    if sink.destination_exists(to).await.with_context(|| {
+        format!(
+            "failed to find out whether {to} already exists, so `{from}` was not renamed: \
+             guessing that the destination is free could replace it"
+        )
+    })? {
+        bail!(
+            "refusing to rename {from} to {to}: {to} already exists, and a rename does not \
+             replace it. Remove {to} first if it is meant to be replaced."
+        );
+    }
+
+    sink.rename(from, to).await
+}
+
+/// The real [`RenameSink`]: an SFTP session.
+pub(crate) struct SftpRenameSink<'a>(pub(crate) &'a mut SftpSession);
+
+impl RenameSink for SftpRenameSink<'_> {
+    async fn destination_exists(&mut self, at: &str) -> Result<bool> {
+        Ok(self.0.try_exists(at).await?)
     }
 
     async fn rename(&mut self, from: &str, to: &str) -> Result<()> {

@@ -4603,6 +4603,84 @@ mod plan_doc_tests {
         );
     }
 
+    /// The rename rule the README states is the one the code enforces.
+    ///
+    /// R208 stopped `Machine::rename` from leaving the answer to the guest's `sshd` and stopped
+    /// the support matrix from calling the row "unchanged". Neither half is worth anything alone:
+    /// a README that promises a refusal the code never sends is worse than silence, and a refusal
+    /// nobody documents is a behaviour change the reader cannot find. So this guard reads all
+    /// three - the row, the changelog entry, and the code that sends (or refuses) the request.
+    #[test]
+    fn the_rename_refusal_is_in_the_readme_the_changelog_and_the_code() {
+        const README_TEXT: &str = include_str!("../README.md");
+        const CHANGELOG_TEXT: &str = include_str!("../CHANGELOG.md");
+        const SSH: &str = include_str!("../src/ssh.rs");
+        const MACHINE: &str = include_str!("../src/machine.rs");
+
+        let flat_readme = README_TEXT.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat_readme.contains("| `rename` | supported; an occupied destination is refused"),
+            "the README's support matrix no longer says an occupied destination is refused"
+        );
+        assert!(
+            flat_readme.contains("a rename does not replace a file"),
+            "the README no longer says a rename does not replace"
+        );
+
+        let unreleased = CHANGELOG_TEXT
+            .split("## [Unreleased]")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## [").next())
+            .expect("the changelog must still have an [Unreleased] section");
+        let flat_changelog = unreleased.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat_changelog
+                .contains("`Machine::rename` now refuses a destination that already exists"),
+            "the changelog no longer records that the rename refuses an occupied destination"
+        );
+
+        let install = SSH
+            .split("pub(crate) async fn install_rename<")
+            .nth(1)
+            .expect("`install_rename` is gone");
+        let install = &install[..install.find("\n}\n").expect("`install_rename` has no end")];
+        let probed = install
+            .find("sink.destination_exists(to)")
+            .expect("the destination is never probed, so the guest decides again");
+        let sent = install
+            .find("sink.rename(from, to)")
+            .expect("no rename is sent at all");
+        assert!(
+            probed < sent,
+            "the probe has to come before the rename: probe at {probed}, rename at {sent}"
+        );
+        // The message, not its spelling: `rustfmt` breaks a long `bail!` across lines with a
+        // continuation, and where a string is wrapped is not part of the contract.
+        let message = install
+            .replace('\\', " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            message.contains("{to} already exists")
+                && message.contains("does not replace it")
+                && message.contains("Remove {to} first"),
+            "the refusal must name the destination, say it is not replaced, and say what to do: \
+             {message}"
+        );
+
+        // The public method has to be the one that was held to it.
+        let machine = MACHINE
+            .split("pub async fn rename<P: AsRef<Path>, Q: AsRef<Path>>")
+            .nth(1)
+            .expect("`Machine::rename` is gone");
+        assert!(
+            machine.contains("let mut sink = SftpRenameSink(sftp);")
+                && machine.contains("install_rename(&mut sink"),
+            "`Machine::rename` no longer goes through `install_rename`"
+        );
+    }
+
     /// A guest name that cannot be spelled is refused, not approximated.
     ///
     /// `to_string_lossy` is not a converter: it renders every non-UTF-8 byte as `U+FFFD`, so

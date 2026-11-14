@@ -44,6 +44,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disagree about whether a command has ended, and the answer can be exercised with real channel
   messages rather than by reading the arm
 
+### Changed
+- `Machine::rename` now refuses a destination that already exists, on both guests, instead of
+  leaving the answer to the guest's `sshd`. The two servers do not answer the same question the
+  same way - SFTP's standard rename is defined to fail when the new name exists, while OpenSSH's
+  `sftp-server` performs the system's `rename(2)`, which replaces it - so the same call could
+  replace a file on one guest and fail on another, while `std::fs::rename` (which this type
+  mirrors) replaces. An occupied destination now fails with an error naming it and saying what to
+  do instead (remove it first). A destination Qlean cannot even inspect is a third case and is
+  not treated as free: the rename is not sent.
+
 ### Fixed
 - A Windows guest path named after one of the reserved device names with a superscript digit -
   `COM¹`, `COM²`, `COM³`, `LPT¹`, `LPT²`, `LPT³` - was accepted, although Windows reserves those

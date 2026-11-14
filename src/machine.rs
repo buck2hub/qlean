@@ -28,8 +28,8 @@ use crate::{
     qemu::launch_qemu,
     qmp,
     ssh::{
-        InteractiveShell, PersistedSshKeypair, Session, connect_ssh, connect_ssh_windows,
-        get_ssh_key,
+        InteractiveShell, PersistedSshKeypair, Session, SftpRenameSink, connect_ssh,
+        connect_ssh_windows, get_ssh_key, install_rename,
     },
     utils::{CommandExt, HEX_ALPHABET, QleanDirs, gen_random_mac, get_free_cid},
     windows::{self, DeploySeed},
@@ -2138,6 +2138,15 @@ impl Machine {
     }
 
     /// Renames a file or directory to a new name.
+    ///
+    /// The destination has to be free: this does not replace an existing file, and an occupied
+    /// destination is refused before anything is sent (remove it first if it is meant to be
+    /// replaced). The decision is Qlean's, not the guest's, because the two guests do not answer
+    /// the same question the same way - SFTP's standard rename is defined to fail when the new
+    /// name exists, while OpenSSH's `sftp-server` performs the system's `rename(2)`, which
+    /// replaces it. `std::fs::rename`, which the rest of this type mirrors, replaces as well, so
+    /// leaving the outcome to the server would make the same call replace on one guest and fail
+    /// on another with nothing in the signature to tell them apart.
     pub async fn rename<P: AsRef<Path>, Q: AsRef<Path>>(&mut self, from: P, to: Q) -> Result<()> {
         let os = self.image.guest_os;
         let from = guest_path_from(os, from.as_ref())?;
@@ -2145,9 +2154,8 @@ impl Machine {
         let (ssh, _) = self.get_ssh("rename a path")?;
 
         let sftp = ssh.get_sftp().await?;
-        sftp.rename(from.as_str(), to.as_str()).await?;
-
-        Ok(())
+        let mut sink = SftpRenameSink(sftp);
+        install_rename(&mut sink, from.as_str(), to.as_str()).await
     }
 
     /// Changes the permissions found on a file or a directory.

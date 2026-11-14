@@ -232,7 +232,8 @@ is `b` in `a`.
 |---|---|---|
 | `upload` / `download` (file and directory) | supported; recursive trees keep spaces and non-ASCII names, and an entry whose name is not valid UTF-8 is refused by name instead of being uploaded under `U+FFFD` (a guest path is a UTF-8 string, so two such names would otherwise collide) | unchanged |
 | `create_dir` / `create_dir_all` / `exists` / `metadata` / `read` / `read_to_string` / `write` | supported | unchanged |
-| `read_dir` / `remove_file` / `remove_dir_all` / `rename` | supported (`remove_dir_all` deletes the tree) | unchanged |
+| `read_dir` / `remove_file` / `remove_dir_all` | supported (`remove_dir_all` deletes the tree) | unchanged |
+| `rename` | supported; an occupied destination is refused before the request is sent (a rename does not replace a file - remove it first), so the answer is Qlean's and not the guest's | same refusal: the decision is Qlean's on both guests, although the servers used to answer it differently |
 | `copy` | PowerShell `Copy-Item -LiteralPath ... -Destination ...`; never `cp` | `cp -p --` as before |
 | `hard_link` | unsupported: returns an error | unchanged |
 | `read_link` | unsupported: returns an error | unchanged |
@@ -593,7 +594,10 @@ The following methods provide filesystem operations compatible with `std::fs` se
 - `Machine::read_to_string(path)` - Read file contents as string.
 - `Machine::remove_dir_all(path)` - Remove a directory after removing all its contents.
 - `Machine::remove_file(path)` - Remove a file.
-- `Machine::rename(from, to)` - Rename or move a file/directory.
+- `Machine::rename(from, to)` - Rename or move a file/directory. The destination has to be
+  free: an occupied one is refused with an error naming it, instead of being decided by the
+  guest's `sshd` (SFTP's standard rename is defined to fail there, OpenSSH's server performs the
+  system's `rename(2)`, which replaces - so the same call used to mean two things).
 - `Machine::set_permissions(path, perm)` - Set file/directory permissions.
 - `Machine::write(path, contents)` - Write bytes to a file.
 
