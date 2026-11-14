@@ -55,6 +55,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not treated as free: the rename is not sent.
 
 ### Fixed
+- An upload to a file directly under a Windows drive root (`C:/a.txt`) failed with "cannot
+  upload to C:/a.txt: it has no directory to stage the bytes in" - a sentence about a drive root
+  that is a directory and does exist. `GuestPath::parent` appended a second colon to the drive
+  (`C::`), the result did not validate, and the path was reported as having no parent at all; the
+  same call on a Linux guest (`/a.txt` -> `/`) was answered correctly, so one relation had two
+  answers. Staging now lands in the drive root, and a test walks path shapes on both guests to
+  check that every path that is not a root has a parent that `join` rebuilds.
 - A Windows guest path named after one of the reserved device names with a superscript digit -
   `COM¹`, `COM²`, `COM³`, `LPT¹`, `LPT²`, `LPT³` - was accepted, although Windows reserves those
   spellings exactly as it reserves `COM1` and `LPT1`: the list the validator keeps had the 25

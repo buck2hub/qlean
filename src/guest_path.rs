@@ -155,17 +155,21 @@ impl GuestPath {
     }
 
     /// Parent directory, or `None` at the filesystem root.
+    ///
+    /// Every path that is not a root has one, on both guests: `C:/a.txt` -> `C:` and
+    /// `/a.txt` -> `/`. The head is used as it is - the drive already carries its colon, so
+    /// appending another one spelled `C::`, which does not validate, and the call answered
+    /// `None` for a path directly under a drive root. That answer was not a curiosity: the
+    /// upload staging rule needs a target's parent to place a sibling, so every upload to a
+    /// file directly under a drive root was refused as if the drive were not a directory.
     pub(crate) fn parent(&self) -> Option<Self> {
         let trimmed = self.text.trim_end_matches('/');
-        match trimmed.rsplit_once('/') {
-            // "C:/Users" -> "C:", which is the Windows root spelling.
-            Some((head, _)) if head.len() == 2 && head.ends_with(':') => {
-                Self::new(self.guest_os, format!("{head}:")).ok()
-            }
-            Some(("", _)) => Self::new(self.guest_os, "/").ok(),
-            Some((head, _)) => Self::new(self.guest_os, head).ok(),
-            None => None,
+        let cut = trimmed.rfind('/')?;
+        let head = &trimmed[..cut];
+        if head.is_empty() {
+            return Self::new(self.guest_os, "/").ok();
         }
+        Self::new(self.guest_os, head).ok()
     }
 
     /// Final component of the path, or `None` at the root.
@@ -596,6 +600,90 @@ mod tests {
         assert!(base.join(r"sub\deeper").is_err());
         assert_eq!(base.parent().unwrap().as_str(), "C:/Users");
         assert!(win("C:").parent().is_none());
+        assert_eq!(
+            win("C:/a.txt").parent().unwrap().as_str(),
+            "C:",
+            "a path directly under a drive root has that drive as its parent"
+        );
+    }
+
+    /// A path one level below a drive root has the drive root as its parent.
+    ///
+    /// `C:/a.txt` and `/a.txt` state the same relation on the two guests, and `parent` used to
+    /// answer it differently: the drive branch appended a second colon (`C::`), the result did
+    /// not validate, and the call returned `None` for a path that plainly has a parent. Nothing
+    /// noticed, because the tests only asked about a path two levels down; the caller that needs
+    /// the answer turns `None` into a refusal, so every upload to a file directly under a drive
+    /// root failed with "it has no directory to stage the bytes in" - about a drive root that is
+    /// a directory and does exist.
+    #[test]
+    fn a_path_directly_under_a_drive_root_has_the_drive_as_its_parent() {
+        assert_eq!(
+            win("C:/a.txt")
+                .parent()
+                .map(|parent| parent.as_str().to_owned()),
+            Some("C:".to_string())
+        );
+        assert_eq!(
+            posix("/a.txt")
+                .parent()
+                .map(|parent| parent.as_str().to_owned()),
+            Some("/".to_string()),
+            "the same relation on a Linux guest is answered the same way"
+        );
+    }
+
+    /// Every path that is not a root has a parent, and the parent plus the name rebuild it.
+    ///
+    /// `parent` and `join` are two halves of one relation: a path that `join` produced and
+    /// `parent` then refuses is a path some caller refuses after building it itself. The shapes
+    /// below are the ones the code builds - `ancestors`, `join`, `strip_prefix` - on both
+    /// guests, so a rule that only holds for one of them fails here.
+    #[test]
+    fn every_path_that_is_not_a_root_has_a_parent_and_join_rebuilds_it() {
+        let shapes = [
+            (GuestOs::Windows, "C:/a.txt"),
+            (GuestOs::Windows, "C:/dir/a.txt"),
+            (GuestOs::Windows, "C:/dir with space/a.txt"),
+            (GuestOs::Windows, "D:/a.txt"),
+            (GuestOs::Linux, "/a.txt"),
+            (GuestOs::Linux, "/dir/a.txt"),
+            (GuestOs::Linux, "/dir with space/a.txt"),
+            // A two-character head is not a drive: `/ab` is a directory name on a POSIX guest.
+            (GuestOs::Linux, "/ab/cd"),
+            (GuestOs::Windows, "C:/ab/cd"),
+        ];
+        for (guest_os, raw) in shapes {
+            let path = GuestPath::new(guest_os, raw).expect("valid path shape");
+            let parent = path
+                .parent()
+                .unwrap_or_else(|| panic!("{raw} has no parent on {guest_os:?}"));
+            assert_eq!(
+                parent.guest_os(),
+                guest_os,
+                "{raw} changed guest on the way up"
+            );
+            let name = path
+                .file_name()
+                .expect("a path that is not a root has a name");
+            assert_eq!(
+                parent
+                    .join(name)
+                    .expect("join the parent and the name")
+                    .as_str(),
+                path.as_str(),
+                "{raw} is not rebuilt from its parent and its name"
+            );
+        }
+        for (guest_os, root) in [(GuestOs::Windows, "C:"), (GuestOs::Linux, "/")] {
+            assert!(
+                GuestPath::new(guest_os, root)
+                    .expect("a root")
+                    .parent()
+                    .is_none(),
+                "{root} is a root and has no parent"
+            );
+        }
         assert!(win("C:").join("Users").unwrap().as_str() == "C:/Users");
     }
 

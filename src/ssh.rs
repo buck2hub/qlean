@@ -1249,6 +1249,84 @@ mod upload_staging_tests {
         assert!(name.len() < 250, "{}", name);
     }
 
+    /// A target directly under a drive root stages in that root.
+    ///
+    /// R206 stages every upload in a sibling of its target, so the staged name is only
+    /// reachable where the target is - which makes the target's parent load-bearing. It used to
+    /// be answered differently by the two guests: `/a.txt` -> `/`, but `C:/a.txt` -> `None`
+    /// ("the drive branch spelled `C::`"), and this is where a user met it - "cannot upload to
+    /// C:/a.txt: it has no directory to stage the bytes in", about a drive root that is a
+    /// directory and exists.
+    #[test]
+    fn a_target_directly_under_a_drive_root_stages_in_that_root() {
+        for (guest_os, target_text, expected_parent) in [
+            (GuestOs::Linux, "/a.txt", "/"),
+            (GuestOs::Windows, "C:/a.txt", "C:"),
+        ] {
+            let target = GuestPath::new(guest_os, target_text).expect("a valid target");
+            let staged = staged_upload_path(&target).unwrap_or_else(|error| {
+                panic!("{target_text} has no sibling to stage in: {error:#}")
+            });
+            assert_eq!(
+                staged.parent().map(|parent| parent.as_str().to_string()),
+                Some(expected_parent.to_string()),
+                "{target_text}"
+            );
+            assert!(
+                staged
+                    .file_name()
+                    .expect("the staged path has a name")
+                    .starts_with(".qlean-upload-"),
+                "{}",
+                staged.as_str()
+            );
+        }
+    }
+
+    /// The drive-root staging fix is in the changelog, and the code still needs the parent.
+    ///
+    /// The bug had no failing test and no changelog entry: the staging call answers a missing
+    /// parent with a refusal that reads like a guest problem, and nothing tied the sentence a
+    /// user sees to the relation that produced it. This guard reads the changelog and the
+    /// function, so a later simplification that drops the parent (or a changelog edit that
+    /// removes the entry) cannot pass alone.
+    #[test]
+    fn the_drive_root_staging_fix_is_in_the_changelog_and_the_code() {
+        const CHANGELOG: &str = include_str!("../CHANGELOG.md");
+        const SSH: &str = include_str!("../src/ssh.rs");
+
+        let unreleased = CHANGELOG
+            .split("## [Unreleased]")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## [").next())
+            .expect("the changelog must still have an [Unreleased] section");
+        let flat = unreleased.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("An upload to a file directly under a Windows drive root"),
+            "the changelog no longer records the drive-root staging failure"
+        );
+        assert!(
+            flat.contains("it has no directory to stage the bytes in"),
+            "the changelog must quote the sentence the user met"
+        );
+
+        let staged = SSH
+            .split("fn staged_upload_path(remote: &GuestPath) -> Result<GuestPath> {")
+            .nth(1)
+            .expect("`staged_upload_path` is gone")
+            .split("\n}\n")
+            .next()
+            .expect("`staged_upload_path` has no end");
+        assert!(
+            staged.contains("remote.parent()"),
+            "the staged name has to be a sibling of the target, so its parent is load-bearing"
+        );
+        assert!(
+            staged.contains("it has no directory to stage the bytes in"),
+            "the refusal a missing parent produces is the sentence the changelog quotes"
+        );
+    }
+
     #[test]
     fn the_upload_path_never_truncates_what_it_opens() {
         const SOURCE: &str = include_str!("ssh.rs");
