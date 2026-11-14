@@ -196,6 +196,16 @@ fn vsock_args(guest_os: GuestOs, cid: u32) -> Vec<String> {
 /// Kept separate from [`launch_qemu`] so the exact channel string qlean relies on can be
 /// handed to a real QEMU in a test: a typo here makes every shutdown fall back to SIGKILL
 /// and every `is_running` check report a dead VM.
+///
+/// The monitor is requested with `-qmp`, not with `-mon chardev=...,mode=control`: QEMU
+/// 11.1.3 already answers that spelling with `warning: '-mon' is deprecated, use '-object'
+/// with 'monitor-hmp' or 'monitor-qmp' types instead`, and a deprecation is only QEMU's
+/// notice that the option is going away. When it does, every launch dies in option parsing
+/// with no guest involved - a Windows first boot reports a spent budget and a blank reason
+/// (F96) instead of the refusal QEMU printed. Measured against that QEMU, `-qmp chardev:qmp0`
+/// starts the same channel with no warning; `-object monitor-qmp` would too, but it is new
+/// enough that an older host would refuse it, and `-qmp` accepts the same chardev reference
+/// the rest of the argument list already uses.
 pub(crate) fn qmp_chardev_args(socket: &Path) -> anyhow::Result<Vec<String>> {
     Ok(vec![
         "-chardev".to_string(),
@@ -203,8 +213,8 @@ pub(crate) fn qmp_chardev_args(socket: &Path) -> anyhow::Result<Vec<String>> {
             "socket,path={},server=on,wait=off,id=qmp0",
             qemu_option_path("QMP socket", socket)?
         ),
-        "-mon".to_string(),
-        "chardev=qmp0,mode=control".to_string(),
+        "-qmp".to_string(),
+        "chardev:qmp0".to_string(),
     ])
 }
 
@@ -289,6 +299,16 @@ fn serial_chardev_option(log: &Path) -> anyhow::Result<String> {
     ))
 }
 
+/// `-monitor` argument that multiplexes the human monitor onto the same console as serial.
+///
+/// Same deprecation as [`qmp_chardev_args`]: `-mon chardev=char0,mode=readline` draws the
+/// `'-mon' is deprecated` warning from QEMU 11.1.3, and `-monitor chardev:char0` asks for the
+/// identical HMP endpoint (the chardev is created with `mux=on`, so the monitor and the guest
+/// console keep sharing stdio) without it.
+fn hmp_chardev_args() -> [&'static str; 2] {
+    ["-monitor", "chardev:char0"]
+}
+
 pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
     // Prepare QEMU command
     let is_windows = params.image.guest_os == GuestOs::Windows;
@@ -342,7 +362,7 @@ pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> 
     qemu_cmd
         .args(["-chardev", &serial_chardev])
         .args(["-serial", "chardev:char0"])
-        .args(["-mon", "chardev=char0,mode=readline"]);
+        .args(hmp_chardev_args());
 
     // The seed medium is a first-boot artifact, and what it carries depends on the guest: a
     // cloud-init NoCloud volume for Linux, the Windows deployment contract (`deploy.json`, the
@@ -1310,14 +1330,9 @@ mod tests {
         args.push("-nographic".to_string());
         args.push("-chardev".to_string());
         args.push(serial_chardev_option(&run_dir.join("serial.log")).expect("serial chardev"));
-        for extra in [
-            "-serial",
-            "chardev:char0",
-            "-mon",
-            "chardev=char0,mode=readline",
-        ] {
-            args.push(extra.to_string());
-        }
+        args.push("-serial".to_string());
+        args.push("chardev:char0".to_string());
+        args.extend(hmp_chardev_args().map(str::to_string));
         args.push("-drive".to_string());
         args.push(seed_drive_option(&iso).expect("seed drive argument"));
         for extra in ["-m", "512", "-smp", "2"] {
@@ -1620,6 +1635,61 @@ mod tests {
             args.iter()
                 .any(|a| a.ends_with("file=/run/qlean dir/OVMF_CODE.fd")),
             "{args:?}"
+        );
+    }
+
+    /// The two monitors are requested with options QEMU has not deprecated.
+    ///
+    /// `-mon chardev=...,mode=control` and `-mon chardev=...,mode=readline` were the whole
+    /// monitor story until R227; QEMU 11.1.3 answers both with `warning: '-mon' is
+    /// deprecated, use '-object' with 'monitor-hmp' or 'monitor-qmp' types instead`. A
+    /// deprecation is a removal notice, and the removal is not a guest failure: option
+    /// parsing refuses the launch, so nothing boots, the console stays empty, and on a
+    /// Windows first boot that surfaces as a spent deployment budget rather than as the
+    /// refusal QEMU printed.
+    ///
+    /// The comparison is on whole arguments, not on a prefix: `-monitor` starts with `-mon`,
+    /// so a prefix check on the deprecated option would report the fix itself as the defect.
+    #[test]
+    fn the_monitors_are_requested_with_options_qemu_has_not_deprecated() {
+        let qmp = qmp_chardev_args(Path::new("/run/qlean/abc/qmp.sock")).expect("qmp args");
+        let mut all = qmp.clone();
+        all.extend(hmp_chardev_args().map(str::to_string));
+
+        let deprecated = all.iter().filter(|arg| arg.as_str() == "-mon").count();
+        assert_eq!(
+            deprecated, 0,
+            "`-mon` is deprecated in QEMU 11.1.3 and will be removed; ask for the monitors              with `-qmp` and `-monitor` instead: {all:?}"
+        );
+        assert!(
+            all.iter().any(|arg| arg == "-qmp") && all.iter().any(|arg| arg == "-monitor"),
+            "one argument each for the control channel and the human monitor: {all:?}"
+        );
+        // Both options take a chardev *reference*, and the reference has to be the id the
+        // `-chardev` beside it defines: QMP on `qmp0`, HMP on the multiplexed `char0` that
+        // `launch_qemu` also points `-serial` at.
+        for expected in ["chardev:qmp0", "chardev:char0"] {
+            assert!(
+                all.iter().any(|arg| arg == expected),
+                "the monitor reference `{expected}` is missing, so QEMU would refuse the \
+                 option or serve the monitor on a channel nothing reads: {all:?}"
+            );
+        }
+        assert!(
+            qmp.iter().any(|arg| arg.contains("id=qmp0")),
+            "the chardev the `-qmp` reference names has to exist: {qmp:?}"
+        );
+
+        // The two helpers only cover the call sites that exist today: `launch_qemu` builds
+        // its list inline around them, so the deprecated spelling could come back there
+        // without touching either helper. Counted over the source instead, as a whole quoted
+        // literal, so `-monitor` is not matched and the only allowed occurrence is this test.
+        let source = include_str!("qemu.rs");
+        assert_eq!(
+            source.matches("\"-mon\"").count(),
+            1,
+            "`-mon` may only appear in this guard's own message; ask for the monitors with \
+             `-qmp` and `-monitor`"
         );
     }
 
