@@ -2739,13 +2739,47 @@ mod plan_doc_tests {
             FIRMWARE.contains("fn wait_outcome("),
             "the TPM stop no longer classifies what a bounded wait returned"
         );
+        // One ladder answers "how does this process end?" for both paths that end a `swtpm`:
+        // the shutdown path and the start that timed out. Pinning the claim here is what keeps
+        // a second answer from growing back in `start`.
         let stop = function_body(FIRMWARE, "async fn stop(&mut self) -> bool");
+        assert!(
+            stop.contains("terminate_and_confirm(&mut self.child)"),
+            "`Swtpm::stop` no longer ends the TPM through the shared ladder"
+        );
+        let ladder = function_body(FIRMWARE, "async fn terminate_and_confirm_within(");
         for fact in ["match wait_outcome(", "WaitOutcome::Failed(error)"] {
             assert!(
-                stop.contains(fact),
-                "`Swtpm::stop` no longer says `{fact}` about a failed wait"
+                ladder.contains(fact),
+                "the shared TPM ladder no longer says `{fact}` about a failed wait"
             );
         }
+        let start = function_body(
+            FIRMWARE,
+            "pub(crate) async fn start(run_dir: &Path) -> Result<Self>",
+        );
+        assert!(
+            !start.contains("start_kill"),
+            "`Swtpm::start` kills a `swtpm` that is slow to open its control socket instead of \
+             asking it to stop and saving the state it has already written"
+        );
+        assert!(
+            start.contains("startup_timeout_message("),
+            "the startup timeout no longer says who it could not stop"
+        );
+        // And the message has to be able to name the process: the pid is gone once the child is
+        // reaped, so it has to be read before the ladder waits for it.
+        let pid_at = start
+            .find("let pid = child.id();")
+            .expect("the startup timeout no longer records which process it was starting");
+        let ladder_at = start
+            .find("terminate_and_confirm(&mut child)")
+            .expect("the startup timeout no longer ends the process it started");
+        assert!(
+            pid_at < ladder_at,
+            "the startup timeout reads the pid after the child was reaped, so its message cannot \
+             name the process that is (or is not) still writing the state directory"
+        );
         assert!(
             !FIRMWARE.contains("is_err()"),
             "the TPM lifecycle asks the timeout wrapper whether it expired instead of what the \

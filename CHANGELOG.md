@@ -55,6 +55,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not treated as free: the rename is not sent.
 
 ### Fixed
+- A `swtpm` that was still starting when the ten-second startup budget ran out was `SIGKILL`ed,
+  the one way Qlean promises never to end a TPM: a `SIGKILL` can leave a half-written
+  `tpm2-00.permall` behind, and the guest then loses the TPM identity it sealed secrets against
+  (on Windows: BitLocker recovery). The shutdown ladder and the startup timeout now share one
+  answer - ask with `SIGTERM`, wait out the grace, and only then kill - and the timeout says
+  which process was being started and whether it is confirmed gone, because a `swtpm` that
+  survived owns the state directory the next start would refuse.
 - A second `swtpm` could be started on a TPM state directory that a live one was already serving:
   `swtpm` does not lock `--tpmstate` (measured with 0.10.2: two daemons with the same `dir=` both
   ran and both wrote `tpm2-00.permall`), so a daemon that outlived its qlean process was

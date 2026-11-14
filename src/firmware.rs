@@ -913,6 +913,71 @@ fn sync_stop_step(probe: WaitProbe, elapsed: Duration, grace: Duration) -> SyncS
 ///
 /// `Child::start_kill` only sends `SIGKILL`, which gives `swtpm` no chance to write the TPM
 /// state file. Non-Unix hosts keep the old behaviour (they cannot run a Windows guest).
+/// End a `swtpm` the one way Qlean ends one: ask it to terminate, give it the grace period to
+/// flush its TPM state, and only then kill it.
+///
+/// Returns whether the process is *confirmed* gone.
+///
+/// The shutdown ladder and the startup timeout are the same question - "how does this process
+/// end?" - and they answered it differently: [`Swtpm::stop`] asked politely, because a `SIGKILL`
+/// leaves a half-written `tpm2-00.permall` behind and the guest loses the TPM identity it sealed
+/// secrets against (on Windows: BitLocker recovery), while [`Swtpm::start`] `SIGKILL`ed a `swtpm`
+/// that had not opened its control socket within ten seconds and said nothing about whether it
+/// was gone. One invariant, two answers - and the impatient one ran on the path a slow host
+/// takes.
+async fn terminate_and_confirm(child: &mut tokio::process::Child) -> bool {
+    terminate_and_confirm_within(child, SHUTDOWN_GRACE).await
+}
+
+/// [`terminate_and_confirm`] with the grace as an argument, so the tests drive this exact code.
+async fn terminate_and_confirm_within(child: &mut tokio::process::Child, grace: Duration) -> bool {
+    signal_terminate(child);
+    match wait_outcome(tokio::time::timeout(grace, child.wait()).await) {
+        WaitOutcome::Exited => true,
+        WaitOutcome::TimedOut => {
+            warn!("swtpm did not exit within {grace:?}; killing it");
+            kill_and_reap(child).await;
+            child.try_wait().is_ok_and(|status| status.is_some())
+        }
+        WaitOutcome::Failed(error) => {
+            warn!(
+                "could not wait for swtpm to exit ({error}); it may still be running, so its \
+                 TPM state directory is not vouched for"
+            );
+            kill_and_reap(child).await;
+            child.try_wait().is_ok_and(|status| status.is_some())
+        }
+    }
+}
+
+/// Kill the child and wait a bounded time for it to leave.
+async fn kill_and_reap(child: &mut tokio::process::Child) {
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+}
+
+/// What a start that timed out waiting for the control socket says.
+///
+/// The old message stopped at "timed out", which left the caller without the two facts that
+/// decide what to do next: which process was being started, and whether it is still there. A
+/// `swtpm` that survived the timeout is still writing the state directory, and the next start
+/// refuses that directory for exactly that reason (see [`live_swtpm_on`]).
+fn startup_timeout_message(socket: &Path, pid: Option<u32>, stopped: bool) -> String {
+    let owner = match pid {
+        Some(pid) => format!("pid {pid}"),
+        None => "the swtpm it started".to_string(),
+    };
+    let ending = if stopped {
+        "was asked to stop and is confirmed gone"
+    } else {
+        "could not be stopped and may still be writing its TPM state"
+    };
+    format!(
+        "timed out waiting for the swtpm control socket at {}: the {owner} {ending}",
+        socket.display()
+    )
+}
+
 fn signal_terminate(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     {
@@ -1035,11 +1100,9 @@ impl Swtpm {
                 );
             }
             if started.elapsed() > Duration::from_secs(10) {
-                let _ = child.start_kill();
-                bail!(
-                    "timed out waiting for the swtpm control socket at {}",
-                    socket.display()
-                );
+                let pid = child.id();
+                let stopped = terminate_and_confirm(&mut child).await;
+                bail!("{}", startup_timeout_message(&socket, pid, stopped));
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -1068,29 +1131,7 @@ impl Swtpm {
     /// confirmation: the caller is about to rebuild this machine's TPM state directory, and
     /// nobody has vouched that its owner is still there.
     pub(crate) async fn stop(&mut self) -> bool {
-        signal_terminate(&mut self.child);
-        match wait_outcome(tokio::time::timeout(SHUTDOWN_GRACE, self.child.wait()).await) {
-            WaitOutcome::Exited => true,
-            WaitOutcome::TimedOut => {
-                warn!("swtpm did not exit within {SHUTDOWN_GRACE:?}; killing it");
-                self.kill_and_reap().await;
-                self.child.try_wait().is_ok_and(|status| status.is_some())
-            }
-            WaitOutcome::Failed(error) => {
-                warn!(
-                    "could not wait for swtpm to exit ({error}); it may still be running, so its \
-                     TPM state directory is not vouched for"
-                );
-                self.kill_and_reap().await;
-                self.child.try_wait().is_ok_and(|status| status.is_some())
-            }
-        }
-    }
-
-    /// Kill the child and wait a bounded time for it to leave.
-    async fn kill_and_reap(&mut self) {
-        let _ = self.child.start_kill();
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await;
+        terminate_and_confirm(&mut self.child).await
     }
 
     /// Stop the process from synchronous code (for example `Drop`).
@@ -2121,6 +2162,111 @@ mod tests {
             !swtpm.stop_now_within(Duration::from_millis(100)),
             "a child that was reaped behind our back was reported as confirmed stopped"
         );
+    }
+
+    /// A timeout says which process was being started and whether it is gone.
+    ///
+    /// "timed out waiting for the control socket" answered neither question, and the two
+    /// answers lead to opposite next steps: a `swtpm` that is still there owns the state
+    /// directory - the next start refuses it for that reason - while one that is confirmed
+    /// gone leaves the directory free for a retry.
+    #[test]
+    fn test_a_startup_timeout_says_who_it_could_not_stop() {
+        let socket = Path::new("/qlean/runs/abc/swtpm.sock");
+        let stopped = startup_timeout_message(socket, Some(4242), true);
+        assert!(stopped.contains("pid 4242"), "{stopped}");
+        assert!(stopped.contains(socket.to_str().unwrap()), "{stopped}");
+        assert!(stopped.contains("confirmed gone"), "{stopped}");
+        assert!(!stopped.contains("may still be writing"), "{stopped}");
+
+        let survived = startup_timeout_message(socket, Some(4242), false);
+        assert!(survived.contains("pid 4242"), "{survived}");
+        assert!(survived.contains("may still be writing"), "{survived}");
+        assert!(
+            !survived.contains("confirmed gone"),
+            "an unconfirmed stop must not be reported as a clean one: {survived}"
+        );
+
+        // The pid is optional: `child.id()` is `None` once the child was reaped.
+        let unknown = startup_timeout_message(socket, None, false);
+        assert!(unknown.contains("the swtpm it started"), "{unknown}");
+        assert!(!unknown.contains("pid None"), "{unknown}");
+    }
+
+    /// A daemon is asked to terminate before it is killed, on every path.
+    ///
+    /// `stop` and the startup timeout both end a `swtpm`, and `SIGKILL` is the one way that
+    /// costs the guest its TPM identity (a half-written state file). The polite signal has to
+    /// land first, and the exit status is what says which signal ended the child: a `sleep`
+    /// dies of `SIGTERM` (15) when it is asked, and only an escalation reports `SIGKILL` (9).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_daemon_is_asked_to_stop_before_it_is_killed() {
+        use std::os::unix::process::ExitStatusExt;
+
+        // Polite first: `sleep` exits on SIGTERM, so a kill-first ladder would report signal 9.
+        let mut polite = tokio::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("sleep is available");
+        let started = Instant::now();
+        assert!(
+            terminate_and_confirm_within(&mut polite, Duration::from_millis(500)).await,
+            "a child that exits on SIGTERM is confirmed gone"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the grace period is plenty for a SIGTERM"
+        );
+        let status = polite
+            .try_wait()
+            .expect("try_wait works")
+            .expect("the child was reaped");
+        assert_eq!(
+            status.signal(),
+            Some(15),
+            "the child has to be asked to stop, not killed"
+        );
+
+        // Uncooperative: ignores SIGTERM, so the ladder has to escalate and still confirm.
+        // The marker says the trap is installed before the signal goes out; without it the
+        // test races the shell's startup and the child dies of SIGTERM instead.
+        let root = temp_dir("swtpm-terminate-first");
+        let installed = root.join("trapped");
+        let mut stubborn = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "trap '' TERM; : > {}; while :; do sleep 0.05; done",
+                installed.display()
+            ))
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("bash must be on PATH");
+        for _ in 0..500 {
+            if installed.is_file() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(installed.is_file(), "the trap never got installed");
+        assert!(
+            terminate_and_confirm_within(&mut stubborn, Duration::from_millis(100)).await,
+            "the escalation has to end with a reaped child"
+        );
+        let status = stubborn
+            .try_wait()
+            .expect("try_wait works")
+            .expect("the child was reaped");
+        assert_eq!(
+            status.signal(),
+            Some(9),
+            "a child that ignores SIGTERM is killed, and the kill is confirmed"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A stale control socket is removed so the real `swtpm` can bind its own.
