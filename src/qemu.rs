@@ -159,20 +159,9 @@ fn windows_firmware_args(
 /// `cache=unsafe`. Spaces are fine (the value is a single argv element), so only the
 /// separators and control characters that break the encoding are rejected.
 fn qemu_option_path(kind: &str, path: &Path) -> anyhow::Result<String> {
-    let text = path.to_string_lossy().into_owned();
-    if text.is_empty() {
-        anyhow::bail!("{kind} path is empty");
-    }
-    if text.contains(',') {
-        anyhow::bail!(
-            "{kind} path `{text}` contains a comma, which QEMU would read as an option separator; \
-             move it to a path without commas"
-        );
-    }
-    if text.chars().any(|c| c.is_control()) {
-        anyhow::bail!("{kind} path `{text}` contains a control character");
-    }
-    Ok(text)
+    // The rule is shared with the `swtpm` argument builder (R239): a comma ends an option value
+    // in both tools, so one function answers for both and they cannot drift apart.
+    crate::utils::option_field_text(kind, path)
 }
 
 /// QEMU arguments for the guest transport.
@@ -1600,6 +1589,44 @@ mod tests {
             "{joined}"
         );
         assert!(joined.contains("-device tpm-tis,tpmdev=tpm0"), "{joined}");
+    }
+
+    /// One rule for a path that travels inside an option list, whichever tool parses it.
+    ///
+    /// R239: `windows_firmware_args` refused a comma and `swtpm_args` handed it over, so
+    /// `spawn` started `swtpm` first and the user got `Error parsing tpmstate options: Unknown
+    /// option 'b/tpm'` (measured in the container against `swtpm` 0.10.2) - a fragment of their
+    /// own path, with nothing pointing at the comma. "Which characters end an option value" is
+    /// one fact about both tools, so this asks both builders and requires the same answer.
+    #[test]
+    fn test_the_option_value_rule_answers_the_same_for_qemu_and_swtpm() {
+        let root = Path::new("/run/qlean svc/VM-1");
+        let shapes: [(&str, Option<&str>); 5] = [
+            ("/run/q,lean/VM-1/tpm", Some("comma")),
+            ("/run/\u{7}/VM-1/tpm", Some("control character")),
+            ("", Some("is empty")),
+            ("/run/qlean dir/VM-1/tpm", None),
+            ("/run/qlean/VM-1/tpm", None),
+        ];
+        for (shape, reason) in shapes {
+            let path = Path::new(shape);
+            let qemu = qemu_option_path("OVMF code image", path);
+            let swtpm = crate::firmware::swtpm_args(
+                path,
+                &root.join("swtpm.sock"),
+                &root.join("swtpm.log"),
+            );
+            assert_eq!(qemu.is_ok(), reason.is_none(), "{shape}: {qemu:?}");
+            assert_eq!(swtpm.is_ok(), reason.is_none(), "{shape}: {swtpm:?}");
+            if let Some(reason) = reason {
+                let qemu = qemu.expect_err("refused");
+                let swtpm = swtpm.expect_err("refused").to_string();
+                assert!(
+                    qemu.to_string().contains(reason) && swtpm.contains(reason),
+                    "both builders have to give the same reason `{reason}`: qemu={qemu}, swtpm={swtpm}"
+                );
+            }
+        }
     }
 
     #[test]

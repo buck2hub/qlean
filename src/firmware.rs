@@ -989,19 +989,28 @@ pub(crate) fn prepare_vars(run_dir: &Path, firmware: &FirmwarePaths) -> Result<P
 /// owner-only even when the run directory itself is world-readable. `startup-clear`
 /// matches a physical TPM, which also discards volatile state on every power cycle,
 /// while sealed and NV data persist in the state directory.
-fn swtpm_args(state_dir: &Path, socket: &Path, log: &Path) -> Vec<String> {
-    vec![
+pub(crate) fn swtpm_args(state_dir: &Path, socket: &Path, log: &Path) -> Result<Vec<String>> {
+    // All three values land inside a `key=value` option list, which `swtpm` splits on commas
+    // exactly like QEMU does: measured in the container against `swtpm` 0.10.2 (R239), a comma
+    // in the state directory gives `Error parsing tpmstate options: Unknown option 'b/tpm'` and
+    // a comma in the log path `Error parsing logging options: Unknown option 'b/ok.log'` - a
+    // fragment, never the comma. The rule that refuses such a path is the QEMU argument
+    // builder's (`utils::option_field_text`), so the two tools cannot answer it differently.
+    let state = crate::utils::option_field_text("swtpm TPM state directory", state_dir)?;
+    let control = crate::utils::option_field_text("swtpm control socket", socket)?;
+    let log = crate::utils::option_field_text("swtpm log file", log)?;
+    Ok(vec![
         "socket".to_string(),
         "--tpm2".to_string(),
         "--tpmstate".to_string(),
-        format!("dir={}", state_dir.to_string_lossy()),
+        format!("dir={state}"),
         "--ctrl".to_string(),
-        format!("type=unixio,path={},mode=0600", socket.to_string_lossy()),
+        format!("type=unixio,path={control},mode=0600"),
         "--flags".to_string(),
         "not-need-init,startup-clear".to_string(),
         "--log".to_string(),
-        format!("file={},level=1", log.to_string_lossy()),
-    ]
+        format!("file={log},level=1"),
+    ])
 }
 
 /// How long `swtpm` gets to flush its state before it is killed.
@@ -1216,11 +1225,14 @@ impl Swtpm {
 
         let program = swtpm_program();
         let mut cmd = tokio::process::Command::new(&program);
-        cmd.args(swtpm_args(&state_dir, &socket, &log))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        cmd.args(
+            swtpm_args(&state_dir, &socket, &log)
+                .context("the run directory cannot be handed to `swtpm` as an option list")?,
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
 
         let mut child = cmd.spawn().with_context(|| {
             format!(
@@ -1393,7 +1405,8 @@ mod tests {
             Path::new("/run/qlean/VM-1/tpm"),
             Path::new("/run/qlean/VM-1/swtpm.sock"),
             Path::new("/run/qlean/VM-1/swtpm.log"),
-        );
+        )
+        .expect("the run directory is a legal option value");
         // The two options whose contents decide what the smoke test can observe: where the
         // state lives, and the control socket's mode.
         for option in args
@@ -2869,13 +2882,92 @@ mod tests {
         );
     }
 
+    /// A run directory that `swtpm` would read as more than one option is refused, by name.
+    ///
+    /// Measured against `swtpm` 0.10.2 in the container (R239): `--tpmstate dir=/t/a,b/tpm` dies
+    /// with `Error parsing tpmstate options: Unknown option 'b/tpm'` and `--log
+    /// file=/t/a,b/ok.log,level=1` with `Error parsing logging options: Unknown option
+    /// 'b/ok.log'`. Both sentences name a *fragment* of the path and neither names the comma, so
+    /// a reader is left with a fragment to explain. The gateway to that has to say which path is
+    /// the problem and why, before `swtpm` is started at all.
+    ///
+    /// The run directory is not hypothetical: it lives under the project data directory, which
+    /// follows `XDG_DATA_HOME`, so `/home/me/My,Stuff/.local/share/qlean/runs` is a legal home.
+    #[test]
+    fn test_swtpm_args_refuse_a_path_the_option_list_would_split() {
+        // Each field in turn, so a guard that only looks at the first one cannot pass.
+        let fields = [
+            ("TPM state directory", "/run/q,lean/VM-1/tpm"),
+            ("control socket", "/run/q,lean/VM-1/swtpm.sock"),
+            ("log file", "/run/q,lean/VM-1/swtpm.log"),
+        ];
+        let plain = [
+            "/run/qlean/VM-1/tpm",
+            "/run/qlean/VM-1/swtpm.sock",
+            "/run/qlean/VM-1/swtpm.log",
+        ];
+        for (broken, (role, comma)) in fields.iter().enumerate() {
+            let mut values = plain.map(PathBuf::from);
+            values[broken] = PathBuf::from(comma);
+            let error = swtpm_args(&values[0], &values[1], &values[2])
+                .expect_err("a comma ends the option value before the path does")
+                .to_string();
+            assert!(
+                error.contains(role),
+                "the field that is wrong has to be named: {error}"
+            );
+            assert!(
+                error.contains(comma),
+                "the whole path has to be quoted, not a fragment of it: {error}"
+            );
+            assert!(
+                error.contains("comma"),
+                "the reason has to be named: {error}"
+            );
+
+            // The same field again, this time with a control character.
+            let mut values = plain.map(PathBuf::from);
+            values[broken] = PathBuf::from(format!("/run/\u{7}/VM-1/{}", broken));
+            let error = swtpm_args(&values[0], &values[1], &values[2])
+                .expect_err("a control character would split the option list")
+                .to_string();
+            assert!(error.contains("control character"), "{error}");
+        }
+        // An empty value is not "no option": it would be handed over as `dir=`.
+        let error = swtpm_args(Path::new(""), Path::new(plain[1]), Path::new(plain[2]))
+            .expect_err("an empty state directory is not a directory")
+            .to_string();
+        assert!(error.contains("is empty"), "{error}");
+
+        // A space is legitimate: the value travels as one argv element.
+        let spaced = swtpm_args(
+            Path::new("/run/qlean dir/VM-1/tpm"),
+            Path::new("/run/qlean dir/VM-1/swtpm.sock"),
+            Path::new("/run/qlean dir/VM-1/swtpm.log"),
+        )
+        .expect("a space does not end an option value");
+        assert!(
+            spaced
+                .iter()
+                .any(|arg| arg == "dir=/run/qlean dir/VM-1/tpm"),
+            "{spaced:?}"
+        );
+        assert!(
+            spaced
+                .iter()
+                .any(|arg| arg == "type=unixio,path=/run/qlean dir/VM-1/swtpm.sock,mode=0600"),
+            "{spaced:?}"
+        );
+    }
+
     #[test]
     fn test_swtpm_args_keep_the_control_socket_owner_only() {
         let args = swtpm_args(
             Path::new("/run/qlean/abc/tpm"),
             Path::new("/run/qlean/abc/swtpm.sock"),
             Path::new("/run/qlean/abc/swtpm.log"),
-        );
+        )
+        .expect("the run directory is a legal option value");
         assert_eq!(args[0], "socket");
         assert!(args.contains(&"--tpm2".to_string()), "{args:?}");
         assert!(

@@ -471,6 +471,40 @@ pub(crate) fn create_dir(purpose: &str, path: &Path) -> Result<()> {
     restrict_dir(path)
 }
 
+/// A path that travels *inside* a `key=value` option list, checked before it is embedded.
+///
+/// QEMU and `swtpm` both split an option list on commas, so a comma in the path ends the value
+/// early and the rest of the path is read as further options. Measured against `swtpm` 0.10.2
+/// (R239): `--tpmstate dir=/t/a,b/tpm` dies with `swtpm: Error parsing tpmstate options:
+/// Unknown option 'b/tpm'`, and `--log file=/t/a,b/ok.log,level=1` with `Error parsing logging
+/// options: Unknown option 'b/ok.log'` - both name a fragment of the path, neither names the
+/// comma. A reader then has a fragment to explain and nothing that says which field was wrong.
+///
+/// So the value is refused before either tool sees it, and refused by the *same* rule for both,
+/// because "which characters end an option value" is one fact: two answers to it is how the
+/// QEMU argument builder came to reject a comma while the `swtpm` one handed it over. A space is
+/// fine - the value travels as a single argv element.
+pub(crate) fn option_field_text(kind: &str, path: &Path) -> Result<String> {
+    let text = path.to_string_lossy().into_owned();
+    if text.is_empty() {
+        bail!("{kind} path is empty");
+    }
+    if text.contains(',') {
+        bail!(
+            "{kind} path `{text}` contains a comma, which QEMU and `swtpm` read as a separator \
+             between options, so the value would end mid-path and the rest would be read as \
+             unknown options; move it to a path without commas"
+        );
+    }
+    if text.chars().any(char::is_control) {
+        bail!(
+            "{kind} path `{text}` contains a control character, which splits the option list \
+             or the line that records it"
+        );
+    }
+    Ok(text)
+}
+
 /// Build a `key=path` command-line argument without lossy path conversion.
 ///
 /// `format!("{key}={}", path.display())` (and `to_string_lossy`) replaces non-UTF-8 bytes
