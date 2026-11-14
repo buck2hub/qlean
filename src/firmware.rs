@@ -356,17 +356,82 @@ fn swtpm_program() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("swtpm"))
 }
 
-fn command_available(program: &Path) -> bool {
-    if program.components().count() > 1 {
-        return program.is_file();
-    }
-    let Some(paths) = std::env::var_os("PATH") else {
+/// Whether `path` is a regular file the host can actually execute.
+///
+/// `is_file` alone answers "something is there", which is what the gate used to ask: a file
+/// that is present but not executable (an unpacked tarball, a backup restored without its
+/// mode, a mount with `noexec`) passed the check and then failed inside `launch` with a bare
+/// `Permission denied (os error 13)` naming no program. The gate exists to name every gap at
+/// the cheapest moment, so "there but unusable" is a gap of its own.
+fn executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(metadata) = std::fs::metadata(path) else {
         return false;
     };
-    std::env::split_paths(&paths).any(|dir| {
+    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+}
+
+/// Whether a host program can be run, and if not, why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Presence {
+    /// Found, and executable.
+    Ready,
+    /// Nothing by that name exists.
+    Missing,
+    /// The name resolves to a file that cannot be executed.
+    NotExecutable(PathBuf),
+}
+
+/// Resolve `program` the way `Command::new` would: a bare name through `PATH`, a path as given.
+fn program_presence(program: &Path) -> Presence {
+    if program.components().count() > 1 {
+        return if executable_file(program) {
+            Presence::Ready
+        } else if program.is_file() {
+            Presence::NotExecutable(program.to_path_buf())
+        } else {
+            Presence::Missing
+        };
+    }
+    let Some(paths) = std::env::var_os("PATH") else {
+        return Presence::Missing;
+    };
+    let mut unusable = None;
+    for dir in std::env::split_paths(&paths) {
         let candidate = dir.join(program);
-        candidate.is_file()
-    })
+        if executable_file(&candidate) {
+            return Presence::Ready;
+        }
+        if unusable.is_none() && candidate.is_file() {
+            unusable = Some(candidate);
+        }
+    }
+    match unusable {
+        Some(path) => Presence::NotExecutable(path),
+        None => Presence::Missing,
+    }
+}
+
+/// How a program that exists but cannot run is named, ahead of that program's remedy.
+fn not_executable_prefix(program: &str, path: &Path) -> String {
+    format!(
+        "`{program}` was found at {} but cannot be executed, so it is not usable: fix that file's \
+         permissions or reinstall the package that ships it",
+        path.display()
+    )
+}
+
+/// The gap one program leaves, worded so the same instruction fits both reasons.
+fn program_problem(program: &str, presence: Presence, remedy: &str) -> Option<String> {
+    match presence {
+        Presence::Ready => None,
+        Presence::Missing => Some(format!("`{program}` was not found: {remedy}")),
+        Presence::NotExecutable(path) => Some(format!(
+            "{}; {remedy}",
+            not_executable_prefix(program, &path)
+        )),
+    }
 }
 
 /// Everything the Windows guest path needs from the host, probed once.
@@ -375,14 +440,14 @@ fn command_available(program: &Path) -> bool {
 /// lacks several pieces must learn about all of them from one run instead of reinstalling
 /// one package per attempt.
 struct HostProbes<'a> {
-    qemu_img_available: bool,
-    qemu_system_available: bool,
+    qemu_img: Presence,
+    qemu_system: Presence,
     kvm_available: bool,
     ovmf: Result<FirmwarePaths>,
     swtpm: &'a Path,
-    swtpm_available: bool,
-    seed_iso_builder_available: bool,
-    virsh_available: bool,
+    swtpm_presence: Presence,
+    seed_iso_builder: Presence,
+    virsh: Presence,
 }
 
 /// Collect every missing Windows host prerequisite, in one pass.
@@ -393,30 +458,32 @@ struct HostProbes<'a> {
 /// failure, and the missing `qemu-system-x86_64` appeared only after that was installed.
 fn host_support_problems(probes: HostProbes<'_>) -> Vec<String> {
     let HostProbes {
-        qemu_img_available,
-        qemu_system_available,
+        qemu_img,
+        qemu_system,
         kvm_available,
         ovmf,
         swtpm,
-        swtpm_available,
-        seed_iso_builder_available,
-        virsh_available,
+        swtpm_presence,
+        seed_iso_builder,
+        virsh,
     } = probes;
 
     let mut problems: Vec<String> = Vec::new();
 
-    if !qemu_img_available {
-        problems.push(format!(
-            "`{QEMU_IMG}` was not found: it creates the per-VM disk overlay from the Windows \
-             image, so install the `qemu-img` package (part of `qemu-base`)"
-        ));
-    }
-    if !qemu_system_available {
-        problems.push(format!(
-            "`{QEMU_SYSTEM}` was not found: it is the program the Windows guest runs under, so \
-             install the `qemu-system-x86` package"
-        ));
-    }
+    // `Presence` separates "not installed" from "installed but cannot run", because the two
+    // need different words: telling someone to install a package they already have sends them
+    // to the wrong problem, which is exactly what a bare `Permission denied` from `launch` did.
+    problems.extend(program_problem(
+        QEMU_IMG,
+        qemu_img,
+        "it creates the per-VM disk overlay from the Windows image, so install the `qemu-img` \
+         package (part of `qemu-base`)",
+    ));
+    problems.extend(program_problem(
+        QEMU_SYSTEM,
+        qemu_system,
+        "it is the program the Windows guest runs under, so install the `qemu-system-x86` package",
+    ));
     if !kvm_available {
         problems.push(
             "KVM acceleration is unavailable: Windows guests require KVM and never fall back to TCG"
@@ -426,22 +493,30 @@ fn host_support_problems(probes: HostProbes<'_>) -> Vec<String> {
     if let Err(err) = ovmf {
         problems.push(err.to_string());
     }
-    if !swtpm_available {
-        problems.push(format!(
-            "`{}` was not found: install the `swtpm` package or set {ENV_SWTPM}",
-            swtpm.display()
-        ));
-    }
-    if !seed_iso_builder_available {
-        problems.push(format!(
-            "`{SEED_ISO_BUILDER}` was not found: it builds the Windows seed medium, so install the `{SEED_ISO_BUILDER}` package"
-        ));
-    }
-    if !virsh_available {
-        problems.push(format!(
+    problems.extend(program_problem(
+        &swtpm.display().to_string(),
+        swtpm_presence,
+        &format!("install the `swtpm` package or set {ENV_SWTPM}"),
+    ));
+    problems.extend(program_problem(
+        SEED_ISO_BUILDER,
+        seed_iso_builder,
+        "it builds the Windows seed medium, so install the `xorriso` package",
+    ));
+    // Built here rather than through `program_problem` for one reason: the plan quotes this
+    // sentence word for word, so both of its shapes have to be plain source text that
+    // `the_plan_quotes_the_prerequisite_error_the_windows_gate_prints` can read back.
+    match virsh {
+        Presence::Ready => {}
+        Presence::Missing => problems.push(format!(
             "`{LEASE_TOOL}` was not found: a Windows guest's address comes from \
              `{LEASE_TOOL} net-dhcp-leases`, so install the `libvirt` package before starting one"
-        ));
+        )),
+        Presence::NotExecutable(path) => problems.push(format!(
+            "{}; a Windows guest's address comes from `{LEASE_TOOL} net-dhcp-leases`, so install \
+             the `libvirt` package before starting one",
+            not_executable_prefix(LEASE_TOOL, &path)
+        )),
     }
 
     problems
@@ -451,13 +526,13 @@ fn host_support_problems(probes: HostProbes<'_>) -> Vec<String> {
 pub(crate) fn ensure_host_support() -> Result<()> {
     let swtpm = swtpm_program();
     let problems = host_support_problems(HostProbes {
-        qemu_img_available: command_available(Path::new(QEMU_IMG)),
-        qemu_system_available: command_available(Path::new(QEMU_SYSTEM)),
+        qemu_img: program_presence(Path::new(QEMU_IMG)),
+        qemu_system: program_presence(Path::new(QEMU_SYSTEM)),
         kvm_available: is_kvm_available(),
         ovmf: resolve_ovmf(),
-        swtpm_available: command_available(&swtpm),
-        seed_iso_builder_available: command_available(Path::new(SEED_ISO_BUILDER)),
-        virsh_available: command_available(Path::new(LEASE_TOOL)),
+        swtpm_presence: program_presence(&swtpm),
+        seed_iso_builder: program_presence(Path::new(SEED_ISO_BUILDER)),
+        virsh: program_presence(Path::new(LEASE_TOOL)),
         swtpm: &swtpm,
     });
 
@@ -1690,28 +1765,28 @@ mod tests {
     /// A host with nothing installed: every gap is reported, in the order the machine hits it.
     fn bare_host_fixture() -> HostProbes<'static> {
         HostProbes {
-            qemu_img_available: false,
-            qemu_system_available: false,
+            qemu_img: Presence::Missing,
+            qemu_system: Presence::Missing,
             kvm_available: false,
             ovmf: Err(anyhow::anyhow!("no OVMF firmware found")),
             swtpm: Path::new("swtpm"),
-            swtpm_available: false,
-            seed_iso_builder_available: false,
-            virsh_available: false,
+            swtpm_presence: Presence::Missing,
+            seed_iso_builder: Presence::Missing,
+            virsh: Presence::Missing,
         }
     }
 
     /// A host that provides everything the Windows guest path needs.
     fn complete_host_fixture() -> HostProbes<'static> {
         HostProbes {
-            qemu_img_available: true,
-            qemu_system_available: true,
+            qemu_img: Presence::Ready,
+            qemu_system: Presence::Ready,
             kvm_available: true,
             ovmf: Ok(firmware_fixture()),
             swtpm: Path::new("swtpm"),
-            swtpm_available: true,
-            seed_iso_builder_available: true,
-            virsh_available: true,
+            swtpm_presence: Presence::Ready,
+            seed_iso_builder: Presence::Ready,
+            virsh: Presence::Ready,
         }
     }
 
@@ -1768,7 +1843,7 @@ mod tests {
     #[test]
     fn test_host_support_reports_only_the_missing_piece() {
         let problems = host_support_problems(HostProbes {
-            seed_iso_builder_available: false,
+            seed_iso_builder: Presence::Missing,
             ..complete_host_fixture()
         });
         assert_eq!(problems.len(), 1, "gaps: {problems:?}");
@@ -1778,7 +1853,7 @@ mod tests {
         );
 
         let problems = host_support_problems(HostProbes {
-            swtpm_available: false,
+            swtpm_presence: Presence::Missing,
             swtpm: Path::new("/opt/swtpm"),
             ..complete_host_fixture()
         });
@@ -1786,7 +1861,7 @@ mod tests {
         assert!(problems[0].contains("/opt/swtpm"), "{problems:?}");
 
         let problems = host_support_problems(HostProbes {
-            virsh_available: false,
+            virsh: Presence::Missing,
             ..complete_host_fixture()
         });
         assert_eq!(problems.len(), 1, "gaps: {problems:?}");
@@ -1798,7 +1873,7 @@ mod tests {
         // The two programs the machine runs first are reported on their own as well, so a
         // host that only lacks one of them still gets that one sentence.
         let problems = host_support_problems(HostProbes {
-            qemu_img_available: false,
+            qemu_img: Presence::Missing,
             ..complete_host_fixture()
         });
         assert_eq!(problems.len(), 1, "gaps: {problems:?}");
@@ -1808,7 +1883,7 @@ mod tests {
         );
 
         let problems = host_support_problems(HostProbes {
-            qemu_system_available: false,
+            qemu_system: Presence::Missing,
             ..complete_host_fixture()
         });
         assert_eq!(problems.len(), 1, "gaps: {problems:?}");
@@ -1820,9 +1895,109 @@ mod tests {
         assert!(INSTALL_HINT.contains("QLEAN_OVMF_CODE"));
     }
 
+    /// A program that is there but cannot be executed is a gap, and named as that gap.
+    ///
+    /// `command_available` asked only `is_file`, so a `swtpm` whose mode lost its executable
+    /// bit (a tarball unpacked elsewhere, a backup restored by hand, a `noexec` mount) passed
+    /// the gate whose whole purpose is to name every gap at the cheapest moment. The failure
+    /// then arrived from inside `launch` as `Permission denied (os error 13)` with no program
+    /// name in it. Probed here: the file exists, `Command::new` on it fails with `EACCES`.
     #[test]
-    fn test_command_available_checks_absolute_paths() {
-        assert!(command_available(Path::new("/bin/sh")));
-        assert!(!command_available(Path::new("/definitely/not/a/binary")));
+    fn test_a_program_that_cannot_be_executed_is_a_gap_of_its_own() {
+        let root = temp_dir("r214-nonexecutable-program");
+        let swtpm = root.join("swtpm");
+        std::fs::write(&swtpm, b"#!/bin/sh\nexit 0\n").expect("write");
+        let mode = |path: &Path, mode: u32| {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(path).expect("stat").permissions();
+            permissions.set_mode(mode);
+            std::fs::set_permissions(path, permissions).expect("chmod");
+        };
+        mode(&swtpm, 0o644);
+
+        // What the host does with it, so the verdict below is about a real inability.
+        let spawned = std::process::Command::new(&swtpm).arg("--version").status();
+        let refusal = match &spawned {
+            Ok(_) => None,
+            Err(error) => Some(error.kind()),
+        };
+        assert_eq!(
+            refusal,
+            Some(std::io::ErrorKind::PermissionDenied),
+            "a file without the executable bit must not run: {spawned:?}"
+        );
+
+        assert_eq!(
+            program_presence(&swtpm),
+            Presence::NotExecutable(swtpm.clone()),
+            "a file that cannot be executed is not `Ready`"
+        );
+        assert_eq!(program_presence(&root.join("absent")), Presence::Missing);
+
+        let problems = host_support_problems(HostProbes {
+            swtpm_presence: program_presence(&swtpm),
+            swtpm: &swtpm,
+            ..complete_host_fixture()
+        });
+        assert_eq!(problems.len(), 1, "gaps: {problems:?}");
+        assert!(
+            problems[0].contains("cannot be executed") && problems[0].contains("swtpm"),
+            "the gap has to say it cannot run, not that it is absent: {problems:?}"
+        );
+        // A `swtpm` given by path is named by that path, so the sentence above cannot show
+        // whether the *location* travels with the message. The next case asks that of a
+        // program the gate knows by a fixed name: the file has to be named separately, or the
+        // user is told to fix a `qemu-img` whose permissions they cannot find.
+        let qemu_img = root.join("qemu-img");
+        std::fs::write(&qemu_img, b"#!/bin/sh\nexit 0\n").expect("write");
+        mode(&qemu_img, 0o644);
+        let problems = host_support_problems(HostProbes {
+            qemu_img: program_presence(&qemu_img),
+            ..complete_host_fixture()
+        });
+        assert_eq!(problems.len(), 1, "gaps: {problems:?}");
+        assert!(
+            problems[0].contains("`qemu-img`") && problems[0].contains("cannot be executed"),
+            "the qemu-img gap has to keep the program name it is filed under: {problems:?}"
+        );
+        assert!(
+            problems[0].contains(&qemu_img.display().to_string()),
+            "the gap has to name the file whose permissions are wrong: {problems:?}"
+        );
+        assert!(
+            !problems[0].contains("was not found"),
+            "`qemu-img` is installed; `not found` is the wrong repair: {problems:?}"
+        );
+        assert!(
+            !problems[0].contains("was not found"),
+            "the file is there; `not found` sends the user to install what they already have: \
+             {problems:?}"
+        );
+
+        // The executable bit is what decides, not the name or the size.
+        mode(&swtpm, 0o755);
+        assert_eq!(program_presence(&swtpm), Presence::Ready);
+        assert!(
+            host_support_problems(HostProbes {
+                swtpm_presence: program_presence(&swtpm),
+                swtpm: &swtpm,
+                ..complete_host_fixture()
+            })
+            .is_empty(),
+            "the same file becomes usable once it can be executed"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_program_presence_checks_absolute_paths() {
+        assert_eq!(program_presence(Path::new("/bin/sh")), Presence::Ready);
+        assert_eq!(
+            program_presence(Path::new("/definitely/not/a/binary")),
+            Presence::Missing
+        );
+        // A directory is not a program, whatever its mode says.
+        assert_eq!(program_presence(Path::new("/bin")), Presence::Missing);
     }
 }

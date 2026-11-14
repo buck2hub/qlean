@@ -3516,6 +3516,80 @@ mod plan_doc_tests {
         }
     }
 
+    /// The plan counts the Windows prerequisite gaps the gate actually reports.
+    ///
+    /// R214: both evidence rows still said four gaps (KVM/OVMF/swtpm/xorriso) and three unit
+    /// tests, while the gate had grown to seven gaps - R93 added the two programs that run
+    /// first, R88 added the lease tool - and four tests drove it. An evidence row is what a
+    /// reader uses to decide whether a review covered the gate, so a stale count there is a
+    /// claim that the review did less than it did, or more.
+    #[test]
+    fn the_plan_counts_the_windows_prerequisite_gaps_the_gate_reports() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        const FIRMWARE: &str = include_str!("../src/firmware.rs");
+
+        // One problem per gap, in the order the machine hits them.
+        let gaps = [
+            "qemu-img",
+            "qemu-system-x86_64",
+            "KVM",
+            "OVMF",
+            "swtpm",
+            "xorriso",
+            "virsh",
+        ];
+        // A test counts as covering the gate when its body calls it; counting call sites would
+        // be wrong, because one test deliberately drives five single-gap hosts.
+        let tests = FIRMWARE
+            .split("\n    #[test]\n")
+            .filter(|section| {
+                let section = section.trim_start();
+                section.starts_with("fn ") && section.contains("host_support_problems(")
+            })
+            .count();
+        let row = |prefix: &str| {
+            PLAN.lines()
+                .find(|line| line.starts_with(prefix))
+                .unwrap_or_else(|| panic!("the plan lost its `{prefix}` row"))
+        };
+        for prefix in ["| 首启介质前置 |", "| 宿主前置聚合 |"] {
+            let row = row(prefix);
+            for gap in gaps {
+                assert!(
+                    row.contains(gap),
+                    "the `{prefix}` row no longer names `{gap}`, which the gate reports: {row}"
+                );
+            }
+            for stale in ["四类", "4 条"] {
+                assert!(
+                    !row.contains(stale),
+                    "the `{prefix}` row still counts the old gaps as `{stale}`: {row}"
+                );
+            }
+        }
+        assert!(
+            row("| 首启介质前置 |").contains("七类"),
+            "the seed-medium row has to say how many kinds of gap the gate reports"
+        );
+        let aggregating = row("| 宿主前置聚合 |");
+        for fact in [
+            "7 条".to_string(),
+            format!("{tests} 个单测"),
+            "不可执行".to_string(),
+        ] {
+            assert!(
+                aggregating.contains(&fact),
+                "the aggregation row no longer states `{fact}`: {aggregating}"
+            );
+        }
+        // The one test that pins the number itself, so the rows cannot drift from it silently.
+        assert!(
+            FIRMWARE.contains("assert_eq!(problems.len(), 7")
+                || FIRMWARE.contains("problems.len(),\n            7"),
+            "no test pins the number of gaps the gate reports"
+        );
+    }
+
     /// The plan quotes the prerequisite error the Windows gate prints, word for word.
     ///
     /// The plan tells a reader what happens once the image variables are set: the gate hands

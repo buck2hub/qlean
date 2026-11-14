@@ -320,6 +320,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A host program that exists but cannot be executed (a tarball unpacked without its mode, a backup restored by hand, a `noexec` mount) passed the Windows prerequisite check, so the only sign of it was `Permission denied (os error 13)` from inside the launch, naming no program. The check now separates "not installed" from "installed but not runnable" and names the program and the file to fix.
 - Use `qemu:///system` URI to enable bridge creation for proper network setup
 
 ## [0.2.1] - 2026-01-29
