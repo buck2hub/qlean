@@ -614,6 +614,17 @@ impl Machine {
         // outlive the failed construction.
         let run_dir_guard = RunDirGuard::new(run_dir.clone());
 
+        // The disk this machine boots from, built once.
+        //
+        // `qemu-img` below writes this path, and `MachineImage::overlay` hands the same file
+        // to `launch_qemu`, which turns it into the `-drive file=...` argument. R249: the path
+        // used to be spelled twice, 17 lines apart - once as the argument `qemu-img` was told
+        // to write, once as the field the machine carried - so a change to one left QEMU
+        // opening a file `qemu-img` never created, reported by QEMU as
+        // `Could not open '<path>': No such file or directory` on the first boot, after the
+        // whole backing image had already been copied into the cache.
+        let overlay_image = run_dir.join("overlay.img");
+
         // Create overlay image
         let mut qemu_img_command = tokio::process::Command::new("qemu-img");
         qemu_img_command
@@ -624,7 +635,7 @@ impl Machine {
             .arg(image.path())
             .arg("-F")
             .arg("qcow2")
-            .arg(run_dir.join("overlay.img"));
+            .arg(&overlay_image);
         debug!(
             "Creating overlay image with command:\n{:?}",
             qemu_img_command.to_string()
@@ -641,7 +652,6 @@ impl Machine {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        let overlay_image = run_dir.join("overlay.img");
 
         // Generate SSH keypair
         let ssh_keypair = get_ssh_key(&dirs.secrets)?;
@@ -870,7 +880,7 @@ StandardError=journal
         }
 
         let machine_image = MachineImage {
-            overlay: overlay_image.clone(),
+            overlay: overlay_image,
             arch: image.guest_arch(),
             guest_os: image.guest_os(),
             seed: seed_iso_path,

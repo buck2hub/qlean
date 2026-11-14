@@ -3894,6 +3894,104 @@ mod plan_doc_tests {
         }
     }
 
+    /// The disk QEMU boots is the disk `qemu-img` created.
+    ///
+    /// `Machine::new` creates the per-VM overlay with `qemu-img create -b <image> -F qcow2
+    /// <overlay>`, and `MachineImage::overlay` carries that same path to `launch_qemu`, which
+    /// turns it into the `-drive file=...` argument. The path used to be built twice, 17 lines
+    /// apart: once as the argument `qemu-img` was told to write, once as the field the machine
+    /// carried. A change to either spelling - a rename, a suffix, a different binding - left
+    /// QEMU opening a file nobody created, which it reports as `Could not open '<path>': No such
+    /// file or directory` at the first boot, long after the backing image had been copied.
+    ///
+    /// Nothing else in the crate may name the overlay: a second file spelling the path is a
+    /// second answer to "which file is this machine's disk", and the two are not compared
+    /// anywhere.
+    #[test]
+    fn the_disk_qemu_boots_is_the_disk_qemu_img_created() {
+        let machine = source_named("src/machine.rs");
+        let machine_production = machine
+            .split("#[cfg(test)]")
+            .next()
+            .expect("split always yields a first part");
+        let new = function_body(
+            machine_production,
+            "pub async fn new(image: &Image, config: &MachineConfig) -> Result<Self> {",
+        );
+
+        assert_eq!(
+            new.matches(r#"join("overlay.img")"#).count(),
+            1,
+            "`Machine::new` has to build the overlay path once: two spellings are two answers to \
+             which file this machine boots from, and nothing compares them"
+        );
+        let bound = new
+            .find(r#"let overlay_image = run_dir.join("overlay.img");"#)
+            .expect(
+                "`Machine::new` must bind the overlay path to `overlay_image` before using it \
+                 twice - an inline argument plus a separate field is the drift this guards",
+            );
+        let written = new.find(".arg(&overlay_image)").unwrap_or_else(|| {
+            panic!(
+                "the `qemu-img` command must be told to write `&overlay_image`, the path \
+                 `MachineImage::overlay` carries"
+            )
+        });
+        assert!(
+            bound < written,
+            "`overlay_image` has to be bound before the `qemu-img` command that writes it"
+        );
+        // Both guest branches build their own `MachineImage` - the Windows one returns early -
+        // and both have to carry the binding `qemu-img` was handed.
+        assert_eq!(
+            new.matches("overlay: overlay_image,").count(),
+            2,
+            "every `MachineImage` in `Machine::new` (one per guest branch) must carry the binding \
+             `qemu-img` was handed, not a path rebuilt next to it"
+        );
+        assert!(
+            !new.contains("overlay_image.clone()"),
+            "cloning `overlay_image` into `MachineImage` is what the second spelling looked like: \
+             the clone means the path was needed again after the struct was built"
+        );
+
+        for (path, source) in CRATE_SOURCES {
+            let production = source
+                .split("#[cfg(test)]")
+                .next()
+                .expect("split always yields a first part");
+            let expected = if *path == "src/machine.rs" { 1 } else { 0 };
+            assert_eq!(
+                production.matches(r#"join("overlay.img")"#).count(),
+                expected,
+                "{path} names the per-VM overlay on its own: the disk this machine boots is the \
+                 file `qemu-img` wrote in `src/machine.rs`, and a second spelling here is a \
+                 second answer that no test compares"
+            );
+        }
+
+        let qemu = source_named("src/qemu.rs");
+        let launch = function_body(
+            qemu.split("#[cfg(test)]")
+                .next()
+                .expect("split always yields a first part"),
+            "pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {",
+        );
+        assert_eq!(
+            launch
+                .matches("disk_drive_option(&params.image.overlay)")
+                .count(),
+            1,
+            "`launch_qemu` must turn `params.image.overlay` into the `-drive` argument: a drive \
+             built from anything else boots a disk `qemu-img` never created"
+        );
+        assert!(
+            !launch.contains("overlay.img"),
+            "`launch_qemu` spells the overlay file name itself instead of using the path the \
+             machine carries"
+        );
+    }
+
     /// Every staged image write goes through the one opener that takes the lock.
     ///
     /// The staged file is named after the destination (`<dest>.part`), so two pooled machines
