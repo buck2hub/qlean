@@ -2216,8 +2216,8 @@ mod plan_doc_tests {
             "pub(crate) async fn walk_remote_dir(",
         );
 
-        // Two calls: the root and each visited child. The single following stat left in the
-        // function is the `follow_links` branch, which dereferences on purpose.
+        // Two calls: the root and each visited child, and no third. There is no following
+        // stat left to excuse: the branch that used to hold the only one is gone (R225).
         assert_eq!(
             body.matches("symlink_metadata").count(),
             2,
@@ -2225,8 +2225,48 @@ mod plan_doc_tests {
         );
         assert_eq!(
             body.matches("sftp.metadata(").count(),
+            0,
+            "a following stat hides links and cannot answer for a broken one - null, not one"
+        );
+    }
+
+    /// The walk cannot be asked to follow a link, because following one cannot be answered.
+    ///
+    /// `walk_remote_dir` carried a `follow_links` branch inherited from `walkdir`, and no
+    /// caller ever passed `true`. It could not have worked either: it pushed the link's
+    /// *target* on the traversal stack, so everything found below a link was named
+    /// `<target>/...`, which is not under the walked root - and both callers derive the
+    /// local name with `strip_prefix(root)`, which refuses exactly that. It also read links
+    /// with a bare `sftp.read_link`, on a guest where `Machine::read_link` refuses the same
+    /// request through `ensure_supported` ("Windows guests do not expose symbolic links over
+    /// SFTP"), and it resolved the answer with `GuestPath::new`, which rejects the `..` a
+    /// relative link almost always contains.
+    #[test]
+    fn the_walk_never_asks_for_a_link_it_could_not_name() {
+        let body = function_body(
+            include_str!("ssh.rs"),
+            "pub(crate) async fn walk_remote_dir(",
+        );
+
+        for gone in ["follow_links", "read_link", "is_symlink"] {
+            assert!(
+                !body.contains(gone),
+                "the walk must not offer to follow a link: `{gone}` is back in the walk"
+            );
+        }
+        // The flag was the whole invitation, so the signature is pinned too: a walk that takes
+        // nothing but a root and a cancellation token cannot grow the branch back quietly.
+        assert!(
+            body.contains("root: &GuestPath,\n        cancel_token: CancellationToken,"),
+            "the walk takes a root and a token, and no request to dereference anything"
+        );
+        // One `stack.push` and no second: the walk can descend into exactly one kind of entry,
+        // and the ban above says which. Pinning the count rather than the branch's spelling
+        // keeps a rename of the local binding out of the guard's business.
+        assert_eq!(
+            body.matches("stack.push(").count(),
             1,
-            "a following stat hides links and cannot answer for a broken one outside `follow_links`"
+            "the walk descends into directories and into nothing else"
         );
     }
 

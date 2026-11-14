@@ -3552,15 +3552,21 @@ impl Session {
 
     /// Walk a remote directory tree over SFTP, similar to walkdir.
     /// Returns a depth-first list of entries including the root.
+    ///
+    /// The walk never follows a link and never reads one: every entry is reported as what it
+    /// is, and a link is a leaf the caller has to decide about. There is no flag to ask for
+    /// more, because there is no answer to give - a link's target can be named outside the
+    /// walked root (so the relative name `download` derives would not exist), a bare
+    /// `read_link` reaches a guest where [`crate::machine::Machine::read_link`] refuses the
+    /// same request, and the `..` in a relative target is exactly what `GuestPath` rejects.
     pub(crate) async fn walk_remote_dir(
         &mut self,
         root: &GuestPath,
-        follow_links: bool,
         cancel_token: CancellationToken,
     ) -> Result<Vec<RemoteDirEntry>> {
         let mut out = Vec::new();
 
-        // Stat the root itself, not what it points at: a walk that follows links cannot
+        // Stat the root itself, not what it points at: a stat that dereferences cannot
         // tell a link from its target, and a broken link is not stat-able at all.
         let root_meta = {
             let sftp = self.get_sftp().await?;
@@ -3625,36 +3631,11 @@ impl Session {
                 let ftype = RemoteFileType::from_attrs(&attrs);
                 out.push(RemoteDirEntry::new(child_path.clone(), ftype.clone()));
 
+                // Only a directory is descended into. A link is reported as a link: the
+                // download refuses it by name, and `remove_dir_all` unlinks it, so no caller
+                // is left guessing what the entry was.
                 if ftype.is_dir() {
                     stack.push(child_path);
-                } else if ftype.is_symlink() && follow_links {
-                    // If it's a symlink and we're following links, stat the target
-                    let target_path = {
-                        let sftp = self.get_sftp().await?;
-                        match sftp.read_link(child_path.as_str()).await {
-                            Ok(tp) => GuestPath::new(child_path.guest_os(), tp)?,
-                            Err(e) => {
-                                bail!("Failed to read_link {}: {}", child_path.as_str(), e);
-                            }
-                        }
-                    };
-                    let target_attrs = {
-                        let sftp = self.get_sftp().await?;
-                        match sftp.metadata(target_path.as_str()).await {
-                            Ok(a) => a,
-                            Err(e) => {
-                                bail!(
-                                    "Failed to stat symlink target {}: {}",
-                                    target_path.as_str(),
-                                    e
-                                );
-                            }
-                        }
-                    };
-                    let target_type = RemoteFileType::from_attrs(&target_attrs);
-                    if target_type.is_dir() {
-                        stack.push(target_path);
-                    }
                 }
             }
         }

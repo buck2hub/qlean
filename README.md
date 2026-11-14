@@ -278,10 +278,11 @@ Path rules for Windows guests:
   uploading to a Linux guest recreates the link on the guest and reports a failure to do so.
   Downloading never turns a link into its target: a link anywhere in the tree, or the path
   the download was asked for, is reported as a link instead of being followed.
-- The walk never follows a link on its own: it asks for each entry's own attributes, so a
-  link is reported as a link. A link to a directory is not folded into the copy as if it
-  were a directory, and a broken link can still be seen - and still be deleted by
-  `remove_dir_all`, which unlinks it instead of recursing.
+- The walk never follows a link, and there is no way to ask it to: it takes a root and a
+  cancellation token, asks for each entry's own attributes, and descends into a directory and
+  nothing else. A link is therefore always reported as a link - a link to a directory is not
+  folded into the copy as if it were a directory, and a broken link can still be seen, and
+  still be deleted by `remove_dir_all`, which unlinks it instead of recursing.
 
 ### Getting Started
 

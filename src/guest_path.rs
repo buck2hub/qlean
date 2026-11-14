@@ -121,11 +121,6 @@ impl GuestPath {
         &self.text
     }
 
-    /// Guest OS this path was validated for.
-    pub(crate) fn guest_os(&self) -> GuestOs {
-        self.guest_os
-    }
-
     /// Join a single child name, refusing names that would escape the path.
     ///
     /// `child` may come from a host-relative walk (always simple names) or from
@@ -658,11 +653,11 @@ mod tests {
             let parent = path
                 .parent()
                 .unwrap_or_else(|| panic!("{raw} has no parent on {guest_os:?}"));
-            assert_eq!(
-                parent.guest_os(),
-                guest_os,
-                "{raw} changed guest on the way up"
-            );
+            // The parent must still be a path of the guest the child was validated for: its
+            // own text has to re-validate under that guest and come back unchanged.
+            let round_tripped = GuestPath::new(guest_os, parent.as_str())
+                .unwrap_or_else(|error| panic!("{raw} left the {guest_os:?} rules: {error}"));
+            assert_eq!(round_tripped, parent, "{raw} changed guest on the way up");
             let name = path
                 .file_name()
                 .expect("a path that is not a root has a name");

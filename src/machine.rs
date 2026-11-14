@@ -1434,11 +1434,7 @@ StandardError=journal
             // Use walk_remote_dir for DFS traversal
             let outcome: Result<()> = async {
                 let entries = ssh
-                    .walk_remote_dir(
-                        &remote_path,
-                        /*follow_links=*/ false,
-                        cancel_token.clone(),
-                    )
+                    .walk_remote_dir(&remote_path, cancel_token.clone())
                     .await?;
 
                 for e in entries {
@@ -2125,9 +2121,7 @@ impl Machine {
         let path = guest_path_from(os, path.as_ref())?;
         // Collect the tree first, then delete children before their parents.
         let (ssh, cancel_token) = self.get_ssh("remove a directory tree")?;
-        let entries = ssh
-            .walk_remote_dir(&path, /*follow_links=*/ false, cancel_token.clone())
-            .await?;
+        let entries = ssh.walk_remote_dir(&path, cancel_token.clone()).await?;
 
         for entry in entries.iter().rev() {
             if cancel_token.is_cancelled() {
