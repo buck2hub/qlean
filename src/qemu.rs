@@ -1309,6 +1309,75 @@ mod tests {
         );
     }
 
+    /// The console chardev keeps the three flags sharing it depends on.
+    ///
+    /// `mux=on` is what lets `-serial` and `-monitor` be the same endpoint, `signal=off` keeps
+    /// QEMU from installing its own SIGINT handling on stdio (qlean owns the teardown), and
+    /// `logappend=on` keeps the serial log of a failed boot when the machine is launched again -
+    /// the console is the guest's own account of a first boot that never finished (R255).
+    #[test]
+    fn the_console_chardev_keeps_the_flags_the_monitor_and_the_log_need() {
+        let log = Path::new("/run/qlean/vm1/serial.log");
+        let chardev = serial_chardev_option(log).expect("the console chardev");
+        assert_eq!(
+            chardev,
+            "stdio,id=char0,mux=on,signal=off,logfile=/run/qlean/vm1/serial.log,logappend=on",
+            "the console chardev is the contract `-serial`, `-monitor` and the log are read \n             through: a dropped flag silently unpicks one of the three"
+        );
+        assert!(
+            chardev.contains("mux=on"),
+            "the monitor needs the multiplexed chardev"
+        );
+        assert!(
+            !chardev.contains("signal=on"),
+            "QEMU must not take over the host's signals"
+        );
+    }
+
+    /// Every launch names its machine once, and an x86_64 Linux guest asks for HPET off.
+    ///
+    /// `-machine hpet=off` halves idle CPU on x86_64 hosts, and it is an x86-only machine
+    /// property: QEMU refuses an unknown machine property, so an aarch64 launch must not carry
+    /// it. A Windows launch gets its machine type from the firmware arguments instead, and a
+    /// second `-machine` on the same command line is a launch QEMU refuses outright (R255).
+    #[test]
+    fn an_x86_64_guest_asks_qemu_to_keep_hpet_off() {
+        let linux = args_of(&launch_params(GuestOs::Linux, false));
+        assert_eq!(
+            values_of(&linux, "-machine"),
+            vec!["hpet=off"],
+            "an amd64 Linux guest has to keep HPET off, and say it once: {linux:?}"
+        );
+
+        let mut arm = launch_params(GuestOs::Linux, false);
+        arm.image.arch = GuestArch::Aarch64;
+        let arm = args_of(&arm);
+        assert!(
+            values_of(&arm, "-machine").is_empty(),
+            "hpet is an x86 machine property, so an aarch64 launch names no machine at all: {arm:?}"
+        );
+
+        let windows_params = launch_params(GuestOs::Windows, false);
+        let firmware_args = windows_firmware_args(
+            windows_params
+                .firmware
+                .as_ref()
+                .expect("a fixture firmware"),
+            windows_params.tpm_socket.as_deref(),
+        )
+        .expect("firmware arguments");
+        let windows = args_of(&windows_params);
+        assert_eq!(
+            values_of(&windows, "-machine"),
+            vec![firmware_args[1].as_str()],
+            "the Windows launch's machine type is the firmware's, and only the firmware's: {windows:?}"
+        );
+        assert!(
+            firmware_args[1].contains("hpet=off"),
+            "the Windows machine type keeps HPET off as well: {firmware_args:?}"
+        );
+    }
+
     /// The command line carries the control channel the machine waits on.
     #[test]
     fn the_command_line_carries_the_control_channel() {
