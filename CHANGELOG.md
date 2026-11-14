@@ -55,6 +55,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not treated as free: the rename is not sent.
 
 ### Fixed
+- A Windows boot could delete a live `swtpm`'s control socket. `Swtpm::start` removes the socket
+  file at the control path because the process table says no daemon serves that TPM state
+  directory - but the scan answered "no daemon" for *every* way of failing to look (a host
+  without a readable `/proc`: `hidepid=2`, a chroot, a sandbox, and every `cmdline` it could not
+  read). On such a host the socket of a running daemon was removed and a second `swtpm` started
+  on the same `tpm2-00.permall`, which can lose the guest's sealed secrets (on Windows: a
+  BitLocker recovery prompt). The scan now distinguishes "read the table, no daemon" from
+  "could not read it", and a boot that could not check refuses instead of touching the socket.
+- The refusal for a non-socket at the `swtpm` control path called a FIFO or a device node
+  "a regular file"; it now names what is really there (`a FIFO (named pipe)`,
+  `a character device`, `a block device`), because that sentence is all the user has before
+  deleting the entry.
 - `Machine::get_ip` for a Windows guest answered with an address no host can dial. The probe
   reports every address of this VM's adapter, and Windows assigns a link-local
   `169.254.0.0/16` address to an adapter that never obtained a DHCP lease - so a guest whose

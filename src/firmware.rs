@@ -629,6 +629,11 @@ fn is_socket_entry(_meta: &std::fs::Metadata) -> bool {
 }
 
 /// Name the entry that is not a socket, for the refusal message.
+///
+/// This sentence is everything the user has before deciding what to delete, so it has to name
+/// what is really there. A FIFO or a device node used to be reported as "a regular file" - the
+/// one property the message exists to report was the one it got wrong, and a reader who ran
+/// `ls -l` on the path was told to distrust the refusal instead of the entry.
 fn describe_control_socket_entry(path: &Path, meta: &std::fs::Metadata) -> String {
     let file_type = meta.file_type();
     if file_type.is_symlink() {
@@ -640,7 +645,30 @@ fn describe_control_socket_entry(path: &Path, meta: &std::fs::Metadata) -> Strin
     if file_type.is_dir() {
         return "a directory".to_string();
     }
-    "a regular file".to_string()
+    match special_file_kind(&file_type) {
+        Some(kind) => kind.to_string(),
+        None => "a regular file".to_string(),
+    }
+}
+
+/// The entry kinds that are neither a regular file nor a directory, on a host that has them.
+#[cfg(unix)]
+fn special_file_kind(file_type: &std::fs::FileType) -> Option<&'static str> {
+    use std::os::unix::fs::FileTypeExt;
+    if file_type.is_fifo() {
+        Some("a FIFO (named pipe)")
+    } else if file_type.is_char_device() {
+        Some("a character device")
+    } else if file_type.is_block_device() {
+        Some("a block device")
+    } else {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn special_file_kind(_file_type: &std::fs::FileType) -> Option<&'static str> {
+    None
 }
 
 /// Whether a `/proc/<pid>/cmdline` payload is a `swtpm` serving `state_dir`.
@@ -686,24 +714,97 @@ fn cmdline_is_swtpm_for(cmdline: &[u8], state_dir: &Path) -> bool {
 ///
 /// A process table that cannot be read yields `None`: refusing a start requires an owner that
 /// was actually found, and guessing one would make the TPM unavailable for no reason.
-fn live_swtpm_on(state_dir: &Path) -> Option<u32> {
-    let entries = std::fs::read_dir("/proc").ok()?;
-    for entry in entries.flatten() {
+fn live_swtpm_on(state_dir: &Path) -> std::io::Result<Option<u32>> {
+    swtpm_in(Path::new("/proc"), state_dir)
+}
+
+/// Find a `swtpm` serving `state_dir`, reading a directory shaped like `/proc`.
+///
+/// `Ok(None)` is the answer "the process table was read, and no `swtpm` serves this state
+/// directory" - the only answer that licenses [`Swtpm::start`] to remove an existing socket.
+/// Every way of *failing to look* is an `Err`, because the two used to be one answer:
+/// `read_dir("/proc")` was passed through `.ok()?` and every unreadable `cmdline` was skipped,
+/// so a host whose `/proc` a process cannot enumerate (`hidepid=2`, a chroot without `/proc`,
+/// a sandbox) looked exactly like a host with no daemon - and `start` then deleted the socket
+/// of the daemon it could not see and started a second one on the same state file.
+///
+/// The table is handed in as a path so the shapes a real host cannot be asked for (an
+/// unreadable table, a `cmdline` that exists but cannot be read) can be tested directly.
+fn swtpm_in(proc_root: &Path, state_dir: &Path) -> std::io::Result<Option<u32>> {
+    let entries = std::fs::read_dir(proc_root)?;
+    for entry in entries {
+        let entry = entry?;
         let Some(pid) = entry
             .file_name()
             .to_str()
-            .and_then(|name| name.parse().ok())
+            .and_then(|name| name.parse::<u32>().ok())
         else {
             continue;
         };
-        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
-            continue;
-        };
-        if cmdline_is_swtpm_for(&cmdline, state_dir) {
-            return Some(pid);
+        match std::fs::read(entry.path().join("cmdline")) {
+            Ok(cmdline) => {
+                if cmdline_is_swtpm_for(&cmdline, state_dir) {
+                    return Ok(Some(pid));
+                }
+            }
+            // The process left the table between the listing and the read: it owns nothing.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            // Anything else is a blind spot, not a process without a command line.
+            Err(error) => return Err(error),
         }
     }
-    None
+    Ok(None)
+}
+
+/// What a boot may do at the control socket path.
+#[derive(Debug, PartialEq, Eq)]
+enum SocketAction {
+    /// Nothing there, or nothing that a new `swtpm` has to clear: it binds the path itself.
+    Use,
+    /// A socket file a crashed run left behind: the new daemon cannot bind on top of it.
+    RemoveStaleSocket,
+}
+
+/// Decide what may happen at the control socket path, before anything there is touched.
+///
+/// The process table is the only thing that tells a stale socket from a live daemon's
+/// endpoint, so the order is the point: a table that could not be read is refused, not
+/// reported as "no daemon", because that answer is exactly what licenses the removal below it.
+fn plan_socket_action(
+    state_dir: &Path,
+    socket_path: &Path,
+    socket: &ControlSocket,
+    live: std::io::Result<Option<u32>>,
+) -> Result<SocketAction> {
+    match live {
+        Ok(Some(pid)) => bail!(
+            "a `swtpm` for this Windows guest's TPM is already running (pid {pid}) and is \
+             serving {}: Qlean will not start a second one on the same state directory, \
+             because both would write the same state file and the guest's sealed secrets \
+             could be lost. Stop that process (or the machine it belongs to) and boot again",
+            state_dir.display()
+        ),
+        Ok(None) => match socket {
+            ControlSocket::Absent => Ok(SocketAction::Use),
+            ControlSocket::Socket => Ok(SocketAction::RemoveStaleSocket),
+            ControlSocket::Foreign(kind) => bail!(
+                "the swtpm control socket path {} is {kind}, so no TPM could be reached through \
+                 it: Qlean keeps its own socket there and does not create that entry, so nothing \
+                 was used or deleted. Remove it and boot again",
+                socket_path.display()
+            ),
+        },
+        Err(error) => bail!(
+            "could not read the process table to check whether a `swtpm` is already serving the \
+             TPM state directory {}: {error}\n\
+             Qlean removes the control socket {} only when it can prove no daemon is serving \
+             it, and a second `swtpm` on the same state directory can lose the guest's sealed \
+             secrets (on Windows: a BitLocker recovery prompt). Nothing was removed. Make \
+             /proc readable (mount it, or run as a user that can) and boot again",
+            state_dir.display(),
+            socket_path.display()
+        ),
+    }
 }
 
 pub(crate) fn prepare_vars(run_dir: &Path, firmware: &FirmwarePaths) -> Result<PathBuf> {
@@ -1018,23 +1119,16 @@ impl Swtpm {
         // serving this VM's TPM. Removing its control socket would leave it running and
         // unreachable, and the second daemon started below would write the same state file as
         // the first - on Windows that is a lost TPM identity and a BitLocker recovery prompt.
-        if let Some(pid) = live_swtpm_on(&state_dir) {
-            bail!(
-                "a `swtpm` for this Windows guest's TPM is already running (pid {pid}) and is \
-                 serving {}: Qlean will not start a second one on the same state directory, \
-                 because both would write the same state file and the guest's sealed secrets \
-                 could be lost. Stop that process (or the machine it belongs to) and boot again",
-                state_dir.display()
-            );
-        }
-        match control_socket_state(&socket).with_context(|| {
+        let live = live_swtpm_on(&state_dir);
+        let state = control_socket_state(&socket).with_context(|| {
             format!(
                 "failed to inspect the swtpm control socket path {}",
                 socket.display()
             )
-        })? {
-            ControlSocket::Absent => {}
-            ControlSocket::Socket => {
+        })?;
+        match plan_socket_action(&state_dir, &socket, &state, live)? {
+            SocketAction::Use => {}
+            SocketAction::RemoveStaleSocket => {
                 // A crashed `swtpm` leaves its socket file behind, and the new one cannot
                 // bind on top of it. Only the socket itself is removed: it is Qlean's own
                 // endpoint, named after the run directory.
@@ -1049,12 +1143,6 @@ impl Swtpm {
                     socket.display()
                 );
             }
-            ControlSocket::Foreign(kind) => bail!(
-                "the swtpm control socket path {} is {kind}, so no TPM could be reached through \
-                 it: Qlean keeps its own socket there and does not create that entry, so nothing \
-                 was used or deleted. Remove it and boot again",
-                socket.display()
-            ),
         }
         let log = run_dir.join("swtpm.log");
 
@@ -1918,6 +2006,190 @@ mod tests {
         assert!(!cmdline_is_swtpm_for(b"", state));
     }
 
+    /// "I could not look" is not "there is nothing there".
+    ///
+    /// `start` removes a socket at the control path only because the process table says no
+    /// daemon serves it. A table that cannot be read is the one input that used to be folded
+    /// into that answer (`read_dir("/proc").ok()?`), which turned "I cannot see the daemon" into
+    /// "there is no daemon" and licensed the removal of a live endpoint, followed by a second
+    /// `swtpm` on the same `tpm2-00.permall`.
+    #[test]
+    fn test_a_proc_table_that_cannot_be_read_is_not_a_clean_one() {
+        let root = temp_dir("swtpm-proc-unreadable");
+        let state_dir = root.join("tpm");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let socket = root.join("swtpm.sock");
+
+        let error = swtpm_in(&root.join("no-such-proc"), &state_dir)
+            .expect_err("a table that cannot be read is not proof that no daemon exists");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+
+        let error = plan_socket_action(&state_dir, &socket, &ControlSocket::Socket, Err(error))
+            .expect_err("a boot that could not check must not delete what it could not check");
+        let text = error.to_string();
+        assert!(
+            text.contains(&state_dir.display().to_string()),
+            "the refusal has to name the state directory it protects: {text}"
+        );
+        assert!(
+            text.contains("Nothing was removed"),
+            "the refusal has to say the socket is still there: {text}"
+        );
+        assert!(
+            text.contains("second `swtpm`"),
+            "the refusal has to say what the removal would risk: {text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The table is read for the daemon's own command line, not for a name in the path.
+    #[test]
+    fn test_the_process_table_is_read_for_a_daemon_serving_this_state_directory() {
+        let root = temp_dir("swtpm-proc-table");
+        let state_dir = root.join("tpm");
+        let other_state = root.join("other-tpm");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let proc_root = root.join("proc");
+        let write_cmdline = |pid: &str, argv: &[&str]| {
+            let dir = proc_root.join(pid);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("cmdline"), argv.join("\0")).unwrap();
+        };
+        // The daemon this VM's state directory belongs to (pid 100).
+        write_cmdline(
+            "100",
+            &[
+                "swtpm",
+                "socket",
+                "--tpmstate",
+                &format!("dir={},mode=0600", state_dir.display()),
+            ],
+        );
+        // A QEMU that merely mentions the directory.
+        write_cmdline(
+            "200",
+            &[
+                "qemu-system-x86_64",
+                "--tpmstate",
+                &format!("dir={}", state_dir.display()),
+            ],
+        );
+        // A `swtpm` for a *different* state directory: a prefix, not a match.
+        write_cmdline(
+            "300",
+            &[
+                "swtpm",
+                "--tpmstate",
+                &format!("dir={}", other_state.display()),
+            ],
+        );
+        // A table entry that is not a pid (a `swtpm` must not be found by its name alone).
+        write_cmdline(
+            "not-a-pid",
+            &[
+                "swtpm",
+                "--tpmstate",
+                &format!("dir={}", state_dir.display()),
+            ],
+        );
+
+        assert_eq!(swtpm_in(&proc_root, &state_dir).unwrap(), Some(100));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `cmdline` that exists but cannot be read is a blind spot, not an empty process.
+    #[test]
+    fn test_a_process_table_entry_that_cannot_be_read_is_not_skipped() {
+        let root = temp_dir("swtpm-proc-blind");
+        let state_dir = root.join("tpm");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let proc_root = root.join("proc");
+        // `cmdline` as a directory: it exists, and reading it fails with something that is not
+        // `NotFound`, which is the shape a hidden `/proc/<pid>/cmdline` takes.
+        std::fs::create_dir_all(proc_root.join("400").join("cmdline")).unwrap();
+
+        let error = swtpm_in(&proc_root, &state_dir)
+            .expect_err("an entry that cannot be read is not an entry without a command line");
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// What may happen at the socket path, for every combination of answers.
+    #[test]
+    fn test_only_a_clean_scan_lets_a_stale_socket_be_removed() {
+        let root = temp_dir("swtpm-socket-plan");
+        let state_dir = root.join("tpm");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let socket = root.join("swtpm.sock");
+
+        assert_eq!(
+            plan_socket_action(&state_dir, &socket, &ControlSocket::Absent, Ok(None)).unwrap(),
+            SocketAction::Use
+        );
+        assert_eq!(
+            plan_socket_action(&state_dir, &socket, &ControlSocket::Socket, Ok(None)).unwrap(),
+            SocketAction::RemoveStaleSocket
+        );
+
+        // A live daemon is refused by pid, whatever sits at the path.
+        for shape in [ControlSocket::Absent, ControlSocket::Socket] {
+            let error = plan_socket_action(&state_dir, &socket, &shape, Ok(Some(4242)))
+                .expect_err("a live daemon must stop the boot");
+            let text = error.to_string();
+            assert!(text.contains("pid 4242"), "{text}");
+            assert!(text.contains("will not start a second one"), "{text}");
+        }
+
+        // An entry Qlean did not create is named and left alone, and the message keeps the path.
+        let error = plan_socket_action(
+            &state_dir,
+            &socket,
+            &ControlSocket::Foreign("a FIFO (named pipe)".to_string()),
+            Ok(None),
+        )
+        .expect_err("a foreign entry is refused, not deleted");
+        let text = error.to_string();
+        assert!(text.contains("a FIFO (named pipe)"), "{text}");
+        assert!(text.contains(&socket.display().to_string()), "{text}");
+        assert!(text.contains("nothing was used or deleted"), "{text}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A FIFO or a device node is named as itself, not as "a regular file".
+    ///
+    /// The sentence is all the user has before deleting the entry, so the one property it
+    /// reports has to be the entry's: a FIFO described as "a regular file" reads as a Qlean
+    /// mistake and invites the reader to distrust a refusal that was right.
+    #[test]
+    #[cfg(unix)]
+    fn test_a_special_file_at_the_socket_path_is_named_as_itself() {
+        let root = temp_dir("swtpm-socket-special");
+
+        // A character device, from a path every Unix host has.
+        assert_eq!(
+            control_socket_state(Path::new("/dev/null")).unwrap(),
+            ControlSocket::Foreign("a character device".to_string())
+        );
+
+        // A FIFO needs `mkfifo`; where it is missing the shape cannot be built at all.
+        let fifo = root.join("swtpm.sock");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if let Ok(status) = made
+            && status.success()
+        {
+            assert_eq!(
+                control_socket_state(&fifo).unwrap(),
+                ControlSocket::Foreign("a FIFO (named pipe)".to_string())
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A `swtpm` that is still serving this VM's TPM is refused before its socket is touched.
     ///
     /// The socket file a crashed run leaves behind and the socket a *live* daemon is serving
@@ -1955,7 +2227,7 @@ mod tests {
         // Give the process table a moment to show the command line.
         let mut found = None;
         for _ in 0..100 {
-            found = live_swtpm_on(&state_dir);
+            found = live_swtpm_on(&state_dir).expect("this host can read /proc");
             if found == Some(pid) {
                 break;
             }
@@ -1992,7 +2264,10 @@ mod tests {
         let _ = fake.wait().await;
         let mut gone = false;
         for _ in 0..100 {
-            if live_swtpm_on(&state_dir).is_none() {
+            if live_swtpm_on(&state_dir)
+                .expect("this host can read /proc")
+                .is_none()
+            {
                 gone = true;
                 break;
             }
