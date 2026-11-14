@@ -55,6 +55,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not treated as free: the rename is not sent.
 
 ### Fixed
+- `Machine::get_ip` for a Windows guest answered with an address no host can dial. The probe
+  reports every address of this VM's adapter, and Windows assigns a link-local
+  `169.254.0.0/16` address to an adapter that never obtained a DHCP lease - so a guest whose
+  DHCP failed had that address returned as *the* lease, and every later connection dialled a
+  dead endpoint instead of reporting the finding the user needed ("DHCP did not answer"). The
+  same address also made a guest that reported its real lease *next to* it look ambiguous, so
+  a perfectly reachable VM was refused. The resolver now treats only dialable unicast IPv4
+  addresses as lease candidates (loopback, unspecified, multicast and broadcast included), and
+  the "no address" error names the link-local case and why it means no lease.
 - A `swtpm` that was still starting when the ten-second startup budget ran out was `SIGKILL`ed,
   the one way Qlean promises never to end a TPM: a `SIGKILL` can leave a half-written
   `tpm2-00.permall` behind, and the guest then loses the TPM identity it sealed secrets against

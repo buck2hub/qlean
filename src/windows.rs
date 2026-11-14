@@ -94,6 +94,11 @@ pub(crate) fn normalize_mac(mac: &str) -> String {
 ///
 /// Unparseable lines are skipped instead of failing the whole query: PowerShell may
 /// emit warnings or blank lines alongside the pairs.
+///
+/// The parser reports what the guest said, including addresses that are not leases (a
+/// link-local `169.254.0.0/16` address is what Windows assigns when no DHCP server
+/// answered). Deciding which of them is dialable belongs to [`select_guest_address`], so a
+/// failure can still show the raw report instead of having it filtered away twice.
 pub(crate) fn parse_adapter_addresses(output: &str) -> Vec<(String, std::net::IpAddr)> {
     output
         .lines()
@@ -109,44 +114,87 @@ pub(crate) fn parse_adapter_addresses(output: &str) -> Vec<(String, std::net::Ip
         .collect()
 }
 
+/// Whether an address the guest reported is one the host could dial as its leased address.
+///
+/// A lease is a routable unicast IPv4 address on the network Qlean attached. Everything else
+/// the probe can report for this VM's MAC is *not* a lease, and returning it is worse than
+/// returning nothing: the caller dials a dead endpoint and every later connection fails
+/// against an address that was never usable.
+///
+/// The one that matters is `169.254.0.0/16`: Windows assigns a link-local address on an
+/// adapter that never obtained a DHCP lease, so it is the guest's own report of "DHCP did not
+/// answer". [`GUEST_IP_QUERY`] filters the same shapes in PowerShell, but the rule is decided
+/// here as well: the resolver must not depend on a string in a script being spelled right, and
+/// an address that only makes a real lease look ambiguous must not do that either.
+fn is_dialable_lease(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            !(v4.is_link_local()
+                || v4.is_loopback()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.is_broadcast())
+        }
+        std::net::IpAddr::V6(_) => false,
+    }
+}
+
 /// Pick the address that belongs to `mac`, refusing to guess.
 ///
-/// Qlean assigns one MAC per VM, so a Windows guest must report exactly one IPv4 address
-/// for its own MAC. Zero matches means the guest has no usable IPv4 address; more than one is
-/// ambiguous (multiple NICs, or a stale address). Neither case may silently fall back to
-/// another VM's lease.
+/// Qlean assigns one MAC per VM, so a Windows guest must report exactly one *dialable* IPv4
+/// address for its own MAC. Zero matches means the guest has no usable IPv4 address; more than
+/// one is ambiguous (two NICs, or a stale address). Neither case may silently fall back to
+/// another VM's lease, and an address no host can dial (see [`is_dialable_lease`]) is not a
+/// candidate at all: it neither becomes the answer nor makes a real lease look ambiguous.
 pub(crate) fn select_guest_address(
     addresses: &[(String, std::net::IpAddr)],
     mac: &str,
 ) -> Result<std::net::IpAddr> {
     let expected = normalize_mac(mac);
-    // Decide on IPv4 only. Keeping the filter here as well as in the parser means a
-    // reported IPv6 address can neither be dialled nor make a single IPv4 address look
-    // ambiguous.
-    let mut matches = addresses
-        .iter()
-        .filter(|(reported_mac, ip)| *reported_mac == expected && ip.is_ipv4())
-        .map(|(_, ip)| *ip);
+    let candidates = || {
+        addresses
+            .iter()
+            .filter(|(reported_mac, ip)| *reported_mac == expected && is_dialable_lease(*ip))
+            .map(|(_, ip)| *ip)
+    };
 
-    let Some(first) = matches.next() else {
+    let Some(first) = candidates().next() else {
         let seen = addresses
             .iter()
             .map(|(reported_mac, ip)| format!("{reported_mac}={ip}"))
             .collect::<Vec<_>>();
+        let link_local = addresses
+            .iter()
+            .filter(|(reported_mac, ip)| {
+                *reported_mac == expected
+                    && matches!(ip, std::net::IpAddr::V4(v4) if v4.is_link_local())
+            })
+            .map(|(_, ip)| ip.to_string())
+            .collect::<Vec<_>>();
+        let reason = if link_local.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nThe only address it reported is link-local ({link_local:?}): Windows assigns \
+                 a 169.254.0.0/16 address to an adapter that never obtained a DHCP lease, so \
+                 the guest has no address to dial yet."
+            )
+        };
         anyhow::bail!(
-            "Windows guest did not report an IPv4 address for MAC {mac} (reported: {seen:?}).\n\
+            "Windows guest did not report a usable IPv4 address for MAC {mac} (reported: \
+             {seen:?}).{reason}\n\
              Check that the guest brought up its virtio network adapter and received a lease."
         );
     };
 
-    if matches.next().is_some() {
-        let candidates = addresses
+    let candidates = candidates().collect::<Vec<_>>();
+    if candidates.len() > 1 {
+        let shown = candidates
             .iter()
-            .filter(|(reported_mac, ip)| *reported_mac == expected && ip.is_ipv4())
-            .map(|(_, ip)| ip.to_string())
+            .map(ToString::to_string)
             .collect::<Vec<_>>();
         anyhow::bail!(
-            "Windows guest reported several IPv4 addresses for MAC {mac} ({candidates:?}); \
+            "Windows guest reported several IPv4 addresses for MAC {mac} ({shown:?}); \
              cannot decide which one is the leased address."
         );
     }
@@ -1137,7 +1185,10 @@ mod tests {
             .expect_err("another VM's address must not be reused")
             .to_string();
         assert!(err.contains("52:54:00:aa:bb:cc"), "{err}");
-        assert!(err.contains("did not report an IPv4 address"), "{err}");
+        assert!(
+            err.contains("did not report a usable IPv4 address"),
+            "{err}"
+        );
         // The leases that were seen are listed to make the failure debuggable, but they
         // are never returned as this VM's address.
         assert!(err.contains("525400112233=192.168.221.43"), "{err}");
@@ -1146,14 +1197,66 @@ mod tests {
 
     #[test]
     fn windows_ip_multiple_addresses_for_one_mac_are_ambiguous() {
-        let output = "52-54-00-AA-BB-CC 192.168.221.42\n52-54-00-AA-BB-CC 169.254.10.20\n";
+        let output = "52-54-00-AA-BB-CC 192.168.221.42\n52-54-00-AA-BB-CC 192.168.221.99\n";
         let addresses = parse_adapter_addresses(output);
         let err = select_guest_address(&addresses, "52:54:00:aa:bb:cc")
-            .expect_err("multiple addresses must not be resolved by guessing")
+            .expect_err("two dialable addresses must not be resolved by guessing")
             .to_string();
         assert!(err.contains("several IPv4 addresses"), "{err}");
         assert!(err.contains("192.168.221.42"), "{err}");
-        assert!(err.contains("169.254.10.20"), "{err}");
+        assert!(err.contains("192.168.221.99"), "{err}");
+    }
+
+    /// A link-local address is the guest saying "DHCP did not answer", not a lease.
+    ///
+    /// Windows assigns `169.254.0.0/16` to an adapter that never obtained a lease. Returning
+    /// it hands the caller a dead endpoint, and the diagnosis the user needs - no lease - is
+    /// replaced by an address that fails to connect for reasons that look like `sshd`.
+    #[test]
+    fn windows_ip_refuses_a_link_local_address_as_the_lease() {
+        let output = "52-54-00-AA-BB-CC 169.254.13.37\n";
+        let addresses = parse_adapter_addresses(output);
+        let err = select_guest_address(&addresses, "52:54:00:aa:bb:cc")
+            .expect_err("a link-local address is not a lease")
+            .to_string();
+        // The evidence is kept: the address the guest actually reported is in the message.
+        assert!(err.contains("169.254.13.37"), "{err}");
+        assert!(
+            err.contains("did not report a usable IPv4 address"),
+            "{err}"
+        );
+        assert!(err.contains("link-local"), "{err}");
+        assert!(err.contains("DHCP"), "{err}");
+    }
+
+    /// A link-local address must not make the real lease look ambiguous.
+    ///
+    /// The probe filters `169.254.*` in PowerShell too, but the resolver is where "is this
+    /// dialable" is decided: a guest that reports both must still yield the lease.
+    #[test]
+    fn windows_ip_selects_the_lease_next_to_a_link_local_address() {
+        let output = "52-54-00-AA-BB-CC 169.254.10.20\n52-54-00-AA-BB-CC 192.168.221.42\n";
+        let addresses = parse_adapter_addresses(output);
+        let selected = select_guest_address(&addresses, "52:54:00:aa:bb:cc")
+            .expect("the lease is the only dialable address");
+        assert_eq!(selected.to_string(), "192.168.221.42");
+    }
+
+    /// Every shape that cannot be dialled is refused, not only the link-local one.
+    #[test]
+    fn windows_ip_refuses_addresses_no_host_can_dial() {
+        for reported in ["127.0.0.1", "0.0.0.0", "224.0.0.1", "255.255.255.255"] {
+            let addresses = parse_adapter_addresses(&format!("52-54-00-AA-BB-CC {reported}\n"));
+            let err = select_guest_address(&addresses, "52:54:00:aa:bb:cc")
+                .expect_err(reported)
+                .to_string();
+            assert!(
+                err.contains("did not report a usable IPv4 address"),
+                "{reported}: {err}"
+            );
+            // Only the link-local case gets the DHCP sentence; the others must not claim it.
+            assert!(!err.contains("link-local"), "{reported}: {err}");
+        }
     }
 
     #[test]
