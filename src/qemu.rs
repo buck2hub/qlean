@@ -1677,6 +1677,73 @@ mod tests {
         );
     }
 
+    /// The smoke test's argv fixtures are the options the launch builds.
+    ///
+    /// `tests/windows_machine.rs` reads QEMU's process arguments with four helpers
+    /// (`pflash_vars_file`, `seed_iso_file`, `overlay_disk_file`, `has_cdrom`), and the argv
+    /// those helpers parse are hand-written strings. That file says, in a comment, "a fixture
+    /// that drifts from them tests the fixture" - and nothing asked whether it had drifted.
+    /// It already had: the pflash fixture lists `readonly=on` before `unit=0` while
+    /// [`windows_firmware_args`] writes `unit=0,readonly=on`, so a byte-for-byte comparison was
+    /// never possible and no comparison existed. The equation is on the option as the set of
+    /// `key=value` pairs QEMU reads, so reordering is free and dropping or renaming a property
+    /// is not.
+    #[test]
+    fn the_smoke_test_arg_fixtures_are_the_drive_options_the_launch_builds() {
+        const SMOKE: &str = include_str!("../tests/windows_machine.rs");
+
+        /// The option as the set of pairs QEMU reads, not as a string.
+        fn pairs(option: &str) -> Vec<&str> {
+            let mut pairs = option.split(',').collect::<Vec<_>>();
+            pairs.sort_unstable();
+            pairs
+        }
+        let fixtures = SMOKE
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .filter(|pair| pair[0] == "-drive")
+            // The fixture is a Rust string in the test file, so the last option of each
+            // literal carries the closing quote and semicolon of the source line.
+            .map(|pair| pair[1].trim_end_matches(['"', ';']))
+            .collect::<Vec<_>>();
+        assert!(
+            fixtures.len() >= 4,
+            "the smoke test no longer writes the `-drive` fixtures this guard reads: {fixtures:?}"
+        );
+        let assert_pinned = |built: String| {
+            assert!(
+                fixtures
+                    .iter()
+                    .any(|fixture| pairs(fixture) == pairs(&built)),
+                "the smoke test parses a fixture no launch produces: `{built}` is not among \
+                 {fixtures:?}, so the helpers are reading the fixture and not the arguments"
+            );
+        };
+
+        let firmware = windows_firmware_args(
+            &VmFirmware {
+                code: PathBuf::from("/usr/share/edk2/x64/OVMF_CODE.4m.fd"),
+                vars: PathBuf::from("/run/qlean/VM-1/ovmf_vars.fd"),
+                secure_boot: false,
+            },
+            None,
+        )
+        .expect("firmware arguments");
+        let pflash = firmware
+            .iter()
+            .filter(|argument| argument.starts_with("if=pflash"))
+            .collect::<Vec<_>>();
+        assert_eq!(pflash.len(), 2, "one pflash option per OVMF image");
+        for option in pflash {
+            assert_pinned(option.clone());
+        }
+        assert_pinned(seed_drive_option(Path::new("/run/qlean/VM-1/seed.iso")).expect("seed"));
+        assert_pinned(
+            disk_drive_option(Path::new("/run/qlean/VM-1/overlay.img")).expect("overlay"),
+        );
+    }
+
     #[test]
     fn test_select_accel_never_falls_back_to_tcg_for_windows() {
         for (kvm, host_matches) in [(false, true), (true, false), (false, false)] {

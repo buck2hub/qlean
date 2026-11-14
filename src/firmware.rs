@@ -875,6 +875,58 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// The smoke test's swtpm fixture is the command line [`swtpm_args`] builds.
+    ///
+    /// `tests/windows_machine.rs` finds the TPM state directory by reading `swtpm`'s argv for
+    /// `--tpmstate dir=`. The argv it reads there is a hand-written string and says so - "a
+    /// fixture that drifts from them tests the fixture" - while nothing compared it with this
+    /// function. A drifted fixture would not fail here; it would fail on the one host with a
+    /// licensed image, after a 15 minute boot, as "the restart reused the same vars" being
+    /// decided from a directory that was never parsed.
+    ///
+    /// Two checks, because the fixture can drift in two ways: the options the parsers read
+    /// (`dir=<state dir>` and `type=...,mode=0600`) have to be in the fixture as this function
+    /// writes them, and `--tpmstate` has to sit directly in front of its `dir=` value, since
+    /// that adjacency is how `tpm_state_dir` finds the directory at all.
+    #[test]
+    fn the_smoke_test_arg_fixture_is_the_swtpm_command_line_the_launch_builds() {
+        const SMOKE: &str = include_str!("../tests/windows_machine.rs");
+
+        let args = swtpm_args(
+            Path::new("/run/qlean/VM-1/tpm"),
+            Path::new("/run/qlean/VM-1/swtpm.sock"),
+            Path::new("/run/qlean/VM-1/swtpm.log"),
+        );
+        // The two options whose contents decide what the smoke test can observe: where the
+        // state lives, and the control socket's mode.
+        for option in args
+            .iter()
+            .filter(|argument| argument.starts_with("dir=") || argument.starts_with("type="))
+        {
+            assert!(
+                SMOKE.contains(option.as_str()),
+                "the smoke test no longer carries swtpm's `{option}`, so the fixture it parses \
+                 is not the command line this crate launches"
+            );
+        }
+        // The flag that makes the state directory appear at all.
+        let at = args
+            .iter()
+            .position(|argument| argument == "--tpmstate")
+            .expect("swtpm is told where its state lives");
+        let parsed = SMOKE
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|pair| pair[0] == args[at] && pair[1] == args[at + 1]);
+        assert!(
+            parsed,
+            "the smoke test does not read `{} {}`: `tpm_state_dir` would answer `None`",
+            args[at],
+            args[at + 1]
+        );
+    }
+
     /// Per-call counter for [`temp_dir`].
     ///
     /// The old name used `Instant::now().elapsed().as_nanos()`, which is measured from an
