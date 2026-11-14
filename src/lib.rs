@@ -1714,6 +1714,47 @@ mod plan_doc_tests {
         }
     }
 
+    /// The two questions a Windows relaunch has to ask have one place to be asked.
+    ///
+    /// `launch` decides whether this launch takes the shared first-boot deadline and whether
+    /// it has to start a software TPM. Both decisions sat inline in `launch` and both could be
+    /// flipped without a single test failing (R244): dropping `is_init` from the deadline
+    /// expression and replacing `self.swtpm.is_none()` with `true` each left the suite green.
+    /// The predicates are tested on their own; this guard covers the wiring, so neither half
+    /// can be changed alone.
+    #[test]
+    fn test_launch_asks_the_two_windows_relaunch_questions_through_their_functions() {
+        let machine = CRATE_SOURCES
+            .iter()
+            .find(|(path, _)| *path == "src/machine.rs")
+            .map(|(_, source)| *source)
+            .expect("src/machine.rs is not in CRATE_SOURCES");
+        let launch = body_of(
+            machine,
+            "async fn launch(&mut self, is_init: bool) -> Result<()>",
+        );
+        let launch = launch.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            launch.contains(
+                "self.first_boot_deadline = takes_first_boot_deadline(is_init, \
+                 self.image.guest_os)"
+            ),
+            "launch no longer asks `takes_first_boot_deadline` with both `is_init` and the \
+             guest OS, so a Windows restart would draw on the first-boot budget again: {launch}"
+        );
+        assert!(
+            !launch.contains("is_init && self.image.guest_os"),
+            "launch spells the first-boot deadline condition out again instead of asking \
+             `takes_first_boot_deadline`"
+        );
+        assert!(
+            launch.contains("if needs_swtpm_start(self.swtpm.is_some()) {"),
+            "launch no longer asks `needs_swtpm_start` about the `swtpm` handle it already \
+             holds, so a restart could replace the process the guest's TPM was created against: \
+             {launch}"
+        );
+    }
+
     /// The seven ignored Windows smoke tests all stop at the precondition the plan describes.
     ///
     /// Every Windows smoke test reaches the host gate, because it builds its machine through it.

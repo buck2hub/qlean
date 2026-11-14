@@ -329,6 +329,31 @@ fn resolve_connect_timeout(config: &MachineConfig, guest_os: GuestOs, is_init: b
     resolve_ssh_timeout(config)
 }
 
+/// Whether this launch runs under the single Windows first-boot deadline.
+///
+/// One deadline covers the lease wait, the `sshd` wait and the deploy-marker wait of the
+/// *first* boot. A restart keeps the plain connect budget: the deployment happens once, and
+/// a later boot that spent the deploy budget on a dead `sshd` would report a first-boot
+/// timeout for a machine that had booted before.
+///
+/// The question is asked here, not spelled out inside `launch`, because a bare `is_init`
+/// dropped from that expression kept the suite green (R244): the claim "later boots keep the
+/// plain connect budget" had nothing watching it.
+fn takes_first_boot_deadline(is_init: bool, guest_os: GuestOs) -> bool {
+    is_init && guest_os == GuestOs::Windows
+}
+
+/// Whether this launch has to start the software TPM itself.
+///
+/// A machine that already started `swtpm` keeps that process: its state directory and control
+/// socket are what the guest's TPM 2.0 device was created against. Replacing the handle with
+/// a second `swtpm` on the same socket would drop the child that owns the first one, so the
+/// restart's TPM would be attached to a socket the guest never saw (R244: `launch` decided
+/// this with a bare `is_none()` and the suite could not tell).
+fn needs_swtpm_start(swtpm_already_started: bool) -> bool {
+    !swtpm_already_started
+}
+
 /// How long closing the SSH session may take during teardown.
 ///
 /// Closing an SSH session is a write to the guest: `eof`/`close`/`disconnect` all wait for
@@ -1738,7 +1763,7 @@ StandardError=journal
         // One deadline for the whole Windows first boot: the lease wait, the `sshd` wait and
         // the deploy-marker wait draw from the same budget instead of starting fresh each
         // time. Later boots keep the plain connect budget with no shared deadline.
-        self.first_boot_deadline = (is_init && self.image.guest_os == GuestOs::Windows)
+        self.first_boot_deadline = takes_first_boot_deadline(is_init, self.image.guest_os)
             .then(|| std::time::Instant::now() + ssh_timeout);
 
         // The pid file is cleared *before* the spawn: `read_pid` accepts the first number that
@@ -1770,7 +1795,7 @@ StandardError=journal
             crate::utils::create_owner_only_dir_all(&run_dir)?;
             let resolved = firmware::resolve_ovmf()?;
             let vars = firmware::prepare_vars(&run_dir, &resolved)?;
-            if self.swtpm.is_none() {
+            if needs_swtpm_start(self.swtpm.is_some()) {
                 self.swtpm = Some(Swtpm::start(&run_dir).await?);
             }
             let socket = match self.swtpm.as_ref() {
@@ -3685,6 +3710,39 @@ mod timeout_tests {
         assert!(
             !started(false, false),
             "nothing started means there is nothing to shut down"
+        );
+    }
+
+    #[test]
+    fn only_a_windows_first_boot_takes_the_shared_deadline() {
+        // The shared deadline exists so one budget covers lease, `sshd` and deploy marker.
+        // A restart draws on the plain connect budget instead: a machine that already booted
+        // must not report a first-boot timeout (R244).
+        assert!(
+            takes_first_boot_deadline(true, GuestOs::Windows),
+            "the Windows first boot is the case the deadline exists for"
+        );
+        assert!(
+            !takes_first_boot_deadline(false, GuestOs::Windows),
+            "a Windows restart keeps the plain connect budget"
+        );
+        assert!(
+            !takes_first_boot_deadline(true, GuestOs::Linux),
+            "a Linux first boot has no deployment to budget for"
+        );
+    }
+
+    #[test]
+    fn a_launch_starts_a_software_tpm_only_while_it_has_none() {
+        // Overwriting the handle with a second `swtpm` drops the child that owns the socket
+        // the guest's TPM 2.0 device was created against (R244).
+        assert!(
+            needs_swtpm_start(false),
+            "a machine without a software TPM has to start one"
+        );
+        assert!(
+            !needs_swtpm_start(true),
+            "a restart must keep the `swtpm` the machine already started"
         );
     }
 
