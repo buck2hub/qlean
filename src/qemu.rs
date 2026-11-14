@@ -431,6 +431,30 @@ fn qemu_arguments(
     Ok(args)
 }
 
+/// Remove the QMP socket a QEMU that is gone left behind.
+///
+/// The launcher asks QEMU to *bind* this path (`server=on`), and QEMU refuses a path that
+/// already exists, so a socket left by a crashed launch turns every later start of that VM
+/// into an option-parsing failure with no guest involved. The removal used to be an `exists()`
+/// check followed by `let _ = remove_file(..)`, which could not fail because it could not
+/// report: an unremovable name was reported by QEMU two steps later as `Failed to bind
+/// socket`, with nothing saying the VM had a leftover.
+fn clear_stale_qmp_socket(socket: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_file(socket) {
+        Ok(()) => Ok(()),
+        // No previous launch, so there is nothing to clear.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to remove the stale QMP socket {}: QEMU binds this path itself and \
+                 refuses one that already exists, so every launch of this VM would fail before \
+                 the guest starts",
+                socket.display()
+            )
+        }),
+    }
+}
+
 pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
     let dirs = QleanDirs::new()?;
     let run_dir = dirs.runs.join(&params.vmid);
@@ -438,9 +462,7 @@ pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> 
     // A socket left behind by a QEMU that died would answer for a process that is gone, and
     // QEMU refuses to bind the path again; it is removed before the launch.
     let (qmp_socket, _) = qmp_socket_and_args(&params.vmid)?;
-    if qmp_socket.exists() {
-        let _ = std::fs::remove_file(&qmp_socket);
-    }
+    clear_stale_qmp_socket(&qmp_socket)?;
 
     // The accelerator is a property of this host and this guest, not of the arguments, and it
     // is what refuses a Windows guest the TCG fallback - so it is decided here, once, and the
@@ -763,6 +785,73 @@ mod tests {
             args.iter()
                 .any(|arg| arg == &format!("socket,path={short},server=on,wait=off,id=qmp0")),
             "{args:?}"
+        );
+    }
+
+    /// A socket a dead QEMU left behind is cleared before QEMU is asked to bind it.
+    #[test]
+    fn a_stale_qmp_socket_is_removed_before_qemu_binds_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("qmp.sock");
+        std::fs::write(&socket, b"left by a launch that died").expect("stale socket");
+
+        clear_stale_qmp_socket(&socket).expect("a stale socket is cleared");
+        assert!(
+            !socket.exists(),
+            "QEMU refuses a socket path that already exists, so the stale one has to be gone"
+        );
+
+        // The same call on a machine that has never started is not an error.
+        clear_stale_qmp_socket(&socket).expect("nothing to clear is not a failure");
+    }
+
+    /// A leftover that cannot be removed says so, instead of being reported by QEMU later.
+    #[test]
+    fn a_stale_socket_that_cannot_be_removed_names_what_is_blocked() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("qmp.sock");
+        std::fs::create_dir(&socket).expect("a directory standing in for an unremovable name");
+
+        let error = clear_stale_qmp_socket(&socket).expect_err("a directory is not removable");
+        let message = format!("{error:#}");
+        assert!(message.contains("QMP socket"), "{message}");
+        assert!(
+            message.contains(&socket.display().to_string()),
+            "the failure has to name the leftover that blocks the launch: {message}"
+        );
+    }
+
+    /// The launch clears the socket it is about to bind, once, before assembling the arguments.
+    ///
+    /// The unit tests above prove the removal works; this pins that a launch performs it, at
+    /// the path `qmp_socket_and_args` chose, before the argument list that names the same path is
+    /// built. Dropping the call is invisible to every other test here - `qemu_arguments` still
+    /// answers correctly - and shows up on a real host as a VM that can never be started again
+    /// after its first crash.
+    #[test]
+    fn the_launch_clears_the_socket_before_it_assembles_the_arguments() {
+        let production = include_str!("qemu.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("split always yields a first part");
+        let call = "clear_stale_qmp_socket(&qmp_socket)?;";
+        assert_eq!(
+            production.matches(call).count(),
+            1,
+            "`launch_qemu` has to clear the stale socket exactly once"
+        );
+        let cleared = production.find(call).expect("the call is there");
+        let assembled = production
+            .find("qemu_arguments(&params, &run_dir, accel)")
+            .expect("the launcher no longer assembles its arguments");
+        assert!(
+            cleared < assembled,
+            "the socket has to be cleared before the argument list that names it is built"
+        );
+        assert!(
+            !production.contains("qmp_socket.exists()")
+                && !production.contains("remove_file(&qmp_socket)"),
+            "the leftover is cleared through `clear_stale_qmp_socket`, whose failure is reported"
         );
     }
 
@@ -1414,6 +1503,18 @@ mod tests {
         assert!(
             !windows.iter().any(|arg| arg.contains("vhost-vsock")),
             "a Windows guest has no vsock: {windows:?}"
+        );
+
+        // A CID that is not the fixture's own, so the assembled line has to follow the
+        // parameter rather than a value both happen to share (R258).
+        let mut other = launch_params(GuestOs::Linux, false);
+        other.cid = 7;
+        let other_args = args_of(&other);
+        assert!(
+            other_args
+                .iter()
+                .any(|arg| arg == "vhost-vsock-pci,id=vhost-vsock-pci0,guest-cid=7"),
+            "the assembled line carries the CID the machine was assigned: {other_args:?}"
         );
     }
 
@@ -2215,6 +2316,27 @@ mod tests {
             args[1].starts_with("vhost-vsock-pci,") && args[1].contains("guest-cid=42"),
             "{args:?}"
         );
+    }
+
+    /// The vsock device carries *this* machine's CID, whatever it happens to be.
+    ///
+    /// The two tests above both used 42 - which is also the fixture's CID - so writing
+    /// `guest-cid=42` into the argument instead of interpolating the parameter was invisible to
+    /// them (R258: it survived). The consequence is not a crash but a silent mis-route: qlean
+    /// reaches a Linux guest over vsock at `params.cid`, so a launch that always declares 42
+    /// connects to whichever guest the host gave 42, and two VMs cannot coexist.
+    #[test]
+    fn the_vsock_device_carries_the_cid_the_machine_was_assigned() {
+        for cid in [3u32, 42, 1337] {
+            let args = vsock_args(GuestOs::Linux, cid);
+            assert_eq!(args.len(), 2, "one `-device` and its value: {args:?}");
+            assert_eq!(args[0], "-device", "{args:?}");
+            assert_eq!(
+                args[1],
+                format!("vhost-vsock-pci,id=vhost-vsock-pci0,guest-cid={cid}"),
+                "the device has to declare the CID the machine was assigned ({cid})"
+            );
+        }
     }
 
     #[test]
