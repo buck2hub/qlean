@@ -815,7 +815,7 @@
 | 项 | 证据 |
 |---|---|
 | 新模块 | `src/firmware.rs`：OVMF 候选探测、`QLEAN_OVMF_CODE`/`QLEAN_OVMF_VARS`/`QLEAN_SWTPM` 覆盖、`prepare_vars`（首启复制、重启复用、拒绝 vars 模板大于 code 镜像的配对）、`Swtpm`（前台进程 + 控制 socket 等待 + `stop`/`Drop` 双保险） |
-| QEMU 参数 | `src/qemu.rs::windows_firmware_args`：`q35,hpet=off[,smm=on]`、可选 `cfi.pflash01 secure`、`if=pflash unit=0 readonly` code、`unit=1` per-VM vars、`chrtpm`/`tpm-tis` |
+| QEMU 参数 | `src/qemu.rs::windows_firmware_args`：`q35,hpet=off[,smm=on]`、可选 `cfi.pflash01 secure`、`if=pflash unit=0 readonly` code、`unit=1` per-VM vars、`chrtpm`/`tpm-tis`；三个路径（code/vars `file=`、`chrtpm` 的 `path=`）先过 `utils::option_field_text`——逗号/控制字符/空值之外还拒**非 UTF-8**（R241：`to_string_lossy` 会把坏字节换成 U+FFFD 从而指向**另一个文件**，容器里 QEMU 11.1.3 对真实 `bad\xff` 目录能打开、对换出来的 `bad\u{fffd}` 报 `Could not open … No such file or directory`），`test_windows_firmware_args_refuse_a_path_that_is_not_utf8` 逐个字段核对 |
 | 选项编码防护 | 所有插入逗号分隔 QEMU 值的宿主路径（overlay、seed ISO、QMP socket、serial logfile、OVMF code/vars、swtpm socket）统一经 `src/qemu.rs::qemu_option_path` 校验：空、含逗号、含控制字符在启动前报可操作错误，避免被解析成注入属性（R27，`85bc525`） |
 | 加速门 | `src/qemu.rs::select_accel`：Windows 无 KVM 或架构不匹配时 `bail!`，Linux 保持 KVM/TCG 回退 |
 | 状态机报错 | `src/machine.rs::session_or_operation_error`：未运行/启动失败/已关机统一返回可操作错误（含机器 id、操作名、`init`/`spawn` 指引），任何会话级入口都不再 panic（R30，`940dbe6`） |

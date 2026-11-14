@@ -1591,6 +1591,40 @@ mod tests {
         assert!(joined.contains("-device tpm-tis,tpmdev=tpm0"), "{joined}");
     }
 
+    /// The three paths that enter `windows_firmware_args` are refused when they are not UTF-8.
+    ///
+    /// R241: the guard converted instead, and the converted path named another file (measured in
+    /// the container: `Could not open '/t/lossy/bad\u{fffd}/OVMF_CODE.fd'` next to a real
+    /// `bad\xff` directory). Every one of the three has to answer for itself, or the fix covers
+    /// only the field someone happened to test.
+    #[test]
+    fn test_windows_firmware_args_refuse_a_path_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let bad = |name: &[u8]| PathBuf::from(std::ffi::OsStr::from_bytes(name));
+        let mut code = firmware(true);
+        code.code = bad(b"/run/qlean-\xff/OVMF_CODE.fd");
+        let mut vars = firmware(true);
+        vars.vars = bad(b"/run/qlean-\xff/ovmf_vars.fd");
+
+        let cases = [
+            (code, None, "OVMF code image"),
+            (vars, None, "OVMF vars image"),
+            (
+                firmware(true),
+                Some(bad(b"/run/qlean-\xff/swtpm.sock")),
+                "swtpm control socket",
+            ),
+        ];
+        for (firmware, socket, field) in cases {
+            let error = windows_firmware_args(&firmware, socket.as_deref())
+                .expect_err("a path that names another file is not usable")
+                .to_string();
+            assert!(error.contains(field), "{field}: {error}");
+            assert!(error.contains("not valid UTF-8"), "{field}: {error}");
+        }
+    }
+
     /// One rule for a path that travels inside an option list, whichever tool parses it.
     ///
     /// R239: `windows_firmware_args` refused a comma and `swtpm_args` handed it over, so

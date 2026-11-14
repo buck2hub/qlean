@@ -484,8 +484,25 @@ pub(crate) fn create_dir(purpose: &str, path: &Path) -> Result<()> {
 /// because "which characters end an option value" is one fact: two answers to it is how the
 /// QEMU argument builder came to reject a comma while the `swtpm` one handed it over. A space is
 /// fine - the value travels as a single argv element.
+///
+/// A path that is not valid UTF-8 is refused rather than converted. `to_string_lossy` replaces
+/// every invalid byte with U+FFFD, so the string it returns names *another* file: measured in the
+/// container (R241) with a directory `bad\xff`, QEMU given the converted path says
+/// `Could not open '/t/lossy/bad\u{fffd}/OVMF_CODE.fd': No such file or directory` while the real
+/// file sits right there - and if a directory spelled with U+FFFD existed, QEMU would open that
+/// file instead, i.e. the guest would boot firmware the caller never named. The caller gets the
+/// path and the reason instead of a substituted file; carrying it losslessly would mean `OsString`
+/// arguments throughout, which `path_argument` already does for the seed ISO.
 pub(crate) fn option_field_text(kind: &str, path: &Path) -> Result<String> {
-    let text = path.to_string_lossy().into_owned();
+    let Some(text) = path.to_str() else {
+        bail!(
+            "{kind} path `{}` is not valid UTF-8, so it cannot be carried in an option value \
+             without replacing bytes and naming a different file; move the run directory to a \
+             UTF-8 path",
+            path.display()
+        );
+    };
+    let text = text.to_string();
     if text.is_empty() {
         bail!("{kind} path is empty");
     }
@@ -2031,6 +2048,43 @@ mod tests {
         let networks = listed_networks(&output, "net-list --all").expect("a successful listing");
         assert!(networks.contains("qlean"), "{networks:?}");
         assert!(!networks.contains(""), "blank lines are not networks");
+    }
+
+    /// A path the guard would have to rewrite is refused, not converted.
+    ///
+    /// R241: `to_string_lossy` turns every invalid byte into U+FFFD, so the string it returns
+    /// names a *different* file. Measured in the container against QEMU 11.1.3: with a real
+    /// directory `bad\xff` holding `OVMF_CODE.fd`, QEMU started with that path reads the file,
+    /// while the converted path gives `Could not open '/t/lossy/bad\u{fffd}/OVMF_CODE.fd': No
+    /// such file or directory`. A directory spelled with U+FFFD would be opened instead - the
+    /// guest booting firmware the caller never named.
+    #[test]
+    fn test_option_field_text_refuses_a_path_it_would_have_to_rewrite() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = Path::new(std::ffi::OsStr::from_bytes(b"/run/qlean-\xff/OVMF_CODE.fd"));
+        let lossy = path.to_string_lossy().into_owned();
+        assert_ne!(
+            Path::new(&lossy),
+            path,
+            "the lossy text has to be a different path for this guard to matter"
+        );
+
+        let error = option_field_text("OVMF code image", path)
+            .expect_err("a path that cannot be carried is not a path that can be converted")
+            .to_string();
+        assert!(error.contains("not valid UTF-8"), "{error}");
+        assert!(
+            error.contains("OVMF code image"),
+            "the field that is wrong has to be named: {error}"
+        );
+
+        // The ordinary case still passes, unchanged and without a copy of the bytes.
+        let plain = Path::new("/run/qlean/OVMF_CODE.fd");
+        assert_eq!(
+            option_field_text("OVMF code image", plain).expect("a UTF-8 path"),
+            "/run/qlean/OVMF_CODE.fd"
+        );
     }
 
     #[test]
