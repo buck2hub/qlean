@@ -1692,7 +1692,7 @@ mod download_tree_tests {
 
     /// When the tree cannot be installed, the bytes are not thrown away: the error says where.
     #[test]
-    fn a_tree_that_cannot_be_installed_says_where_the_complete_download_is() {
+    fn a_tree_that_cannot_be_installed_says_where_the_rest_of_it_is() {
         let dir = scratch("occupied");
         let local = dir.join("out");
         std::fs::write(&local, b"a file where a tree has to go").expect("a file in the way");
@@ -1702,7 +1702,15 @@ mod download_tree_tests {
             .expect_err("a file cannot hold an entry of the tree");
 
         let text = format!("{error:#}");
-        assert!(text.contains("the complete download is left at"), "{text}");
+        // Whichever entry `read_dir` yields first - the file or the directory - the caller is
+        // pointed at the same place, so this assertion cannot depend on the order (R222).
+        assert!(
+            text.contains(&format!(
+                "the entries not yet installed are left at {}",
+                staged.display()
+            )),
+            "{text}"
+        );
         assert_eq!(
             std::fs::read(staged.join("deploy.json")).unwrap(),
             b"{}",
@@ -1713,6 +1721,85 @@ mod download_tree_tests {
             b"a file where a tree has to go",
             "the file in the way was replaced by a partial install"
         );
+    }
+
+    /// Every way a merge can fail points the caller at the same place.
+    ///
+    /// R222: the merge reported a directory it could not create as "failed to create the local
+    /// directory <path>" and nothing more, while its file branch named the download's location -
+    /// so the one sentence a caller with a half-installed tree needs depended on which entry
+    /// `read_dir` happened to yield first. A CI run whose directories sorted first found it; the
+    /// same commit passed locally. Each row blocks the merge at a different depth, so every error
+    /// site in the walk is reached: a file at the top, a directory at the top, a file one level
+    /// in, and a directory two levels in.
+    #[test]
+    fn every_merge_failure_says_where_the_rest_of_the_download_is() {
+        // (blocked shape, staged tree, entries that must still be staged afterwards)
+        let rows: [(&str, &[&str], &[&str]); 4] = [
+            ("a file at the top", &["deploy.json"], &["deploy.json"]),
+            (
+                "a directory at the top",
+                &["nested/deep.txt"],
+                &["nested/deep.txt"],
+            ),
+            (
+                "a file one level in",
+                &["nested/deep.txt"],
+                &["nested/deep.txt"],
+            ),
+            ("a directory two levels in", &["a/b/c.txt"], &["a/b/c.txt"]),
+        ];
+        for (shape, staged_files, still_staged) in rows {
+            let name = shape.replace(' ', "-");
+            let dir = scratch(&name);
+            let local = dir.join("out");
+            // The blocker: a file where a directory has to go, or a file where the tree itself
+            // has to go, one or two levels down.
+            match shape {
+                "a file at the top" | "a directory at the top" => {
+                    std::fs::write(&local, b"a file where a tree has to go")
+                        .expect("file in the way")
+                }
+                "a file one level in" => {
+                    std::fs::create_dir_all(&local).expect("destination directory");
+                    std::fs::write(local.join("nested"), b"a file in the way")
+                        .expect("file in the way");
+                }
+                _ => {
+                    std::fs::create_dir_all(local.join("a")).expect("destination directory");
+                    std::fs::write(local.join("a/b"), b"a file in the way")
+                        .expect("file in the way");
+                }
+            }
+            let staged = staged_download_path(&dir.join("out"));
+            for file in staged_files {
+                let path = staged.join(file);
+                std::fs::create_dir_all(path.parent().expect("parent")).expect("staged directory");
+                std::fs::write(&path, b"staged").expect("staged file");
+            }
+
+            let error = install_downloaded_tree(&staged, &local)
+                .expect_err("the merge cannot finish with a file in the way");
+            let text = format!("{error:#}");
+
+            // The closing parenthesis is part of what is checked: naming a path *inside* the
+            // staged tree is not the same answer - the caller was told about the tree, and the
+            // entries it is missing can be in sibling branches the named path does not cover.
+            assert!(
+                text.contains(&format!(
+                    "the entries not yet installed are left at {})",
+                    staged.display()
+                )),
+                "{shape}: the error does not say where the download is: {text}"
+            );
+            for file in still_staged {
+                assert!(
+                    staged.join(file).is_file(),
+                    "{shape}: the failed install emptied {}",
+                    staged.join(file).display()
+                );
+            }
+        }
     }
 
     /// A half tree that could not be removed is named: it holds the guest's files.
@@ -1955,37 +2042,67 @@ pub(crate) fn install_downloaded_tree(staged: &Path, local_root: &Path) -> Resul
 
 /// Move a staged tree into a directory that already exists, entry by entry.
 ///
-/// The staged tree is emptied as it goes, so the staging directory is gone when this returns and
-/// is still the whole answer when it fails - the error names it, which is the one thing a caller
-/// with a half-installed tree needs to know.
+/// A merge consumes the staged tree as it goes, so a failure partway leaves the entries that
+/// already moved at the caller's name and everything else still staged - this is not an atomic
+/// install and does not pretend to be (a fresh name in [`install_downloaded_tree`] is). What it
+/// does owe a caller with a half-installed tree is one place to look, so every error below names
+/// the same directory: the staged root the caller was told about. R222: the directory branch said
+/// only "failed to create the local directory <path>", the file branch named the staged *file*
+/// rather than the staged *directory*, and the doc above claimed the staging tree was "still the
+/// whole answer when it fails". Whether a caller got the location therefore depended on the order
+/// `read_dir` yielded entries in - a CI run whose directories came first lost the sentence, the
+/// same commit passed locally.
+///
+/// `root` is the staging directory the download was announced at; `staged` is the subtree being
+/// walked right now.
 fn merge_downloaded_tree(staged: &Path, local_root: &Path) -> Result<()> {
+    merge_downloaded_tree_into(staged, local_root, staged)
+}
+
+fn merge_downloaded_tree_into(staged: &Path, local_root: &Path, root: &Path) -> Result<()> {
+    let left_at = || {
+        format!(
+            "the entries not yet installed are left at {}",
+            root.display()
+        )
+    };
     let entries = std::fs::read_dir(staged).with_context(|| {
         format!(
-            "failed to read the staged download {} (the complete download is left there)",
-            staged.display()
+            "failed to read the staged download {} ({})",
+            staged.display(),
+            left_at()
         )
     })?;
     for entry in entries {
-        let entry = entry
-            .with_context(|| format!("failed to read the staged download {}", staged.display()))?;
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to read the staged download {} ({})",
+                staged.display(),
+                left_at()
+            )
+        })?;
         let from = entry.path();
         let to = local_root.join(entry.file_name());
-        let metadata = std::fs::symlink_metadata(&from)
-            .with_context(|| format!("failed to inspect the staged {}", from.display()))?;
+        let metadata = std::fs::symlink_metadata(&from).with_context(|| {
+            format!(
+                "failed to inspect the staged {} ({})",
+                from.display(),
+                left_at()
+            )
+        })?;
         if metadata.is_dir() {
             std::fs::create_dir_all(&to).with_context(|| {
-                format!("failed to create the local directory {}", to.display())
-            })?;
-            merge_downloaded_tree(&from, &to)?;
-        } else {
-            // A file (or a link, which this crate never stages) replaces its name in one step.
-            std::fs::rename(&from, &to).with_context(|| {
                 format!(
-                    "failed to install {} (the complete download is left at {})",
+                    "failed to create the local directory {} ({})",
                     to.display(),
-                    from.display()
+                    left_at()
                 )
             })?;
+            merge_downloaded_tree_into(&from, &to, root)?;
+        } else {
+            // A file (or a link, which this crate never stages) replaces its name in one step.
+            std::fs::rename(&from, &to)
+                .with_context(|| format!("failed to install {} ({})", to.display(), left_at()))?;
         }
     }
     std::fs::remove_dir(staged).with_context(|| {

@@ -324,6 +324,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "URL scheme is not allowed", while the same file as a bare path worked. `file:///abs/path`
   and `file://localhost/abs/path` are now read as the paths they name; a `file://` URL with a
   host component or percent-escapes is refused with the fix in the message.
+- Installing a downloaded tree into an existing directory reported only the path it could not
+  create when the failure came from a directory, and pointed at a single staged file when it
+  came from a file - so whether the caller learned where the rest of the download is depended
+  on which entry the filesystem listed first. Every failure now names the staged directory
+  the entries that were not installed are still in.
 - The Windows seed medium's `deploy.json` was written with the umask's permissions, so it was
   readable by every local user while the medium's own documentation says its files are `0600`;
   `authorized_keys` was written at the umask's permissions too and then `chmod`ed. All three
