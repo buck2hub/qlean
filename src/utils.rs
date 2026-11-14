@@ -421,10 +421,17 @@ pub(crate) struct QleanDirs {
 impl QleanDirs {
     pub(crate) fn new() -> Result<Self> {
         let project_dir = project_dir_or_explain(ProjectDirs::from("", "", "qlean"))?;
+        Self::under(project_dir.data_dir().to_path_buf())
+    }
 
-        // Dir containing persistent data (usually ~/.local/share/qlean/)
-        let data_dir = project_dir.data_dir().to_path_buf();
-        create_dir("data", &data_dir)?;
+    /// The four directories under `data_dir`, each created owner-only.
+    ///
+    /// Kept separate from [`QleanDirs::new`] so the refusal of a data directory at the
+    /// filesystem root, and the advice attached when one of the four cannot be created, can be
+    /// exercised without redefining the test process's own environment.
+    fn under(data_dir: PathBuf) -> Result<Self> {
+        data_dir_has_a_real_home(&data_dir)?;
+        create_dir("data", &data_dir).with_context(|| data_dir_advice(&data_dir))?;
 
         // Dir containing cached images (usually ~/.local/share/qlean/images/)
         let images = data_dir.join("images");
@@ -444,6 +451,40 @@ impl QleanDirs {
             runs,
         })
     }
+}
+
+/// Refuse a data directory that only exists because the account's home is `/`.
+///
+/// With `HOME` unset (a container, `env -i`, `sudo` without `-E`), `ProjectDirs` falls back to
+/// the passwd entry, and an account whose home is `/` resolves the data directory to
+/// `/.local/share/qlean` - a path at the filesystem root, which is never a home directory and
+/// holds the client private key plus every VM's host key. Accepting it turns a missing
+/// environment variable into `failed to create the data directory` with a permission error,
+/// which reads like a bug in Qlean; refuse it with the same advice the missing-environment
+/// case gives.
+fn data_dir_has_a_real_home(data_dir: &Path) -> Result<()> {
+    if data_dir == Path::new("/.local/share/qlean") {
+        anyhow::bail!(
+            "cannot place Qlean's data directory at {data_dir:?}: the account's home directory \
+             is `/`, so the data directory resolves to the filesystem root. {}",
+            data_dir_advice(data_dir)
+        );
+    }
+    Ok(())
+}
+
+/// Say where the data directory came from whenever it cannot be created.
+///
+/// The path alone is not actionable: `/.local/share/qlean` or
+/// `/nonexistent/.local/share/qlean` is what an unset account home looks like, and only the
+/// environment variable that overrides it lets the user move it somewhere writable.
+fn data_dir_advice(data_dir: &Path) -> String {
+    format!(
+        "Qlean's data directory ({}) comes from `XDG_DATA_HOME` when it is set, and from the \
+         account's home directory otherwise; set `XDG_DATA_HOME` (for example \
+         `/var/lib/qlean`) to place it somewhere writable",
+        data_dir.display()
+    )
 }
 
 /// Explain why Qlean has no data directory instead of panicking inside `ProjectDirs`.
@@ -1886,6 +1927,91 @@ mod tests {
             lease_address_for(&leases, "52:54:00:aa:bb:cc").map(|ip| ip.to_string()),
             Some("192.168.221.77".to_string())
         );
+    }
+
+    /// A data directory at the filesystem root is what an account whose home is `/` produces,
+    /// not a place Qlean may keep private keys in.
+    #[test]
+    fn test_a_data_directory_at_the_filesystem_root_is_refused() {
+        let err = data_dir_has_a_real_home(Path::new("/.local/share/qlean"))
+            .expect_err("an account home of `/` must not become a data directory")
+            .to_string();
+        assert!(err.contains("the account's home directory is `/`"), "{err}");
+        assert!(err.contains("XDG_DATA_HOME"), "{err}");
+
+        data_dir_has_a_real_home(Path::new("/home/me/.local/share/qlean"))
+            .expect("a real home directory is fine");
+        data_dir_has_a_real_home(Path::new("/var/lib/qlean"))
+            .expect("an override is fine whatever it is");
+    }
+
+    /// The advice names the override and the path, because the path alone reads like a bug.
+    #[test]
+    fn test_the_data_directory_advice_names_the_override_and_the_path() {
+        let advice = data_dir_advice(Path::new("/.local/share/qlean"));
+        assert!(advice.contains("XDG_DATA_HOME"), "{advice}");
+        assert!(advice.contains("/.local/share/qlean"), "{advice}");
+        assert!(
+            !advice.contains("\n"),
+            "one line, not a paragraph: {advice}"
+        );
+    }
+
+    /// The data directory the four Qlean directories are built under is checked on the way in,
+    /// not only by a helper the production path could stop calling.
+    #[test]
+    fn test_the_qlean_directories_refuse_a_data_directory_at_the_filesystem_root() {
+        let err = QleanDirs::under(PathBuf::from("/.local/share/qlean"))
+            .err()
+            .expect("an account home of `/` must not become a data directory")
+            .to_string();
+        assert!(err.contains("the account's home directory is `/`"), "{err}");
+        assert!(err.contains("XDG_DATA_HOME"), "{err}");
+
+        let root = std::env::temp_dir().join(format!(
+            "qlean-dirs-under-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let dirs = QleanDirs::under(root.clone()).expect("a writable data directory is fine");
+        assert_eq!(dirs.base, root);
+        for (name, path) in [
+            ("images", &dirs.images),
+            ("secrets", &dirs.secrets),
+            ("runs", &dirs.runs),
+        ] {
+            assert!(path.is_dir(), "the {name} directory should exist: {path:?}");
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A data directory that cannot be created says where it came from, because the path on its
+    /// own (`/.local/share/qlean`, `/nonexistent/.local/share/qlean`) reads like a bug in Qlean.
+    #[test]
+    fn test_a_data_directory_that_cannot_be_created_says_where_it_came_from() {
+        let root = std::env::temp_dir().join(format!(
+            "qlean-dirs-advice-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&root).expect("temp root");
+        // A regular file where a directory would have to be: `create_dir_all` fails with ENOTDIR.
+        let blocker = root.join("not-a-directory");
+        std::fs::write(&blocker, b"x").expect("blocker file");
+
+        let err = QleanDirs::under(blocker.join("data"))
+            .err()
+            .expect("an uncreatable data directory must be reported")
+            .to_string();
+        assert!(err.contains("XDG_DATA_HOME"), "{err}");
+        assert!(err.contains("not-a-directory"), "{err}");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

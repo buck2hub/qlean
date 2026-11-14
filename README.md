@@ -419,6 +419,8 @@ More examples live in the [tests](tests) directory.
 
 Qlean uses a dedicated libvirt virtual network for isolated, reproducible connectivity between test VMs. The default definition is written to `~/.local/share/qlean/network.xml`:
 
+Qlean's data directory is `$XDG_DATA_HOME/qlean` when `XDG_DATA_HOME` is set, and `~/.local/share/qlean` otherwise. A host where the account's home directory is `/` (a container, `env -i`, `sudo` without `-E`) has nowhere sensible to put it, so Qlean refuses that path by name instead of trying to create `/.local/share/qlean`; set `XDG_DATA_HOME` to a writable directory in that case.
+
 ```xml
 <network>
   <name>qlean</name>
