@@ -324,6 +324,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "URL scheme is not allowed", while the same file as a bare path worked. `file:///abs/path`
   and `file://localhost/abs/path` are now read as the paths they name; a `file://` URL with a
   host component or percent-escapes is refused with the fix in the message.
+- The Windows seed medium's `deploy.json` was written with the umask's permissions, so it was
+  readable by every local user while the medium's own documentation says its files are `0600`;
+  `authorized_keys` was written at the umask's permissions too and then `chmod`ed. All three
+  files on the medium are now created owner-only and installed by a rename, so an interrupted
+  run cannot leave a truncated `deploy.json` that still parses as some contract.
 - A link placed where a VM's per-VM OVMF vars image belongs was followed instead of refused:
   a link to a shared template had its target chmodded to `0600`, and a dangling link made the
   copy branch create the file it named, outside the run directory. Such an entry is now

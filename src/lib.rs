@@ -1908,6 +1908,38 @@ mod plan_doc_tests {
         );
     }
 
+    /// Every file on the Windows seed medium is written by the one owner-only writer.
+    ///
+    /// R221: the medium's own documentation says its files are `0600`, and three writers
+    /// disagreed - `authorized_keys` used `tokio::fs::write` then a `chmod` (a window at the
+    /// umask's `0644`), `deploy.json` used `tokio::fs::write` and no restriction at all, and
+    /// only the host private key used the atomic owner-only writer. The test that was supposed
+    /// to pin this named two of the three files, so the forgotten one passed. This guard pins
+    /// the rule at the source instead: no bare write inside `stage`, and one owner-only write
+    /// for every file path it stages.
+    #[test]
+    fn every_file_on_the_windows_seed_medium_is_written_owner_only() {
+        let source = include_str!("windows.rs");
+        let body = function_body(source, "    pub(crate) async fn stage(");
+
+        assert!(
+            !body.contains("tokio::fs::write(") && !body.contains("std::fs::write("),
+            "a bare write creates the file at the umask's permissions, and a `chmod` afterwards \
+             leaves that window open"
+        );
+        let staged = body.matches("root.join(\"").count();
+        let owner_only = body.matches("write_owner_only_atomically(&").count();
+        assert_eq!(
+            staged, owner_only,
+            "the medium stages {staged} file paths but writes {owner_only} of them owner-only"
+        );
+        assert_eq!(
+            staged, 3,
+            "the seed medium's file set changed: `authorized_keys`, `deploy.json` and \
+             `ssh_host_ed25519_key` are what the documentation describes"
+        );
+    }
+
     /// The per-VM vars image is classified from its own attributes, never through a link.
     ///
     /// R220: `prepare_vars` decided with `dest.is_file()`, a following `stat`. A link to a

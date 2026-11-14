@@ -240,28 +240,33 @@ impl DeploySeed {
         crate::utils::restrict_dir(&dir)?;
         crate::utils::restrict_dir(&root)?;
 
+        // Every file on this medium is written by the same helper, which creates it owner-only
+        // and installs it by a rename. R221: `authorized_keys` was written with
+        // `tokio::fs::write` and `chmod`ed afterwards - a window at the umask's `0644` - and
+        // `deploy.json` was written with `tokio::fs::write` and never restricted at all, so a
+        // file the seed's own documentation says is 0600 was readable by every local user; the
+        // atomic install also means a crash cannot leave a truncated `deploy.json` that still
+        // parses as *some* contract.
         let authorized_keys = ensure_trailing_newline(client_pubkey);
         let authorized_keys_path = root.join("authorized_keys");
-        tokio::fs::write(&authorized_keys_path, authorized_keys)
-            .await
+        crate::utils::write_owner_only_atomically(&authorized_keys_path, &authorized_keys)
             .with_context(|| {
                 format!(
                     "failed to write Windows seed authorized_keys at {}",
                     authorized_keys_path.display()
                 )
             })?;
-        set_owner_only(&authorized_keys_path).await?;
 
-        let contract = serde_json::to_vec_pretty(&DeployContract::current())?;
+        let contract = serde_json::to_string_pretty(&DeployContract::current())?;
         let contract_path = root.join("deploy.json");
-        tokio::fs::write(&contract_path, contract)
-            .await
-            .with_context(|| {
+        crate::utils::write_owner_only_atomically(&contract_path, &contract).with_context(
+            || {
                 format!(
                     "failed to write Windows seed contract at {}",
                     contract_path.display()
                 )
-            })?;
+            },
+        )?;
 
         let host_key_path = root.join("ssh_host_ed25519_key");
         // This is a private key: it must be owner-only from the moment it exists, not
@@ -451,10 +456,6 @@ fn ensure_seed_medium_is_sealed(path: &Path) -> Result<()> {
         path.display()
     );
     Ok(())
-}
-
-async fn set_owner_only(path: &Path) -> Result<()> {
-    crate::utils::restrict_file(path)
 }
 
 /// Quote a path as a PowerShell single-quoted literal.
@@ -802,10 +803,27 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let (_seed, _host_key) = stage(tmp.path()).await?;
         let root = tmp.path().join("seed").join(SEED_ROOT);
-        for name in ["authorized_keys", "ssh_host_ed25519_key"] {
-            let mode = std::fs::metadata(root.join(name))?.permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "{name} should be 0600, got {mode:o}");
+        // Every file on the medium, discovered instead of listed: R221 found `deploy.json` at
+        // 0700-directory-only protection because this list named two of the three files, and a
+        // list is a sample - the set of files is the claim, so the set is what gets checked.
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(&root)? {
+            let entry = entry?;
+            let mode = entry.metadata()?.permissions().mode() & 0o777;
+            assert_eq!(
+                mode,
+                0o600,
+                "{} should be 0600, got {mode:o}",
+                entry.path().display()
+            );
+            names.push(entry.file_name().to_string_lossy().into_owned());
         }
+        names.sort();
+        assert_eq!(
+            names,
+            ["authorized_keys", "deploy.json", "ssh_host_ed25519_key"],
+            "the medium holds a different set of files than the documentation describes"
+        );
         // The directories must not be traversable either: the host private key and the
         // seed medium live inside them.
         for path in [tmp.path().join("seed"), root] {
