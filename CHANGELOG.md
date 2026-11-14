@@ -38,6 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Machine::open_interactive_shell` returns an actionable error for `GuestOs::Windows` instead of attempting a vsock shell
 - `is_running` no longer reports a live QEMU as stopped just because its control socket is missing: a live process without a socket is an error, so a second QEMU cannot be started on the same disk
 - `with_pool` no longer requires `/dev/vhost-vsock`, and `with_machine` requires it only for `GuestOs::Linux`
+- The two SSH command loops end through one shared decision instead of each matching the
+  channel's messages itself: what a message means to a loop waiting for an exit status - a status,
+  an `exit-signal`, or ordinary traffic - is answered once, so `call` and `run_command` cannot
+  disagree about whether a command has ended, and the answer can be exercised with real channel
+  messages rather than by reading the arm
 
 ### Fixed
 - A download that failed or was cancelled left the half it had received under the target's own

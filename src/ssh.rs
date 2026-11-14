@@ -463,83 +463,62 @@ pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
 mod exit_signal_tests {
     use super::*;
 
-    /// Every match block in this file that waits for an exit status, by brace matching.
+    /// The source after each `wait().await else`, up to the next one: one region per channel loop.
     ///
-    /// A text search would answer "does the file mention it" - which one loop can satisfy while
-    /// the other keeps dropping the message. These are the two loops that wait for a command.
-    fn match_blocks(source: &str) -> Vec<&str> {
-        let opener = concat!("match ", "msg {");
-        let mut out = Vec::new();
+    /// A text search over the whole file would answer "does the file mention it" - which one loop
+    /// can satisfy while the other keeps dropping the message. These are the loops that wait.
+    fn wait_regions(source: &str) -> Vec<&str> {
+        let anchor = concat!(".wait().await", " else");
+        let mut regions = Vec::new();
         let mut from = 0;
-        while let Some(at) = source[from..].find(opener) {
-            let start = from + at + opener.len() - 1;
-            let mut depth = 0usize;
-            let mut end = source.len();
-            for (offset, ch) in source[start..].char_indices() {
-                match ch {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth = depth.saturating_sub(1);
-                        if depth == 0 {
-                            end = start + offset + 1;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            out.push(&source[start..end]);
-            from = end;
+        while let Some(at) = source[from..].find(anchor) {
+            let start = from + at;
+            let next = source[start + anchor.len()..]
+                .find(anchor)
+                .map(|more| start + anchor.len() + more)
+                .unwrap_or(source.len());
+            regions.push(&source[start..next]);
+            from = next;
         }
-        out
+        regions
     }
 
-    /// Both command loops turn an `exit-signal` into the reason, not into a dropped connection.
+    /// No loop that waits on a channel can loop forever or end for the wrong reason.
     ///
-    /// `call` (which streams to the host's stdout) and `run_command` (which collects) each wait
-    /// for the same messages, and each dropped `exit-signal` the same way: the channel closed and
-    /// the caller was told "SSH channel closed before exit status", which is also what a pulled
-    /// cable says. Fixing one loop and not the other is exactly the drift this catches.
-    ///
-    /// The two interactive-shell readers end on `exit-status`, `eof` or `close` and return
-    /// `Ok(None)`, so a signal-killed shell is already finished for them - `eof` follows the
-    /// signal. They pass the same check because they name a terminator that does arrive.
+    /// The two command loops end through [`command_step`] (R204), which is where `exit-signal` is
+    /// turned into the reason; the two interactive-shell readers end on `exit-status`, `eof` or
+    /// `close` and return `Ok(None)`, so a signal-killed shell is already finished for them -
+    /// `eof` follows the signal. Every loop that waits therefore has to name one of those: a
+    /// decision that can end it, the signal itself, or the terminator that arrives after one.
     #[test]
-    fn both_command_loops_report_a_signal_killed_command() {
+    fn every_loop_waiting_for_a_status_can_end_a_signal_killed_command() {
         const SOURCE: &str = include_str!("ssh.rs");
-        let waits_for_status = concat!("ChannelMsg::", "ExitStatus");
-        let signal_arm = concat!("ChannelMsg::", "ExitSignal");
+        let decides = concat!("command_", "step(&msg");
+        let handles_signal = concat!("ChannelMsg::", "ExitSignal");
         let ends_anyway = concat!("ChannelMsg::", "Eof");
 
-        let blocks = match_blocks(SOURCE);
-        let loops: Vec<&str> = blocks
-            .iter()
-            .copied()
-            .filter(|block| block.contains(waits_for_status))
-            .collect();
+        let loops = wait_regions(SOURCE);
         assert!(
-            loops.len() >= 2,
-            "the file has {} loops waiting for an exit status, not 2: the scan is looking at the \
-             wrong blocks",
+            loops.len() >= 4,
+            "only {} loops wait on a channel: the scan is looking at the wrong regions",
             loops.len()
         );
-        let mut reporting = 0;
         for (index, block) in loops.iter().enumerate() {
-            if block.contains(signal_arm) {
-                reporting += 1;
-                continue;
-            }
             assert!(
-                block.contains(ends_anyway),
-                "command loop {} waits for `exit-status`, ignores `exit-signal` and does not end on \
-                 `eof` either: a command the guest killed is reported as a dropped \
-                 connection:\n{block}",
+                block.contains(decides)
+                    || block.contains(handles_signal)
+                    || block.contains(ends_anyway),
+                "loop {} waits on a channel but neither decides through the shared function, nor \
+                 handles `exit-signal`, nor ends on `eof`: a command the guest killed would be \
+                 reported as a dropped connection:\n{block}",
                 index + 1
             );
         }
-        assert!(
-            reporting >= 2,
-            "only {reporting} loops report an exit signal: `call` and `run_command` both must"
+        let deciding = loops.iter().filter(|block| block.contains(decides)).count();
+        assert_eq!(
+            deciding, 2,
+            "`call` and `run_command` are the two loops that wait for a command, and both must \
+             decide through the shared function"
         );
     }
 
@@ -874,6 +853,112 @@ mod download_staging_tests {
     }
 }
 
+#[cfg(test)]
+mod command_step_tests {
+    use super::*;
+
+    /// The real `ChannelMsg` variant, not an argument list of my own choosing.
+    fn exit_signal(signal: russh::Sig, core_dumped: bool, report: &str) -> ChannelMsg {
+        ChannelMsg::ExitSignal {
+            signal_name: signal,
+            core_dumped,
+            error_message: report.to_string(),
+            lang_tag: "en".to_string(),
+        }
+    }
+
+    #[test]
+    fn an_exit_status_ends_the_loop_with_its_code() {
+        assert_eq!(
+            command_step(
+                &ChannelMsg::ExitStatus { exit_status: 7 },
+                "powershell -Command exit 7"
+            ),
+            CommandStep::Finished(7)
+        );
+        assert_eq!(
+            command_step(&ChannelMsg::ExitStatus { exit_status: 0 }, "true"),
+            CommandStep::Finished(0)
+        );
+    }
+
+    /// The pair that was never proven: the message has to arrive as the *reason*.
+    ///
+    /// Every field is distinct in this message, so a wiring mistake (the guest's report read as
+    /// the signal, the core-dump flag ignored) cannot pass for the right one.
+    #[test]
+    fn an_exit_signal_ends_the_loop_with_the_signal_the_dump_and_the_report() {
+        let step = command_step(
+            &exit_signal(russh::Sig::KILL, true, "Out of memory: killed process 4120"),
+            "powershell -Command ./ql-deploy.ps1",
+        );
+        let CommandStep::Killed(message) = step else {
+            panic!("a signal-killed command must end the loop, got {step:?}");
+        };
+        assert!(message.contains("SIGKILL"), "{message}");
+        assert!(message.contains("dumped core"), "{message}");
+        assert!(
+            message.contains("Out of memory: killed process 4120"),
+            "{message}"
+        );
+        assert!(
+            message.contains("powershell -Command ./ql-deploy.ps1"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("closed before exit status"),
+            "the channel sentence blamed the transport: {message}"
+        );
+    }
+
+    #[test]
+    fn the_server_name_of_a_signal_outside_the_rfc_list_survives() {
+        let step = command_step(
+            &exit_signal(russh::Sig::Custom("SIGSYS".to_string()), false, ""),
+            "cmd",
+        );
+        let CommandStep::Killed(message) = step else {
+            panic!("expected a killed step, got {step:?}");
+        };
+        assert!(message.contains("SIGSYS"), "{message}");
+        assert!(
+            !message.contains("dumped core"),
+            "no dump was reported: {message}"
+        );
+    }
+
+    /// Output and the rest of the traffic must not be mistaken for an ending.
+    #[test]
+    fn output_and_benign_messages_do_not_end_the_loop() {
+        for msg in [
+            ChannelMsg::Data {
+                data: b"hello".to_vec().into(),
+            },
+            ChannelMsg::ExtendedData {
+                data: b"warning".to_vec().into(),
+                ext: 1,
+            },
+            ChannelMsg::Success,
+            ChannelMsg::Eof,
+            ChannelMsg::Close,
+        ] {
+            assert_eq!(command_step(&msg, "cmd"), CommandStep::Output);
+        }
+    }
+
+    /// Both command loops end through the same decision, so they cannot disagree.
+    #[test]
+    fn both_command_loops_decide_through_one_function() {
+        const SOURCE: &str = include_str!("ssh.rs");
+        let call_site = concat!("command_", "step(&msg, command)");
+        assert_eq!(
+            SOURCE.matches(call_site).count(),
+            2,
+            "the loops that wait for a status do not both go through the decision function"
+        );
+    }
+}
+
 /// Run `operation` with a budget, naming it as Qlean's own limit rather than the guest's.
 async fn bounded<T>(
     budget: Duration,
@@ -929,6 +1014,46 @@ fn install_download(staged: &Path, local: &Path) -> Result<()> {
             local.display()
         )
     })
+}
+
+/// What one message from a command channel means to the loop waiting for a status.
+#[derive(Debug, PartialEq, Eq)]
+enum CommandStep {
+    /// The command finished with this exit code.
+    Finished(u32),
+    /// The command was killed: the server sent `exit-signal` instead of a status, so there is no
+    /// code to report and the reason is in the message.
+    Killed(String),
+    /// Anything else - output, a window adjustment, an open confirmation - leaves the loop alone.
+    Output,
+}
+
+/// Decide what one channel message does to a command loop.
+///
+/// The decision lives here so it can be given real messages: `ChannelMsg::ExitSignal` reads
+/// `signal_name`, `core_dumped` and `error_message`, and the tests hand it one of those variants
+/// rather than calling [`killed_by_signal`] directly, which is what let the arm's wiring go
+/// unproven when the arm first existed. Both command loops decide here, so `call` and
+/// `run_command` cannot disagree about what ends a command.
+fn command_step(msg: &ChannelMsg, command: &str) -> CommandStep {
+    match msg {
+        ChannelMsg::ExitStatus { exit_status } => CommandStep::Finished(*exit_status),
+        // A killed command has no exit status: the server sends `exit-signal` instead and closes
+        // the channel, so waiting for a status would report a dropped connection whenever the
+        // guest killed the command.
+        ChannelMsg::ExitSignal {
+            signal_name,
+            core_dumped,
+            error_message,
+            ..
+        } => CommandStep::Killed(killed_by_signal(
+            command,
+            signal_name,
+            *core_dumped,
+            error_message,
+        )),
+        _ => CommandStep::Output,
+    }
 }
 
 /// The signal an SSH `exit-signal` names, in the spelling Qlean reports.
@@ -1384,38 +1509,27 @@ impl Session {
                     command
                 );
             };
-            match msg {
-                // Write data to the terminal
-                ChannelMsg::Data { ref data } => {
-                    stdout.write_all(data).await?;
-                    stdout.flush().await?;
-                }
-                ChannelMsg::ExtendedData { ref data, ext: 1 } => {
-                    // ext == 1 means it's stderr content
-                    // https://github.com/Eugeny/russh/discussions/258
-                    stderr.write_all(data).await?;
-                    stderr.flush().await?;
-                }
-
-                // The command has returned an exit code
-                ChannelMsg::ExitStatus { exit_status } => {
-                    code = exit_status;
+            match command_step(&msg, command) {
+                CommandStep::Finished(status) => {
+                    code = status;
                     channel.eof().await?;
                     break;
                 }
-                // A command killed by a signal never gets an exit status: the server sends
-                // `exit-signal` instead and closes. Ignoring it made this loop report a
-                // dropped connection for a guest that killed the command.
-                ChannelMsg::ExitSignal {
-                    signal_name,
-                    core_dumped,
-                    error_message,
-                    ..
-                } => bail!(
-                    "{}",
-                    killed_by_signal(command, &signal_name, core_dumped, &error_message)
-                ),
-                _ => {}
+                CommandStep::Killed(message) => bail!("{message}"),
+                CommandStep::Output => match msg {
+                    // Write data to the terminal
+                    ChannelMsg::Data { ref data } => {
+                        stdout.write_all(data).await?;
+                        stdout.flush().await?;
+                    }
+                    ChannelMsg::ExtendedData { ref data, ext: 1 } => {
+                        // ext == 1 means it's stderr content
+                        // https://github.com/Eugeny/russh/discussions/258
+                        stderr.write_all(data).await?;
+                        stderr.flush().await?;
+                    }
+                    _ => {}
+                },
             }
         }
         Ok(code)
@@ -1478,33 +1592,25 @@ impl Session {
                     command
                 );
             };
-            match msg {
-                // Write data to the buffer
-                ChannelMsg::Data { ref data } => {
-                    stdout.extend_from_slice(data);
-                }
-                ChannelMsg::ExtendedData { ref data, ext: 1 } => {
-                    // ext == 1 means it's stderr content
-                    // https://github.com/Eugeny/russh/discussions/258
-                    stderr.extend_from_slice(data);
-                }
-                // The command has returned an exit code
-                ChannelMsg::ExitStatus { exit_status } => {
-                    code = exit_status;
+            match command_step(&msg, command) {
+                CommandStep::Finished(status) => {
+                    code = status;
                     channel.eof().await?;
                     break;
                 }
-                // Same arm as `call`, for the same reason: no exit status is coming.
-                ChannelMsg::ExitSignal {
-                    signal_name,
-                    core_dumped,
-                    error_message,
-                    ..
-                } => bail!(
-                    "{}",
-                    killed_by_signal(command, &signal_name, core_dumped, &error_message)
-                ),
-                _ => {}
+                CommandStep::Killed(message) => bail!("{message}"),
+                CommandStep::Output => match msg {
+                    // Write the chunk to the buffer
+                    ChannelMsg::Data { ref data } => {
+                        stdout.extend_from_slice(data);
+                    }
+                    ChannelMsg::ExtendedData { ref data, ext: 1 } => {
+                        // ext == 1 means it's stderr content
+                        // https://github.com/Eugeny/russh/discussions/258
+                        stderr.extend_from_slice(data);
+                    }
+                    _ => {}
+                },
             }
         }
         Ok((code, stdout, stderr))
