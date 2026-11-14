@@ -4116,14 +4116,22 @@ mod plan_doc_tests {
         );
     }
 
-    /// The traceability table points at names, not at line numbers.
+    /// The traceability table points at names that exist, not at line numbers.
     ///
     /// R127 taught this table's numbers to stay inside their files, which kept them syntactically
     /// valid and let them rot semantically: after ten implementation cards, the row that used to
     /// point at `Machine::exec` pointed at a `let` binding in a test, and nothing objected. R79
     /// fixed the same rot in the baseline table by pinning it to a commit; a table that is read
-    /// as "where this lives" cannot carry a snapshot, so its anchors are symbols. The symbol scan
-    /// above then keeps them honest.
+    /// as "where this lives" cannot carry a snapshot, so its anchors are symbols.
+    ///
+    /// R212 measured what "symbol" was still worth: rejecting line ranges made a citation
+    /// *shaped* right, not *true*. The row for `src/windows.rs::guest_ip_query_command` kept
+    /// passing after the name was renamed into one no file defines, because nothing opened the
+    /// file the table named. Each citation is therefore resolved now - the file is read from
+    /// the crate root and the symbol has to be introduced by a definition keyword (`fn`,
+    /// `struct`, `enum`, `trait`, `const`, `static`, `type`) in that file. A citation cannot be
+    /// satisfied by a mention in a comment or by a call site, and a symbol that moved to
+    /// another file fails rather than silently pointing at the wrong module.
     #[test]
     fn the_traceability_table_points_at_symbols_not_at_line_numbers() {
         const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
@@ -4160,8 +4168,28 @@ mod plan_doc_tests {
                     "the traceability table cites `{citation}`: a line range is true only until \
                      the next edit, so this table points at `src/<file>.rs::<symbol>` instead"
                 );
-                if citation.contains("::") {
+                if let Some((file, symbol)) = citation.split_once("::") {
                     symbols += 1;
+                    // A citation whose symbol does not exist is worse than a line range: the
+                    // range at least pointed at something. R212 measured this scan staying
+                    // green after `windows.rs::guest_ip_query_command` was renamed on paper
+                    // into a name no file defines, so the scan now opens the file it names
+                    // and looks for the item.
+                    let source = std::fs::read_to_string(
+                        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "the traceability table cites `{citation}`, but `{file}` cannot be \
+                             read: {error}"
+                        )
+                    });
+                    let item = symbol.rsplit("::").next().unwrap_or(symbol);
+                    assert!(
+                        defines_item(&source, item),
+                        "the traceability table cites `{citation}`, but `{file}` defines no \
+                         `{item}`: the anchor of a row has to be something a reader can open"
+                    );
                 }
                 rest = &rest[close..];
             }
@@ -4172,6 +4200,73 @@ mod plan_doc_tests {
             "only {symbols} rows of the traceability table point at a symbol: the scan is not \
              looking at the table"
         );
+
+        /// Whether `source` defines an item called `item`.
+        ///
+        /// The keyword that introduces a definition has to be the first thing on its line,
+        /// after visibility and qualifiers. That is what keeps a citation from being
+        /// satisfied by the *mention* of a name: a call site (`.walk_remote_dir(`), a doc
+        /// comment, and - the case this scan was written for - a test that fingerprints the
+        /// source with a needle like `"pub(crate) async fn walk_remote_dir("` all contain
+        /// `fn <name>` without defining anything. Comments are cut off first, so a rustdoc
+        /// line that spells a signature does not count either.
+        fn defines_item(source: &str, item: &str) -> bool {
+            const QUALIFIERS: [&str; 6] = ["pub", "crate", "super", "self", "async", "unsafe"];
+            const KINDS: [&str; 7] = ["fn", "struct", "enum", "trait", "const", "static", "type"];
+            source.lines().any(|line| {
+                // Comments and string literals are cut off: the file is full of source
+                // fingerprints like `"pub(crate) async fn walk_remote_dir("`, and a needle
+                // is not a definition.
+                let code = line
+                    .split("//")
+                    .next()
+                    .unwrap_or_default()
+                    .split('"')
+                    .next()
+                    .unwrap_or_default()
+                    .split('\'')
+                    .next()
+                    .unwrap_or_default();
+                let tokens = code
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .filter(|token| !token.is_empty())
+                    .collect::<Vec<_>>();
+                let Some(at) = tokens.iter().position(|token| !QUALIFIERS.contains(token)) else {
+                    return false;
+                };
+                let kind = tokens[at];
+                if !KINDS.contains(&kind) {
+                    return false;
+                }
+                // `const fn name` introduces a function; `const NAME` a constant.
+                let name_at = if kind == "const" && tokens.get(at + 1) == Some(&"fn") {
+                    at + 2
+                } else {
+                    at + 1
+                };
+                tokens.get(name_at) == Some(&item)
+            })
+        }
+
+        // The resolver's own contract, in the three shapes that used to pass a scanning
+        // grep: a definition, a call site, and a source needle inside a test.
+        assert!(defines_item(
+            "    pub(crate) async fn walk_remote_dir(",
+            "walk_remote_dir"
+        ));
+        assert!(defines_item("const fn deploy_timeout(", "deploy_timeout"));
+        assert!(!defines_item(
+            "            .walk_remote_dir(",
+            "walk_remote_dir"
+        ));
+        assert!(!defines_item(
+            r#"            "pub(crate) async fn walk_remote_dir(","#,
+            "walk_remote_dir"
+        ));
+        assert!(!defines_item(
+            "        /// `walk_remote_dir` backs `Machine::download`",
+            "walk_remote_dir"
+        ));
     }
 
     /// The evidence summary repeats the lifecycle its card declares, in a third place.
