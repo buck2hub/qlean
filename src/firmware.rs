@@ -565,6 +565,84 @@ fn not_a_plain_file(path: &Path, meta: &std::fs::Metadata) -> String {
     "not a regular file".to_string()
 }
 
+/// What sits at the `swtpm` control socket path.
+///
+/// [`Swtpm::start`] used `path.exists()` as its readiness answer, and "exists" is not
+/// "listening": a directory or a plain file left in the run directory answered yes on the
+/// first poll, so `start` returned a TPM whose control socket was not a socket and the launch
+/// carried on to hand QEMU `-chardev socket,path=<that entry>`. Measured against a real
+/// `swtpm` 0.10.2: with a directory at the path, `start` returned `Ok` in 0.02s and the
+/// caller was told the TPM was ready while nothing had bound the endpoint.
+///
+/// A socket is the one shape that can be ready; a leftover socket file (a crashed run) is
+/// removed so the new `swtpm` can bind; anything else is refused by name instead of being
+/// deleted, because the run directory is the user's and Qlean did not create that entry.
+#[derive(Debug, PartialEq, Eq)]
+enum ControlSocket {
+    /// Nothing there: `swtpm` creates the socket when it is ready.
+    Absent,
+    /// A unix socket: the endpoint, or the stale one a crashed run left behind.
+    Socket,
+    /// Something else, worded for the message that refuses it.
+    Foreign(String),
+}
+
+impl ControlSocket {
+    /// Whether the TPM's control socket is actually there.
+    fn is_socket(&self) -> bool {
+        matches!(self, ControlSocket::Socket)
+    }
+}
+
+/// Classify the entry at the `swtpm` control socket path.
+fn control_socket_state(path: &Path) -> std::io::Result<ControlSocket> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ControlSocket::Absent);
+        }
+        Err(error) => return Err(error),
+    };
+    if is_socket_entry(&meta) {
+        return Ok(ControlSocket::Socket);
+    }
+    Ok(ControlSocket::Foreign(describe_control_socket_entry(
+        path, &meta,
+    )))
+}
+
+/// Whether this directory entry really is a unix socket.
+///
+/// The control socket is a unix socket, so only a Unix host can tell one from a file. On a
+/// host that cannot: `swtpm` does not run there either - a Windows guest needs KVM - so the
+/// answer only has to stay out of the way: anything that exists keeps the previous meaning
+/// instead of turning every start into a refusal.
+#[cfg(unix)]
+fn is_socket_entry(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    meta.file_type().is_socket()
+}
+
+#[cfg(not(unix))]
+fn is_socket_entry(_meta: &std::fs::Metadata) -> bool {
+    true
+}
+
+/// Name the entry that is not a socket, for the refusal message.
+fn describe_control_socket_entry(path: &Path, meta: &std::fs::Metadata) -> String {
+    let file_type = meta.file_type();
+    if file_type.is_symlink() {
+        return match std::fs::read_link(path) {
+            Ok(target) => format!("a symlink to {}", target.display()),
+            Err(_) => "a symlink".to_string(),
+        };
+    }
+    if file_type.is_dir() {
+        return "a directory".to_string();
+    }
+    "a regular file".to_string()
+}
+
 pub(crate) fn prepare_vars(run_dir: &Path, firmware: &FirmwarePaths) -> Result<PathBuf> {
     let dest = run_dir.join("ovmf_vars.fd");
     let code_len = std::fs::metadata(&firmware.code)
@@ -807,8 +885,34 @@ impl Swtpm {
         crate::utils::create_owner_only_dir_all(&state_dir)
             .with_context(|| format!("failed to create TPM state dir {}", state_dir.display()))?;
         let socket = run_dir.join("swtpm.sock");
-        if socket.exists() {
-            let _ = std::fs::remove_file(&socket);
+        match control_socket_state(&socket).with_context(|| {
+            format!(
+                "failed to inspect the swtpm control socket path {}",
+                socket.display()
+            )
+        })? {
+            ControlSocket::Absent => {}
+            ControlSocket::Socket => {
+                // A crashed `swtpm` leaves its socket file behind, and the new one cannot
+                // bind on top of it. Only the socket itself is removed: it is Qlean's own
+                // endpoint, named after the run directory.
+                std::fs::remove_file(&socket).with_context(|| {
+                    format!(
+                        "failed to remove the stale swtpm control socket {}",
+                        socket.display()
+                    )
+                })?;
+                debug!(
+                    "Removed the stale swtpm control socket at {}",
+                    socket.display()
+                );
+            }
+            ControlSocket::Foreign(kind) => bail!(
+                "the swtpm control socket path {} is {kind}, so no TPM could be reached through \
+                 it: Qlean keeps its own socket there and does not create that entry, so nothing \
+                 was used or deleted. Remove it and boot again",
+                socket.display()
+            ),
         }
         let log = run_dir.join("swtpm.log");
 
@@ -829,7 +933,15 @@ impl Swtpm {
 
         let started = Instant::now();
         loop {
-            if socket.exists() {
+            if control_socket_state(&socket)
+                .with_context(|| {
+                    format!(
+                        "failed to inspect the swtpm control socket path {}",
+                        socket.display()
+                    )
+                })?
+                .is_socket()
+            {
                 debug!("swtpm control socket ready at {}", socket.display());
                 return Ok(Self { child, socket });
             }
@@ -1521,6 +1633,110 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The control socket path is classified, not merely "does something exist".
+    ///
+    /// Before R228 `Swtpm::start` asked `path.exists()` and nothing else. Measured against a
+    /// real `swtpm` 0.10.2 in the container: with a directory at the socket path, `start`
+    /// returned `Ok` in 0.02s, `socket()` named the directory, and the first boot went on to
+    /// hand QEMU `-chardev socket,path=<a directory>`. The gap is visible without any program
+    /// at all, which is why the classification is a function of its own.
+    #[test]
+    fn test_the_control_socket_path_is_classified_by_shape() {
+        let root = temp_dir("swtpm-socket-shape");
+        let socket = root.join("swtpm.sock");
+
+        assert_eq!(
+            control_socket_state(&socket).unwrap(),
+            ControlSocket::Absent
+        );
+
+        write_file(&socket, 16);
+        assert_eq!(
+            control_socket_state(&socket).unwrap(),
+            ControlSocket::Foreign("a regular file".to_string())
+        );
+        assert!(!control_socket_state(&socket).unwrap().is_socket());
+
+        std::fs::remove_file(&socket).unwrap();
+        std::fs::create_dir_all(&socket).unwrap();
+        assert_eq!(
+            control_socket_state(&socket).unwrap(),
+            ControlSocket::Foreign("a directory".to_string())
+        );
+
+        // A real socket is the only shape that answers "the TPM's endpoint is there".
+        #[cfg(unix)]
+        {
+            std::fs::remove_dir_all(&socket).unwrap();
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            assert_eq!(
+                control_socket_state(&socket).unwrap(),
+                ControlSocket::Socket
+            );
+            assert!(control_socket_state(&socket).unwrap().is_socket());
+            drop(listener);
+        }
+
+        // A link is not the socket either: following it would hand QEMU somebody else's
+        // endpoint, and the run directory is Qlean's own - it never creates a link there.
+        std::fs::remove_file(&socket).ok();
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("elsewhere"), &socket).unwrap();
+            let state = control_socket_state(&socket).unwrap();
+            assert!(
+                matches!(&state, ControlSocket::Foreign(kind) if kind.starts_with("a symlink to ")),
+                "{state:?}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A foreign entry is refused by name, and the user's entry is left where it is.
+    ///
+    /// `start` cannot be entered without spawning `swtpm`, but the refusal is decided before
+    /// the spawn: a run directory whose socket path holds a directory fails here without any
+    /// program installed, which is what makes this testable on a host without `swtpm`.
+    #[tokio::test]
+    async fn test_a_foreign_entry_at_the_control_socket_path_is_refused_not_deleted() {
+        for (entry, expected) in [("directory", "a directory"), ("file", "a regular file")] {
+            let root = temp_dir(&format!("swtpm-foreign-{entry}"));
+            let run_dir = root.join("run");
+            std::fs::create_dir_all(&run_dir).unwrap();
+            let socket = run_dir.join("swtpm.sock");
+            if entry == "directory" {
+                std::fs::create_dir_all(&socket).unwrap();
+            } else {
+                std::fs::write(&socket, b"hand-made").unwrap();
+            }
+
+            let error = match Swtpm::start(&run_dir).await {
+                Ok(_) => panic!("a non-socket at the control socket path is not a running TPM"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("swtpm control socket path") && error.contains(expected),
+                "the refusal has to name the entry it found: {error}"
+            );
+            assert!(
+                error.contains("Remove it and boot again"),
+                "the refusal has to say what to do: {error}"
+            );
+            assert!(
+                error.contains(&socket.display().to_string()),
+                "the refusal has to name the path: {error}"
+            );
+            assert!(
+                socket.exists(),
+                "the entry is the user's, so Qlean refuses it instead of deleting it"
+            );
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
     #[test]
     fn test_prepare_vars_rejects_a_stale_per_vm_image() {
         // The distribution replaced OVMF after this VM was created: booting on the old
@@ -1671,6 +1887,40 @@ mod tests {
             !swtpm.stop_now_within(Duration::from_millis(100)),
             "a child that was reaped behind our back was reported as confirmed stopped"
         );
+    }
+
+    /// A stale control socket is removed so the real `swtpm` can bind its own.
+    ///
+    /// A crashed run leaves the socket file behind and `swtpm` refuses to bind on top of it,
+    /// so `start` deletes exactly that entry - it is Qlean's own endpoint - and the TPM has to
+    /// come up on the same path. Container evidence only: this needs the real program.
+    #[cfg(unix)]
+    #[ignore = "needs a real `swtpm` on the host"]
+    #[tokio::test]
+    async fn test_a_real_swtpm_starts_over_a_stale_control_socket() {
+        let run_dir = temp_dir("swtpm-stale-socket");
+        let socket = run_dir.join("swtpm.sock");
+        {
+            let stale = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            drop(stale);
+        }
+        assert_eq!(
+            control_socket_state(&socket).unwrap(),
+            ControlSocket::Socket,
+            "the fixture has to leave a real socket file behind"
+        );
+
+        let mut tpm = match Swtpm::start(&run_dir).await {
+            Ok(tpm) => tpm,
+            Err(error) => panic!("a real swtpm is required for this test: {error}"),
+        };
+        assert_eq!(tpm.socket(), socket.as_path());
+        assert!(
+            control_socket_state(&socket).unwrap().is_socket(),
+            "the path has to hold the new swtpm's socket, not the stale one"
+        );
+        let stopped = tpm.stop().await;
+        assert!(stopped, "the real swtpm has to be confirmed gone");
     }
 
     /// Name of the state file a real `swtpm` writes its TPM 2.0 state into.

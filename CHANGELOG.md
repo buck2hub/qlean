@@ -55,6 +55,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not treated as free: the rename is not sent.
 
 ### Fixed
+- A `swtpm` control socket path that held anything but a socket - a directory or a plain file left
+  in the run directory - was reported as a running TPM. `Swtpm::start` asked `path.exists()` and
+  accepted the first yes, so the launch went on to hand QEMU a `-chardev socket` pointing at that
+  entry and the first boot failed there instead. The path is now classified by shape: a stale
+  socket file is removed so the new `swtpm` can bind on it, and any other entry is refused by name
+  with what to do, without deleting it.
 - A directory download that failed left a partial tree under the caller's own name: `download`
   created `<local>/<basename>` and then filled it file by file, so a cancelled transfer, a symbolic
   link it refuses, an unsupported entry or one file that did not arrive left a directory that

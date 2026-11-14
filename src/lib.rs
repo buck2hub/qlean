@@ -3700,9 +3700,27 @@ mod plan_doc_tests {
             row.contains(&format!("{sites} 处 `SMOKE-UNAVAILABLE` 短路点")),
             "the snapshot row does not state that the source has {sites} short-circuit paths"
         );
+        // The row's two numbers have to move together with the crate: the total it says it
+        // runs, and how many of those passes verified nothing here. Two of them short-circuit
+        // in this image (the bridge and the refused kill), so the second is the first minus
+        // two - and both are read from the sources rather than spelled out again.
+        let ignored: usize = CRATE_SOURCES
+            .iter()
+            .filter(|(path, _)| path.starts_with("src/"))
+            .map(|(_, source)| {
+                source
+                    .lines()
+                    .filter(|line| line.trim_start().starts_with("#[ignore"))
+                    .count()
+            })
+            .sum();
+        const SHORT_CIRCUITS_IN_THE_IMAGE: usize = 2;
         assert!(
-            row.contains("`11 passed` 只证明 9 条真跑"),
-            "the snapshot row presents `11 passed` as eleven executed tests"
+            row.contains(&format!(
+                "`{ignored} passed` 只证明 {} 条真跑",
+                ignored - SHORT_CIRCUITS_IN_THE_IMAGE
+            )),
+            "the snapshot row presents `{ignored} passed` as {ignored} executed tests"
         );
         for name in [
             "QLEAN_REFUSED_KILL_PID",
