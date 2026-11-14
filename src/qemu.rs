@@ -31,21 +31,42 @@ use crate::{
 /// Unset or `0` = wait until QEMU exits (required for keep-alive VMs).
 /// Set `QLEAN_QEMU_TIMEOUT_SECS` to a positive value only for bounded test runs.
 fn resolve_qemu_wait_timeout() -> Option<Duration> {
-    match std::env::var("QLEAN_QEMU_TIMEOUT_SECS") {
-        Ok(raw) => match raw.trim().parse::<u64>() {
-            Ok(0) => None,
-            Ok(secs) => Some(Duration::from_secs(secs)),
-            Err(_) => {
-                warn!(
-                    value = %raw,
-                    "invalid QLEAN_QEMU_TIMEOUT_SECS, waiting indefinitely for QEMU"
-                );
-                None
-            }
-        },
-        Err(_) => None,
+    let raw = std::env::var("QLEAN_QEMU_TIMEOUT_SECS").ok()?;
+    match parse_wait_timeout(&raw) {
+        Ok(limit) => limit,
+        Err(_) => {
+            warn!(
+                value = %raw,
+                "invalid QLEAN_QEMU_TIMEOUT_SECS, waiting indefinitely for QEMU"
+            );
+            None
+        }
     }
 }
+
+/// Read `QLEAN_QEMU_TIMEOUT_SECS` without touching the environment.
+///
+/// `0` is the documented "no limit" and must not turn into a zero-second limit: that would
+/// kill every guest the moment it started, and a keep-alive VM would never come up.
+fn parse_wait_timeout(raw: &str) -> Result<Option<Duration>, std::num::ParseIntError> {
+    let secs = raw.trim().parse::<u64>()?;
+    Ok(if secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(secs))
+    })
+}
+
+/// The name of each architecture, in the spelling QEMU and `std::env::consts::ARCH` use.
+///
+/// One table, because the QEMU program name and the host check have to agree: a host read as
+/// the wrong architecture loses KVM for every guest and refuses Windows guests outright, and
+/// an amd64 guest started by the 32-bit binary is not the machine this crate promised.
+const ARCHES: [(GuestArch, &str); 3] = [
+    (GuestArch::Amd64, "x86_64"),
+    (GuestArch::Aarch64, "aarch64"),
+    (GuestArch::Riscv64, "riscv64"),
+];
 
 pub(crate) fn qemu_system_program(arch: GuestArch) -> &'static str {
     match arch {
@@ -55,13 +76,15 @@ pub(crate) fn qemu_system_program(arch: GuestArch) -> &'static str {
     }
 }
 
+fn host_arch_of(host: &str) -> Option<GuestArch> {
+    ARCHES
+        .iter()
+        .find(|(_, name)| *name == host)
+        .map(|(arch, _)| *arch)
+}
+
 fn host_arch() -> Option<GuestArch> {
-    match std::env::consts::ARCH {
-        "x86_64" => Some(GuestArch::Amd64),
-        "aarch64" => Some(GuestArch::Aarch64),
-        "riscv64" => Some(GuestArch::Riscv64),
-        _ => None,
-    }
+    host_arch_of(std::env::consts::ARCH)
 }
 
 pub(crate) struct QemuLaunchParams {
@@ -2274,6 +2297,72 @@ mod tests {
             nic_device_option("52:54:00:aa:bb:cc").contains("netdev=net0"),
             "the device must attach to the netdev defined by `netdev_option`"
         );
+    }
+
+    #[test]
+    fn the_qemu_program_is_named_after_the_architecture_it_starts() {
+        // An amd64 guest started by `qemu-system-i386` boots a 32-bit machine that is not the
+        // one the caller asked for, and `qemu-system-x86_64` misspelt is a "No such file or
+        // directory" on every launch (R254).
+        for (arch, name) in ARCHES {
+            assert_eq!(
+                qemu_system_program(arch),
+                format!("qemu-system-{name}"),
+                "the program for {arch:?} has to be QEMU's own spelling of it"
+            );
+        }
+        let mut names: Vec<&str> = ARCHES.iter().map(|(_, name)| *name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), ARCHES.len(), "two architectures share a name");
+    }
+
+    #[test]
+    fn the_host_is_read_in_the_same_table_the_program_names_come_from() {
+        // Reading an x86_64 host as aarch64 makes `host_arch() == Some(image.arch)` false
+        // everywhere: Linux silently loses KVM and every Windows guest is refused for an
+        // architecture mismatch that does not exist (R254).
+        assert_eq!(host_arch_of("x86_64"), Some(GuestArch::Amd64));
+        assert_eq!(host_arch_of("aarch64"), Some(GuestArch::Aarch64));
+        assert_eq!(host_arch_of("riscv64"), Some(GuestArch::Riscv64));
+        assert_eq!(
+            host_arch_of("i686"),
+            None,
+            "a 32-bit host runs no guest here"
+        );
+        assert_eq!(host_arch_of(""), None);
+        assert_eq!(host_arch_of("x86-64"), None, "QEMU's spelling, not uname's");
+        for (arch, name) in ARCHES {
+            assert_eq!(host_arch_of(name), Some(arch), "{name} has to be readable");
+        }
+        assert_eq!(
+            host_arch(),
+            host_arch_of(std::env::consts::ARCH),
+            "the host has to be read through the table, not around it"
+        );
+    }
+
+    #[test]
+    fn a_zero_second_limit_is_no_limit() {
+        // `QLEAN_QEMU_TIMEOUT_SECS=0` documented "wait for QEMU" used to be a zero-second
+        // limit: the guest was killed on the first poll and a keep-alive VM never came up.
+        assert_eq!(parse_wait_timeout("0"), Ok(None));
+        assert_eq!(parse_wait_timeout(" 0 "), Ok(None));
+        assert_eq!(
+            parse_wait_timeout("90"),
+            Ok(Some(Duration::from_secs(90))),
+            "the variable is in seconds, not in minutes"
+        );
+        assert_eq!(
+            parse_wait_timeout(" 45\n"),
+            Ok(Some(Duration::from_secs(45)))
+        );
+        for unreadable in ["", "  ", "abc", "-5", "1.5", "6h", "0x10"] {
+            assert!(
+                parse_wait_timeout(unreadable).is_err(),
+                "{unreadable:?} is not a number of seconds"
+            );
+        }
     }
 
     #[test]
