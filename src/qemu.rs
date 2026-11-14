@@ -282,15 +282,29 @@ fn disk_drive_option(overlay: &Path) -> anyhow::Result<String> {
     ))
 }
 
+/// The chardev id the serial console, the human monitor and `-serial` all name.
+///
+/// One chardev is created (`-chardev stdio,id=char0,...`), the guest console is attached to it
+/// (`-serial chardev:char0`) and the human monitor is multiplexed onto it (`-monitor
+/// chardev:char0`). R250: those three spellings were three string literals, so renaming one
+/// left QEMU refusing the launch with an unknown chardev - or, worse, the console and the
+/// monitor silently attaching to different ends.
+const SERIAL_CHARDEV_ID: &str = "char0";
+
 /// `-chardev` argument that tees the serial console into the run directory.
 ///
 /// The console is the guest's own account of a first boot that never finished, so the
 /// argument that captures it is shared with the real-QEMU launch test as well.
 fn serial_chardev_option(log: &Path) -> anyhow::Result<String> {
     Ok(format!(
-        "stdio,id=char0,mux=on,signal=off,logfile={},logappend=on",
+        "stdio,id={SERIAL_CHARDEV_ID},mux=on,signal=off,logfile={},logappend=on",
         qemu_option_path("serial log", log)?
     ))
+}
+
+/// Name of the chardev `-serial` and `-monitor` attach to.
+fn serial_chardev_name() -> String {
+    format!("chardev:{SERIAL_CHARDEV_ID}")
 }
 
 /// `-monitor` argument that multiplexes the human monitor onto the same console as serial.
@@ -299,64 +313,79 @@ fn serial_chardev_option(log: &Path) -> anyhow::Result<String> {
 /// `'-mon' is deprecated` warning from QEMU 11.1.3, and `-monitor chardev:char0` asks for the
 /// identical HMP endpoint (the chardev is created with `mux=on`, so the monitor and the guest
 /// console keep sharing stdio) without it.
-fn hmp_chardev_args() -> [&'static str; 2] {
-    ["-monitor", "chardev:char0"]
+fn hmp_chardev_args() -> [String; 2] {
+    ["-monitor".to_string(), serial_chardev_name()]
 }
 
-pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
-    // Prepare QEMU command
-    let is_windows = params.image.guest_os == GuestOs::Windows;
+/// The complete argument list of one QEMU launch.
+///
+/// Every option below is *computed* somewhere else - `disk_drive_option`, `netdev_option`,
+/// `nic_device_option`, `serial_chardev_option`, `hmp_chardev_args`, `vsock_args`,
+/// `windows_firmware_args`, `qmp_socket_and_args`, `seed_drive_option` - and this function is
+/// the only place that puts them on a command line. R250: it used to be interleaved with
+/// `spawn`, `read_pid` and the output plumbing, so no test could see the assembled command
+/// and ten mutations - dropping the disk, the NIC, the monitor, the vsock, the firmware, the
+/// accelerators, the serial chardev, or handing the guest the seed on every boot - all left
+/// the suite green. The launch then failed inside the guest instead of here.
+///
+/// Kept separate from [`launch_qemu`] so the command line can be inspected without spawning
+/// anything.
+fn qemu_arguments(
+    params: &QemuLaunchParams,
+    run_dir: &Path,
+    accel: Accel,
+) -> anyhow::Result<Vec<String>> {
+    /// Append one option and its value.
+    fn push(args: &mut Vec<String>, items: &[&str]) {
+        args.extend(items.iter().map(|item| item.to_string()));
+    }
 
-    let mut qemu_cmd = tokio::process::Command::new(qemu_system_program(params.image.arch));
+    let is_windows = params.image.guest_os == GuestOs::Windows;
+    let mut args: Vec<String> = Vec::new();
+
     if is_windows {
         let firmware = params.firmware.as_ref().with_context(
             || "Windows guest launched without OVMF firmware; internal invariant violated",
         )?;
-        qemu_cmd.args(windows_firmware_args(
+        args.extend(windows_firmware_args(
             firmware,
             params.tpm_socket.as_deref(),
         )?);
     } else if params.image.arch == GuestArch::Amd64 {
         // Decrease idle CPU usage on x86_64.
-        qemu_cmd.args(["-machine", "hpet=off"]);
+        push(&mut args, &["-machine", "hpet=off"]);
     }
 
-    qemu_cmd.args(vsock_args(params.image.guest_os, params.cid));
+    args.extend(vsock_args(params.image.guest_os, params.cid));
 
-    let (qmp_socket, qmp_args) = qmp_socket_and_args(&params.vmid)?;
-    if qmp_socket.exists() {
-        let _ = std::fs::remove_file(&qmp_socket);
-    }
-
-    let dirs = QleanDirs::new()?;
-    let run_dir = dirs.runs.join(&params.vmid);
-
-    qemu_cmd.args(qmp_args);
+    // The monitor socket and the arguments that expose it as monitor `qmp0`.
+    let (_qmp_socket, qmp_args) = qmp_socket_and_args(&params.vmid)?;
+    args.extend(qmp_args);
 
     let disk_drive = disk_drive_option(&params.image.overlay)?;
-    qemu_cmd
-        // Disk
-        .args(["-drive", &disk_drive])
-        // No GUI
-        .arg("-nographic");
+    push(&mut args, &["-drive", &disk_drive]);
+    // No GUI
+    push(&mut args, &["-nographic"]);
 
-    qemu_cmd
-        .args(["-netdev", &netdev_option()])
-        .args(["-device", &nic_device_option(&params.mac_address)]);
+    let netdev = netdev_option();
+    let nic = nic_device_option(&params.mac_address);
+    push(&mut args, &["-netdev", &netdev]);
+    push(&mut args, &["-device", &nic]);
 
     // Memory and CPUs
-    qemu_cmd
-        .args(["-m", &params.config.mem.to_string()])
-        .args(["-smp", &params.config.core.to_string()]);
+    let mem = params.config.mem.to_string();
+    let cores = params.config.core.to_string();
+    push(&mut args, &["-m", &mem]);
+    push(&mut args, &["-smp", &cores]);
 
     // Output redirection
     // We multiplex QEMU monitor + guest serial onto stdio AND tee it into a file under the run dir.
     let serial_log = run_dir.join("serial.log");
     let serial_chardev = serial_chardev_option(&serial_log)?;
-    qemu_cmd
-        .args(["-chardev", &serial_chardev])
-        .args(["-serial", "chardev:char0"])
-        .args(hmp_chardev_args());
+    let serial_name = serial_chardev_name();
+    push(&mut args, &["-chardev", &serial_chardev]);
+    push(&mut args, &["-serial", &serial_name]);
+    args.extend(hmp_chardev_args());
 
     // The seed medium is a first-boot artifact, and what it carries depends on the guest: a
     // cloud-init NoCloud volume for Linux, the Windows deployment contract (`deploy.json`, the
@@ -364,24 +393,48 @@ pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> 
     // one: a second boot that re-attached the seed would re-run the first-boot task against an
     // image that is already deployed.
     if params.is_init {
-        qemu_cmd.args(["-drive", &seed_drive_option(&params.image.seed)?]);
+        let seed_drive = seed_drive_option(&params.image.seed)?;
+        push(&mut args, &["-drive", &seed_drive]);
     }
 
-    match select_accel(
+    match accel {
+        Accel::Kvm => {
+            push(&mut args, &["-accel", "kvm"]);
+            push(&mut args, &["-cpu", "host"]);
+        }
+        Accel::Tcg => push(&mut args, &["-accel", "tcg"]),
+    }
+
+    Ok(args)
+}
+
+pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
+    let dirs = QleanDirs::new()?;
+    let run_dir = dirs.runs.join(&params.vmid);
+
+    // A socket left behind by a QEMU that died would answer for a process that is gone, and
+    // QEMU refuses to bind the path again; it is removed before the launch.
+    let (qmp_socket, _) = qmp_socket_and_args(&params.vmid)?;
+    if qmp_socket.exists() {
+        let _ = std::fs::remove_file(&qmp_socket);
+    }
+
+    // The accelerator is a property of this host and this guest, not of the arguments, and it
+    // is what refuses a Windows guest the TCG fallback - so it is decided here, once, and the
+    // TCG warning is printed only when TCG is what this launch will actually use.
+    let accel = select_accel(
         is_kvm_available(),
         host_arch() == Some(params.image.arch),
         params.image.guest_os,
-    )? {
-        Accel::Kvm => {
-            qemu_cmd.args(["-accel", "kvm"]).args(["-cpu", "host"]);
-        }
-        Accel::Tcg => {
-            qemu_cmd.args(["-accel", "tcg"]);
-            warn!(
-                "KVM acceleration is unavailable for this host/guest architecture pair. Falling back to TCG emulation, which may be slower."
-            );
-        }
+    )?;
+    if accel == Accel::Tcg {
+        warn!(
+            "KVM acceleration is unavailable for this host/guest architecture pair. Falling back to TCG emulation, which may be slower."
+        );
     }
+    let argument_list = qemu_arguments(&params, &run_dir, accel)?;
+    let mut qemu_cmd = tokio::process::Command::new(qemu_system_program(params.image.arch));
+    qemu_cmd.args(&argument_list);
 
     // Spawn QEMU process
     debug!("QEMU command: {:?}", qemu_cmd.to_string());
@@ -1061,6 +1114,281 @@ mod tests {
     }
 
     ///
+    /// A launch params fixture for the command-line tests.
+    ///
+    /// `machine.rs` builds this from a real machine; here only the fields the argument list
+    /// reads are interesting, and none of them touches the filesystem.
+    fn launch_params(guest_os: GuestOs, is_init: bool) -> QemuLaunchParams {
+        QemuLaunchParams {
+            expected_to_exit: exiting(false),
+            cid: 42,
+            image: MachineImage {
+                overlay: PathBuf::from("/run/qlean/vm1/overlay.img"),
+                arch: GuestArch::Amd64,
+                guest_os,
+                seed: PathBuf::from("/run/qlean/vm1/seed.iso"),
+            },
+            config: MachineConfig {
+                core: 2,
+                mem: 512,
+                disk: None,
+                clear: true,
+                ssh_timeout: None,
+            },
+            vmid: "vm1".to_string(),
+            is_init,
+            cancel_token: CancellationToken::new(),
+            mac_address: "52:54:00:aa:bb:cc".to_string(),
+            firmware: Some(firmware(false)),
+            tpm_socket: Some(PathBuf::from("/run/qlean/vm1/swtpm.sock")),
+        }
+    }
+
+    fn test_run_dir() -> PathBuf {
+        PathBuf::from("/run/qlean/vm1")
+    }
+
+    fn args_of(params: &QemuLaunchParams) -> Vec<String> {
+        qemu_arguments(params, &test_run_dir(), Accel::Tcg).expect("the argument list")
+    }
+
+    /// Every `value` that follows `option` in an argument list.
+    fn values_of<'a>(args: &'a [String], option: &str) -> Vec<&'a str> {
+        args.windows(2)
+            .filter(|pair| pair[0] == option)
+            .map(|pair| pair[1].as_str())
+            .collect()
+    }
+
+    /// The command line attaches the disk the machine boots and the seed it may need.
+    ///
+    /// `qemu_arguments` is the only place that decides what reaches QEMU. Every option it
+    /// appends is built somewhere else, so a dropped step - or one that hands the guest another
+    /// path - leaves the launch missing a device, and the guest then fails for a reason that
+    /// names nothing about the command line. R250: ten of twelve wiring mutations left the suite
+    /// green, because the argument list was interleaved with `spawn` and could not be inspected.
+    #[test]
+    fn the_command_line_attaches_the_disk_and_the_first_boot_seed() {
+        let first_boot = args_of(&launch_params(GuestOs::Linux, true));
+        let drives = values_of(&first_boot, "-drive");
+        assert_eq!(
+            drives.len(),
+            2,
+            "a first boot attaches the overlay and the seed medium: {first_boot:?}"
+        );
+        assert!(
+            drives.contains(&"file=/run/qlean/vm1/overlay.img,if=virtio,cache=writeback"),
+            "the machine boots the overlay it created: {drives:?}"
+        );
+        assert!(
+            drives
+                .iter()
+                .any(|drive| drive.contains("media=cdrom") && drive.contains("seed.iso")),
+            "the first boot attaches the seed medium as a CD-ROM: {drives:?}"
+        );
+        assert!(
+            first_boot.iter().any(|arg| arg == "-nographic"),
+            "the launch is headless: {first_boot:?}"
+        );
+
+        let second_boot = args_of(&launch_params(GuestOs::Linux, false));
+        assert_eq!(
+            values_of(&second_boot, "-drive").len(),
+            1,
+            "a second boot attaches the overlay and nothing else: {second_boot:?}"
+        );
+    }
+
+    /// The command line attaches a NIC on the bridge, with the MAC the lease lookup uses.
+    ///
+    /// The NIC and the netdev are two arguments that have to agree on `net0`, and the MAC is the
+    /// only handle the lease lookup has on this guest. Dropping either leaves a guest with no
+    /// network: on a Windows first boot that is a spent 900s budget and a message about a lease
+    /// that never appeared, not about a device that was never attached.
+    #[test]
+    fn the_command_line_attaches_the_nic_that_will_ask_for_a_lease() {
+        let args = args_of(&launch_params(GuestOs::Windows, true));
+        let netdev = values_of(&args, "-netdev");
+        assert_eq!(netdev.len(), 1, "one netdev: {args:?}");
+        assert_eq!(
+            netdev[0],
+            format!("bridge,id=net0,br={QLEAN_BRIDGE_NAME}"),
+            "the NIC is attached to the bridge Qlean creates and checks"
+        );
+
+        let device = values_of(&args, "-device")
+            .into_iter()
+            .find(|value| value.starts_with("virtio-net-pci,"))
+            .unwrap_or_else(|| panic!("the launch attaches no NIC: {args:?}"));
+        assert!(
+            device.contains("netdev=net0"),
+            "the NIC and the netdev have to name the same id: {device}"
+        );
+        assert!(
+            device.contains("mac=52:54:00:aa:bb:cc"),
+            "the NIC must carry the MAC `find_lease_address` searches for: {device}"
+        );
+    }
+
+    /// The command line carries the memory and the core count it was configured with.
+    #[test]
+    fn the_command_line_carries_the_configured_memory_and_cores() {
+        let params = launch_params(GuestOs::Linux, false);
+        let args = args_of(&params);
+        let mem = params.config.mem.to_string();
+        let cores = params.config.core.to_string();
+        assert_eq!(
+            values_of(&args, "-m"),
+            vec![mem.as_str()],
+            "`-m` must be the configured memory: {args:?}"
+        );
+        assert_eq!(
+            values_of(&args, "-smp"),
+            vec![cores.as_str()],
+            "`-smp` must be the configured core count: {args:?}"
+        );
+    }
+
+    /// The console, the human monitor and `-serial` all name the one chardev.
+    ///
+    /// Three literals used to agree on `char0`. QEMU rejects an unknown chardev while parsing
+    /// options, so a rename in one place refuses the launch before the guest starts - and a
+    /// launch that attaches the console to one chardev and the monitor to another loses the
+    /// console a failing first boot is diagnosed from.
+    #[test]
+    fn the_console_and_the_monitor_share_the_one_chardev() {
+        let args = args_of(&launch_params(GuestOs::Linux, false));
+        // Two chardevs exist: the QMP one (`id=qmp0`) and the console one. The console is the
+        // one `-serial` and `-monitor` attach to.
+        let chardev = values_of(&args, "-chardev")
+            .into_iter()
+            .find(|value| value.starts_with("stdio,"))
+            .unwrap_or_else(|| panic!("the launch creates no console chardev: {args:?}"));
+        assert!(
+            chardev.contains(&format!("id={SERIAL_CHARDEV_ID}")),
+            "the chardev is created with the id the serial console names: {chardev}"
+        );
+        assert!(
+            chardev.contains("logfile=/run/qlean/vm1/serial.log"),
+            "the console is teed into the run directory: {chardev}"
+        );
+
+        let name = serial_chardev_name();
+        assert_eq!(
+            values_of(&args, "-serial"),
+            vec![name.as_str()],
+            "the guest console attaches to that chardev: {args:?}"
+        );
+        assert_eq!(
+            values_of(&args, "-monitor"),
+            vec![name.as_str()],
+            "the human monitor multiplexes onto that chardev: {args:?}"
+        );
+    }
+
+    /// The command line carries the control channel the machine waits on.
+    #[test]
+    fn the_command_line_carries_the_control_channel() {
+        let args = args_of(&launch_params(GuestOs::Linux, false));
+        let (_, qmp_args) = qmp_socket_and_args("vm1").expect("qmp arguments");
+        assert!(
+            qmp_args.iter().any(|arg| arg == "-qmp"),
+            "`qmp_socket_and_args` produced no control channel: {qmp_args:?}"
+        );
+        for expected in &qmp_args {
+            assert!(
+                args.contains(expected),
+                "the launch does not carry {expected:?}, so nothing can ask this QEMU anything: \
+                 {args:?}"
+            );
+        }
+    }
+
+    /// A Linux guest gets a vsock device with the CID it was assigned; a Windows guest gets none.
+    #[test]
+    fn the_command_line_carries_the_vsock_cid_of_a_linux_guest() {
+        let params = launch_params(GuestOs::Linux, false);
+        let args = args_of(&params);
+        let device = format!(
+            "vhost-vsock-pci,id=vhost-vsock-pci0,guest-cid={}",
+            params.cid
+        );
+        assert!(
+            args.iter().any(|arg| arg == &device),
+            "a Linux guest is reached over vsock and needs its own CID: {args:?}"
+        );
+
+        let windows = args_of(&launch_params(GuestOs::Windows, false));
+        assert!(
+            !windows.iter().any(|arg| arg.contains("vhost-vsock")),
+            "a Windows guest has no vsock: {windows:?}"
+        );
+    }
+
+    /// A Windows guest is launched with the firmware and TPM device it was given.
+    #[test]
+    fn the_command_line_carries_the_firmware_of_a_windows_guest() {
+        let params = launch_params(GuestOs::Windows, false);
+        let firmware_args = windows_firmware_args(
+            params.firmware.as_ref().expect("a fixture firmware"),
+            params.tpm_socket.as_deref(),
+        )
+        .expect("firmware arguments");
+        let args = qemu_arguments(&params, &test_run_dir(), Accel::Kvm).expect("the argument list");
+        for expected in &firmware_args {
+            assert!(
+                args.contains(expected),
+                "the Windows launch drops {expected:?} from its firmware arguments: {args:?}"
+            );
+        }
+        assert!(
+            !args.iter().any(|arg| arg == "hpet=off"),
+            "the Windows firmware arguments already pick a machine type: {args:?}"
+        );
+    }
+
+    /// The argument list the launch computes is the one the process is spawned with.
+    ///
+    /// `qemu_arguments` can be perfectly wired and still reach nothing: `qemu_cmd.args(...)` is
+    /// a separate statement, and dropping it launches QEMU with no options at all, which the
+    /// guest-level tests cannot see (`qemu_arguments` still answers correctly). R250 caught
+    /// this as a surviving mutation, so it is pinned here.
+    #[test]
+    fn the_argument_list_that_was_computed_is_the_one_the_process_gets() {
+        let production = include_str!("qemu.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("split always yields a first part");
+        assert_eq!(
+            production
+                .matches("qemu_arguments(&params, &run_dir, accel)")
+                .count(),
+            1,
+            "`launch_qemu` has to take its arguments from `qemu_arguments`"
+        );
+        assert_eq!(
+            production.matches("qemu_cmd.args(&argument_list);").count(),
+            1,
+            "the computed argument list has to be handed to the process it was computed for"
+        );
+    }
+
+    /// The accelerator the launch decided on is the one on the command line.
+    #[test]
+    fn the_command_line_carries_the_accelerator_it_was_given() {
+        let params = launch_params(GuestOs::Linux, false);
+        let kvm = qemu_arguments(&params, &test_run_dir(), Accel::Kvm).expect("kvm arguments");
+        assert_eq!(values_of(&kvm, "-accel"), vec!["kvm"], "{kvm:?}");
+        assert_eq!(values_of(&kvm, "-cpu"), vec!["host"], "{kvm:?}");
+
+        let tcg = qemu_arguments(&params, &test_run_dir(), Accel::Tcg).expect("tcg arguments");
+        assert_eq!(values_of(&tcg, "-accel"), vec!["tcg"], "{tcg:?}");
+        assert!(
+            values_of(&tcg, "-cpu").is_empty(),
+            "TCG has no host CPU to pass through: {tcg:?}"
+        );
+    }
+
     /// The seed medium is attached on the first boot and on nothing else.
     ///
     /// `Machine::spawn` calls the same launcher, and the only thing that keeps a deployed Windows
@@ -1075,10 +1403,7 @@ mod tests {
         // count below is the number of places that attach the medium, and a guard that
         // quotes the expression it counts would count itself.
         let call = ["seed_drive_option(&params", ".image.seed)"].concat();
-        let attach_sites: Vec<&str> = source
-            .lines()
-            .filter(|line| line.contains(&call) && line.trim_start().starts_with("qemu_cmd"))
-            .collect();
+        let attach_sites: Vec<&str> = source.lines().filter(|line| line.contains(&call)).collect();
         assert_eq!(
             attach_sites.len(),
             1,
@@ -1348,8 +1673,8 @@ mod tests {
         args.push("-chardev".to_string());
         args.push(serial_chardev_option(&run_dir.join("serial.log")).expect("serial chardev"));
         args.push("-serial".to_string());
-        args.push("chardev:char0".to_string());
-        args.extend(hmp_chardev_args().map(str::to_string));
+        args.push(serial_chardev_name());
+        args.extend(hmp_chardev_args());
         args.push("-drive".to_string());
         args.push(seed_drive_option(&iso).expect("seed drive argument"));
         for extra in ["-m", "512", "-smp", "2"] {
@@ -1743,7 +2068,7 @@ mod tests {
     fn the_monitors_are_requested_with_options_qemu_has_not_deprecated() {
         let qmp = qmp_chardev_args(Path::new("/run/qlean/abc/qmp.sock")).expect("qmp args");
         let mut all = qmp.clone();
-        all.extend(hmp_chardev_args().map(str::to_string));
+        all.extend(hmp_chardev_args());
 
         let deprecated = all.iter().filter(|arg| arg.as_str() == "-mon").count();
         assert_eq!(

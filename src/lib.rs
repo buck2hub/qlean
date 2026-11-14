@@ -305,13 +305,14 @@ mod plan_doc_tests {
         let qemu = source_named("src/qemu.rs");
         let machine = source_named("src/machine.rs");
 
-        let launch = body_of(qemu, "pub(crate) async fn launch_qemu(");
+        // The command line is assembled by `qemu_arguments`; `launch_qemu` only spawns it.
+        let launch = body_of(qemu, "fn qemu_arguments(");
         assert_eq!(
             launch
                 .matches("nic_device_option(&params.mac_address)")
                 .count(),
             1,
-            "the launch has to hand the NIC the same MAC it was launched with, once"
+            "the command line has to hand the NIC the same MAC it was launched with, once"
         );
         assert!(
             !launch.contains("\"52:54:00"),
@@ -3975,19 +3976,19 @@ mod plan_doc_tests {
             qemu.split("#[cfg(test)]")
                 .next()
                 .expect("split always yields a first part"),
-            "pub(crate) async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {",
+            "fn qemu_arguments(\n    params: &QemuLaunchParams,\n    run_dir: &Path,\n    accel: Accel,\n) -> anyhow::Result<Vec<String>> {",
         );
         assert_eq!(
             launch
                 .matches("disk_drive_option(&params.image.overlay)")
                 .count(),
             1,
-            "`launch_qemu` must turn `params.image.overlay` into the `-drive` argument: a drive \
-             built from anything else boots a disk `qemu-img` never created"
+            "`qemu_arguments` must turn `params.image.overlay` into the `-drive` argument: a \
+             drive built from anything else boots a disk `qemu-img` never created"
         );
         assert!(
             !launch.contains("overlay.img"),
-            "`launch_qemu` spells the overlay file name itself instead of using the path the \
+            "`qemu_arguments` spells the overlay file name itself instead of using the path the \
              machine carries"
         );
     }
