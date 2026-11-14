@@ -810,44 +810,110 @@ const BRIDGE_HELPER_CANDIDATES: [&str; 3] = [
     "/usr/local/libexec/qemu-bridge-helper",
 ];
 
-/// Locate the bridge helper, preferring a known install path over one on `PATH`.
-fn bridge_helper_path(exists: impl Fn(&Path) -> bool, on_path: bool) -> Option<PathBuf> {
-    BRIDGE_HELPER_CANDIDATES
-        .iter()
-        .map(Path::new)
-        .find(|candidate| exists(candidate))
-        .map(Path::to_path_buf)
-        .or_else(|| on_path.then(|| PathBuf::from(BRIDGE_HELPER_PROGRAM)))
+/// What the bridge-helper probe found, and how the two kinds of "not installed" differ.
+///
+/// QEMU runs this helper itself for `-netdev bridge`, and a helper that exists but cannot be
+/// executed fails that exec exactly like a helper that runs and fails - measured in the
+/// container, both print `-netdev bridge,br=qlbr0,id=n0: bridge helper failed` and name
+/// neither the file nor the reason (R242). The gate therefore has to answer the question QEMU
+/// asks - "can this file be executed?" - and keep the two answers apart.
+#[derive(Debug, PartialEq, Eq)]
+enum BridgeHelper {
+    /// An executable file QEMU can run.
+    Usable(PathBuf),
+    /// A file by that name exists, and nothing can execute it.
+    Unexecutable(PathBuf),
+    /// No file by that name on any known path or on `PATH`.
+    Absent,
 }
 
-/// Explain a missing bridge helper, including the second thing that breaks bridging.
-fn bridge_helper_problem(found: Option<&Path>) -> Option<String> {
-    found.is_none().then(|| {
-        format!(
+/// Locate the bridge helper, preferring a known install path over one on `PATH`.
+///
+/// The two questions are asked here rather than passed in: `is_executable_file` is what QEMU's
+/// exec needs, and `is_file` only ever feeds the message that says the difference. The
+/// candidate list is a parameter so the tests can point this at real files in a temporary
+/// directory - the wiring is what R242 found unverified, the same way R240 found the Windows
+/// program probes. `on_path` and `on_path_unusable` are the two answers for the bare name,
+/// resolved through `PATH` by the caller because that lookup reads the environment.
+fn bridge_helper_state(
+    candidates: &[&str],
+    on_path: Option<PathBuf>,
+    on_path_unusable: Option<PathBuf>,
+) -> BridgeHelper {
+    let known: Vec<PathBuf> = candidates
+        .iter()
+        .map(Path::new)
+        .map(Path::to_path_buf)
+        .collect();
+    if let Some(found) = known.iter().find(|candidate| is_executable_file(candidate)) {
+        return BridgeHelper::Usable(found.clone());
+    }
+    if let Some(found) = on_path {
+        return BridgeHelper::Usable(found);
+    }
+    if let Some(broken) = known.iter().find(|candidate| candidate.is_file()) {
+        return BridgeHelper::Unexecutable(broken.clone());
+    }
+    match on_path_unusable {
+        Some(broken) => BridgeHelper::Unexecutable(broken),
+        None => BridgeHelper::Absent,
+    }
+}
+
+/// Explain a bridge helper QEMU could not use, including the second thing that breaks bridging.
+fn bridge_helper_problem(state: &BridgeHelper) -> Option<String> {
+    let allow = "Also make sure `/etc/qemu/bridge.conf` contains `allow qlbr0`";
+    match state {
+        BridgeHelper::Usable(_) => None,
+        BridgeHelper::Unexecutable(path) => Some(format!(
+            "`{BRIDGE_HELPER_PROGRAM}` is installed at {} but cannot be executed: check that \
+             file's permissions and that its filesystem is not mounted `noexec`. QEMU execs it \
+             to attach a VM to the `qlbr0` bridge and reports that failure only as `bridge \
+             helper failed`. {allow}",
+            path.display()
+        )),
+        BridgeHelper::Absent => Some(format!(
             "`{BRIDGE_HELPER_PROGRAM}` was not found in {} or on `PATH`: QEMU runs it to attach a VM to \
              the `qlbr0` bridge. Install the QEMU package that ships it, and make sure \
              `/etc/qemu/bridge.conf` contains `allow qlbr0`",
             BRIDGE_HELPER_CANDIDATES.join(", ")
-        )
-    })
+        )),
+    }
 }
 
-/// Whether `program` is found by a bare-name lookup, as `Command::new` would run it.
-fn program_on_path(program: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| dir.join(program).is_file())
+/// The file a bare program name resolves to when it can be executed.
+///
+/// The counterpart of [`unexecutable_on_path`]: a bare-name lookup has to answer what
+/// `Command::new(program)` needs, and that execs the file rather than stat-ing it.
+fn executable_on_path(program: &str) -> Option<PathBuf> {
+    executable_on_path_in(program, std::env::var_os("PATH").as_deref())
+}
+
+/// Same lookup with the search path injected, so a test can hand it a temporary directory
+/// instead of the environment (`set_var` is `unsafe` in edition 2024 and unavailable here).
+fn executable_on_path_in(program: &str, search: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    if program.contains('/') {
+        let path = Path::new(program);
+        return is_executable_file(path).then(|| path.to_path_buf());
+    }
+    let paths = search?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join(program))
+        .find(|candidate| is_executable_file(candidate))
 }
 
 /// Ensure the guest-independent host prerequisites (CLI tools, bridge helper, network).
 pub(crate) async fn ensure_host_prerequisites() -> Result<()> {
     let mut problems = check_commands_available(&REQUIRED_PROGRAMS).await;
-    let helper = bridge_helper_path(
-        |path| path.is_file(),
-        program_on_path(BRIDGE_HELPER_PROGRAM),
+    // The same two questions the Windows program gate asks (`is_executable_file`), because a
+    // helper that exists and cannot be executed is the failure QEMU compresses into
+    // `bridge helper failed` (R242).
+    let helper = bridge_helper_state(
+        &BRIDGE_HELPER_CANDIDATES,
+        executable_on_path(BRIDGE_HELPER_PROGRAM),
+        unexecutable_on_path(BRIDGE_HELPER_PROGRAM),
     );
-    problems.extend(bridge_helper_problem(helper.as_deref()));
+    problems.extend(bridge_helper_problem(&helper));
 
     anyhow::ensure!(
         problems.is_empty(),
@@ -1891,34 +1957,114 @@ mod tests {
         assert!(problems[0].contains("was not found"), "{problems:?}");
     }
 
+    /// Both questions are asked of real files here: an executable known path wins, and a
+    /// present-but-unexecutable one loses to an executable copy on `PATH`.
     #[test]
-    fn test_bridge_helper_path_prefers_a_known_install_path() {
-        let found = bridge_helper_path(
-            |candidate| candidate == Path::new("/usr/libexec/qemu-bridge-helper"),
-            true,
-        );
+    fn test_bridge_helper_state_prefers_a_known_install_path_it_can_run() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let known = dir.path().join("qemu-bridge-helper");
+        let on_path = dir.path().join("path-copy");
+        for file in [&known, &on_path] {
+            std::fs::write(file, b"#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // A broken copy in the known locations must not hide a working one on `PATH`: the
+        // gate would then refuse a host where QEMU would have worked.
+        std::fs::set_permissions(&known, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let candidates = [known.to_str().unwrap()];
         assert_eq!(
-            found.as_deref(),
-            Some(Path::new("/usr/libexec/qemu-bridge-helper"))
+            bridge_helper_state(&candidates, Some(on_path.clone()), None),
+            BridgeHelper::Usable(on_path.clone())
+        );
+        std::fs::set_permissions(&known, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            bridge_helper_state(&candidates, Some(on_path), None),
+            BridgeHelper::Usable(known)
         );
     }
 
     #[test]
-    fn test_bridge_helper_path_falls_back_to_path_lookup() {
+    fn test_bridge_helper_state_falls_back_to_path_lookup() {
         assert_eq!(
-            bridge_helper_path(|_| false, true).as_deref(),
-            Some(Path::new("qemu-bridge-helper"))
+            bridge_helper_state(
+                &[],
+                Some(PathBuf::from("/opt/bin/qemu-bridge-helper")),
+                None
+            ),
+            BridgeHelper::Usable(PathBuf::from("/opt/bin/qemu-bridge-helper"))
         );
-        assert_eq!(bridge_helper_path(|_| false, false), None);
+        assert_eq!(bridge_helper_state(&[], None, None), BridgeHelper::Absent);
+    }
+
+    /// A helper that exists and cannot be executed is not "installed": this is the answer QEMU
+    /// never gives, because its only sentence for it is `bridge helper failed` (R242).
+    #[test]
+    fn test_a_bridge_helper_that_cannot_be_executed_is_not_reported_as_installed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let broken = dir.path().join("qemu-bridge-helper");
+        std::fs::write(&broken, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let candidates = [broken.to_str().unwrap()];
+        let state = bridge_helper_state(&candidates, None, None);
+        assert_eq!(state, BridgeHelper::Unexecutable(broken.clone()));
+        let problem = bridge_helper_problem(&state).expect("a problem");
+        // It has to name the file: QEMU never does, and the fix is that one file's mode.
+        let named = broken.to_string_lossy().into_owned();
+        assert!(problem.contains(&named), "{problem}");
+        assert!(problem.contains("cannot be executed"), "{problem}");
+        assert!(problem.contains("noexec"), "{problem}");
+        // The other half of bridging still applies.
+        assert!(problem.contains("/etc/qemu/bridge.conf"), "{problem}");
+        assert!(problem.contains("allow qlbr0"), "{problem}");
+        assert!(!problem.contains("  "), "{problem}");
+        // The same answer when only the `PATH` copy is unusable.
+        let on_path = bridge_helper_state(&[], None, Some(broken.clone()));
+        assert_eq!(on_path, BridgeHelper::Unexecutable(broken));
+    }
+
+    /// A file on `PATH` by that name is only found when it can be executed - the question
+    /// `Command::new` asks, which the old `is_file()` probe answered with "yes" (R242).
+    #[test]
+    fn test_a_program_on_path_has_to_be_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("qlean-r242-helper");
+        std::fs::write(&program, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let search = dir.path().as_os_str();
+        assert_eq!(
+            executable_on_path_in("qlean-r242-helper", Some(search)),
+            None
+        );
+        let program_text = program.to_str().unwrap();
+        assert_eq!(
+            unexecutable_on_path(program_text).as_deref(),
+            Some(program.as_path())
+        );
+
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            executable_on_path_in("qlean-r242-helper", Some(search)).as_deref(),
+            Some(program.as_path())
+        );
+        assert_eq!(unexecutable_on_path(program_text), None);
     }
 
     #[test]
     fn test_bridge_helper_problem_explains_both_requirements() {
         assert!(
-            bridge_helper_problem(Some(Path::new("/usr/lib/qemu/qemu-bridge-helper"))).is_none()
+            bridge_helper_problem(&BridgeHelper::Usable(PathBuf::from(
+                "/usr/lib/qemu/qemu-bridge-helper"
+            )))
+            .is_none()
         );
 
-        let problem = bridge_helper_problem(None).expect("a problem");
+        let problem = bridge_helper_problem(&BridgeHelper::Absent).expect("a problem");
         // The binary is only half of it: the helper also needs the bridge allowlist.
         assert!(problem.contains("`qemu-bridge-helper`"), "{problem}");
         assert!(problem.contains("/etc/qemu/bridge.conf"), "{problem}");

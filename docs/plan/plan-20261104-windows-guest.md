@@ -1081,7 +1081,7 @@
 | 清理幂等且不致命 | `src/windows.rs::DeploySeed::remove` + `confirm_deployment` 的 `warn!`：半途清理不算失败（R50，`0b10e09`） |
 | 失败路径可终止 | `src/machine.rs::reap_launch_task`：清理阶段有界等待 QEMU，原始启动错误必定返回（R49，`0cb5988`） |
 | 关停结果可验证 | `src/machine.rs::teardown_step`/`TeardownStep::Unkillable`：SIGKILL 未生效时失败并保留 pid，不谎报关停（R48，`36ab2f7`） |
-| 桥接依赖进前置检查 | `src/utils.rs::bridge_helper_problem`：`qemu-bridge-helper`（`libexec`，非 `PATH`）与其 `/etc/qemu/bridge.conf` 允许列表一起被报出（R47，`f549dfb`） |
+| 桥接依赖进前置检查 | `src/utils.rs::bridge_helper_problem`：`qemu-bridge-helper`（`libexec`，非 `PATH`）与其 `/etc/qemu/bridge.conf` 允许列表一起被报出（R47，`f549dfb`）。**R242（`review R242`）把「有没有这个文件」换成「能不能跑它」**：`bridge_helper_state` 用与 Windows 五程序同一道判据 `is_executable_file`（`usable`）回答 QEMU 的问题，`exists`（`is_file`）只用来把答案分成 `Usable`/`Unexecutable`/`Absent` 三种，报文点名那个文件的权限与 `noexec`。依据是 QEMU 自己的报文：容器里把 `qemu-bridge-helper` 改成 0644，与「能执行但失败」打印**同一句** `-netdev bridge,br=qlbr0,id=n0: bridge helper failed`，既不点文件也不说原因（`sh` 侧则是 `Permission denied`）。 |
 | 启动 future 不被取消 | `src/pool.rs::run_all`：单台失败不影响其余机器启动，避免留下无 pid 的 QEMU（R46，`f2426cd`） |
 | 固件候选按可用性筛选 | `src/firmware.rs::resolve_ovmf_with`：无 Microsoft 密钥的 secboot pair 只记原因并继续，普通候选仍可落地（R45，`3c0ad9f`） |
 | 停止路径可诊断 | `src/qemu.rs::describe_exit`：teardown 的 SIGTERM/SIGKILL 不再算失败，未请求的死亡点名信号而不再输出 `None`（R44，`1bb1af1`） |
