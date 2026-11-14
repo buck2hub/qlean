@@ -339,7 +339,7 @@ async fn discover_windows_endpoint(
         )
     })?;
     let ip = crate::utils::find_lease_address(&mac_address, timeout).await?;
-    Ok((std::net::SocketAddr::new(ip, windows::SSH_PORT), host_key))
+    Ok((windows::ssh_endpoint(ip), host_key))
 }
 
 /// Error for a Windows launch whose QEMU task finished before the guest reached a DHCP lease.
@@ -368,8 +368,14 @@ fn qemu_exit_before_lease(
 /// default). Using the plain connect budget there would abort a working first
 /// boot at 180s, leaving the deployment budget unreachable. Later boots and
 /// Linux guests keep the historical connect budget.
-fn resolve_connect_timeout(config: &MachineConfig, guest_os: GuestOs, is_init: bool) -> Duration {
-    if guest_os == GuestOs::Windows && is_init {
+///
+/// The decision is handed in as the answer to [`takes_first_boot_deadline`], not re-derived
+/// from `(guest_os, is_init)` here: a second spelling of the same question in this function
+/// kept the suite green while giving every Windows *restart* the 900s first-boot budget (R253),
+/// because the one test that covered restarts used an `ssh_timeout` override, which makes the
+/// two budgets equal and the claim unfalsifiable.
+fn resolve_connect_timeout(config: &MachineConfig, first_boot: bool) -> Duration {
+    if first_boot {
         return windows::deploy_timeout(config);
     }
     resolve_ssh_timeout(config)
@@ -463,6 +469,53 @@ fn remaining_first_boot_budget(
             remaining_budget(deadline).ok_or_else(|| spent_first_boot_budget(phase, budget))
         }
         None => Ok(budget),
+    }
+}
+
+/// How long the deployment-marker wait may keep polling, and what to say when it runs out.
+///
+/// The wait receives the shared deadline and the machine's config, and resolves the budget
+/// itself, so the loop cannot be handed the wrong number: spelling `windows::deploy_timeout`
+/// and `remaining_first_boot_budget` out inside [`Machine::confirm_deployment`] meant a wait
+/// that ignored the shared deadline (another full budget after a spent one) and a wait that
+/// used the 180s connect budget both stayed green (R253). `expired_at` takes the elapsed time
+/// as an argument so the `>=` boundary - "the budget is spent, not almost spent" - is
+/// testable without sleeping.
+#[derive(Debug)]
+pub(crate) struct DeploymentWait {
+    started: std::time::Instant,
+    remaining: Duration,
+    budget: Duration,
+}
+
+impl DeploymentWait {
+    /// Resolve the budget for `phase`, or fail if the shared deadline is already spent.
+    fn begin(
+        deadline: Option<std::time::Instant>,
+        config: &MachineConfig,
+        phase: &str,
+    ) -> Result<Self> {
+        let budget = windows::deploy_timeout(config);
+        let remaining = remaining_first_boot_budget(deadline, budget, phase)?;
+        Ok(Self {
+            started: std::time::Instant::now(),
+            remaining,
+            budget,
+        })
+    }
+
+    /// Whether the budget this wait was given is spent.
+    fn expired_at(&self, elapsed: Duration) -> bool {
+        elapsed >= self.remaining
+    }
+
+    fn expired(&self) -> bool {
+        self.expired_at(self.started.elapsed())
+    }
+
+    /// The error for a wait that ran out, naming the deployment and its budget.
+    fn timeout_error(&self) -> anyhow::Error {
+        anyhow::anyhow!("{}", windows::deploy_timeout_message(self.budget))
     }
 }
 
@@ -1635,14 +1688,14 @@ StandardError=journal
             return Ok(());
         }
 
-        let timeout = windows::deploy_timeout(&self.config);
-        let start = std::time::Instant::now();
         // A first boot that is still running shares one deadline with the lease and `sshd`
         // waits, so the documented budget bounds the whole boot instead of one phase. An
-        // expired deadline is a failure here, not a fresh budget.
-        let remaining = remaining_first_boot_budget(
+        // expired deadline is a failure here, not a fresh budget. Both facts live in
+        // `DeploymentWait`: it is handed the deadline and the config, not a number the loop
+        // was supposed to compute correctly.
+        let wait = DeploymentWait::begin(
             self.first_boot_deadline,
-            timeout,
+            &self.config,
             "the deployment marker appeared",
         )?;
         // A marker poll that cannot reach the guest says nothing about deployment: the
@@ -1667,24 +1720,17 @@ StandardError=journal
                     )
                 });
             }
-            if start.elapsed() >= remaining {
-                bail!("{}", windows::deploy_timeout_message(timeout));
+            if wait.expired() {
+                return Err(wait.timeout_error());
             }
             tokio::time::sleep(windows::DEPLOY_POLL_INTERVAL).await;
         }
 
+        // The guest is deployed and the machine is usable. Cleanup is reported, never returned:
+        // a leftover seed file cannot turn a successful first boot into a failure, and a `?`
+        // here did exactly that (R253).
         if let Some(seed) = self.deploy_seed.take() {
-            let iso = seed.iso_path().to_path_buf();
-            match seed.remove().await {
-                Ok(()) => debug!("VM-{} deployed; seed medium removed", self.id),
-                // The guest is deployed and the machine is usable: a leftover seed file
-                // must not turn a successful first boot into a failure. It stays inside
-                // the owner-only run directory, so report it and move on.
-                Err(e) => warn!(
-                    "VM-{} deployed, but the seed medium {iso:?} could not be removed: {e:#}",
-                    self.id
-                ),
-            }
+            discard_deployed_seed(seed, &self.id).await;
         }
         Ok(())
     }
@@ -1694,22 +1740,12 @@ StandardError=journal
     /// `Ok(false)` means the guest answered and the marker is absent; `Err` means the
     /// question could not be asked, which must not be mistaken for "not deployed yet".
     async fn deploy_marker_present(&mut self) -> Result<bool> {
-        marker_probe_guard(
-            self.ssh.is_some() && self.ssh_cancel_token.is_some(),
-            &self.id,
-        )?;
-        let Some(cancel_token) = self.ssh_cancel_token.clone() else {
-            bail!(
-                "internal inconsistency: VM-{} has a session but no cancellation token",
-                self.id
-            );
-        };
-        let Some(ssh) = self.ssh.as_mut() else {
-            bail!(
-                "internal inconsistency: VM-{} was reported reachable without a session",
-                self.id
-            );
-        };
+        // The session lookup is the same one every other guest operation uses: it answers
+        // "which session, which cancellation token" or the shared not-running error. Spelling
+        // the condition out here (`ssh.is_some() && token.is_some()`) meant an `||` typo
+        // replaced the actionable "start it first" message with an internal-inconsistency one
+        // (R253), and the two `bail!` arms behind it were unreachable anyway.
+        let (ssh, cancel_token) = self.get_ssh("check the Windows deployment marker")?;
         let cmd = windows::marker_probe_command();
         let (code, stdout, stderr) = ssh.call_probe(&cmd, cancel_token).await?;
         if code != 0 {
@@ -1718,7 +1754,7 @@ StandardError=journal
                 String::from_utf8_lossy(&stderr).trim()
             );
         }
-        Ok(String::from_utf8_lossy(&stdout).contains(windows::MARKER_PRESENT_TOKEN))
+        Ok(marker_seen(&String::from_utf8_lossy(&stdout)))
     }
 
     /// Guest operating system family of this machine's image.
@@ -1832,7 +1868,10 @@ StandardError=journal
             self.cid, self.keypair.privkey_path,
         );
 
-        let ssh_timeout = resolve_connect_timeout(&self.config, self.image.guest_os, is_init);
+        let ssh_timeout = resolve_connect_timeout(
+            &self.config,
+            takes_first_boot_deadline(is_init, self.image.guest_os),
+        );
         // One deadline for the whole Windows first boot: the lease wait, the `sshd` wait and
         // the deploy-marker wait draw from the same budget instead of starting fresh each
         // time. Later boots keep the plain connect budget with no shared deadline.
@@ -2928,6 +2967,30 @@ impl MarkerWatch {
     }
 }
 
+/// Whether the marker probe's output says the marker exists.
+///
+/// The probe is read-only and always exits 0, so only its stdout decides. Reading it the other
+/// way round (or matching a different word) makes an unfinished deployment look finished, and
+/// the seed is deleted while the guest is still installing from it (R253).
+fn marker_seen(stdout: &str) -> bool {
+    stdout.contains(windows::MARKER_PRESENT_TOKEN)
+}
+
+/// Report, never return, a deployment seed that could not be cleaned up.
+///
+/// Returning `()` is the point: by the time this runs the guest is deployed and usable, so a
+/// leftover seed file must not turn a successful first boot into a failure. It stays inside the
+/// owner-only run directory, so it is reported and forgotten (R253).
+async fn discard_deployed_seed(seed: crate::windows::DeploySeed, machine_id: &str) {
+    let iso = seed.iso_path().to_path_buf();
+    match seed.remove().await {
+        Ok(()) => debug!("VM-{machine_id} deployed; seed medium removed"),
+        Err(error) => warn!(
+            "VM-{machine_id} deployed, but the seed medium {iso:?} could not be removed: {error:#}"
+        ),
+    }
+}
+
 /// Refuse to `init` a machine whose route is not `init`.
 ///
 /// The pool decides a start with [`start_actions`]; the public entry point has to answer the
@@ -2957,22 +3020,6 @@ fn spawn_guard(needs_first_boot: bool, machine_id: &str) -> Result<()> {
         "VM-{machine_id} has a Windows deployment that has not run yet, and `spawn` boots \
          without the deployment medium; use `init` for the first boot and `spawn` afterwards"
     )
-}
-
-/// Refuse to probe the deployment marker without a session.
-///
-/// A missing session is not evidence that the deployment has not finished: reporting
-/// `Ok(false)` there made [`Machine::confirm_deployment`] poll for the whole budget and then
-/// claim the deployment timed out. The distinction is the entire contract of
-/// [`Machine::deploy_marker_present`], so it lives in one testable place.
-fn marker_probe_guard(session_present: bool, machine_id: &str) -> Result<()> {
-    if session_present {
-        return Ok(());
-    }
-    Err(not_running_error(
-        "check the Windows deployment marker",
-        machine_id,
-    ))
 }
 
 /// Why a session-scoped operation cannot run: the machine is not up.
@@ -5038,19 +5085,25 @@ mod timeout_tests {
         assert_eq!(running_check(true, true, true), RunningCheck::AskQmp);
     }
 
-    #[test]
-    fn marker_probe_without_a_session_is_an_error_not_a_missing_marker() {
+    #[tokio::test]
+    async fn marker_probe_without_a_session_is_an_error_not_a_missing_marker() {
         // `Ok(false)` here would make a deployment wait the full budget and then blame the
-        // guest for a host-side problem.
-        let error = marker_probe_guard(false, "abc123")
+        // guest for a host-side problem. The question is asked of the machine itself, so a
+        // machine that never started answers with the shared "not running" error - the same
+        // one every other guest operation uses - and not with an internal-inconsistency one.
+        let mut machine = Machine::for_tests_with_guest(GuestOs::Windows, None);
+        let error = machine
+            .deploy_marker_present()
+            .await
             .expect_err("no session must be an error")
             .to_string();
         assert!(
             error.contains("check the Windows deployment marker"),
             "{error}"
         );
-        assert!(error.contains("VM-abc123"), "{error}");
-        assert!(marker_probe_guard(true, "abc123").is_ok());
+        assert!(error.contains("VM-never-started"), "{error}");
+        assert!(error.contains("not running"), "{error}");
+        assert!(!error.contains("internal inconsistency"), "{error}");
     }
 
     #[test]
@@ -5089,24 +5142,35 @@ mod timeout_tests {
         // 900s, not the 180s/300s Linux connect budget: the guest still has to
         // install the seed key and enable sshd before it answers.
         assert_eq!(
-            resolve_connect_timeout(&config(None), GuestOs::Windows, true),
+            resolve_connect_timeout(&config(None), true),
             windows::deploy_timeout(&config(None))
         );
         assert_eq!(
-            resolve_connect_timeout(&config(None), GuestOs::Windows, true),
+            resolve_connect_timeout(&config(None), true),
             Duration::from_secs(windows::DEPLOY_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            resolve_connect_timeout(&config(Some(45)), true),
+            Duration::from_secs(45)
         );
     }
 
     #[test]
     fn windows_restart_keeps_the_connect_budget() {
-        // No deployment happens on spawn, so the override is the plain connect budget.
-        assert_eq!(
-            resolve_connect_timeout(&config(Some(45)), GuestOs::Windows, false),
-            Duration::from_secs(45)
+        // No deployment happens on spawn, so the budget is the plain connect one. The claim is
+        // only observable *without* an override: `ssh_timeout` is both budgets at once, so the
+        // older spelling of this test - which set it - passed even when every Windows boot took
+        // the deployment budget (R253).
+        let conf = config(None);
+        let restart = resolve_connect_timeout(&conf, false);
+        assert_eq!(restart, resolve_ssh_timeout(&conf));
+        assert_ne!(
+            restart,
+            Duration::from_secs(windows::DEPLOY_TIMEOUT_SECS),
+            "a restart must not draw on the first-boot deployment budget"
         );
         assert_eq!(
-            resolve_connect_timeout(&config(Some(45)), GuestOs::Windows, true),
+            resolve_connect_timeout(&config(Some(45)), false),
             Duration::from_secs(45)
         );
     }
@@ -5115,12 +5179,239 @@ mod timeout_tests {
     fn linux_first_boot_keeps_the_connect_budget() {
         let conf = config(None);
         assert_eq!(
-            resolve_connect_timeout(&conf, GuestOs::Linux, true),
+            resolve_connect_timeout(&conf, false),
             resolve_ssh_timeout(&conf)
         );
         assert_eq!(
-            resolve_connect_timeout(&config(Some(45)), GuestOs::Linux, true),
+            resolve_connect_timeout(&config(Some(45)), false),
             Duration::from_secs(45)
         );
+    }
+}
+
+#[cfg(test)]
+/// The wait for the deployment marker decides three things without a guest: which budget it
+/// draws on, when that budget is spent, and what it says when it runs out.
+mod deployment_wait_tests {
+    use super::*;
+
+    fn config(ssh_timeout: Option<u64>) -> MachineConfig {
+        MachineConfig {
+            ssh_timeout,
+            ..MachineConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_wait_takes_the_budget_from_the_config_it_was_handed() {
+        // Not a number the caller computed: `confirm_deployment` spelled the budget out itself,
+        // and the 180s connect budget left the suite green (R253).
+        let bare = DeploymentWait::begin(None, &config(None), "the deployment marker appeared")
+            .expect("no shared deadline cannot be spent");
+        assert_eq!(bare.remaining, windows::deploy_timeout(&config(None)));
+        assert_eq!(
+            bare.remaining,
+            Duration::from_secs(windows::DEPLOY_TIMEOUT_SECS)
+        );
+        let overridden =
+            DeploymentWait::begin(None, &config(Some(45)), "the deployment marker appeared")
+                .expect("no shared deadline cannot be spent");
+        assert_eq!(overridden.remaining, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn a_shared_deadline_that_is_already_spent_fails_before_the_first_poll() {
+        // A first boot that used its budget on the lease and `sshd` must not get a fresh wait
+        // for the marker.
+        let spent = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("a second before now exists");
+        let error =
+            DeploymentWait::begin(Some(spent), &config(None), "the deployment marker appeared")
+                .expect_err("a spent deadline is a failure, not a fresh budget");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("the deployment marker appeared"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("{}s", windows::DEPLOY_TIMEOUT_SECS)),
+            "the message has to name the budget: {message}"
+        );
+    }
+
+    #[test]
+    fn the_budget_is_spent_when_it_is_reached_and_not_before() {
+        // `>=`, not `>`: a wait that stops one poll late is harmless, one that never stops is
+        // the whole budget again. `expired_at` takes the elapsed time so the boundary can be
+        // asserted without sleeping.
+        let wait = DeploymentWait::begin(None, &config(Some(5)), "the deployment marker appeared")
+            .expect("no shared deadline cannot be spent");
+        assert!(
+            !wait.expired_at(Duration::from_millis(4_999)),
+            "a budget with a millisecond left is not spent"
+        );
+        assert!(wait.expired_at(Duration::from_secs(5)), "5s of a 5s budget");
+        let no_budget =
+            DeploymentWait::begin(None, &config(Some(0)), "the deployment marker appeared")
+                .expect("no shared deadline cannot be spent");
+        assert!(
+            no_budget.expired_at(Duration::ZERO),
+            "a zero budget is spent from the start"
+        );
+    }
+
+    #[test]
+    fn the_timeout_error_names_the_deployment_and_its_budget() {
+        let wait = DeploymentWait::begin(None, &config(None), "the deployment marker appeared")
+            .expect("no shared deadline cannot be spent");
+        let message = format!("{:#}", wait.timeout_error());
+        assert!(
+            message.contains("first-boot deployment"),
+            "the error has to name what did not finish: {message}"
+        );
+        assert!(
+            message.contains(&format!("{}s", windows::DEPLOY_TIMEOUT_SECS)),
+            "the error has to name the budget: {message}"
+        );
+        assert!(
+            message.contains(windows::GUEST_DEPLOY_MARKER),
+            "the error has to name the marker the guest task writes: {message}"
+        );
+    }
+
+    #[test]
+    fn the_loop_asks_the_wait_and_never_computes_a_budget_itself() {
+        // The two survivors this replaces: a loop that compared against the full budget, and one
+        // that handed `remaining_first_boot_budget` a `None` deadline. Both have to be gone from
+        // `confirm_deployment` - one construction point, fed by the machine's own fields.
+        const SOURCE: &str = include_str!("machine.rs");
+        let at = SOURCE
+            .find("pub(crate) async fn confirm_deployment(")
+            .expect("machine.rs has no confirm_deployment");
+        let rest = &SOURCE[at..];
+        let body = &rest[..rest
+            .find("/// Whether the guest reports that its first-boot deployment finished")
+            .expect("confirm_deployment has no end")];
+        assert_eq!(
+            body.matches("DeploymentWait::begin(").count(),
+            1,
+            "the wait has to be built once, in confirm_deployment"
+        );
+        assert!(
+            body.contains("self.first_boot_deadline"),
+            "the wait has to be handed the shared deadline"
+        );
+        assert!(
+            body.contains("&self.config"),
+            "the wait has to be handed the machine's config, not a number"
+        );
+        assert!(
+            !body.contains("windows::deploy_timeout("),
+            "the loop must not compute the budget itself"
+        );
+        assert!(
+            !body.contains("remaining_first_boot_budget("),
+            "the loop must not resolve the shared deadline itself"
+        );
+        assert!(
+            !body.contains("Duration::from_secs("),
+            "a literal budget in the loop is the defect this replaces"
+        );
+    }
+
+    #[test]
+    fn the_marker_is_seen_only_when_the_probe_says_deployed() {
+        // The probe prints one word and always exits 0, so stdout is the whole answer. Reading it
+        // inverted confirms a deployment that has not happened and deletes the seed while the
+        // guest is still installing from it (R253).
+        assert!(marker_seen("deployed\r\n"), "the probe's own output");
+        assert!(marker_seen("deployed"), "stdout without a newline");
+        assert!(!marker_seen(""), "an absent marker prints nothing");
+        assert!(!marker_seen("ready\r\n"), "another word is not the marker");
+    }
+
+    /// The body of one function in `machine.rs`, so a guard is not satisfied by its own text.
+    fn body_of<'a>(source: &'a str, signature: &str, next: &str) -> &'a str {
+        let at = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("machine.rs has no {signature}"));
+        let rest = &source[at..];
+        &rest[..rest
+            .find(next)
+            .unwrap_or_else(|| panic!("{signature} has no end marked by {next}"))]
+    }
+
+    #[test]
+    fn the_endpoint_is_asked_of_the_windows_module() {
+        // `SocketAddr::new(ip, 2222)` at the discovery site reached a guest that never answers,
+        // and the suite could not tell (R253). The port has one name, in `windows`.
+        const SOURCE: &str = include_str!("machine.rs");
+        // Split so this scan does not find its own text and report a second call site.
+        let discovery = body_of(
+            SOURCE,
+            concat!("async fn discover_windows_", "endpoint("),
+            "/// Error for a Windows launch whose QEMU task finished",
+        );
+        assert_eq!(
+            discovery.matches("windows::ssh_endpoint(").count(),
+            1,
+            "the lease lookup has to build the endpoint through the windows module: {discovery}"
+        );
+        assert!(
+            !discovery.contains("SocketAddr::new("),
+            "an address spelled out here is the defect this replaces: {discovery}"
+        );
+        assert!(
+            !discovery.contains("22"),
+            "a port literal here is the defect this replaces: {discovery}"
+        );
+    }
+
+    #[test]
+    fn the_ip_query_matches_this_machines_own_mac() {
+        // The adapter list is matched against the MAC the lease was issued for; anything else
+        // reports another machine's address from `get_ip` (R253).
+        const SOURCE: &str = include_str!("machine.rs");
+        let query = body_of(
+            SOURCE,
+            "async fn query_windows_ip(",
+            "/// Check if the machine is currently running.",
+        );
+        assert_eq!(
+            query
+                .matches("select_guest_address(&addresses, &self.mac_address)")
+                .count(),
+            1,
+            "the address query has to be matched against this machine's MAC: {query}"
+        );
+        assert!(
+            !query.contains("GUEST_USERNAME"),
+            "the guest account is not a MAC: {query}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unremovable_seed_is_reported_and_never_fails_the_deployment() {
+        // `discard_deployed_seed` returns `()`, so a caller cannot propagate its error: making a
+        // leftover seed file fatal turned a successful first boot into a failure (R253).
+        let deployed = tempfile::tempdir().expect("temp dir");
+        let seed_dir = deployed.path().join("seed");
+        std::fs::create_dir_all(seed_dir.join(windows::SEED_ROOT)).expect("seed root");
+        let iso = deployed.path().join("seed.iso");
+        std::fs::write(&iso, b"medium").expect("medium");
+        let seed = crate::windows::DeploySeed::for_tests(seed_dir.clone(), iso.clone());
+        discard_deployed_seed(seed, "vm-1").await;
+        assert!(!iso.exists(), "the seed medium is removed");
+        assert!(!seed_dir.exists(), "the staged directory is removed");
+
+        // A directory where the medium belongs: removal fails, and the deployment still stands.
+        let stuck = tempfile::tempdir().expect("temp dir");
+        let stuck_dir = stuck.path().join("seed");
+        std::fs::create_dir_all(&stuck_dir).expect("seed dir");
+        let stuck_iso = stuck.path().join("seed.iso");
+        std::fs::create_dir_all(&stuck_iso).expect("a directory in the medium's place");
+        let seed = crate::windows::DeploySeed::for_tests(stuck_dir, stuck_iso);
+        discard_deployed_seed(seed, "vm-2").await;
     }
 }

@@ -64,6 +64,16 @@ pub(crate) const MARKER_PRESENT_TOKEN: &str = "deployed";
 /// TCP port Windows guests expose their OpenSSH server on.
 pub(crate) const SSH_PORT: u16 = 22;
 
+/// Endpoint a Windows guest's OpenSSH server answers on.
+///
+/// The port has one name and one place that puts it into an address: the host side spelled the
+/// address out as `SocketAddr::new(ip, windows::SSH_PORT)` inside the lease lookup, and a port
+/// written there instead of read from [`SSH_PORT`] reaches a guest that never answers - the
+/// connect then waits out the whole budget and reports `sshd`, not the wrong port (R253).
+pub(crate) fn ssh_endpoint(ip: std::net::IpAddr) -> std::net::SocketAddr {
+    std::net::SocketAddr::new(ip, SSH_PORT)
+}
+
 /// Command used as the Windows readiness probe once the session is up.
 ///
 /// `cmd /c ver` exercises the transport, the deployed key and a working
@@ -342,6 +352,15 @@ impl DeploySeed {
     /// Path of the seed ISO that QEMU attaches on first boot.
     pub(crate) fn iso_path(&self) -> &Path {
         &self.iso
+    }
+
+    /// A staged seed that only names two paths, for callers that exercise cleanup.
+    ///
+    /// Nothing is written: the point is to hand a path pair to the code under test, the way
+    /// [`DeploySeed::stage`] would after a real first boot.
+    #[cfg(test)]
+    pub(crate) fn for_tests(dir: PathBuf, iso: PathBuf) -> Self {
+        Self { dir, iso }
     }
 
     /// Build the ISO9660+Joliet image from the staged directory.
@@ -852,6 +871,18 @@ mod tests {
             "the account that receives the key is `{GUEST_USERNAME}`, and the README does not \
              name it"
         );
+    }
+
+    #[test]
+    fn the_endpoint_puts_the_guest_there_sshd_listens() {
+        // The guest contract says OpenSSH on 22; the host side reaches it through this one
+        // function, so a wrong port here is a boot that never answers, reported as a broken
+        // `sshd` rather than as a wrong port (R253).
+        let ip = "192.0.2.7".parse().expect("an address literal");
+        let endpoint = ssh_endpoint(ip);
+        assert_eq!(endpoint.ip(), ip, "the lease address is kept as given");
+        assert_eq!(endpoint.port(), SSH_PORT);
+        assert_eq!(SSH_PORT, 22, "the port the image's sshd listens on");
     }
 
     #[test]
