@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_vsock::{VsockAddr, VsockStream};
 use tracing::{debug, info};
 
+use crate::GuestOs;
 use crate::guest_path::GuestPath;
 
 #[cfg(test)]
@@ -138,6 +139,203 @@ mod transfer_tests {
         result.expect("a healthy transfer must succeed");
         assert_eq!(written.len(), payload.len());
         assert_eq!(written, payload);
+    }
+}
+
+#[cfg(test)]
+mod connect_target_tests {
+    use super::*;
+    use russh::keys::PrivateKey;
+    use russh::keys::ssh_key::private::Ed25519Keypair;
+
+    fn public_key() -> PublicKey {
+        let key = Ed25519Keypair::random(&mut rand::rng());
+        PrivateKey::from(key).public_key().clone()
+    }
+
+    /// This file without this module: the guards below count call sites, and a guard that reads
+    /// its own needles would count itself.
+    fn production() -> String {
+        let mut source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ssh.rs"))
+                .expect("this file is readable");
+        // Concatenated so that these needles are not themselves findable in this file.
+        let start = source
+            .find(concat!("mod connect_target_", "tests {"))
+            .expect("this module is in the file");
+        let end = start
+            + source[start..]
+                .find(concat!("mod host_key_window_", "tests {"))
+                .expect("the next module is in the file");
+        assert!(start < end, "the modules must stay in file order");
+        source.replace_range(start..end, "");
+        source
+    }
+
+    /// A Windows session must never accept whatever host key answers on the lease address: the
+    /// image contract has the first boot install Qlean's own key, so any other key means the
+    /// client is talking to a different guest.
+    #[test]
+    fn only_a_windows_target_pins_its_host_key() {
+        let linux = linux_connect_target();
+        assert_eq!(linux.transport_name, "vsock");
+        assert_eq!(linux.username, "root");
+        assert!(!linux.pinned, "a Linux guest keeps its first-use trust");
+        assert!(
+            vsock_connect_params(Duration::from_secs(5), CancellationToken::new())
+                .expected_host_key
+                .is_none(),
+            "the vsock session must not claim a pin"
+        );
+
+        let windows = windows_connect_target();
+        assert_eq!(windows.transport_name, "tcp");
+        assert_eq!(windows.username, crate::windows::GUEST_USERNAME);
+        assert_ne!(
+            windows.username, "root",
+            "the Windows image has no root account"
+        );
+        assert!(windows.pinned, "the Windows key is deployed, never guessed");
+
+        let key = public_key();
+        let params = tcp_connect_params(
+            Duration::from_secs(5),
+            CancellationToken::new(),
+            key.clone(),
+        );
+        assert_eq!(params.expected_host_key, Some(key));
+    }
+
+    /// The pin and the target are one decision: a target that requires a key handed no key must
+    /// stop before a transport is opened, not accept whatever answers.
+    #[tokio::test]
+    async fn a_target_that_requires_a_pin_refuses_an_unpinned_attempt() {
+        let params = ConnectParams {
+            target: windows_connect_target(),
+            timeout: Duration::from_secs(5),
+            cancel_token: CancellationToken::new(),
+            expected_host_key: None,
+        };
+        let private = PrivateKey::from(Ed25519Keypair::random(&mut rand::rng()));
+        let Err(error) = Session::connect_over(params, private, || async {
+            std::io::Result::<tokio::net::TcpStream>::Err(std::io::Error::other("never used"))
+        })
+        .await
+        else {
+            panic!("an unpinned Windows attempt must not reach the transport");
+        };
+        let error = error.to_string();
+        assert!(error.contains("refusing to connect over tcp"), "{error}");
+        assert!(error.contains("requires"), "{error}");
+    }
+
+    /// One name for the port a Linux guest's `sshd` listens on, used at the one vsock call site.
+    #[test]
+    fn the_vsock_endpoint_names_the_port_sshd_listens_on() {
+        assert_eq!(VSOCK_SSH_PORT, 22);
+        let source = production();
+        assert_eq!(
+            source.matches("cid,\n            VSOCK_SSH_PORT,").count(),
+            1,
+            "exactly one call site hands the named port to the vsock session"
+        );
+        assert!(
+            !source.contains("cid,\n            22,"),
+            "the vsock port must not be spelled as a literal argument"
+        );
+    }
+
+    /// A spent budget must say which transport it was on: the vsock message cannot be reused for
+    /// a Windows TCP attempt, or the operator chases a device that is not in play.
+    #[test]
+    fn each_transport_reports_its_own_name_and_timeout() {
+        let linux = linux_connect_target();
+        let windows = windows_connect_target();
+        assert!(
+            linux.timeout_message.contains("vsock"),
+            "{}",
+            linux.timeout_message
+        );
+        assert!(
+            windows.timeout_message.contains("tcp"),
+            "{}",
+            windows.timeout_message
+        );
+        assert_ne!(linux.timeout_message, windows.timeout_message);
+        assert_ne!(linux.transport_name, windows.transport_name);
+    }
+
+    /// The per-attempt budget has to stay short enough to retry, and never collapse to zero.
+    #[test]
+    fn an_attempt_budget_is_short_but_never_zero() {
+        assert_eq!(per_attempt_budget(Duration::ZERO), Duration::from_secs(1));
+        assert_eq!(
+            per_attempt_budget(Duration::from_millis(500)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            per_attempt_budget(Duration::from_secs(3)),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            per_attempt_budget(Duration::from_secs(3600)),
+            Duration::from_secs(12),
+            "one attempt must not swallow a whole deployment budget"
+        );
+    }
+
+    /// Each guest answers readiness with the command its image actually ships.
+    #[test]
+    fn each_guest_probes_readiness_with_its_own_command() {
+        let linux = readiness_probe_command(GuestOs::Linux);
+        let windows = readiness_probe_command(GuestOs::Windows);
+        assert_eq!(linux, "true");
+        assert_eq!(windows, crate::windows::READINESS_COMMAND);
+        assert_ne!(linux, windows);
+        assert!(!windows.is_empty());
+    }
+
+    /// Ready means exit status zero, and nothing else.
+    #[test]
+    fn only_a_zero_exit_status_says_ready() {
+        assert!(readiness_probe_succeeded(0));
+        for code in [1u32, 2, 127, 255, 9009] {
+            assert!(
+                !readiness_probe_succeeded(code),
+                "exit {code} must not count as ready"
+            );
+        }
+    }
+
+    /// Both readiness probes are built from the one command decision, and the loop's verdict is
+    /// the one predicate: a call site that spells either again is the bug this round fixed.
+    #[test]
+    fn the_connect_loops_ask_the_shared_decisions() {
+        let source = production();
+        assert_eq!(
+            source.matches("readiness_probe_command(GuestOs::").count(),
+            2,
+            "the two connect loops are the only readiness call sites"
+        );
+        assert_eq!(
+            source.matches("readiness_probe_succeeded(").count(),
+            2,
+            "one definition, one call site"
+        );
+        assert!(
+            !source.contains("session.call(\"true\""),
+            "the Linux probe command must come from the shared decision"
+        );
+        assert_eq!(
+            source.matches("per_attempt_budget(remaining)").count(),
+            2,
+            "both connect loops spend the shared per-attempt budget"
+        );
+        assert_eq!(
+            source.matches("expected_host_key: None").count(),
+            1,
+            "only the vsock builder may open an unpinned session"
+        );
     }
 }
 
@@ -2622,16 +2820,119 @@ fn is_fatal_connect_error(error: &anyhow::Error) -> bool {
         .any(|cause| cause.to_string().contains(PINNED_KEY_REJECTED))
 }
 
+/// The facts each guest's transport decides before russh is involved.
+///
+/// Two guests, two transports, and four things that must not drift apart: the user the image
+/// actually runs, the name the transport is reported under, the message a spent budget gets,
+/// and whether the per-VM host key is pinned. Each used to be spelled at its own
+/// `ConnectParams` construction site, and a census of twelve mutants over `src/ssh.rs` left nine
+/// alive (R252): the Windows path could lose its pinning entirely - a session that accepts any
+/// host key - and every one of the 507 tests stayed green, because reaching either path needs a
+/// live guest.
+pub(crate) struct ConnectTarget {
+    /// Transport name used in error messages ("vsock", "tcp").
+    pub(crate) transport_name: &'static str,
+    /// User the guest image runs `sshd` for.
+    pub(crate) username: &'static str,
+    /// Message used when the budget elapses while the guest is still not listening.
+    pub(crate) timeout_message: &'static str,
+    /// Whether this transport pins the per-VM host key injected during deployment.
+    pub(crate) pinned: bool,
+}
+
+/// The vsock port a Linux guest's `sshd` listens on.
+///
+/// One name for one port: the guest image runs `sshd` on 22, and the vsock endpoint has to name
+/// the same number inside a CID that is per-VM.
+pub(crate) const VSOCK_SSH_PORT: u32 = 22;
+
+/// The target a Linux guest's session uses: vsock, as `root`, pinned to nothing.
+pub(crate) fn linux_connect_target() -> ConnectTarget {
+    ConnectTarget {
+        transport_name: "vsock",
+        username: "root",
+        timeout_message: "Timeout while connecting to VM via vsock.",
+        pinned: false,
+    }
+}
+
+/// The target a Windows guest's session uses: TCP, as the deployed user, pinned to its key.
+///
+/// `pinned` is not decoration: the image contract has the first boot install Qlean's own host
+/// key, so a key that is not the deployed one means the client is talking to some other guest -
+/// the one case the retry loop must never paper over.
+pub(crate) fn windows_connect_target() -> ConnectTarget {
+    ConnectTarget {
+        transport_name: "tcp",
+        username: crate::windows::GUEST_USERNAME,
+        timeout_message: "Timeout while connecting to VM via tcp.",
+        pinned: true,
+    }
+}
+
+/// Budget for one connection attempt inside a repeated loop.
+///
+/// A short attempt keeps the loop responsive (a refused connection is retried every 250ms),
+/// while a guest that is listening but slow to answer still gets the whole remaining budget, up
+/// to the per-attempt ceiling. The ceiling is the 12 seconds below: the `.min` that used to sit
+/// after it named 25 seconds and could never bind, because 12 < 25.
+pub(crate) fn per_attempt_budget(remaining: Duration) -> Duration {
+    const CEILING: Duration = Duration::from_secs(12);
+    CEILING.min(remaining.max(Duration::from_secs(1)))
+}
+
+/// The command whose exit status says "this guest can run commands".
+///
+/// Linux images ship a `true`; Windows images only promise the PowerShell readiness command, so
+/// the two are not interchangeable and neither may be spelled at a call site.
+pub(crate) fn readiness_probe_command(guest_os: GuestOs) -> &'static str {
+    match guest_os {
+        GuestOs::Linux => "true",
+        GuestOs::Windows => crate::windows::READINESS_COMMAND,
+    }
+}
+
+/// Whether a readiness probe's exit status says the guest is ready.
+///
+/// Exactly zero. Inverting this would hold a Windows launch for its whole deployment budget and
+/// then report the guest as unreachable, which is the same symptom as a guest that never booted.
+pub(crate) fn readiness_probe_succeeded(exit_code: u32) -> bool {
+    exit_code == 0
+}
+
 /// Everything a single SSH connection attempt needs besides the transport itself.
 struct ConnectParams {
-    username: &'static str,
+    target: ConnectTarget,
     timeout: Duration,
     cancel_token: CancellationToken,
     expected_host_key: Option<PublicKey>,
-    /// Transport name used in error messages ("vsock", "tcp").
-    transport_name: &'static str,
-    /// Message used when `timeout` elapses while the guest is still not listening.
-    timeout_message: &'static str,
+}
+
+/// The parameters a Linux guest's vsock session is opened with.
+fn vsock_connect_params(timeout: Duration, cancel_token: CancellationToken) -> ConnectParams {
+    ConnectParams {
+        target: linux_connect_target(),
+        timeout,
+        cancel_token,
+        expected_host_key: None,
+    }
+}
+
+/// The parameters a Windows guest's TCP session is opened with.
+///
+/// The key is an argument, not an option, so no later edit can quietly open a Windows session
+/// that accepts whatever host key answers.
+fn tcp_connect_params(
+    timeout: Duration,
+    cancel_token: CancellationToken,
+    expected_host_key: PublicKey,
+) -> ConnectParams {
+    ConnectParams {
+        target: windows_connect_target(),
+        timeout,
+        cancel_token,
+        expected_host_key: Some(expected_host_key),
+    }
 }
 
 /// This struct is a convenience wrapper around a russh client that handles the input/output event
@@ -2659,13 +2960,28 @@ impl Session {
         Fut: std::future::Future<Output = std::io::Result<S>>,
     {
         let ConnectParams {
-            username,
+            target,
             timeout,
             cancel_token,
             expected_host_key,
-            transport_name,
-            timeout_message,
         } = params;
+        let ConnectTarget {
+            transport_name,
+            username,
+            timeout_message,
+            pinned,
+        } = target;
+        // The two halves have to agree: a transport that promises a pinned key and then gets
+        // none would accept whatever host key answers, which is the one thing the Windows
+        // contract rules out. Cheap to check, and it cannot be reached by a test otherwise.
+        if pinned != expected_host_key.is_some() {
+            bail!(
+                "refusing to connect over {transport_name}: the target {} a pinned host key but \
+                 the attempt was handed {}",
+                if pinned { "requires" } else { "forbids" },
+                if pinned { "none" } else { "one" }
+            );
+        }
         let config = russh::client::Config {
             keepalive_interval: Some(Duration::from_secs(5)),
             ..<_>::default()
@@ -2793,25 +3109,15 @@ impl Session {
     /// Connect to an SSH server via vsock (Linux guests).
     async fn connect(
         privkey: PrivateKey,
-        username: &'static str,
         cid: u32,
         port: u32,
         timeout: Duration,
         cancel_token: CancellationToken,
     ) -> Result<Self> {
         let vsock_addr = VsockAddr::new(cid, port);
-        Self::connect_over(
-            ConnectParams {
-                username,
-                timeout,
-                cancel_token,
-                expected_host_key: None,
-                transport_name: "vsock",
-                timeout_message: "Timeout while connecting to VM via vsock.",
-            },
-            privkey,
-            || VsockStream::connect(vsock_addr),
-        )
+        Self::connect_over(vsock_connect_params(timeout, cancel_token), privkey, || {
+            VsockStream::connect(vsock_addr)
+        })
         .await
     }
 
@@ -2822,21 +3128,13 @@ impl Session {
     /// per-VM host key that was injected during deployment.
     async fn connect_tcp(
         privkey: PrivateKey,
-        username: &'static str,
         addr: std::net::SocketAddr,
         timeout: Duration,
         cancel_token: CancellationToken,
         expected_host_key: PublicKey,
     ) -> Result<Self> {
         Self::connect_over(
-            ConnectParams {
-                username,
-                timeout,
-                cancel_token,
-                expected_host_key: Some(expected_host_key),
-                transport_name: "tcp",
-                timeout_message: "Timeout while connecting to VM via tcp.",
-            },
+            tcp_connect_params(timeout, cancel_token, expected_host_key),
             privkey,
             || tokio::net::TcpStream::connect(addr),
         )
@@ -3225,15 +3523,12 @@ pub(crate) async fn connect_ssh(
         }
 
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let per_attempt_timeout = Duration::from_secs(12)
-            .min(remaining.max(Duration::from_secs(1)))
-            .min(Duration::from_secs(25));
+        let per_attempt_timeout = per_attempt_budget(remaining);
 
         match Session::connect(
             privkey.clone(),
-            "root",
             cid,
-            22,
+            VSOCK_SSH_PORT,
             per_attempt_timeout,
             cancel_token.clone(),
         )
@@ -3247,10 +3542,15 @@ pub(crate) async fn connect_ssh(
                     bail!("SSH connection timed out");
                 }
 
-                let _ =
-                    tokio::time::timeout(ready_budget, session.call("true", cancel_token.clone()))
-                        .await
-                        .context("SSH readiness probe timed out")??;
+                let _ = tokio::time::timeout(
+                    ready_budget,
+                    session.call(
+                        readiness_probe_command(GuestOs::Linux),
+                        cancel_token.clone(),
+                    ),
+                )
+                .await
+                .context("SSH readiness probe timed out")??;
 
                 debug!("SSH command channel is ready");
                 return Ok(session);
@@ -3295,13 +3595,10 @@ pub(crate) async fn connect_ssh_windows(
         }
 
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let per_attempt_timeout = Duration::from_secs(12)
-            .min(remaining.max(Duration::from_secs(1)))
-            .min(Duration::from_secs(25));
+        let per_attempt_timeout = per_attempt_budget(remaining);
 
         match Session::connect_tcp(
             privkey.clone(),
-            crate::windows::GUEST_USERNAME,
             addr,
             per_attempt_timeout,
             cancel_token.clone(),
@@ -3314,17 +3611,16 @@ pub(crate) async fn connect_ssh_windows(
                 if ready_budget == Duration::ZERO {
                     bail!("SSH connection timed out");
                 }
+                let command = readiness_probe_command(GuestOs::Windows);
                 let probe = tokio::time::timeout(
                     ready_budget,
-                    session
-                        .call_with_output(crate::windows::READINESS_COMMAND, cancel_token.clone()),
+                    session.call_with_output(command, cancel_token.clone()),
                 )
                 .await
                 .context("SSH readiness probe timed out")??;
-                if probe.0 != 0 {
+                if !readiness_probe_succeeded(probe.0) {
                     last_err = Some(anyhow::anyhow!(
-                        "Windows readiness probe `{}` exited with {}",
-                        crate::windows::READINESS_COMMAND,
+                        "Windows readiness probe `{command}` exited with {}",
                         probe.0
                     ));
                     sleep(Duration::from_millis(250)).await;
@@ -3848,14 +4144,7 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         let err = Session::connect_over(
-            ConnectParams {
-                username: "qlean",
-                timeout: Duration::from_secs(5),
-                cancel_token: cancel,
-                expected_host_key: Some(public),
-                transport_name: "tcp",
-                timeout_message: "timeout",
-            },
+            tcp_connect_params(Duration::from_secs(5), cancel, public),
             private,
             || async {
                 std::io::Result::<tokio::net::TcpStream>::Err(std::io::Error::other("never used"))
