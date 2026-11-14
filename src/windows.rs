@@ -76,7 +76,14 @@ pub(crate) const READINESS_COMMAND: &str = "cmd /c ver";
 /// Only IPv4 addresses of adapters that are actually up are reported, and loopback and
 /// APIPA (`169.254.0.0/16`) addresses are excluded so a link-local address cannot be
 /// mistaken for the leased one.
-pub(crate) const GUEST_IP_QUERY: &str = "%ErrorActionPreference='Stop'; Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | ForEach-Object { $mac = $_.MacAddress; Get-NetIPAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } | ForEach-Object { '{0} {1}' -f $mac, $_.IPAddress } }";
+///
+/// The first statement sets `$ErrorActionPreference` so a failing cmdlet ends the query
+/// instead of contributing nothing: an empty list reaches [`select_guest_address`] as "this
+/// MAC has no address", which points at DHCP instead of at the broken query. It must be a
+/// *variable* assignment - the previous spelling `%ErrorActionPreference='Stop'` was parsed
+/// as the `ForEach-Object` alias followed by an argument, so the policy was never applied
+/// (R216).
+pub(crate) const GUEST_IP_QUERY: &str = "$ErrorActionPreference='Stop'; Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | ForEach-Object { $mac = $_.MacAddress; Get-NetIPAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } | ForEach-Object { '{0} {1}' -f $mac, $_.IPAddress } }";
 
 /// Normalize a MAC address for comparison (`-`, `:` and case are not significant).
 pub(crate) fn normalize_mac(mac: &str) -> String {
@@ -1062,6 +1069,34 @@ mod tests {
         assert!(GUEST_IP_QUERY.contains("169.254.*"));
         assert!(GUEST_IP_QUERY.contains("Get-NetIPAddress"));
         assert!(!GUEST_IP_QUERY.contains("hostname -I"));
+    }
+
+    /// The query sets its error policy, so a failing cmdlet cannot look like "no address".
+    ///
+    /// R216: the constant began with `%ErrorActionPreference='Stop'`. `%` is PowerShell's
+    /// alias for `ForEach-Object`, so that token is a command name, not a variable
+    /// assignment: the policy was never applied and a `Get-NetAdapter`/`Get-NetIPAddress`
+    /// failure simply produced no lines, which `select_guest_address` reports as "this MAC
+    /// has no IPv4 address" - a diagnosis that sends the reader to DHCP.
+    #[test]
+    fn windows_ip_query_stops_at_a_failing_cmdlet() {
+        let policy = "$ErrorActionPreference='Stop'";
+        assert!(
+            GUEST_IP_QUERY.starts_with(policy),
+            "the query has to set the policy before it runs anything: {GUEST_IP_QUERY}"
+        );
+        assert!(
+            !GUEST_IP_QUERY.contains("%ErrorActionPreference"),
+            "`%ErrorActionPreference` is the `ForEach-Object` alias, not a variable: {GUEST_IP_QUERY}"
+        );
+        let policy_at = GUEST_IP_QUERY.find(policy).expect("checked above");
+        let first_cmdlet = GUEST_IP_QUERY
+            .find("Get-NetAdapter")
+            .expect("the query lost its adapter enumeration");
+        assert!(
+            policy_at < first_cmdlet,
+            "the policy has to be set before the first cmdlet: {GUEST_IP_QUERY}"
+        );
     }
 
     #[test]

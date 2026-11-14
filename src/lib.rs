@@ -3684,7 +3684,41 @@ mod plan_doc_tests {
         }
     }
 
-    /// The plan quotes the prerequisite error the Windows gate prints, word for word.
+    /// A PowerShell preference assignment is a variable assignment.
+    ///
+    /// R216: `windows::GUEST_IP_QUERY` began with `%ErrorActionPreference='Stop'`. `%` is
+    /// PowerShell's alias for `ForEach-Object`, so that token is a command name and the
+    /// policy was never applied - a statement that reads like a guarantee and does nothing.
+    /// The guest-side scripts are the one part of this crate no unit test can execute here,
+    /// so the property that can be checked is the one that was wrong: a variable name starts
+    /// with `$`.
+    #[test]
+    fn every_powershell_preference_assignment_uses_a_variable() {
+        for (path, source) in CRATE_SOURCES {
+            for (at, _) in source.match_indices("ErrorActionPreference=") {
+                let before = &source[..at];
+                // A doc comment may name the wrong spelling on purpose; only source lines
+                // that are not comments are scripts.
+                let line_start = before.rfind('\n').map_or(0, |index| index + 1);
+                let line = &source[line_start..];
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                // The pattern this guard searches for, and the message it prints, are not
+                // scripts: both name the assignment without a sigil.
+                if before.ends_with('"') {
+                    continue;
+                }
+                assert!(
+                    before.ends_with('$'),
+                    "`{path}` assigns `ErrorActionPreference` without the `$` that makes it a \
+                     variable, so the preference is never set: {line}"
+                );
+            }
+        }
+    }
+
+    /// The plan quotes the prerequisite error the Windows gate prints, word for word.    /// The plan quotes the prerequisite error the Windows gate prints, word for word.
     ///
     /// The plan tells a reader what happens once the image variables are set: the gate hands
     /// over to the host check, which names the missing program. A quote that drifts from the

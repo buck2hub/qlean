@@ -320,6 +320,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The Windows guest address query began with `%ErrorActionPreference='Stop'`, which PowerShell reads as the
+  `ForEach-Object` alias followed by an argument rather than as a variable assignment: the policy was never
+  set, so a failing adapter query contributed no lines and the result was reported as "this MAC has no
+  IPv4 address". It now sets `$ErrorActionPreference` before the first cmdlet.
 - The Linux dependency check and the DHCP lease lookup reported every failure to start a program as
   "not found", so a host program that exists but cannot be executed (a `noexec` mount, a file restored
   without its mode) produced "`qemu-img` is required but was not found (Permission denied (os error 13)):
