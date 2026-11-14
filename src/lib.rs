@@ -1023,6 +1023,37 @@ mod plan_doc_tests {
             }
         }
 
+        /// The tally that belongs to the label it follows.
+        ///
+        /// It may sit behind spaces, an opening parenthesis or the word `实测`
+        /// (`变异四条` / `变异（四条）` / `变异实测（三条被抓）`), and behind nothing else. R219:
+        /// the reader used to accept a numeral *anywhere* in the next twelve characters, so
+        /// `变异（把两条 ensure 调序）` read as a tally of two - a correct R218 row was refused
+        /// until its prose was reworded around the reader, and a row whose own count was wrong
+        /// could be rescued by any `两条` in the text after it.
+        fn tally_after_label(text: &str) -> Option<usize> {
+            /// Words that carry no number of their own, so the numeral behind them still
+            /// belongs to the label. `变异被抓三条` states the same three as `变异三条被抓`.
+            const CONNECTORS: &[&str] = &["实测", "被抓", "通过", "共"];
+
+            let mut rest = text;
+            loop {
+                rest = rest.trim_start_matches([' ', '\u{3000}', '（', '(', '：', ':']);
+                let mut advanced = false;
+                for token in CONNECTORS {
+                    if let Some(after) = rest.strip_prefix(token) {
+                        rest = after;
+                        advanced = true;
+                        break;
+                    }
+                }
+                if !advanced {
+                    break;
+                }
+            }
+            leading_tally(rest).map(|(count, _)| count)
+        }
+
         /// The clause a label sits in: a tally never describes a neighbour's clause.
         fn clause(text: &str) -> &str {
             let cut = text
@@ -1039,17 +1070,10 @@ mod plan_doc_tests {
             let at = search + offset;
             search = at + label.len();
             let after = clause(&text[at + label.len()..]);
-            let window_end = after
-                .char_indices()
-                .nth(12)
-                .map(|(at, _)| at)
-                .unwrap_or(after.len());
-            // The tally follows the label directly (`变异四条`) or behind a word or two
-            // (`变异实测（三条被抓）`).
-            if let Some(count) = after[..window_end]
-                .char_indices()
-                .find_map(|(at, _)| leading_tally(&after[at..]).map(|(count, _)| count))
-            {
+            // The tally follows the label directly (`变异四条`), behind an opening parenthesis,
+            // or behind the word `实测` (`变异实测（三条被抓）`) - and nowhere else: anything
+            // between the label and the numeral is prose, and prose is not a tally.
+            if let Some(count) = tally_after_label(after) {
                 found = Some(count);
                 continue;
             }
@@ -1075,6 +1099,45 @@ mod plan_doc_tests {
             }
         }
         found
+    }
+
+    /// A tally is the number next to its label, not a number in the prose after it.
+    ///
+    /// R219: the reader accepted a numeral anywhere in the twelve characters behind the label,
+    /// so `变异（把两条 `anyhow::ensure!` 调序）` read as a tally of two. A correct R218 row was
+    /// refused twice until its prose was reworded around the reader - the guard was shaping the
+    /// evidence instead of reading it - and a row whose own count was wrong could be rescued by
+    /// any `两条` after it.
+    #[test]
+    fn a_tally_is_the_number_next_to_its_label() {
+        for (text, expected) in [
+            ("本轮计数：变异 6 条被抓、对照 2 条通过", Some(6)),
+            ("变异实测（三条被抓）：① 把 `x` 改成 `y`", Some(3)),
+            ("变异三条被抓。门禁全绿", Some(3)),
+            ("变异被抓三条：① 子条目改回 `metadata`", Some(3)),
+            ("负结果两条（一是探针、二是对照）", Some(2)),
+            ("变异（把两条 `anyhow::ensure!` 调序）", None),
+            ("变异在真文档两行相同时无法区分", None),
+            ("变异体自身编译失败", None),
+        ] {
+            let label = if text.starts_with('负') {
+                "负结果"
+            } else {
+                "变异"
+            };
+            assert_eq!(
+                spelled_tally(text, label),
+                expected,
+                "`{text}` read as {:?}",
+                spelled_tally(text, label)
+            );
+        }
+
+        // The shape that tripped: the count sentence first, then prose that mentions the label
+        // with a `两条` of its own right behind it. The prose must not replace the count.
+        let row = "| R218 | x | PASS | y | 无 | 本轮计数：变异 6 条被抓、对照 2 条通过；②第一个对照变异（把两条 `anyhow::ensure!` 调序） |";
+        assert_eq!(spelled_tally(row, "变异"), Some(6), "{row}");
+        assert_eq!(spelled_tally(row, "对照"), Some(2), "{row}");
     }
 
     /// The review log reads newest-first, with every round exactly once and none missing.
