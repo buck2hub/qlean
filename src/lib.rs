@@ -217,6 +217,81 @@ mod plan_doc_tests {
         body
     }
 
+    /// One source file from [`CRATE_SOURCES`], by the name the guards use for it.
+    fn source_named(name: &str) -> &'static str {
+        CRATE_SOURCES
+            .iter()
+            .find(|(path, _)| *path == name)
+            .map(|(_, text)| *text)
+            .unwrap_or_else(|| {
+                panic!("{name} is no longer among the sources this guard reads: the guard would be scanning a shorter list than the code it speaks about")
+            })
+    }
+
+    /// The launch and the DHCP lease lookup have to be handed the same MAC.
+    ///
+    /// Windows discovery has no other handle on the guest: `discover_windows_endpoint` asks
+    /// `find_lease_address` for the address leased to `self.mac_address`, and the guest only ever
+    /// gets an address under the MAC `-device` gives its NIC. Both sides therefore read one field,
+    /// and the way they can drift apart is a call site that spells a different value (a fresh
+    /// `gen_random_mac()`, a literal, a copy taken before a restart). Nothing else would notice: the
+    /// guest boots, the NIC is present, and a Windows first boot spends its whole 900s deployment
+    /// budget waiting for a lease that was never recorded (R247).
+    #[test]
+    fn the_launch_and_the_lease_lookup_are_handed_the_same_mac() {
+        let qemu = source_named("src/qemu.rs");
+        let machine = source_named("src/machine.rs");
+
+        let launch = body_of(qemu, "pub(crate) async fn launch_qemu(");
+        assert_eq!(
+            launch
+                .matches("nic_device_option(&params.mac_address)")
+                .count(),
+            1,
+            "the launch has to hand the NIC the same MAC it was launched with, once"
+        );
+        assert!(
+            !launch.contains("\"52:54:00"),
+            "the launch site spells a MAC out instead of passing the one it was given"
+        );
+
+        assert_eq!(
+            machine
+                .matches("mac_address: self.mac_address.to_owned(),")
+                .count(),
+            1,
+            "every launch has to carry the machine's own MAC, and there is one launch path"
+        );
+        assert_eq!(
+            machine.matches("discover_windows_endpoint(").count(),
+            2,
+            "`discover_windows_endpoint` is defined once and called once; a second call site is \
+             a second answer to which MAC this machine uses"
+        );
+        let mut call_sites = machine.match_indices("discover_windows_endpoint(");
+        let _definition = call_sites.next().expect("the definition is gone");
+        let (at, _) = call_sites
+            .next()
+            .expect("the call site is gone: the machine no longer discovers a Windows endpoint");
+        let head = &machine[at..(at + 160).min(machine.len())];
+        let argument = head
+            .split_once('(')
+            .map(|(_, rest)| rest.trim_start())
+            .expect("a call without a parenthesis is not a call");
+        assert!(
+            argument.starts_with("self.mac_address.clone(),"),
+            "the lease lookup must be handed the machine's own MAC, not a fresh one: {argument}"
+        );
+        let discovery = body_of(machine, "async fn discover_windows_endpoint(");
+        assert_eq!(
+            discovery
+                .matches("crate::utils::find_lease_address(&mac_address, timeout)")
+                .count(),
+            1,
+            "the lease lookup has to search for the MAC it was handed"
+        );
+    }
+
     /// Each card's id, lifecycle and acceptance token, in the order the plan declares them.
     fn card_states(plan: &str) -> Vec<(String, String, String)> {
         let mut cards: Vec<(String, String, String)> = Vec::new();

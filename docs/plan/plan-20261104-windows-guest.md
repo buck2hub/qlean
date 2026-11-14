@@ -1542,6 +1542,7 @@
 | 文档副本一致性 `(new)` | README「API Reference」里手抄的字段文档必须与 crate 的 rustdoc 逐字一致（`ssh_timeout` 在 Windows 首启是 900s 部署预算，不是 vsock 的 180s） | `cargo test --lib the_readme_documents_the_config_fields_the_way_the_crate_does`（改任一侧即失败） |
 | 宿主固件解析 `(new)` | 真实 `edk2-ovmf`/`ovmf` 布局：候选路径、Secure Boot 标志、vars 尺寸关系、回退通知 | 装了固件包的机器：`cargo test --lib -- --ignored firmware_resolve`（CI 不装固件包，故 `#[ignore]`） |
 | seed 介质契约 `(new)` | 真实 `xorriso` 产出的卷标 `QLEANSEED`、Joliet 目录布局、解包字节、ISO `0600` | 有 `xorriso` 的机器：`cargo test --lib -- --ignored windows_seed_medium`（CI 不装 `xorriso`，故 `#[ignore]`） |
+| NIC 与租约同一条 MAC `(new)` | 交给 `-device` 的 MAC 必须是 `find_lease_address` 收到的那个：两个不同的 MAC 都要反映进参数、每个只出现一次；`-device` 的 `netdev=` 必须指向 `netdev_option` 定义的 id，该 netdev 必须挂在 `QLEAN_BRIDGE_NAME` 上；`launch_qemu` 只许把 `params.mac_address` 交给 NIC，`Machine` 的两处入口（启动参数、Windows 端点发现）都只许传 `self.mac_address`。R247 实测：把 `mac={mac_address}` 换成固定 MAC，488 条套件全绿——唯一点名这条主张的用例 `test_the_guest_nic_carries_the_mac_that_lease_lookup_searches_for` 是 `#[ignore]`，且在参考镜像里打印 `SMOKE-UNAVAILABLE: QEMU could not attach to qlbr0: failed to drop privileges` 后 `ok`（带该变异的二进制跑 `--ignored --exact` 实测 `1 passed`, 0.03s），所以这条等式此前在任何能跑的地方都没有守卫 | `cargo test --lib qemu::tests::the_nic_arguments_carry_the_mac_the_lease_lookup_searches_for`、`cargo test --lib plan_doc_tests::the_launch_and_the_lease_lookup_are_handed_the_same_mac` |
 | 编译门槛 | CI 编译所有 target，包括 ignored Windows 测试 | `cargo test --no-run --all-targets` |
 | 性能 | hash 流式无回归 | `cargo bench --bench hash_benchmark` |
 

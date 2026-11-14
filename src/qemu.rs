@@ -1903,6 +1903,54 @@ mod tests {
         );
     }
 
+    /// The guest NIC is the only thing that ties the guest to the lease Windows discovery waits for.
+    ///
+    /// `find_lease_address` is handed the machine's own MAC; the NIC carries whatever
+    /// `nic_device_option` writes into `-device`. Those are the same field at every call site, so
+    /// the remaining way they can disagree is inside the argument itself - and nothing caught
+    /// that until R247: replacing `mac={mac_address}` with a fixed MAC left the whole suite green
+    /// (486 passed), because the one test that asks a real monitor which MAC the NIC has
+    /// (`test_the_guest_nic_carries_the_mac_that_lease_lookup_searches_for`) is `#[ignore]`d
+    /// *and* short-circuits wherever the bridge helper is missing - which is this project's CI and
+    /// its smoke image alike. A drift here is not visible on the bridge: the guest boots, the NIC
+    /// is there, and the lease lookup searches for a MAC no NIC ever used, so a Windows first boot
+    /// spends the whole 900s deployment budget waiting for an address that cannot arrive.
+    #[test]
+    fn the_nic_arguments_carry_the_mac_the_lease_lookup_searches_for() {
+        // Two different MACs: a constant in `-device` can satisfy neither comparison twice.
+        for mac in ["52:54:00:aa:bb:cc", "52:54:00:12:34:56"] {
+            let device = nic_device_option(mac);
+            assert_eq!(
+                device,
+                format!("virtio-net-pci,netdev=net0,mac={mac}"),
+                "the guest NIC must carry the very MAC `find_lease_address` is handed, and\
+                 nothing else in the argument may change with it"
+            );
+            assert_eq!(
+                device.matches(mac).count(),
+                1,
+                "the MAC must appear exactly once in {device}"
+            );
+        }
+
+        // The device names its netdev by id, and that netdev is the one on Qlean's own bridge:
+        // a NIC attached to another netdev - or to this netdev on another bridge - boots and
+        // shows up on *a* network, while the leases Qlean reads never mention it.
+        let netdev = netdev_option();
+        assert!(
+            netdev.contains("id=net0"),
+            "the netdev is no longer named net0: {netdev}"
+        );
+        assert!(
+            netdev.contains(&format!("br={QLEAN_BRIDGE_NAME}")),
+            "the netdev must sit on Qlean's bridge {QLEAN_BRIDGE_NAME}: {netdev}"
+        );
+        assert!(
+            nic_device_option("52:54:00:aa:bb:cc").contains("netdev=net0"),
+            "the device must attach to the netdev defined by `netdev_option`"
+        );
+    }
+
     #[test]
     fn test_select_accel_never_falls_back_to_tcg_for_windows() {
         for (kvm, host_matches) in [(false, true), (true, false), (false, false)] {
