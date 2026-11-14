@@ -3292,11 +3292,40 @@ mod plan_doc_tests {
         // a wedged QEMU could hide the original error behind a hang (F176).
         let body = function_body(MACHINE, "async fn tear_down_failed_launch<T>");
         assert!(
-            body.contains("reap_launch_task(qemu_handle"),
-            "the shared launch teardown no longer reaps the launch task through the bounded helper"
+            body.contains("reap_launch_task(qemu_handle, REAP_GRACE)"),
+            "the shared launch teardown no longer reaps the launch task through the bounded \
+             helper with the budget that lets a dying QEMU finish"
+        );
+        // The session close is a write to the guest, so it is bounded like `shutdown`'s: an
+        // unbounded await here trades the launch error for a hang on the path that exists to
+        // report it (R259: it survived the census).
+        assert!(
+            body.contains("bounded_teardown(SSH_CLOSE_BUDGET, ssh.close())"),
+            "the launch teardown closes the session without a budget"
+        );
+        assert!(
+            !body.contains("let _ = ssh.close().await;"),
+            "the launch teardown awaits the session close with nothing bounding it"
+        );
+        // The socket is what proves the pid is still this machine's QEMU: `.ok()` throws that
+        // away and falls back to the `argv[0]`-only identity, which signals a recycled pid.
+        assert!(
+            body.contains("match qmp::qmp_socket_path(&self.id)"),
+            "the launch teardown no longer asks for the identity it hands to the killer"
+        );
+        assert!(
+            body.contains("terminate_qemu(pid, Some(&socket))")
+                && !body.contains("terminate_qemu(pid, None)"),
+            "the launch teardown kills a pid without the socket that identifies it"
+        );
+        assert!(
+            !body.contains("identity.as_deref()")
+                && !body.contains("qmp_socket_path(&self.id).ok()"),
+            "the launch teardown still degrades the identity to \"unknown\" instead of reporting it"
         );
         for step in [
-            "self.ssh = None;",
+            "self.ssh.take()",
+            "self.ip = None;",
             "self.pid.take()",
             "self.stop_swtpm().await",
             "terminate_qemu",

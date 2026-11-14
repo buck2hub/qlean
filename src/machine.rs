@@ -432,6 +432,15 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 /// long before the grace is spent.
 const TEARDOWN_POLL: Duration = Duration::from_millis(100);
 
+/// How long a failed launch waits for its QEMU process to be reaped before abandoning it.
+///
+/// The reaper exists so a wedged QEMU cannot hide the original launch error, which means the
+/// budget has to be long enough for a QEMU that *is* dying (SIGTERM, a flush of a writeback
+/// overlay, the pid going away) and short enough that the error the user is waiting for still
+/// arrives. A budget of zero would abandon every process, including the healthy ones, and
+/// leave an orphan holding the overlay the next start wants to rebuild.
+const REAP_GRACE: Duration = Duration::from_secs(5);
+
 /// How long a local host tool on the launch path may take.
 ///
 /// `qemu-img` creates only COW metadata and `xorriso` packs two small files, so both finish in
@@ -1169,18 +1178,38 @@ StandardError=journal
     /// leaves a VM that `is_running` reports and a TPM that outlives it.
     ///
     /// The wait for QEMU to exit is bounded and abandons the task: a wedged QEMU must not
-    /// hide the original launch error behind a hang (F176).
+    /// hide the original launch error behind a hang (F176). The same applies to closing the
+    /// session - `shutdown` already bounds that write with [`SSH_CLOSE_BUDGET`], because a
+    /// guest that stopped answering blocks the write, so an unbounded await here would trade
+    /// the launch error for a hang on the very path that exists to report it.
     async fn tear_down_failed_launch<T>(&mut self, qemu_handle: tokio::task::JoinHandle<T>) {
-        if let Some(ssh) = self.ssh.as_mut() {
-            let _ = ssh.close().await;
+        if let Some(mut ssh) = self.ssh.take()
+            && bounded_teardown(SSH_CLOSE_BUDGET, ssh.close())
+                .await
+                .is_none()
+        {
+            warn!(
+                "closing the SSH session of the failed launch for VM-{} did not finish within \
+                 {}s; teardown continues and the launch error is reported",
+                self.id,
+                SSH_CLOSE_BUDGET.as_secs()
+            );
         }
-        self.ssh = None;
         self.ip = None;
         if let Some(pid) = self.pid.take() {
-            let identity = qmp::qmp_socket_path(&self.id).ok();
-            terminate_qemu(pid, identity.as_deref()).await;
+            // The socket is what proves `pid` is still this machine's QEMU. Falling back to
+            // the `argv[0]`-only identity when it cannot be named would signal a pid that may
+            // have been recycled, so an unnameable socket leaves the process alone and says so.
+            match qmp::qmp_socket_path(&self.id) {
+                Ok(socket) => terminate_qemu(pid, Some(&socket)).await,
+                Err(error) => warn!(
+                    "not terminating QEMU pid {pid}: the socket that identifies it could not be \
+                     named ({error:#}); kill it manually before starting VM-{} again",
+                    self.id
+                ),
+            }
         }
-        reap_launch_task(qemu_handle, Duration::from_secs(5)).await;
+        reap_launch_task(qemu_handle, REAP_GRACE).await;
         self.stop_swtpm().await;
     }
 
@@ -4687,6 +4716,24 @@ mod timeout_tests {
         assert_eq!(
             teardown_step(true, SHUTDOWN_GRACE + TEARDOWN_POLL, SHUTDOWN_GRACE, false),
             TeardownStep::ForceKill
+        );
+    }
+
+    /// The launch reap grace has to let a QEMU that is actually dying finish dying.
+    ///
+    /// `reap_launch_task` abandons the task when its budget is spent, so the budget is the line
+    /// between "the original launch error is reported" and "an orphan QEMU keeps the overlay
+    /// the next start wants to rebuild". A budget of zero passes every other test in this file
+    /// (the task in the fixture had already finished) and abandons every real one.
+    #[test]
+    fn the_launch_reap_grace_lets_a_dying_qemu_finish() {
+        assert!(
+            REAP_GRACE >= std::time::Duration::from_secs(2),
+            "{REAP_GRACE:?} is too short for a QEMU that was just asked to stop: the reaper              would abandon a process that is still shutting down, leaving it to hold the overlay"
+        );
+        assert!(
+            REAP_GRACE <= SHUTDOWN_GRACE,
+            "a failed launch may not wait longer for its reaper ({REAP_GRACE:?}) than a clean              shutdown waits for the guest to power itself off ({SHUTDOWN_GRACE:?})"
         );
     }
 
