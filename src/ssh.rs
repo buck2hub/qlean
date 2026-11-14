@@ -1723,6 +1723,49 @@ mod download_tree_tests {
         );
     }
 
+    /// A fresh name that cannot be taken leaves the whole tree staged, and says where.
+    ///
+    /// The fresh-name install is a single `rename`, and its failure branch is a message of its
+    /// own: the tree is complete and hidden under a dot-prefixed name, so the sentence naming it
+    /// is the only way the caller can find the bytes that arrived. The *file* download has a test
+    /// for exactly this sentence, the tree did not - R222's mutation pass deleted the sentence
+    /// from `install_downloaded_tree` and the whole suite stayed green (F231), because only the
+    /// merge below was ever exercised with a blocked install.
+    #[test]
+    fn a_tree_whose_name_cannot_be_taken_says_where_the_download_stayed() {
+        let dir = scratch("tree-name-blocked");
+        // The caller asked for `out/sub` while `out` is a regular file: `local_root.exists()` is
+        // false, so the install takes the fresh-name branch, and the `rename` has no directory to
+        // land in. The whole tree arrived before this point.
+        let local = dir.join("out").join("sub");
+        std::fs::write(dir.join("out"), b"a file where a directory has to go")
+            .expect("a file in the way");
+        let staged = staged_tree(&dir);
+
+        let error = install_downloaded_tree(&staged, &local)
+            .expect_err("a tree cannot be installed under a name that has no directory");
+
+        let text = format!("{error:#}");
+        assert!(
+            text.contains(&format!(
+                "the complete download is left at {}",
+                staged.display()
+            )),
+            "the error does not say where the download is: {text}"
+        );
+        // The message above is a claim about the disk, not a courtesy: the tree it names must
+        // still be there, complete, or the caller was pointed at nothing.
+        assert!(
+            staged.join("deploy.json").is_file() && staged.join("nested/deep.txt").is_file(),
+            "the failed install emptied {}",
+            staged.display()
+        );
+        assert!(
+            !local.exists(),
+            "the caller's name was taken by an install that failed: {text}"
+        );
+    }
+
     /// Every way a merge can fail points the caller at the same place.
     ///
     /// R222: the merge reported a directory it could not create as "failed to create the local
