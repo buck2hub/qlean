@@ -28,8 +28,9 @@ use crate::{
     qemu::launch_qemu,
     qmp,
     ssh::{
-        InteractiveShell, PersistedSshKeypair, Session, SftpRenameSink, connect_ssh,
-        connect_ssh_windows, get_ssh_key, install_rename,
+        InteractiveShell, PersistedSshKeypair, Session, SftpRenameSink, abandon_staged_tree,
+        connect_ssh, connect_ssh_windows, get_ssh_key, install_downloaded_tree, install_rename,
+        staged_download_path,
     },
     utils::{CommandExt, HEX_ALPHABET, QleanDirs, gen_random_mac, get_free_cid},
     windows::{self, DeploySeed},
@@ -1405,7 +1406,10 @@ StandardError=journal
             ssh.download_file(&remote_path, &local_target, cancel_token.clone())
                 .await?;
         } else if remote_meta.is_dir() {
-            // For directory: mirror into local_path/<basename>
+            // For directory: mirror into local_path/<basename>, but let that name mean what it
+            // says. The walk fills a hidden sibling and the tree takes the name only after the
+            // last entry arrived - a directory that exists but holds half an answer is worse than
+            // no directory, because it reads as the answer.
             let base = remote_path.file_name().ok_or_else(|| {
                 anyhow::anyhow!(
                     "remote path {} has no basename to reuse",
@@ -1413,61 +1417,89 @@ StandardError=journal
                 )
             })?;
             let local_root = local_path.join(base);
-            tokio::fs::create_dir_all(&local_root).await.map_err(|e| {
-                anyhow::anyhow!("Failed to create local directory {:?}: {}", local_root, e)
+            let staged_root = staged_download_path(&local_root);
+            if let Some(parent) = staged_root.parent() {
+                tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                    anyhow::anyhow!("Failed to create local directory {:?}: {}", parent, e)
+                })?;
+            }
+            tokio::fs::create_dir_all(&staged_root).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to create the staged download {:?}: {}",
+                    staged_root,
+                    e
+                )
             })?;
 
             // Use walk_remote_dir for DFS traversal
-            let entries = ssh
-                .walk_remote_dir(
-                    &remote_path,
-                    /*follow_links=*/ false,
-                    cancel_token.clone(),
-                )
-                .await?;
-
-            for e in entries {
-                if cancel_token.is_cancelled() {
-                    bail!("Download cancelled");
-                }
-
-                // Compute local path relative to the remote root
-                let rel = e.path().strip_prefix(&remote_path).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "remote entry {} is not under {}",
-                        e.path().as_str(),
-                        remote_path.as_str()
+            let outcome: Result<()> = async {
+                let entries = ssh
+                    .walk_remote_dir(
+                        &remote_path,
+                        /*follow_links=*/ false,
+                        cancel_token.clone(),
                     )
-                })?;
-                let local_entry = if rel.is_empty() {
-                    local_root.clone()
-                } else {
-                    local_root.join(rel)
-                };
+                    .await?;
 
-                if e.file_type().is_dir() {
-                    tokio::fs::create_dir_all(&local_entry).await.map_err(|e| {
-                        anyhow::anyhow!("Failed to create local directory {:?}: {}", local_entry, e)
-                    })?;
-                } else if e.file_type().is_file() {
-                    if let Some(parent) = local_entry.parent() {
-                        tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                            anyhow::anyhow!("Failed to create local directory {:?}: {}", parent, e)
-                        })?;
+                for e in entries {
+                    if cancel_token.is_cancelled() {
+                        bail!("Download cancelled");
                     }
-                    ssh.download_file(e.path(), &local_entry, cancel_token.clone())
-                        .await?;
-                } else if e.file_type().is_symlink() {
-                    bail!(
-                        "cannot download the symbolic link {} as a link; download its target instead",
-                        e.path().as_str()
-                    );
-                } else {
-                    bail!(
-                        "unsupported filesystem entry while downloading {}",
-                        e.path().as_str()
-                    );
+
+                    // Compute local path relative to the remote root
+                    let rel = e.path().strip_prefix(&remote_path).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "remote entry {} is not under {}",
+                            e.path().as_str(),
+                            remote_path.as_str()
+                        )
+                    })?;
+                    let staged_entry = if rel.is_empty() {
+                        staged_root.clone()
+                    } else {
+                        staged_root.join(rel)
+                    };
+
+                    if e.file_type().is_dir() {
+                        tokio::fs::create_dir_all(&staged_entry).await.map_err(|e| {
+                            anyhow::anyhow!(
+                                "Failed to create local directory {:?}: {}",
+                                staged_entry,
+                                e
+                            )
+                        })?;
+                    } else if e.file_type().is_file() {
+                        if let Some(parent) = staged_entry.parent() {
+                            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                                anyhow::anyhow!(
+                                    "Failed to create local directory {:?}: {}",
+                                    parent,
+                                    e
+                                )
+                            })?;
+                        }
+                        ssh.download_file(e.path(), &staged_entry, cancel_token.clone())
+                            .await?;
+                    } else if e.file_type().is_symlink() {
+                        bail!(
+                            "cannot download the symbolic link {} as a link; download its target instead",
+                            e.path().as_str()
+                        );
+                    } else {
+                        bail!(
+                            "unsupported filesystem entry while downloading {}",
+                            e.path().as_str()
+                        );
+                    }
                 }
+
+                Ok(())
+            }
+            .await;
+
+            match outcome {
+                Ok(()) => install_downloaded_tree(&staged_root, &local_root)?,
+                Err(error) => return Err(abandon_staged_tree(&staged_root, error)),
             }
         } else {
             bail!("Unsupported remote path type");

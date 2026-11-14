@@ -55,6 +55,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not treated as free: the rename is not sent.
 
 ### Fixed
+- A directory download that failed left a partial tree under the caller's own name: `download`
+  created `<local>/<basename>` and then filled it file by file, so a cancelled transfer, a symbolic
+  link it refuses, an unsupported entry or one file that did not arrive left a directory that
+  existed and held plausible files - a half-mirrored `out` reads as `out`. The bytes now go to a
+  hidden sibling and the tree takes the caller's name only after the last entry arrived: a fresh
+  name is one rename, so nothing ever reads half of it, and a name that already exists is merged
+  into (this crate does not delete a user's files to install an answer). A failure removes the
+  staged half, or names where it stayed if the disk refuses to let it go.
 - An upload to a file directly under a Windows drive root (`C:/a.txt`) failed with "cannot
   upload to C:/a.txt: it has no directory to stage the bytes in" - a sentence about a drive root
   that is a directory and does exist. `GuestPath::parent` appended a second colon to the drive

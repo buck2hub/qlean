@@ -1601,6 +1601,182 @@ mod download_staging_tests {
 }
 
 #[cfg(test)]
+mod download_tree_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("qlean-tree-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        dir
+    }
+
+    /// A staged tree with the shapes a real walk produces: files, nested directories.
+    fn staged_tree(dir: &Path) -> PathBuf {
+        let staged = staged_download_path(&dir.join("out"));
+        std::fs::create_dir_all(staged.join("nested")).expect("staged directory");
+        std::fs::write(staged.join("deploy.json"), b"{}").expect("staged file");
+        std::fs::write(staged.join("nested/deep.txt"), b"deep").expect("staged file");
+        staged
+    }
+
+    /// A complete tree takes the caller's name in one step, and the staging name goes away.
+    #[test]
+    fn a_complete_tree_is_installed_under_the_callers_name() {
+        let dir = scratch("complete");
+        let local = dir.join("out");
+        let staged = staged_tree(&dir);
+
+        install_downloaded_tree(&staged, &local).expect("a complete tree installs");
+
+        assert!(local.is_dir());
+        assert_eq!(std::fs::read(local.join("deploy.json")).unwrap(), b"{}");
+        assert_eq!(
+            std::fs::read(local.join("nested/deep.txt")).unwrap(),
+            b"deep"
+        );
+        assert!(!staged.exists(), "the staging tree stayed behind");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "the output directory holds only the answer: {:?}",
+            std::fs::read_dir(&dir).unwrap().count()
+        );
+    }
+
+    /// A tree that never completed leaves nothing under the caller's name, and says so.
+    #[test]
+    fn a_failed_tree_download_leaves_no_directory_under_the_callers_name() {
+        let dir = scratch("failed");
+        let local = dir.join("out");
+        let staged = staged_tree(&dir);
+
+        let error = abandon_staged_tree(&staged, anyhow::anyhow!("Download cancelled"));
+
+        assert!(error.to_string().contains("Download cancelled"), "{error}");
+        assert!(
+            !local.exists(),
+            "a half tree took the caller's name: {:?}",
+            std::fs::read_dir(&local).map(|entries| entries
+                .map(|e| e.expect("entry").path())
+                .collect::<Vec<_>>())
+        );
+        assert!(!staged.exists(), "the staged half was left on the disk");
+    }
+
+    /// A name that was already there keeps its own files - installing an answer is not a delete.
+    #[test]
+    fn an_existing_destination_keeps_its_files_and_gains_the_new_tree() {
+        let dir = scratch("existing");
+        let local = dir.join("out");
+        std::fs::create_dir_all(local.join("nested")).expect("existing directory");
+        std::fs::write(local.join("local-only.txt"), b"mine").expect("existing file");
+        let staged = staged_tree(&dir);
+
+        install_downloaded_tree(&staged, &local)
+            .expect("a complete tree merges into an existing one");
+
+        assert_eq!(
+            std::fs::read(local.join("local-only.txt")).unwrap(),
+            b"mine",
+            "installing the tree deleted a file the caller put there"
+        );
+        assert_eq!(std::fs::read(local.join("deploy.json")).unwrap(), b"{}");
+        assert_eq!(
+            std::fs::read(local.join("nested/deep.txt")).unwrap(),
+            b"deep",
+            "a nested entry was not installed into an existing directory"
+        );
+        assert!(!staged.exists(), "the staging tree stayed behind");
+    }
+
+    /// When the tree cannot be installed, the bytes are not thrown away: the error says where.
+    #[test]
+    fn a_tree_that_cannot_be_installed_says_where_the_complete_download_is() {
+        let dir = scratch("occupied");
+        let local = dir.join("out");
+        std::fs::write(&local, b"a file where a tree has to go").expect("a file in the way");
+        let staged = staged_tree(&dir);
+
+        let error = install_downloaded_tree(&staged, &local)
+            .expect_err("a file cannot hold an entry of the tree");
+
+        let text = format!("{error:#}");
+        assert!(text.contains("the complete download is left at"), "{text}");
+        assert_eq!(
+            std::fs::read(staged.join("deploy.json")).unwrap(),
+            b"{}",
+            "the staged tree was emptied by the failed install"
+        );
+        assert_eq!(
+            std::fs::read(&local).unwrap(),
+            b"a file where a tree has to go",
+            "the file in the way was replaced by a partial install"
+        );
+    }
+
+    /// A half tree that could not be removed is named: it holds the guest's files.
+    #[test]
+    fn a_staged_tree_that_cannot_be_removed_is_named_in_the_error() {
+        let dir = scratch("unremovable");
+        let staged = dir.join("not-a-directory");
+        std::fs::write(&staged, b"a file, so removing it as a tree fails").expect("file");
+
+        let error = abandon_staged_tree(&staged, anyhow::anyhow!("Download cancelled"));
+
+        let text = format!("{error:#}");
+        assert!(text.contains("Download cancelled"), "{text}");
+        assert!(
+            text.contains("the partial download could not be removed from"),
+            "the error does not say where the half download stayed: {text}"
+        );
+        assert!(text.contains(&staged.display().to_string()), "{text}");
+    }
+
+    /// The directory branch of `download` stages the tree, and never fills the caller's name.
+    #[test]
+    fn the_directory_download_stages_the_tree_before_it_takes_the_name() {
+        const SOURCE: &str = include_str!("machine.rs");
+        const CHANGELOG: &str = include_str!("../CHANGELOG.md");
+
+        let start = SOURCE
+            .find("pub async fn download<")
+            .expect("machine.rs has no download");
+        let rest = &SOURCE[start..];
+        let end = rest[1..]
+            .find("\n    pub async fn ")
+            .map(|end| end + 1)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        assert!(
+            body.contains(concat!("install_downloaded", "_tree(")),
+            "the directory download no longer installs the tree it staged"
+        );
+        assert!(
+            body.contains(concat!("abandon_staged", "_tree(")),
+            "a failed tree download no longer throws the staged half away"
+        );
+        assert!(
+            !body.contains(concat!("create_dir_all(&local", "_root)")),
+            "the directory download creates the caller's name before the walk finishes, so a \
+             failure leaves a partial tree under that name"
+        );
+
+        let unreleased = CHANGELOG
+            .split("## [Unreleased]")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## [").next())
+            .expect("the changelog must still have an [Unreleased] section");
+        let flat = unreleased.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("A directory download that failed"),
+            "the changelog no longer records the partial-tree download"
+        );
+    }
+}
+
+#[cfg(test)]
 mod command_step_tests {
     use super::*;
 
@@ -1729,7 +1905,7 @@ async fn bounded<T>(
 /// name of its own per download, so two concurrent downloads to the same target cannot install
 /// each other's half. The leading dot keeps a failed transfer out of a `ls` of the output
 /// directory while it is still running.
-fn staged_download_path(local: &Path) -> PathBuf {
+pub(crate) fn staged_download_path(local: &Path) -> PathBuf {
     static DOWNLOADS: AtomicU64 = AtomicU64::new(0);
     let name = local
         .file_name()
@@ -1740,6 +1916,99 @@ fn staged_download_path(local: &Path) -> PathBuf {
         std::process::id(),
         DOWNLOADS.fetch_add(1, Ordering::Relaxed)
     ))
+}
+
+/// Install a fully staged tree download under `local_root`, and make the name durable.
+///
+/// `download` used to `create_dir_all(local_root)` and then fill that directory file by file, so
+/// a walk that failed halfway - a cancelled transfer, a symbolic link it refuses, an unsupported
+/// entry, one file that did not arrive - left a *partial* tree under the caller's own name, and
+/// nothing on the disk told it from a complete one: the directory existed, it held plausible
+/// files, and a half-mirrored `out` directory reads as `out`. `download_file` had the same shape
+/// and was fixed by staging each file (see [`Session::place_download`]); a tree is where it costs
+/// more, because the tree is the unit callers ask for.
+///
+/// So the walk fills a hidden sibling directory and the tree takes the caller's name in one step
+/// once the last entry arrived. A fresh name is a single rename, so no reader ever sees half of
+/// it. A name that already exists keeps the meaning it had: the new tree is merged into it,
+/// because replacing it would delete files the caller put there, and this crate does not delete a
+/// user's files to install an answer.
+pub(crate) fn install_downloaded_tree(staged: &Path, local_root: &Path) -> Result<()> {
+    if !local_root.exists() {
+        std::fs::rename(staged, local_root).with_context(|| {
+            format!(
+                "failed to install {} (the complete download is left at {})",
+                local_root.display(),
+                staged.display()
+            )
+        })?;
+    } else {
+        merge_downloaded_tree(staged, local_root)?;
+    }
+    crate::utils::sync_directory_of(local_root).with_context(|| {
+        format!(
+            "wrote {} but could not make its directory durable",
+            local_root.display()
+        )
+    })
+}
+
+/// Move a staged tree into a directory that already exists, entry by entry.
+///
+/// The staged tree is emptied as it goes, so the staging directory is gone when this returns and
+/// is still the whole answer when it fails - the error names it, which is the one thing a caller
+/// with a half-installed tree needs to know.
+fn merge_downloaded_tree(staged: &Path, local_root: &Path) -> Result<()> {
+    let entries = std::fs::read_dir(staged).with_context(|| {
+        format!(
+            "failed to read the staged download {} (the complete download is left there)",
+            staged.display()
+        )
+    })?;
+    for entry in entries {
+        let entry = entry
+            .with_context(|| format!("failed to read the staged download {}", staged.display()))?;
+        let from = entry.path();
+        let to = local_root.join(entry.file_name());
+        let metadata = std::fs::symlink_metadata(&from)
+            .with_context(|| format!("failed to inspect the staged {}", from.display()))?;
+        if metadata.is_dir() {
+            std::fs::create_dir_all(&to).with_context(|| {
+                format!("failed to create the local directory {}", to.display())
+            })?;
+            merge_downloaded_tree(&from, &to)?;
+        } else {
+            // A file (or a link, which this crate never stages) replaces its name in one step.
+            std::fs::rename(&from, &to).with_context(|| {
+                format!(
+                    "failed to install {} (the complete download is left at {})",
+                    to.display(),
+                    from.display()
+                )
+            })?;
+        }
+    }
+    std::fs::remove_dir(staged).with_context(|| {
+        format!(
+            "failed to remove the staging directory {}",
+            staged.display()
+        )
+    })
+}
+
+/// Throw away a staged tree that never became an answer, and say where it stayed if it stayed.
+///
+/// The bytes are not the caller's problem on failure, but a hidden half-mirror that could not be
+/// removed is: it holds a copy of the guest's files with no name saying so.
+pub(crate) fn abandon_staged_tree(staged: &Path, error: anyhow::Error) -> anyhow::Error {
+    match std::fs::remove_dir_all(staged) {
+        Ok(()) => error,
+        Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => error,
+        Err(cleanup) => error.context(format!(
+            "the partial download could not be removed from {} either: {cleanup}",
+            staged.display()
+        )),
+    }
 }
 
 /// Install a fully staged download under `local`, and make the name durable.
