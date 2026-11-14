@@ -19,6 +19,16 @@ pub(crate) static HEX_ALPHABET: [char; 16] = [
 pub(crate) const VIRSH_CONNECTION_URI: &str = "qemu:///system";
 pub(crate) const QLEAN_BRIDGE_NAME: &str = "qlbr0";
 
+/// Name of the libvirt network Qlean defines, starts and reads DHCP leases from.
+///
+/// The same name is asked for by six separate `virsh` calls and written into the network
+/// definition, and none of those places can see the others: `net-list` asks whether the
+/// network exists and is active, `net-autostart`/`net-start` name it, `net-dumpxml` reads its
+/// bridge, and Windows discovery reads `net-dhcp-leases` from it. Spelled out at each site, a
+/// drift in one of them is the same failure as R247's MAC: the guest comes up on the network
+/// Qlean created while the lease lookup asks a network that never saw it (R248).
+pub(crate) const QLEAN_NETWORK_NAME: &str = "qlean";
+
 // NOTE: `derive_mac()` was previously used by an experimental multi-NIC TCP hostfwd
 // path. The current implementation is vsock-only, so we avoid keeping unused code
 // that triggers `dead_code` warnings.
@@ -306,7 +316,7 @@ async fn find_lease_address_with(
         cmd.arg("-c")
             .arg(VIRSH_CONNECTION_URI)
             .arg("net-dhcp-leases")
-            .arg("qlean");
+            .arg(QLEAN_NETWORK_NAME);
 
         // One wedged `virsh` must not outlive the deadline: cap the call by whatever is
         // left of the budget (at least a millisecond, so the loop always makes progress).
@@ -1148,6 +1158,32 @@ fn ensure_vsock() -> Result<()> {
     Ok(())
 }
 
+/// The libvirt network definition Qlean writes when `qlean` does not exist yet.
+///
+/// Built from [`QLEAN_NETWORK_NAME`] and [`QLEAN_BRIDGE_NAME`] rather than spelled out, so the
+/// network Qlean hands out is the one every `virsh` call in this module names, and the bridge
+/// QEMU attaches the NIC to (`-netdev bridge,br={QLEAN_BRIDGE_NAME}`) is the bridge this
+/// network provides. Both halves were literals until R248: nothing compared the definition with
+/// the launch, so a different bridge here booted the guest on a bridge that does not exist
+/// (QEMU prints `bridge helper failed`) and the next run then refused the network it had just
+/// written.
+fn qlean_network_xml() -> String {
+    format!(
+        r#"
+<network>
+  <name>{QLEAN_NETWORK_NAME}</name>
+  <bridge name='{QLEAN_BRIDGE_NAME}'/>
+  <forward mode="nat"/>
+  <ip address='192.168.221.1' netmask='255.255.255.0'>
+    <dhcp>
+      <range start='192.168.221.2' end='192.168.221.254'/>
+    </dhcp>
+  </ip>
+</network>
+"#
+    )
+}
+
 async fn ensure_network() -> Result<()> {
     let mut command = tokio::process::Command::new("virsh");
     command
@@ -1160,7 +1196,7 @@ async fn ensure_network() -> Result<()> {
         .await
         .context("failed to execute virsh to check qlean network")?;
     let all_networks = listed_networks(&output, "net-list --all")?;
-    let net_exists = all_networks.contains("qlean");
+    let net_exists = all_networks.contains(QLEAN_NETWORK_NAME);
 
     let mut command = tokio::process::Command::new("virsh");
     command
@@ -1176,7 +1212,7 @@ async fn ensure_network() -> Result<()> {
     .await
     .context("failed to execute virsh to check qlean network")?;
     let active_networks = listed_networks(&output, "net-list")?;
-    let net_active = active_networks.contains("qlean");
+    let net_active = active_networks.contains(QLEAN_NETWORK_NAME);
 
     // QEMU is always launched with `br={QLEAN_BRIDGE_NAME}`, so a `qlean` network that
     // exists but hands out a different bridge cannot work: QEMU would fail to attach the
@@ -1195,21 +1231,10 @@ async fn ensure_network() -> Result<()> {
 
     if !net_exists {
         debug!("Creating qlean network");
-        let xml = r#"
-<network>
-  <name>qlean</name>
-  <bridge name='qlbr0'/>
-  <forward mode="nat"/>
-  <ip address='192.168.221.1' netmask='255.255.255.0'>
-    <dhcp>
-      <range start='192.168.221.2' end='192.168.221.254'/>
-    </dhcp>
-  </ip>
-</network>
-"#;
+        let xml = qlean_network_xml();
         let dirs = QleanDirs::new()?;
         let xml_path = dirs.base.join("network.xml");
-        tokio::fs::write(&xml_path, xml)
+        tokio::fs::write(&xml_path, &xml)
             .await
             .context("failed to write qlean network xml file")?;
 
@@ -1237,7 +1262,7 @@ async fn ensure_network() -> Result<()> {
             .arg("-c")
             .arg(VIRSH_CONNECTION_URI)
             .arg("net-autostart")
-            .arg("qlean");
+            .arg(QLEAN_NETWORK_NAME);
         let output = bounded_output(
             command,
             VIRSH_CALL_BUDGET,
@@ -1257,7 +1282,7 @@ async fn ensure_network() -> Result<()> {
             .arg("-c")
             .arg(VIRSH_CONNECTION_URI)
             .arg("net-start")
-            .arg("qlean");
+            .arg(QLEAN_NETWORK_NAME);
         let output = bounded_output(command, VIRSH_CALL_BUDGET, "start the qlean network")
             .await
             .context("failed to execute virsh to start qlean network")?;
@@ -1318,7 +1343,7 @@ async fn existing_network_bridge() -> Result<Option<String>> {
         .arg("-c")
         .arg(VIRSH_CONNECTION_URI)
         .arg("net-dumpxml")
-        .arg("qlean");
+        .arg(QLEAN_NETWORK_NAME);
     let output = bounded_output(
         command,
         VIRSH_CALL_BUDGET,
@@ -2288,6 +2313,33 @@ mod tests {
   </ip>
 </network>
 ";
+
+    /// The definition Qlean writes has to hand out the bridge QEMU attaches the NIC to.
+    ///
+    /// `-netdev bridge,br={QLEAN_BRIDGE_NAME}` is the only way the guest reaches the network
+    /// whose leases Windows discovery reads, so a definition naming another bridge puts the
+    /// guest on a bridge that does not exist: QEMU reports `bridge helper failed`, no lease is
+    /// ever recorded, and a Windows first boot spends its 900s deployment budget on the
+    /// consequence. The next run then refuses the very network it wrote (`bridge mismatch`).
+    /// Until R248 the definition was a literal in `ensure_network` with nothing comparing it to
+    /// the launch, and changing its bridge name left all 488 tests green.
+    #[test]
+    fn the_network_qlean_defines_hands_out_the_bridge_the_launch_attaches_to() {
+        let xml = qlean_network_xml();
+        assert_eq!(
+            network_bridge_name(&xml).as_deref(),
+            Some(QLEAN_BRIDGE_NAME),
+            "the network Qlean defines must provide the bridge QEMU attaches to: {xml}"
+        );
+        assert!(
+            xml.contains(&format!("<name>{QLEAN_NETWORK_NAME}</name>")),
+            "the definition must be the network every `virsh` call in this module names: {xml}"
+        );
+        // The lease lookup depends on this network's DHCP server, so the definition has to
+        // carry one; a network without a `<dhcp>` range records no leases at all.
+        assert!(xml.contains("<dhcp>"), "{xml}");
+        assert!(xml.contains("<range start="), "{xml}");
+    }
 
     #[test]
     fn existing_qlean_network_bridge_is_read_from_the_definition() {

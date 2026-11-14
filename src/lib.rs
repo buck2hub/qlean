@@ -228,6 +228,69 @@ mod plan_doc_tests {
             })
     }
 
+    /// Every `virsh` call in `src/utils.rs` has to name the network Qlean defines.
+    ///
+    /// The network is asked about through six separate calls - does it exist, is it active,
+    /// start it, autostart it, dump its bridge, read its leases - and the definition itself
+    /// names it a seventh time. Any one of them naming another network is a silent failure in the
+    /// one that Windows discovery depends on: `net-dhcp-leases` read from `default` never lists
+    /// this guest, so a first boot waits out its 900s budget, and the code that would report the
+    /// mismatch (`net-dumpxml`) is the same call that is now reading the wrong network. R248
+    /// measured it: five of those six spellings could be changed to `default` with all 488 tests
+    /// green, because no test drives `ensure_network` (it shells out to `virsh`).
+    #[test]
+    fn the_network_qlean_defines_is_the_one_every_virsh_call_names() {
+        // Spelled with `stringify!` so this guard does not read as a `QLEAN_` override of its
+        // own: the environment guard scans string literals, and a const quoted by a test is
+        // exactly the "prose handed to a user" case it cannot tell from a real override.
+        let network_name = stringify!(QLEAN_NETWORK_NAME);
+        let bridge_name = stringify!(QLEAN_BRIDGE_NAME);
+
+        let utils = source_named("src/utils.rs");
+        // Every call site names the network through the const, so the counts are part of the
+        // claim: one function asking `default` once is enough to search the wrong lease table,
+        // and "the body mentions the const somewhere" cannot see that (`ensure_network` has four
+        // sites: exists, active, autostart, start).
+        for (what, signature, uses) in [
+            (
+                "the DHCP lease lookup Windows discovery waits on",
+                "async fn find_lease_address_with(",
+                1,
+            ),
+            ("the network setup", "async fn ensure_network()", 4),
+            ("the bridge check", "async fn existing_network_bridge()", 1),
+        ] {
+            let body = body_of(utils, signature);
+            assert!(
+                !body.contains("\"qlean\""),
+                "{what} spells the network name out instead of asking `{network_name}` for it"
+            );
+            assert_eq!(
+                body.matches(network_name).count(),
+                uses,
+                "{what} has to name its network through `{network_name}` at every call site"
+            );
+        }
+
+        // The definition is written by that function, not respelled next to it.
+        assert!(
+            body_of(utils, "async fn ensure_network()").contains("qlean_network_xml()"),
+            "`ensure_network` must define the network through `qlean_network_xml`"
+        );
+
+        let definition = body_of(utils, "fn qlean_network_xml()");
+        for half in [
+            format!("<name>{{{network_name}}}</name>"),
+            format!("<bridge name='{{{bridge_name}}}'/>"),
+        ] {
+            assert!(
+                definition.contains(&half),
+                "the network Qlean writes must be built from the names the rest of the module \
+                 uses, and it no longer states `{half}`"
+            );
+        }
+    }
+
     /// The launch and the DHCP lease lookup have to be handed the same MAC.
     ///
     /// Windows discovery has no other handle on the guest: `discover_windows_endpoint` asks
