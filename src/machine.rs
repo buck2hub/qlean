@@ -414,6 +414,24 @@ fn needs_swtpm_start(swtpm_already_started: bool) -> bool {
 /// instead of failing it.
 const SSH_CLOSE_BUDGET: Duration = Duration::from_secs(5);
 
+/// How long a shutdown waits for the guest to power itself off before SIGKILL.
+///
+/// A guest that received the ACPI power button writes its filesystem and then leaves; a
+/// Windows guest that never loaded the driver behind that button ignores it completely. The
+/// grace has to be long enough for the first case (a flush of a few hundred MB over a
+/// writeback overlay is seconds, not milliseconds) and short enough that the second case is a
+/// kill, not a hang. Killing immediately turns every clean shutdown into a hard one, and the
+/// guest sees it as a power loss.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+
+/// How often a shutdown looks at the QEMU process while it waits out [`SHUTDOWN_GRACE`].
+///
+/// One look costs a read of `/proc/<pid>/stat`, so the interval is a compromise between
+/// noticing an exit promptly and not spinning: at a hundred milliseconds a thirty-second grace
+/// is three hundred looks, and a machine that exited right after the power button is noticed
+/// long before the grace is spent.
+const TEARDOWN_POLL: Duration = Duration::from_millis(100);
+
 /// How long a local host tool on the launch path may take.
 ///
 /// `qemu-img` creates only COW metadata and `xorriso` packs two small files, so both finish in
@@ -1298,13 +1316,20 @@ StandardError=journal
 
         info!("🔌 Shutting down VM-{}", self.id);
 
+        // One resolution of the run's socket, used for both halves of the teardown: the guest
+        // is asked to switch off through it, and the pid is only killed while its command line
+        // still serves it. Resolving a second time with `.ok()` is how the kill came to fall
+        // back to the weaker `argv[0]`-only identity, which SIGKILLs any QEMU whose pid was
+        // recycled (another VM of this user's, a libvirt domain) instead of the one Qlean
+        // started.
+        let socket_path = qmp::qmp_socket_path(&self.id)?;
+
+        // The guest is asked to power down before its exit is declared expected. Both orders
+        // are wrong in different ways: declaring it without asking turns the guest's own clean
+        // exit into `QEMU exited unexpectedly`, and asking without declaring it reports the
+        // same exit as a crash instead of a shutdown.
         if self.pid.is_some() {
-            let socket_path = qmp::qmp_socket_path(&self.id)?;
-            if let Err(e) = qmp::powerdown(&socket_path).await {
-                // The guest will be killed instead of shut down: say why, at a level the
-                // user sees, because the diagnostic below only mentions the timeout.
-                warn!("could not ask the guest to power down, it may be killed instead: {e:#}");
-            }
+            request_power_down(&socket_path).await;
         }
 
         self.qemu_should_exit.store(true, Ordering::SeqCst);
@@ -1324,10 +1349,8 @@ StandardError=journal
 
         if let Some(pid) = self.pid {
             debug!("Waiting for QEMU process {} to exit", pid);
-            let identity = qmp::qmp_socket_path(&self.id).ok();
-            let identity = identity.as_deref();
-            let max_wait_time = Duration::from_secs(30);
-            let poll_interval = Duration::from_millis(100);
+            let max_wait_time = SHUTDOWN_GRACE;
+            let poll_interval = TEARDOWN_POLL;
             let start = std::time::Instant::now();
             let mut kill_sent = false;
 
@@ -1349,7 +1372,7 @@ StandardError=journal
                             "QEMU process {} did not exit within timeout, force killing",
                             pid
                         );
-                        match kill_step(&force_kill(pid, identity)) {
+                        match kill_step(&force_kill(pid, Some(&socket_path))) {
                             KillStep::KeepPolling => {
                                 kill_sent = true;
                                 tokio::time::sleep(poll_interval).await;
@@ -2622,6 +2645,19 @@ fn signal_term(pid: u32) -> std::io::Result<()> {
         return Ok(());
     }
     Err(std::io::Error::last_os_error())
+}
+
+/// Ask the guest to switch itself off through QMP, reporting a refusal without ending teardown.
+///
+/// A refusal is not a failed shutdown: it means the guest will be killed once
+/// [`SHUTDOWN_GRACE`] is spent, so the warning names that consequence instead of letting the
+/// timeout diagnostic come as a surprise. Extracted because the request and the
+/// `qemu_should_exit` declaration it licenses are one sequence - a shutdown that declares the
+/// exit expected without having asked for it reports the guest's own power-off as a crash.
+async fn request_power_down(socket_path: &Path) {
+    if let Err(e) = qmp::powerdown(socket_path).await {
+        warn!("could not ask the guest to power down, it may be killed instead: {e:#}");
+    }
 }
 
 /// Stop a QEMU process this crate started, best effort.
@@ -4620,6 +4656,58 @@ mod timeout_tests {
         assert_eq!(
             teardown_step(false, grace + Duration::from_secs(1), grace, false),
             TeardownStep::StillGone
+        );
+    }
+
+    /// The teardown budget the loop uses is a real budget, and it is the one that was tested.
+    ///
+    /// `teardown_step` is exercised with a local `30s`, which is why shrinking the shutdown's
+    /// own grace to a millisecond left the suite green: every guest would be SIGKILLed before
+    /// it could flush its disk, and a Windows guest would come back with a dirty filesystem.
+    /// The constants are the wiring between the tested decision and the running loop, so they
+    /// are asserted here.
+    #[test]
+    fn the_teardown_grace_is_long_enough_for_a_guest_to_shut_itself_down() {
+        assert!(
+            SHUTDOWN_GRACE >= std::time::Duration::from_secs(10),
+            "a guest that was asked to power down needs more than {SHUTDOWN_GRACE:?} to flush \
+             its disk, and killing it sooner is a power loss"
+        );
+        assert!(
+            SHUTDOWN_GRACE.as_millis() >= 100 * TEARDOWN_POLL.as_millis(),
+            "the grace has to be looked at many times - a poll that is a sizeable fraction of \
+             it adds that fraction to every stop and makes the exit notice late: \
+             {SHUTDOWN_GRACE:?} at {TEARDOWN_POLL:?}"
+        );
+        // The two decisions the loop depends on, asked through the constants that feed it.
+        assert_eq!(
+            teardown_step(true, SHUTDOWN_GRACE, SHUTDOWN_GRACE, false),
+            TeardownStep::KeepWaiting
+        );
+        assert_eq!(
+            teardown_step(true, SHUTDOWN_GRACE + TEARDOWN_POLL, SHUTDOWN_GRACE, false),
+            TeardownStep::ForceKill
+        );
+    }
+
+    /// The SSH close budget has to be a budget, not "give up before the write leaves the host".
+    #[tokio::test]
+    async fn the_ssh_close_budget_lets_a_healthy_session_close() {
+        assert!(
+            SSH_CLOSE_BUDGET >= std::time::Duration::from_secs(1),
+            "closing a session is a round trip to the guest: {SSH_CLOSE_BUDGET:?} expires before \
+             the last write leaves the host, so every shutdown would warn that the guest stopped \
+             answering"
+        );
+        assert_eq!(
+            bounded_teardown(SSH_CLOSE_BUDGET, async { 42 }).await,
+            Some(42),
+            "a session that closes at once must close, not be reported as a timeout"
+        );
+        assert_eq!(
+            bounded_teardown(std::time::Duration::ZERO, std::future::pending::<()>()).await,
+            None,
+            "a spent budget has to report that it was spent"
         );
     }
 

@@ -1936,6 +1936,97 @@ mod plan_doc_tests {
         );
     }
 
+    /// `shutdown` asks the guest before it declares the exit expected, and kills only through
+    /// the identity it already resolved.
+    ///
+    /// Four mutants survived this round because the decision functions are tested and the
+    /// wiring between them was not: replacing the QMP power-down with an always-`Ok` (every
+    /// shutdown becomes a thirty-second wait and a hard kill, which a Windows guest sees as a
+    /// power loss), passing `None` as the kill's identity (a second resolution that came out
+    /// empty fell back to the weaker `argv[0]`-only match, so a recycled pid running somebody
+    /// else's QEMU was SIGKILLed), rewriting the liveness `?` into `unwrap_or(false)` (an
+    /// unreadable `/proc` was read as "the guest is gone", so the pid was cleared while a live
+    /// guest still held its overlay), and dropping the SWTPM stop or the address reset.
+    #[test]
+    fn the_shutdown_asks_the_guest_before_it_expects_the_exit() {
+        let machine = CRATE_SOURCES
+            .iter()
+            .find(|(path, _)| *path == "src/machine.rs")
+            .map(|(_, source)| *source)
+            .expect("src/machine.rs is not in CRATE_SOURCES");
+        let shutdown = body_of(machine, "pub async fn shutdown(&mut self) -> Result<()>");
+        let shutdown = shutdown.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let asked = shutdown
+            .find("request_power_down(&socket_path)")
+            .unwrap_or_else(|| {
+                panic!("`shutdown` no longer asks the guest to power down, so every stop is a \n                 hard kill after the whole grace: {shutdown}")
+            });
+        assert_eq!(
+            shutdown.matches("request_power_down(").count(),
+            1,
+            "`shutdown` asks for a power-down {count} times; the request belongs in one place",
+            count = shutdown.matches("request_power_down(").count()
+        );
+        let expected = shutdown
+            .find("self.qemu_should_exit.store(true, Ordering::SeqCst);")
+            .expect("`shutdown` no longer declares the exit expected");
+        assert!(
+            asked < expected,
+            "`shutdown` declares the QEMU exit expected before it asks the guest to power down, \
+             so the guest's own clean exit is reported as `QEMU exited unexpectedly`: {shutdown}"
+        );
+        assert!(
+            shutdown.contains("let socket_path = qmp::qmp_socket_path(&self.id)?;"),
+            "`shutdown` resolves the run's socket as a fallible value, or not at all: a `.ok()` \
+             lets the kill fall back to the weaker `argv[0]`-only identity: {shutdown}"
+        );
+        assert!(
+            !shutdown.contains("qmp_socket_path(&self.id).ok()"),
+            "`shutdown` degrades a failed identity into `None`, and `None` kills any QEMU whose \
+             pid was recycled: {shutdown}"
+        );
+        assert!(
+            shutdown.contains("force_kill(pid, Some(&socket_path))"),
+            "`shutdown` kills the pid without the socket identity it just used to ask the guest \
+             to power down: {shutdown}"
+        );
+        assert!(
+            !shutdown.contains("force_kill(pid, None)"),
+            "`shutdown` kills a pid it cannot identify: {shutdown}"
+        );
+        assert!(
+            shutdown.contains("teardown_liveness(process_is_gone(pid), pid)?"),
+            "`shutdown` no longer propagates a liveness check that could not look, so an \
+             unreadable `/proc` is read as a finished shutdown and the next start rebuilds the \
+             overlay of a live guest: {shutdown}"
+        );
+        assert!(
+            !shutdown.contains("unwrap_or"),
+            "`shutdown` defaults a check it could not make: {shutdown}"
+        );
+        assert!(
+            shutdown.contains("let max_wait_time = SHUTDOWN_GRACE;")
+                && shutdown.contains("let poll_interval = TEARDOWN_POLL;"),
+            "`shutdown` no longer waits out the grace it was tested with: {shutdown}"
+        );
+        assert!(
+            shutdown.contains("bounded_teardown(SSH_CLOSE_BUDGET, ssh.close())"),
+            "`shutdown` closes the session without its budget, so a guest that stopped \
+             answering blocks teardown before the kill: {shutdown}"
+        );
+        assert!(
+            shutdown.contains("self.stop_swtpm().await;"),
+            "`shutdown` leaves the TPM process running, and it keeps writing the state \
+             directory the next start reuses: {shutdown}"
+        );
+        assert!(
+            shutdown.contains("self.ip = None;"),
+            "`shutdown` keeps the address of a machine that is gone, so the next `get_ip` \
+             answers with a lease nobody holds: {shutdown}"
+        );
+    }
+
     /// The seven ignored Windows smoke tests all stop at the precondition the plan describes.
     ///
     /// Every Windows smoke test reaches the host gate, because it builds its machine through it.
