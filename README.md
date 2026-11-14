@@ -67,7 +67,10 @@ The gate runs before a Windows machine is created and reports **every** gap in o
 the order of this table. It also separates a program that is not installed from one that is
 installed but **cannot be executed** (a binary on a `noexec` mount, or one whose unpacking lost
 its mode): that second message names the file and tells you which permissions to fix, because
-reinstalling a package that is already there cannot help.
+reinstalling a package that is already there cannot help. A firmware image is checked the same
+way: one that is empty, truncated, or not a multiple of `0x1000` bytes is reported with its path,
+because `qemu-system-x86_64` refuses such an image later on with `system firmware block device
+pflash0 has invalid size` — a sentence that names the pflash device and never the file.
 
 ```bash
 # Arch

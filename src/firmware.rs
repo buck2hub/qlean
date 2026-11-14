@@ -20,6 +20,8 @@ use crate::is_kvm_available;
 const ENV_OVMF_CODE: &str = "QLEAN_OVMF_CODE";
 /// Override for the OVMF vars template.
 const ENV_OVMF_VARS: &str = "QLEAN_OVMF_VARS";
+/// What `qemu-system-x86_64` requires of a pflash image: a non-zero multiple of this.
+const PFLASH_SIZE_ALIGNMENT: u64 = 0x1000;
 /// Override for the `swtpm` binary.
 const ENV_SWTPM: &str = "QLEAN_SWTPM";
 
@@ -183,12 +185,44 @@ struct ResolvedFirmware {
 
 /// Resolve firmware using injectable probes for presence and Secure Boot enrollment.
 ///
+/// QEMU's own rule for a pflash image, checked here so the gate can name the file first.
+///
+/// `qemu-system-x86_64` refuses a firmware image whose size is not a non-zero multiple of
+/// 0x1000 - "system firmware block device pflash0 has invalid size 0 ... its size must be a
+/// non-zero multiple of 0x1000" - and that sentence names the pflash device, never the file.
+/// A truncated download or a placeholder somebody `touch`ed therefore used to pass the gate as
+/// "ready" and surface as a start that failed for a reason nobody could trace back (R238).
+fn pflash_image_problem(path: &Path) -> Option<String> {
+    let len = match std::fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            return Some(format!(
+                "could not read {} to check the firmware image's size ({error}): reinstall the \
+                 package that ships it, or point {ENV_OVMF_CODE} and {ENV_OVMF_VARS} at a usable \
+                 pair",
+                path.display()
+            ));
+        }
+    };
+    if len == 0 || len % PFLASH_SIZE_ALIGNMENT != 0 {
+        return Some(format!(
+            "{} is {len} bytes, which QEMU cannot use as a firmware image: a pflash image has to \
+             be a non-zero multiple of {PFLASH_SIZE_ALIGNMENT:#x} bytes (qemu says \"system firmware \
+             block device pflash0 has invalid size\" and names the device, not this file), so the \
+             image is truncated or a placeholder - reinstall the package that ships it",
+            path.display()
+        ));
+    }
+    None
+}
+
 /// A candidate whose code image is present but whose vars template carries no Microsoft
 /// keys is *skipped*, not returned: returning it makes the caller fail even when a plain
 /// (Secure Boot disabled) candidate is available, which is the common layout on a host
 /// whose distro ships only `OVMF_VARS.4m.fd` next to `OVMF_CODE.secboot.4m.fd`.
 fn resolve_ovmf_with(
     exists: &dyn Fn(&Path) -> bool,
+    pflash_problem: &dyn Fn(&Path) -> Option<String>,
     enrolls_microsoft_keys: &dyn Fn(&Path) -> std::io::Result<bool>,
 ) -> ResolvedFirmware {
     let mut resolved = ResolvedFirmware::default();
@@ -200,6 +234,16 @@ fn resolve_ovmf_with(
         let Some(vars) = vars.iter().map(Path::new).find(|vars| exists(vars)) else {
             continue;
         };
+        // An image QEMU will refuse is not a candidate: skipping it lets a later, usable layout
+        // win, and the reason is reported if none does.
+        let unusable: Vec<String> = [code, vars]
+            .into_iter()
+            .filter_map(pflash_problem)
+            .collect();
+        if !unusable.is_empty() {
+            resolved.skipped.extend(unusable);
+            continue;
+        }
         if *secure {
             let enrolled = match enrolls_microsoft_keys(vars) {
                 Ok(true) => true,
@@ -286,8 +330,16 @@ fn secure_boot_skipped_notice(skipped: &[String]) -> Option<String> {
 
 /// Resolve the host OVMF firmware pair, honoring the environment overrides.
 pub(crate) fn resolve_ovmf() -> Result<FirmwarePaths> {
-    let env_code = env_nonempty(ENV_OVMF_CODE);
-    let env_vars = env_nonempty(ENV_OVMF_VARS);
+    resolve_ovmf_pair(env_nonempty(ENV_OVMF_CODE), env_nonempty(ENV_OVMF_VARS))
+}
+
+/// The same decision, with the two override values given instead of read from the environment.
+///
+/// The override branch is the one the install hint tells a reader to use when their layout is
+/// unusual, and it was the branch that accepted any *file* - two empty images passed as a usable
+/// pair. Split out (R238) so a directory can be asked the question without writing to the
+/// environment, which the rest of this suite reads in parallel.
+fn resolve_ovmf_pair(env_code: Option<String>, env_vars: Option<String>) -> Result<FirmwarePaths> {
     match (env_code, env_vars) {
         (Some(code), Some(vars)) => {
             let code = PathBuf::from(code);
@@ -302,6 +354,11 @@ pub(crate) fn resolve_ovmf() -> Result<FirmwarePaths> {
                 "{ENV_OVMF_VARS} points at {}, which is not a file",
                 vars.display()
             );
+            for image in [&code, &vars] {
+                if let Some(problem) = pflash_image_problem(image) {
+                    bail!("{problem}");
+                }
+            }
             let secure_boot = is_secure_boot_name(&code);
             ensure_secure_boot_pair(&code, &vars, secure_boot)?;
             Ok(FirmwarePaths {
@@ -314,9 +371,10 @@ pub(crate) fn resolve_ovmf() -> Result<FirmwarePaths> {
             bail!("{ENV_OVMF_CODE} and {ENV_OVMF_VARS} must be set together; {INSTALL_HINT}")
         }
         (None, None) => {
-            let resolved = resolve_ovmf_with(&|path| path.is_file(), &|path| {
-                vars_template_enrolls_microsoft_keys(path)
-            });
+            let resolved =
+                resolve_ovmf_with(&|path| path.is_file(), &pflash_image_problem, &|path| {
+                    vars_template_enrolls_microsoft_keys(path)
+                });
             match resolved.paths {
                 Some(paths) => {
                     // Re-check through the shared entry point: it also reports a template
@@ -1447,7 +1505,7 @@ mod tests {
         let code = Path::new("/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd");
         let vars = Path::new("/usr/share/edk2/x64/OVMF_VARS.4m.ms.fd");
         let probe = |path: &Path| path == code || path == vars;
-        let resolved = resolve_ovmf_with(&probe, &ms_only)
+        let resolved = resolve_ovmf_with(&probe, &|_| None, &ms_only)
             .paths
             .expect("candidate");
         assert_eq!(resolved.code, code);
@@ -1458,7 +1516,7 @@ mod tests {
         let plain_code = Path::new("/usr/share/OVMF/OVMF_CODE_4M.fd");
         let plain_vars = Path::new("/usr/share/OVMF/OVMF_VARS_4M.fd");
         let probe = |path: &Path| path == plain_code || path == plain_vars;
-        let resolved = resolve_ovmf_with(&probe, &ms_only)
+        let resolved = resolve_ovmf_with(&probe, &|_| None, &ms_only)
             .paths
             .expect("candidate");
         assert_eq!(resolved.code, plain_code);
@@ -1473,7 +1531,7 @@ mod tests {
         let ms_vars = Path::new("/usr/share/OVMF/OVMF_VARS_4M.ms.fd");
         let plain_vars = Path::new("/usr/share/OVMF/OVMF_VARS_4M.fd");
         let probe = |path: &Path| path == code || path == ms_vars || path == plain_vars;
-        let resolved = resolve_ovmf_with(&probe, &ms_only)
+        let resolved = resolve_ovmf_with(&probe, &|_| None, &ms_only)
             .paths
             .expect("secure pair");
         assert_eq!(resolved.vars_template, ms_vars, "the .ms template wins");
@@ -1490,7 +1548,7 @@ mod tests {
         let plain_code = Path::new("/usr/share/edk2/x64/OVMF_CODE.4m.fd");
         let probe = |path: &Path| path == secboot_code || path == plain_vars || path == plain_code;
 
-        let resolved = resolve_ovmf_with(&probe, &ms_only);
+        let resolved = resolve_ovmf_with(&probe, &|_| None, &ms_only);
         let paths = resolved.paths.expect("the plain candidate is usable");
         assert_eq!(paths.code, plain_code);
         assert_eq!(paths.vars_template, plain_vars);
@@ -1510,7 +1568,7 @@ mod tests {
         let plain_vars = Path::new("/usr/share/edk2/ovmf/OVMF_VARS.fd");
         let probe = |path: &Path| path == secboot_code || path == plain_vars;
 
-        let resolved = resolve_ovmf_with(&probe, &ms_only);
+        let resolved = resolve_ovmf_with(&probe, &|_| None, &ms_only);
         assert!(resolved.paths.is_none());
         let message = no_usable_firmware_message(&resolved);
         assert!(message.contains("no usable OVMF firmware"), "{message}");
@@ -1525,7 +1583,7 @@ mod tests {
         let probe = |path: &Path| path == secboot_code || path == vars;
         let unreadable = |_: &Path| Err(std::io::Error::other("permission denied"));
 
-        let resolved = resolve_ovmf_with(&probe, &unreadable);
+        let resolved = resolve_ovmf_with(&probe, &|_| None, &unreadable);
         assert!(resolved.paths.is_none());
         assert!(
             resolved.skipped[0].contains("permission denied"),
@@ -1544,7 +1602,7 @@ mod tests {
         let plain_code = Path::new("/usr/share/edk2/x64/OVMF_CODE.4m.fd");
         let probe = |path: &Path| path == secboot_code || path == plain_vars || path == plain_code;
 
-        let resolved = resolve_ovmf_with(&probe, &ms_only);
+        let resolved = resolve_ovmf_with(&probe, &|_| None, &ms_only);
         let paths = resolved.paths.expect("the plain candidate is usable");
         assert!(!paths.secure_boot);
 
@@ -1570,7 +1628,7 @@ mod tests {
         let ms_vars = Path::new("/usr/share/edk2/x64/OVMF_VARS.4m.ms.fd");
         let probe = |path: &Path| path == code || path == ms_vars;
 
-        let resolved = resolve_ovmf_with(&probe, &ms_only);
+        let resolved = resolve_ovmf_with(&probe, &|_| None, &ms_only);
         assert!(resolved.paths.expect("the pair is usable").secure_boot);
         assert!(resolved.skipped.is_empty(), "{:?}", resolved.skipped);
         assert_eq!(secure_boot_skipped_notice(&resolved.skipped), None);
@@ -1633,7 +1691,7 @@ mod tests {
         // Same probes `resolve_ovmf` uses, so this records the *real* decision including
         // the reasons it skipped a Secure Boot pair: on the Arch layout the skipped list is
         // what feeds the "Secure Boot is disabled" warning.
-        let probed = resolve_ovmf_with(&|path| path.is_file(), &|path| {
+        let probed = resolve_ovmf_with(&|path| path.is_file(), &pflash_image_problem, &|path| {
             vars_template_enrolls_microsoft_keys(path)
         });
         let probed_paths = probed.paths.as_ref().expect("the same pair resolves");
@@ -1655,7 +1713,7 @@ mod tests {
 
     #[test]
     fn test_resolve_ovmf_with_probe_reports_nothing_found() {
-        let resolved = resolve_ovmf_with(&|_| false, &ms_only);
+        let resolved = resolve_ovmf_with(&|_| false, &|_| None, &ms_only);
         assert!(resolved.paths.is_none());
         assert!(resolved.skipped.is_empty());
         assert!(no_usable_firmware_message(&resolved).contains("no usable OVMF firmware"));
@@ -3253,6 +3311,124 @@ mod tests {
     /// `/usr/local/bin` was reported as present, and the start failed later with nothing naming
     /// the file. The search is given a directory here rather than the host's own `PATH`, so the
     /// answer is about this tree and not about what the test image happens to have installed.
+    /// A firmware image QEMU will refuse is a gap the gate states, with the file's name in it.
+    ///
+    /// The gate accepted any *file*: two empty images passed as a usable OVMF pair (probed
+    /// R238 - `resolve_ovmf()` returned `Ok` with `code` and `vars` both 0 bytes), and the start
+    /// then died on QEMU's own sentence, `system firmware block device pflash0 has invalid size
+    /// 0 ... its size must be a non-zero multiple of 0x1000`, which names the pflash device and
+    /// never the file. QEMU states the rule, so this is not a matter of taste: the gate asks the
+    /// same question, of the same two images, before promising a start.
+    #[test]
+    fn test_pflash_image_problem_matches_what_qemu_requires() {
+        let root = temp_dir("r238-pflash-rule");
+        let image = |name: &str, len: u64| {
+            let path = root.join(name);
+            std::fs::write(&path, vec![0u8; len as usize]).expect("write");
+            path
+        };
+
+        // QEMU's rule, exactly: a non-zero multiple of 0x1000.
+        for len in [0x1000u64, 0x2000, 0x40_0000] {
+            let path = image(&format!("ok-{len}.fd"), len);
+            assert_eq!(pflash_image_problem(&path), None, "{len} bytes is usable");
+        }
+        for len in [0u64, 1, 4095, 0x1001] {
+            let path = image(&format!("bad-{len}.fd"), len);
+            let problem = pflash_image_problem(&path).expect("an unusable image is a problem");
+            assert!(
+                problem.contains(&path.display().to_string()),
+                "the problem has to name the file QEMU would refuse: {problem}"
+            );
+            assert!(
+                problem.contains(&len.to_string()),
+                "the problem has to state the size it found ({len}): {problem}"
+            );
+            assert!(
+                problem.contains("0x1000"),
+                "the problem has to state QEMU's rule: {problem}"
+            );
+        }
+        // A file that cannot even be stat'ed is still this file's problem, not silence.
+        let absent = root.join("absent.fd");
+        let problem = pflash_image_problem(&absent).expect("an unreadable image is a problem");
+        assert!(problem.contains(&absent.display().to_string()), "{problem}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The override branch - what the install hint tells a reader to use - asks that question too.
+    #[test]
+    fn test_ovmf_override_rejects_an_image_qemu_would_refuse() {
+        let root = temp_dir("r238-ovmf-override");
+        let code = root.join("OVMF_CODE.fd");
+        let vars = root.join("OVMF_VARS.fd");
+        let write = |path: &Path, len: usize| std::fs::write(path, vec![0u8; len]).expect("write");
+        let pair = |code: &Path, vars: &Path| {
+            resolve_ovmf_pair(
+                Some(code.display().to_string()),
+                Some(vars.display().to_string()),
+            )
+        };
+
+        write(&code, 0);
+        write(&vars, 0x1000);
+        let error = pair(&code, &vars).expect_err("an empty code image is not usable");
+        let message = error.to_string();
+        assert!(message.contains(&code.display().to_string()), "{message}");
+        assert!(message.contains("0x1000"), "{message}");
+
+        // A truncated download: right file, wrong length.
+        write(&code, 0x1000);
+        write(&vars, 0x1001);
+        let error = pair(&code, &vars).expect_err("an unaligned vars template is not usable");
+        assert!(
+            error.to_string().contains(&vars.display().to_string()),
+            "the template is the one that is wrong: {error}"
+        );
+
+        // Usable images still resolve, so the check cannot pass by refusing everything.
+        write(&code, 0x40_0000);
+        write(&vars, 0x40000);
+        let paths = pair(&code, &vars).expect("a usable pair still resolves");
+        assert_eq!(paths.code, code);
+        assert_eq!(paths.vars_template, vars);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A broken image earlier in the layout list does not hide a usable pair after it.
+    #[test]
+    fn test_resolve_ovmf_skips_an_image_qemu_cannot_use() {
+        let code = Path::new("/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd");
+        let vars = Path::new("/usr/share/edk2/x64/OVMF_VARS.4m.ms.fd");
+        let plain_code = Path::new("/usr/share/OVMF/OVMF_CODE_4M.fd");
+        let plain_vars = Path::new("/usr/share/OVMF/OVMF_VARS_4M.fd");
+        let probe = |path: &Path| [code, vars, plain_code, plain_vars].contains(&path);
+        // The Secure Boot pair is present but its code image is empty.
+        let pflash = |path: &Path| (path == code).then(|| format!("{} is 0 bytes", path.display()));
+        let resolved = resolve_ovmf_with(&probe, &pflash, &ms_only);
+        let paths = resolved.paths.expect("the later usable pair wins");
+        assert_eq!(paths.code, plain_code);
+        assert_eq!(paths.vars_template, plain_vars);
+        assert!(
+            resolved
+                .skipped
+                .iter()
+                .any(|reason| reason.contains(&code.display().to_string())),
+            "the skipped empty image has to be named: {:?}",
+            resolved.skipped
+        );
+
+        // With only the broken pair present, the message names it instead of saying nothing.
+        let only_broken = |path: &Path| path == code || path == vars;
+        let resolved = resolve_ovmf_with(&only_broken, &pflash, &ms_only);
+        assert!(resolved.paths.is_none());
+        let message = no_usable_firmware_message(&resolved);
+        assert!(message.contains(&code.display().to_string()), "{message}");
+        assert!(message.contains("is 0 bytes"), "{message}");
+    }
+
     #[test]
     fn test_program_presence_searches_a_given_path() {
         use std::os::unix::fs::PermissionsExt;
