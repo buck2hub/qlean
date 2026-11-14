@@ -2949,6 +2949,41 @@ mod tests {
         assert_eq!(message.lines().count(), 8, "{message}");
     }
 
+    /// The gaps come out in the order the README's prerequisite table lists them.
+    ///
+    /// R234 made the README say the table runs "in the order of this table" == the order the
+    /// gate reports. Only two of the seven positions were pinned - `problems[2]` and
+    /// `problems[3]` - and the other five could be swapped with the whole suite green, which
+    /// would leave a promise describing a message that no longer exists. The order is one fact
+    /// with two descriptions again, so the two are compared here instead of both being trusted:
+    /// each reported gap is identified by the name it carries, and the sequence has to be the
+    /// shared list from `crate::plan_doc_tests`.
+    #[test]
+    fn test_host_support_lists_the_gaps_in_the_readmes_order() {
+        let problems = host_support_problems(bare_host_fixture());
+        let mut reported: Vec<&str> = Vec::new();
+        for problem in &problems {
+            // Exactly one, so a message that named two gaps cannot pass by naming the right one
+            // twice: "one problem per gap" is what makes a sequence of them meaningful.
+            let named: Vec<&str> = crate::plan_doc_tests::WINDOWS_PREREQUISITE_GAPS
+                .into_iter()
+                .filter(|gap| problem.contains(gap))
+                .collect();
+            assert_eq!(
+                named.len(),
+                1,
+                "this gap names {named:?}, so the reported order cannot be read: {problem:?}"
+            );
+            reported.push(named[0]);
+        }
+        assert_eq!(
+            reported,
+            crate::plan_doc_tests::WINDOWS_PREREQUISITE_GAPS.to_vec(),
+            "the gate reports the gaps in a different order than the README's table, which now \
+             promises to be the order of this message"
+        );
+    }
+
     #[test]
     fn test_host_support_is_quiet_when_everything_is_present() {
         let problems = host_support_problems(complete_host_fixture());

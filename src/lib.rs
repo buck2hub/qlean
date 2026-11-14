@@ -143,11 +143,14 @@ mod plan_doc_tests {
 
     /// Every gap the Windows host gate can report, in the order the machine hits them.
     ///
-    /// One definition, two guards: the plan's evidence rows quote this list, and the README's
-    /// prerequisite table has to spell it out in the same order (R234). Keeping a copy in each
+    /// One definition, three guards: the plan's evidence rows quote this list, the README's
+    /// prerequisite table has to spell it out in the same order (R234), and the gate itself has
+    /// to *report* the gaps in that order (`src/firmware.rs`'s
+    /// `test_host_support_lists_the_gaps_in_the_readmes_order`, R235). Keeping a copy in each
     /// guard is how the two descriptions drifted apart in the first place - the plan counted
-    /// seven gaps while the README listed three.
-    const WINDOWS_PREREQUISITE_GAPS: [&str; 7] = [
+    /// seven gaps while the README listed three, and the README's order promise then pointed at
+    /// a message order nothing checked.
+    pub(crate) const WINDOWS_PREREQUISITE_GAPS: [&str; 7] = [
         "qemu-img",
         "qemu-system-x86_64",
         "KVM",
