@@ -320,6 +320,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A digest written in uppercase named its own image cache entry: the body kept the caller's casing
+  while every comparison of it was case-insensitive, so the same image was fetched and kept twice.
+  The digest is now normalized to lowercase when it is parsed.
 - The Windows guest address query began with `%ErrorActionPreference='Stop'`, which PowerShell reads as the
   `ForEach-Object` alias followed by an argument rather than as a variable assignment: the policy was never
   set, so a failing adapter query contributed no lines and the result was reported as "this MAC has no

@@ -451,6 +451,9 @@ This defines a **NAT** network named `qlean` in libvirt, backed by the Linux bri
     pub source: Option<String>,
     /// Digest of the image, in the form of `sha256:<hex>` or `sha512:<hex>`.
     ///
+    /// Hex digits may be written in either case: the digest is normalized to lowercase when
+    /// it is parsed, so both spellings name the same cache entry and the same verification.
+    ///
     /// It must be set together with `source`.
     pub digest: Option<String>,
     /// Whether to clear the image after use, defaults to `false`. 

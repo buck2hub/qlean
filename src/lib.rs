@@ -2133,6 +2133,14 @@ mod plan_doc_tests {
                     !doc.contains("should"),
                     "{name}: the doc above `{field}` hedges a rule the code enforces: {doc}"
                 );
+                // R217: the digest is a file name. A reader who types the hex in uppercase
+                // must learn here that it is normalized, not from a second download.
+                if field.contains("digest") {
+                    assert!(
+                        doc.contains("either case") && doc.contains("lowercase"),
+                        "{name}: the doc above `{field}` must say that the hex is normalized: {doc}"
+                    );
+                }
             }
         }
     }

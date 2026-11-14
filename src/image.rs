@@ -102,6 +102,9 @@ pub struct ImageConfig {
     pub source: Option<String>,
     /// Digest of the image, in the form of `sha256:<hex>` or `sha512:<hex>`.
     ///
+    /// Hex digits may be written in either case: the digest is normalized to lowercase when
+    /// it is parsed, so both spellings name the same cache entry and the same verification.
+    ///
     /// It must be set together with `source`; see [`ImageConfig::source`] for the rule and
     /// the error a half-set pair produces.
     pub digest: Option<String>,
@@ -408,7 +411,14 @@ fn parse_prefixed_digest(s: &str) -> Result<(ShaType, String)> {
         "sha512" => ShaType::Sha512,
         _ => bail!("unsupported digest algorithm prefix: {}", algo),
     };
-    let body = hex.trim();
+    // Hexadecimal is case-insensitive, and every comparison of a digest in this module
+    // already says so (`eq_ignore_ascii_case` in `Image::new`, `Image::load` and
+    // `verify_fetched`). The body is also a *file name* - `cache_name_base` builds
+    // `sha256-<hex>` - so keeping the caller's casing made one digest into two cache slots:
+    // `sha256:AB..` and `sha256:ab..` verified as equal, missed each other in the cache, and
+    // downloaded the whole image twice. Normalize once, here, and the name is a function of
+    // the digest rather than of how it was typed.
+    let body = hex.trim().to_ascii_lowercase();
     anyhow::ensure!(!body.is_empty(), "digest body cannot be empty");
     anyhow::ensure!(
         body.chars().all(|c| c.is_ascii_hexdigit()),
@@ -1424,13 +1434,65 @@ f0442f3cd0087a609ecd5241109ddef0cbf4a1e05372e13d82c97fc77b35b2d8ecff85aea6770915
         assert!(builtin_remote_image(Distro::Debian, GuestArch::Aarch64).is_err());
     }
 
+    /// Both halves of a digest are case-insensitive, and the body is *normalized*.
+    ///
+    /// R217: this test said "case insensitive" but only checked the algorithm prefix, and
+    /// then asserted that the body kept the uppercase spelling - the property the cache name
+    /// depends on was pinned to the wrong answer.
     #[test]
     fn test_parse_prefixed_digest_case_insensitive() {
         let upper = "AB".repeat(64);
         let (algo, hex) = parse_prefixed_digest(&format!("SHA512:{upper}")).unwrap();
         assert_eq!(algo, ShaType::Sha512);
-        assert_eq!(hex, upper);
+        assert_eq!(hex, "ab".repeat(64));
+        assert_eq!(hex, hex.to_ascii_lowercase());
 
+        assert!(parse_prefixed_digest("md5:abcd").is_err());
+    }
+
+    /// One digest, one cache slot, however it was spelled.
+    ///
+    /// The digest names a file under the image cache, so a casing difference that the
+    /// verifier ignores must not create a second name: the entry the caller already has is
+    /// checked by digest, so a second name can only be a fresh multi-gigabyte download and a
+    /// duplicate copy on disk.
+    #[test]
+    fn test_the_cache_name_of_a_digest_ignores_how_it_was_spelled() {
+        for prefix in ["sha256", "sha512"] {
+            let width = if prefix == "sha256" { 32 } else { 64 };
+            let lower = format!("sha256:{}", "ab".repeat(width)).replace("sha256", prefix);
+            let mut names = Vec::new();
+            for spelling in [
+                lower.clone(),
+                lower.to_ascii_uppercase(),
+                format!("{}:{}", prefix.to_ascii_uppercase(), "aB".repeat(width)),
+            ] {
+                let digest = parse_prefixed_digest(&spelling).unwrap();
+                names.push(
+                    image_cache_name(
+                        GuestOs::Windows,
+                        Distro::Debian,
+                        GuestArch::Amd64,
+                        &None,
+                        Some(&digest),
+                    )
+                    .unwrap(),
+                );
+            }
+            assert_eq!(
+                names[0], names[1],
+                "{prefix}: the uppercase spelling names its own cache slot"
+            );
+            assert_eq!(
+                names[0], names[2],
+                "{prefix}: the mixed spelling names its own cache slot"
+            );
+            assert!(
+                !names[0].contains(|c: char| c.is_ascii_uppercase()),
+                "the cache name must not carry the caller's casing: {}",
+                names[0]
+            );
+        }
         assert!(parse_prefixed_digest("md5:abcd").is_err());
     }
 
