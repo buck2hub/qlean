@@ -730,6 +730,82 @@ mod tests {
         assert_eq!(documented, written);
     }
 
+    /// The prose half of the image contract names what the guest will actually find.
+    ///
+    /// `deploy.json` is the machine-readable half and has its own equality guard. Everything
+    /// else an image author has to implement - the volume label the task mounts by, the
+    /// directory the seed is grafted as, the three file names inside it, the account and the
+    /// marker - lives only in README prose and in the constants this module writes. Renaming
+    /// `SEED_VOLUME_LABEL` or `SEED_ROOT` left the whole suite green (measured), so a
+    /// conforming image would have stopped finding the medium or the files with no test
+    /// objecting: exactly the silent break the `deploy.json` guard exists to prevent, one
+    /// layer down.
+    ///
+    /// The expected names come from a seed that was really staged and really read back, not
+    /// from a list in the test: a fourth file added to the medium is an undocumented contract
+    /// change, not a new line in a fixture.
+    #[tokio::test]
+    async fn the_image_contract_in_the_readme_names_what_the_guest_will_find() {
+        let parent = tempfile::tempdir().expect("temp dir");
+        let run_dir = parent.path().join("abc123");
+        std::fs::create_dir_all(&run_dir).expect("run directory");
+        let host_key = generate_host_key(&run_dir).expect("host key");
+        DeploySeed::stage(&run_dir, "ssh-ed25519 AAAATEST client\n", &host_key)
+            .await
+            .expect("staged");
+
+        let root = run_dir.join("seed").join(SEED_ROOT);
+        let mut names = std::fs::read_dir(&root)
+            .expect("the seed root")
+            .map(|entry| {
+                entry
+                    .expect("a seed entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            ["authorized_keys", "deploy.json", "ssh_host_ed25519_key"],
+            "the medium holds three files; a fourth is a contract change the README must state"
+        );
+
+        let readme = include_str!("../README.md");
+        let section = readme
+            .split("#### Windows image contract")
+            .nth(1)
+            .expect("the README must document the Windows image contract");
+
+        // The guest finds the medium by label and nothing else, so the label is the one string
+        // a conforming image cannot infer.
+        assert!(
+            section.contains(SEED_VOLUME_LABEL),
+            "the image task mounts the medium by the label `{SEED_VOLUME_LABEL}`, and the \
+             README does not name it"
+        );
+        // Every file the guest is told to read is addressed under the graft point, so the
+        // directory name is part of both strings.
+        for name in &names {
+            let path = format!("{SEED_ROOT}/{name}");
+            assert!(
+                section.contains(&path),
+                "the seed really holds `{path}`, and the README does not send the image there"
+            );
+        }
+        assert!(
+            section.contains(GUEST_DEPLOY_MARKER),
+            "the marker path the probe waits for is `{GUEST_DEPLOY_MARKER}`, and the README \
+             does not name it"
+        );
+        assert!(
+            section.contains(&format!("`{GUEST_USERNAME}`")),
+            "the account that receives the key is `{GUEST_USERNAME}`, and the README does not \
+             name it"
+        );
+    }
+
     #[test]
     fn test_marker_probe_quotes_the_marker_path() {
         let command = marker_probe_command();
