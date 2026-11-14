@@ -643,6 +643,69 @@ fn describe_control_socket_entry(path: &Path, meta: &std::fs::Metadata) -> Strin
     "a regular file".to_string()
 }
 
+/// Whether a `/proc/<pid>/cmdline` payload is a `swtpm` serving `state_dir`.
+///
+/// `swtpm` does not lock the directory it keeps the TPM state in. Measured in the container
+/// against `swtpm` 0.10.2: two daemons started with the same `--tpmstate dir=` both stayed
+/// alive, both bound their own control socket, and both wrote the same `tpm2-00.permall`.
+/// So "there is already a `swtpm` for this VM" is invisible in the state directory itself and
+/// has to be read off the process table, exactly like [`cmdline_is_this_machines_qemu`] reads
+/// QEMU's identity off it: a leftover socket file and a socket a *live* daemon is serving look
+/// identical, and only the process tells them apart.
+///
+/// Only `argv[0]` names the program: a later argument can name `swtpm` (a log path, a
+/// comment) without the process being one. The state directory is then matched on the
+/// argument that *follows* `--tpmstate` and on its first comma-separated field, because the
+/// value is an option list (`dir=<path>,mode=0600`) and a prefix comparison would confuse
+/// `.../tpm` with `.../tpm2`.
+///
+/// [`cmdline_is_this_machines_qemu`]: crate::machine::cmdline_is_this_machines_qemu
+fn cmdline_is_swtpm_for(cmdline: &[u8], state_dir: &Path) -> bool {
+    let mut arguments = cmdline.split(|byte| *byte == 0);
+    let program = String::from_utf8_lossy(arguments.next().unwrap_or_default());
+    let program = program.rsplit('/').next().unwrap_or_default();
+    if !program.starts_with("swtpm") {
+        return false;
+    }
+    let wanted = state_dir.to_string_lossy();
+    let mut previous = String::new();
+    for argument in arguments {
+        let argument = String::from_utf8_lossy(argument);
+        if previous == "--tpmstate" {
+            let value = argument.split(',').next().unwrap_or_default();
+            if value == format!("dir={wanted}") {
+                return true;
+            }
+        }
+        previous = argument.to_string();
+    }
+    false
+}
+
+/// The pid of a `swtpm` that is already serving `state_dir`, if any.
+///
+/// A process table that cannot be read yields `None`: refusing a start requires an owner that
+/// was actually found, and guessing one would make the TPM unavailable for no reason.
+fn live_swtpm_on(state_dir: &Path) -> Option<u32> {
+    let entries = std::fs::read_dir("/proc").ok()?;
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse().ok())
+        else {
+            continue;
+        };
+        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        if cmdline_is_swtpm_for(&cmdline, state_dir) {
+            return Some(pid);
+        }
+    }
+    None
+}
+
 pub(crate) fn prepare_vars(run_dir: &Path, firmware: &FirmwarePaths) -> Result<PathBuf> {
     let dest = run_dir.join("ovmf_vars.fd");
     let code_len = std::fs::metadata(&firmware.code)
@@ -885,6 +948,20 @@ impl Swtpm {
         crate::utils::create_owner_only_dir_all(&state_dir)
             .with_context(|| format!("failed to create TPM state dir {}", state_dir.display()))?;
         let socket = run_dir.join("swtpm.sock");
+        // Before anything at the socket path is touched: `swtpm` does not lock its state
+        // directory, so a daemon that outlived the qlean process that started it keeps
+        // serving this VM's TPM. Removing its control socket would leave it running and
+        // unreachable, and the second daemon started below would write the same state file as
+        // the first - on Windows that is a lost TPM identity and a BitLocker recovery prompt.
+        if let Some(pid) = live_swtpm_on(&state_dir) {
+            bail!(
+                "a `swtpm` for this Windows guest's TPM is already running (pid {pid}) and is \
+                 serving {}: Qlean will not start a second one on the same state directory, \
+                 because both would write the same state file and the guest's sealed secrets \
+                 could be lost. Stop that process (or the machine it belongs to) and boot again",
+                state_dir.display()
+            );
+        }
         match control_socket_state(&socket).with_context(|| {
             format!(
                 "failed to inspect the swtpm control socket path {}",
@@ -1737,6 +1814,163 @@ mod tests {
         }
     }
 
+    /// A command line names this VM's TPM state only when it is a `swtpm` and the directory
+    /// follows `--tpmstate`.
+    ///
+    /// `swtpm` does not lock its state directory: two daemons with the same
+    /// `--tpmstate dir=` both run (measured against `swtpm` 0.10.2 in the container). The
+    /// identity therefore has to come off `/proc/<pid>/cmdline`, and it has to be exact -
+    /// "a process naming a similar path" would refuse a start for a VM that owns nothing.
+    #[test]
+    fn test_a_cmdline_names_the_tpm_state_directory_only_next_to_its_flag() {
+        let state = Path::new("/qlean/runs/abc/tpm");
+        let cmdline = |args: &[&str]| args.join("\0").into_bytes();
+
+        // What `swtpm_args` builds for this VM.
+        assert!(cmdline_is_swtpm_for(
+            &cmdline(&[
+                "/usr/bin/swtpm",
+                "socket",
+                "--tpm2",
+                "--tpmstate",
+                "dir=/qlean/runs/abc/tpm,mode=0600",
+                "--ctrl",
+                "type=unixio,path=/qlean/runs/abc/swtpm.sock",
+            ]),
+            state
+        ));
+        // The program is `argv[0]`: naming `swtpm` in a later argument does not make a
+        // process one, and a log path is exactly that trap.
+        assert!(!cmdline_is_swtpm_for(
+            &cmdline(&[
+                "/usr/bin/qemu-system-x86_64",
+                "-chardev",
+                "socket,path=/usr/bin/swtpm",
+                "--tpmstate",
+                "dir=/qlean/runs/abc/tpm",
+            ]),
+            state
+        ));
+        // Another VM's `swtpm` serves its own state directory, not this one.
+        assert!(!cmdline_is_swtpm_for(
+            &cmdline(&["swtpm", "--tpmstate", "dir=/qlean/runs/other/tpm,mode=0600",]),
+            state
+        ));
+        // A prefix is not the directory: `/tpm2` is a different VM.
+        assert!(!cmdline_is_swtpm_for(
+            &cmdline(&["swtpm", "--tpmstate", "dir=/qlean/runs/abc/tpm2"]),
+            state
+        ));
+        // The value only counts where `swtpm` reads it: next to `--tpmstate`. A stray
+        // argument that happens to spell the directory proves nothing.
+        assert!(!cmdline_is_swtpm_for(
+            &cmdline(&[
+                "swtpm",
+                "--log",
+                "dir=/qlean/runs/abc/tpm",
+                "file=/dev/null"
+            ]),
+            state
+        ));
+        // No arguments at all: the program alone cannot own a directory.
+        assert!(!cmdline_is_swtpm_for(b"swtpm\0", state));
+        assert!(!cmdline_is_swtpm_for(b"", state));
+    }
+
+    /// A `swtpm` that is still serving this VM's TPM is refused before its socket is touched.
+    ///
+    /// The socket file a crashed run leaves behind and the socket a *live* daemon is serving
+    /// look the same, so deleting it "because it is stale" cuts the endpoint out from under a
+    /// running TPM and then starts a second daemon on the same state directory. The process
+    /// whose `argv` names this VM's `--tpmstate` is the only witness, and it has to be
+    /// consulted before the removal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_live_swtpm_for_this_vm_is_refused_before_its_socket_is_touched() {
+        let root = temp_dir("swtpm-live-owner");
+        let run_dir = root.join("run");
+        let state_dir = run_dir.join("tpm");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        // A live process whose command line says it serves this VM's TPM state. `argv[0]` is
+        // the deciding field, so the process is reached through a link named `swtpm`; the
+        // trailing `: ` keeps `sh` from `exec`ing `sleep` and dropping the arguments.
+        let program = root.join("swtpm");
+        std::os::unix::fs::symlink("/bin/sh", &program).unwrap();
+        let mut fake = tokio::process::Command::new(&program)
+            .arg("-c")
+            .arg("sleep 30; :")
+            .arg("--tpmstate")
+            .arg(format!("dir={}", state_dir.display()))
+            .kill_on_drop(true)
+            .spawn()
+            .expect("sh is available");
+        let pid = fake.id().expect("the fake has a pid");
+
+        // The endpoint the fake owns, in the shape a crashed run leaves behind.
+        let socket = run_dir.join("swtpm.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        // Give the process table a moment to show the command line.
+        let mut found = None;
+        for _ in 0..100 {
+            found = live_swtpm_on(&state_dir);
+            if found == Some(pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            found,
+            Some(pid),
+            "the fake has to be found by its command line"
+        );
+
+        let error = match Swtpm::start(&run_dir).await {
+            Ok(_) => panic!("a live TPM on this state directory is not a second TPM to start"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains(&format!("pid {pid}"))
+                && error.contains(&state_dir.display().to_string()),
+            "the refusal has to name the process and the directory it serves: {error}"
+        );
+        assert!(
+            error.contains("will not start a second one"),
+            "the refusal has to say what it refuses: {error}"
+        );
+        assert!(
+            socket.exists(),
+            "the live daemon's endpoint must survive the refusal"
+        );
+
+        // The refusal comes from the process, not from the socket: once the process is gone
+        // the same run directory gets past this check (and on this host stops at the missing
+        // program, which is a different message).
+        fake.start_kill().unwrap();
+        let _ = fake.wait().await;
+        let mut gone = false;
+        for _ in 0..100 {
+            if live_swtpm_on(&state_dir).is_none() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(gone, "the fake has to leave the process table");
+        let error = match Swtpm::start(&run_dir).await {
+            Ok(_) => panic!("`swtpm` is not installed on this host"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            !error.contains(&format!("pid {pid}")),
+            "a gone process is not an owner: {error}"
+        );
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn test_prepare_vars_rejects_a_stale_per_vm_image() {
         // The distribution replaced OVMF after this VM was created: booting on the old
@@ -1921,6 +2155,62 @@ mod tests {
         );
         let stopped = tpm.stop().await;
         assert!(stopped, "the real swtpm has to be confirmed gone");
+    }
+
+    /// A real `swtpm` owns its state directory, and the next start says so.
+    ///
+    /// `swtpm` 0.10.2 does not lock `--tpmstate`: measured in the container, two daemons with
+    /// the same directory both ran and both wrote `tpm2-00.permall`. Qlean therefore has to
+    /// read the owner off the process table itself. Without the check the second `start`
+    /// deleted the live daemon's control socket and spawned a second writer of the same state
+    /// - on Windows that is a lost TPM identity and a BitLocker recovery prompt.
+    ///
+    /// Container evidence only: this needs the real program.
+    #[cfg(unix)]
+    #[ignore = "needs a real `swtpm` on the host"]
+    #[tokio::test]
+    async fn test_a_real_swtpm_owns_its_state_directory_against_a_second_start() {
+        let run_dir = temp_dir("swtpm-owned-state");
+        let mut first = match Swtpm::start(&run_dir).await {
+            Ok(tpm) => tpm,
+            Err(error) => panic!("a real swtpm is required for this test: {error}"),
+        };
+        let pid = first.child.id().expect("a spawned swtpm has a pid");
+        let socket = run_dir.join("swtpm.sock");
+
+        let error = match Swtpm::start(&run_dir).await {
+            Ok(_) => panic!("the state directory is being written by pid {pid}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains(&format!("pid {pid}")),
+            "the refusal has to name the running TPM: {error}"
+        );
+        assert!(
+            control_socket_state(&socket).unwrap().is_socket(),
+            "the refusal must leave the live daemon's endpoint in place"
+        );
+
+        // The first daemon was never touched: it still flushes its state on the way out.
+        assert!(
+            first.stop().await,
+            "the first swtpm has to be confirmed gone"
+        );
+
+        // And the run directory is not wedged: with the owner gone, the TPM starts again.
+        let mut second = match Swtpm::start(&run_dir).await {
+            Ok(tpm) => tpm,
+            Err(error) => panic!("a free state directory has to be usable: {error}"),
+        };
+        assert!(
+            control_socket_state(&socket).unwrap().is_socket(),
+            "the new daemon binds the same control socket path"
+        );
+        assert!(
+            second.stop().await,
+            "the second swtpm has to be confirmed gone"
+        );
+        let _ = std::fs::remove_dir_all(&run_dir);
     }
 
     /// Name of the state file a real `swtpm` writes its TPM 2.0 state into.

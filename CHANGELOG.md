@@ -55,6 +55,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not treated as free: the rename is not sent.
 
 ### Fixed
+- A second `swtpm` could be started on a TPM state directory that a live one was already serving:
+  `swtpm` does not lock `--tpmstate` (measured with 0.10.2: two daemons with the same `dir=` both
+  ran and both wrote `tpm2-00.permall`), so a daemon that outlived its qlean process was
+  indistinguishable from the stale socket file a crash leaves behind - `Swtpm::start` deleted its
+  control socket and spawned a second writer of the same state, which on Windows loses the TPM
+  identity the guest sealed secrets against (BitLocker recovery). The owner is now read off
+  `/proc/<pid>/cmdline` (a `swtpm` whose `--tpmstate dir=` names this VM's state directory) before
+  the socket path is touched, and a start that finds one is refused with the pid and the
+  directory instead of starting a second daemon.
 - A `swtpm` control socket path that held anything but a socket - a directory or a plain file left
   in the run directory - was reported as a running TPM. `Swtpm::start` asked `path.exists()` and
   accepted the first yes, so the launch went on to hand QEMU a `-chardev socket` pointing at that
