@@ -411,7 +411,7 @@ const QEMU_SYSTEM: &str = "qemu-system-x86_64";
 fn swtpm_program() -> PathBuf {
     env_nonempty(ENV_SWTPM)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("swtpm"))
+        .unwrap_or_else(|| PathBuf::from(SWTPM))
 }
 
 /// Whether `path` is a regular file the host can actually execute.
@@ -441,10 +441,53 @@ enum Presence {
 }
 
 /// Resolve `program` the way `Command::new` would: a bare name through `PATH`, a path as given.
+#[cfg(test)]
 fn program_presence(program: &Path) -> Presence {
     let paths = std::env::var_os("PATH");
     program_presence_in(paths.as_deref(), program)
 }
+
+impl<'a> HostProbes<'a> {
+    /// Every host question the gate asks, with the program search path handed in.
+    ///
+    /// The five program fields used to be written out at the call site, one
+    /// `program_presence(Path::new(CONSTANT))` per field, and nothing anywhere compared a field
+    /// with the program it was supposed to be about: swapping `QEMU_IMG` and `QEMU_SYSTEM` there
+    /// left the whole suite green (probed R240, 465 passed). The cost of that swap is a gate that
+    /// says `` `qemu-system-x86_64` was not found `` on a host that has it and lacks `qemu-img`,
+    /// so the reader reinstalls the package that is already installed, and the start fails
+    /// anyway when `qemu-img` is asked to create the overlay.
+    ///
+    /// One constructor, so there is one place that answers "which program is this field about",
+    /// and it takes the search path as an argument so a directory can be asked the question.
+    fn with_search_path(paths: Option<&'a std::ffi::OsStr>, swtpm: &'a Path) -> Self {
+        Self {
+            qemu_img: program_presence_in(paths, Path::new(QEMU_IMG)),
+            qemu_system: program_presence_in(paths, Path::new(QEMU_SYSTEM)),
+            kvm_available: is_kvm_available(),
+            ovmf: resolve_ovmf(),
+            swtpm_presence: program_presence_in(paths, swtpm),
+            seed_iso_builder: program_presence_in(paths, Path::new(SEED_ISO_BUILDER)),
+            virsh: program_presence_in(paths, Path::new(LEASE_TOOL)),
+            swtpm,
+        }
+    }
+
+    /// The five program questions, labelled with the program each one is about.
+    #[cfg(test)]
+    fn program_fields(&self) -> [(&'static str, &Presence); 5] {
+        [
+            (QEMU_IMG, &self.qemu_img),
+            (QEMU_SYSTEM, &self.qemu_system),
+            (SEED_ISO_BUILDER, &self.seed_iso_builder),
+            (LEASE_TOOL, &self.virsh),
+            (SWTPM, &self.swtpm_presence),
+        ]
+    }
+}
+
+/// The `swtpm` program name the gate probes when the environment does not override it.
+const SWTPM: &str = "swtpm";
 
 /// The same question, with the search path given instead of read from the environment.
 ///
@@ -592,16 +635,10 @@ fn host_support_problems(probes: HostProbes<'_>) -> Vec<String> {
 /// Check every host prerequisite for a Windows guest, reporting all gaps at once.
 pub(crate) fn ensure_host_support() -> Result<()> {
     let swtpm = swtpm_program();
-    let problems = host_support_problems(HostProbes {
-        qemu_img: program_presence(Path::new(QEMU_IMG)),
-        qemu_system: program_presence(Path::new(QEMU_SYSTEM)),
-        kvm_available: is_kvm_available(),
-        ovmf: resolve_ovmf(),
-        swtpm_presence: program_presence(&swtpm),
-        seed_iso_builder: program_presence(Path::new(SEED_ISO_BUILDER)),
-        virsh: program_presence(Path::new(LEASE_TOOL)),
-        swtpm: &swtpm,
-    });
+    let problems = host_support_problems(HostProbes::with_search_path(
+        std::env::var_os("PATH").as_deref(),
+        &swtpm,
+    ));
 
     anyhow::ensure!(
         problems.is_empty(),
@@ -3519,6 +3556,90 @@ mod tests {
         let message = no_usable_firmware_message(&resolved);
         assert!(message.contains(&code.display().to_string()), "{message}");
         assert!(message.contains("is 0 bytes"), "{message}");
+    }
+
+    /// Each of the five program fields is about the program its name says, and only that one.
+    ///
+    /// Probed before writing this (R240): swapping `QEMU_IMG` and `QEMU_SYSTEM` at the gate's
+    /// call site left the suite at 465 passed, because every other test builds `HostProbes` from
+    /// literals and so never asks which program a field came from. A host that has
+    /// `qemu-system-x86_64` and lacks `qemu-img` then gets "`qemu-system-x86_64` was not found",
+    /// reinstalls what it already has, and dies later in `qemu-img create`.
+    ///
+    /// A directory with exactly one of the five programs in it makes the answer unambiguous:
+    /// the field named after that program is the only one that can be `Ready`.
+    #[test]
+    fn test_host_probes_ask_each_question_about_the_program_it_names() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("host-probes-wiring");
+        let paths = std::env::join_paths([&dir]).expect("one directory joins");
+        for program in [QEMU_IMG, QEMU_SYSTEM, SEED_ISO_BUILDER, LEASE_TOOL, SWTPM] {
+            let file = dir.join(program);
+            std::fs::write(&file, b"#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let probes = HostProbes::with_search_path(Some(paths.as_os_str()), Path::new(SWTPM));
+            for (name, presence) in probes.program_fields() {
+                if name == program {
+                    assert_eq!(
+                        *presence,
+                        Presence::Ready,
+                        "{program} must answer for itself"
+                    );
+                } else {
+                    assert_eq!(
+                        *presence,
+                        Presence::Missing,
+                        "{program} must not answer for {name}"
+                    );
+                }
+            }
+            std::fs::remove_file(&file).unwrap();
+        }
+
+        // The same for a file that exists and cannot be run: the field keeps the path it found,
+        // so the message names the file that is wrong and not a program that is merely absent.
+        let unrunnable = dir.join(LEASE_TOOL);
+        std::fs::write(&unrunnable, b"").unwrap();
+        std::fs::set_permissions(&unrunnable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let probes = HostProbes::with_search_path(Some(paths.as_os_str()), Path::new(SWTPM));
+        assert_eq!(
+            probes.virsh,
+            Presence::NotExecutable(unrunnable.clone()),
+            "the field has to carry the file it found"
+        );
+        for (name, presence) in probes.program_fields() {
+            if name != LEASE_TOOL {
+                assert_eq!(*presence, Presence::Missing, "{name}");
+            }
+        }
+        std::fs::remove_file(&unrunnable).unwrap();
+
+        // The `swtpm` field asks about the program the caller passed, not about a literal: the
+        // environment can point the gate at a different build (QLEAN_SWTPM), and the gate has to
+        // probe that one or the message names a program the user is not using.
+        let overridden = dir.join("swtpm-custom");
+        std::fs::write(&overridden, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&overridden, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let probes =
+            HostProbes::with_search_path(Some(paths.as_os_str()), Path::new("swtpm-custom"));
+        assert_eq!(
+            probes.swtpm,
+            Path::new("swtpm-custom"),
+            "the field keeps the path it was given"
+        );
+        assert_eq!(
+            probes.swtpm_presence,
+            Presence::Ready,
+            "the given program is the one probed"
+        );
+        for (name, presence) in probes.program_fields() {
+            if name != SWTPM {
+                assert_eq!(*presence, Presence::Missing, "{name}");
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

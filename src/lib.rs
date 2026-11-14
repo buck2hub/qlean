@@ -3961,6 +3961,7 @@ mod plan_doc_tests {
             ("QEMU_SYSTEM", "qemu-system-x86_64"),
             ("SEED_ISO_BUILDER", "xorriso"),
             ("LEASE_TOOL", "virsh"),
+            ("SWTPM", "swtpm"),
         ] {
             let declaration = format!("const {constant}: &str = \"{value}\";");
             assert!(
@@ -3970,9 +3971,9 @@ mod plan_doc_tests {
             );
         }
         assert!(
-            FIRMWARE.contains("PathBuf::from(\"swtpm\")"),
-            "`swtpm_program` no longer defaults to `swtpm`, so the README's `swtpm` row names a \
-             program the gate does not look for"
+            FIRMWARE.contains("PathBuf::from(SWTPM)"),
+            "`swtpm_program` no longer defaults to the `SWTPM` constant, so the README's `swtpm` \
+             row names a program the gate does not look for"
         );
 
         // The table's claim about the two causes is the gate's own sentence, not a paraphrase.
