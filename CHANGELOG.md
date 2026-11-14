@@ -320,6 +320,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The Linux dependency check and the DHCP lease lookup reported every failure to start a program as
+  "not found", so a host program that exists but cannot be executed (a `noexec` mount, a file restored
+  without its mode) produced "`qemu-img` is required but was not found (Permission denied (os error 13)):
+  install it and try again" - advice that reinstalls a package the host already has. Both places now read
+  the failure's `ErrorKind`, name the file and the two repairs that fit it, and share one definition of
+  "executable" with the Windows prerequisite check.
 - A host program that exists but cannot be executed (a tarball unpacked without its mode, a backup restored by hand, a `noexec` mount) passed the Windows prerequisite check, so the only sign of it was `Permission denied (os error 13)` from inside the launch, naming no program. The check now separates "not installed" from "installed but not runnable" and names the program and the file to fix.
 - Use `qemu:///system` URI to enable bridge creation for proper network setup
 

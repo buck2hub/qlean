@@ -58,7 +58,12 @@ const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 /// the two need opposite advice.
 pub(crate) enum BoundedFailure {
     /// The program never started.
-    NotRun(anyhow::Error),
+    ///
+    /// Kept as the `std::io::Error` rather than a formatted string because its
+    /// [`std::io::ErrorKind`] is what separates "no such program" from "the program is
+    /// here and the host refuses to run it": those two need opposite advice, and a string
+    /// loses the distinction at the one place that still knows it (R215).
+    NotRun(std::io::Error),
     /// The program was still running at the deadline and was killed.
     Killed {
         /// Name of the program that was killed.
@@ -114,7 +119,7 @@ pub(crate) async fn run_bounded(
     cmd.kill_on_drop(true);
     match tokio::time::timeout(budget, cmd.output()).await {
         Ok(Ok(output)) => Ok(output),
-        Ok(Err(error)) => Err(BoundedFailure::NotRun(error.into())),
+        Ok(Err(error)) => Err(BoundedFailure::NotRun(error)),
         Err(_) => Err(BoundedFailure::Killed {
             program,
             budget,
@@ -326,6 +331,17 @@ async fn find_lease_address_with(
                 // under the whole deployment budget, so polling a missing `virsh` would spend
                 // 900s to discover a fact that was knowable before the guest started — and
                 // then blame libvirt access or the guest's DHCP.
+                //
+                // "Not available" covers two causes whose repairs have nothing in common, so
+                // the cause decides the sentence: an installed client the host refuses to run
+                // is not fixed by installing the package that shipped it (R215).
+                if let Some(reason) = not_executable_reason(program, &error) {
+                    bail!(
+                        "no DHCP lease table can be read: {reason}.\n\
+                         Windows guests discover their address through `{program} net-dhcp-leases`, \
+                         so fix that file before starting a Windows guest"
+                    );
+                }
                 bail!(
                     "no DHCP lease table can be read: `{program}` is not available ({error:#}).\n\
                      Windows guests discover their address through `{program} net-dhcp-leases`, \
@@ -804,13 +820,66 @@ pub(crate) async fn ensure_prerequisites(guest_os: crate::image::GuestOs) -> Res
     Ok(())
 }
 
+/// Whether `path` is a regular file the host can actually execute.
+///
+/// The single definition of "executable" in this crate: the Windows prerequisite gate
+/// (`crate::firmware::executable_file`) delegates here, because two answers to "can this
+/// program run?" is how one gate accepts a file the other one rejects.
+pub(crate) fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+}
+
+/// The file a bare program name resolves to when it exists but cannot be executed.
+///
+/// Only used to name the file in an error message: the probe itself still runs the program,
+/// which is the only way to learn that a *working* installation really works.
+fn unexecutable_on_path(program: &str) -> Option<PathBuf> {
+    if program.contains('/') {
+        let path = Path::new(program);
+        return (path.is_file() && !is_executable_file(path)).then(|| path.to_path_buf());
+    }
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file() && !is_executable_file(candidate))
+}
+
+/// Why a program that could not be started is installed-but-unrunnable, if it is.
+///
+/// `NotFound` and `PermissionDenied` arrive as one failure shape ("the program never ran"),
+/// and this is the one place that tells them apart, for both gates. Returns `None` for every
+/// other start failure, whose message belongs to the caller.
+///
+/// The wording may not say "not found" or "install it": the sentence is read by someone who
+/// already has the package, and telling them to install it again is what made the gate
+/// useless (R215).
+pub(crate) fn not_executable_reason(program: &str, error: &std::io::Error) -> Option<String> {
+    if error.kind() != std::io::ErrorKind::PermissionDenied {
+        return None;
+    }
+    let file = unexecutable_on_path(program)
+        .map(|path| format!(" at {}", path.display()))
+        .unwrap_or_default();
+    Some(format!(
+        "`{program}` is installed{file} but cannot be executed ({error}): check that file's \
+         permissions and that its filesystem is not mounted `noexec`"
+    ))
+}
+
 /// How probing one required program turned out.
 #[derive(Debug)]
 enum ProgramProbe {
     /// The program answered `--version`.
     Available,
-    /// The program is not on `PATH` (or cannot be executed).
+    /// Nothing by that name exists.
     Missing(String),
+    /// The program exists but the host refuses to execute it.
+    NotExecutable(String),
     /// The program exists but `--version` failed, so the installation is broken.
     Broken(String),
     /// The program exists but did not answer `--version` inside the probe budget.
@@ -829,6 +898,10 @@ fn program_problems(probes: &[(&str, ProgramProbe)]) -> Vec<String> {
             ProgramProbe::Missing(reason) => Some(format!(
                 "`{program}` is required but was not found ({reason}): install it and try again"
             )),
+            // The reason already names the program, the file and the two repairs that fit an
+            // installed-but-unrunnable program; adding "install it" here is what contradicted
+            // the parenthetical it is printed next to (R215).
+            ProgramProbe::NotExecutable(reason) => Some(reason.clone()),
             ProgramProbe::Broken(status) => Some(format!(
                 "`{program}` is installed but `{program} --version` failed ({status}): the installation looks broken"
             )),
@@ -856,7 +929,10 @@ async fn check_commands_available(programs: &[&'static str]) -> Vec<String> {
             Err(failure @ BoundedFailure::Killed { .. }) => {
                 ProgramProbe::Unusable(failure.to_string())
             }
-            Err(BoundedFailure::NotRun(error)) => ProgramProbe::Missing(error.to_string()),
+            Err(BoundedFailure::NotRun(error)) => match not_executable_reason(program, &error) {
+                Some(reason) => ProgramProbe::NotExecutable(reason),
+                None => ProgramProbe::Missing(error.to_string()),
+            },
         };
         probes.push((*program, probe));
     }
@@ -1240,6 +1316,46 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "waited {elapsed:?} for a program that is not installed"
+        );
+    }
+
+    /// R215: the lease lookup separates "no lease tool" from "a tool the host will not run".
+    #[tokio::test]
+    async fn test_a_lease_tool_that_cannot_be_executed_keeps_its_own_advice() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("temp dir");
+        let program = root.path().join("virsh");
+        std::fs::write(&program, b"#!/bin/sh\nexit 0\n").expect("write");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let name = program.display().to_string();
+
+        let start = std::time::Instant::now();
+        let error = find_lease_address_with(
+            "52:54:00:aa:bb:cc",
+            std::time::Duration::from_secs(30),
+            &name,
+        )
+        .await
+        .expect_err("a program without an execute bit cannot answer");
+        let elapsed = start.elapsed();
+        let message = format!("{error:#}");
+
+        assert!(
+            message.contains(&name),
+            "the file to fix must be named: {message}"
+        );
+        assert!(
+            message.contains("cannot be executed") && message.contains("noexec"),
+            "an installed client is a permissions problem: {message}"
+        );
+        assert!(
+            !message.contains("install the `libvirt` package"),
+            "installing libvirt again is the wrong repair: {message}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "waited {elapsed:?} for a program that cannot be executed"
         );
     }
 
@@ -2280,5 +2396,126 @@ mod owner_only_tests {
             !seed_root.contains("create_dir_all(&root)"),
             "the seed root is created with the umask's permissions before a `chmod` closes them"
         );
+    }
+    /// R215: an installed program the host refuses to execute is not a missing package.
+    #[tokio::test]
+    async fn test_an_unexecutable_program_is_reported_as_unrunnable() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let program = root.path().join("qemu-img");
+        std::fs::write(&program, b"#!/bin/sh\nexit 0\n").expect("write");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod 0644");
+
+        // The probe fails the same way the gate used to misread: `spawn` answers EACCES.
+        let refusal = std::process::Command::new(&program)
+            .arg("--version")
+            .output()
+            .expect_err("0644 is not executable");
+        assert_eq!(refusal.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let name: &'static str = Box::leak(program.display().to_string().into_boxed_str());
+        let problems = check_commands_available(&[name]).await;
+        assert_eq!(problems.len(), 1, "one program, one problem: {problems:#?}");
+        let problem = &problems[0];
+        assert!(
+            problem.contains("is installed") && problem.contains("cannot be executed"),
+            "the message must name the cause: {problem}"
+        );
+        assert!(
+            problem.contains(&program.display().to_string()),
+            "the message must name the file: {problem}"
+        );
+        assert!(
+            problem.contains("noexec"),
+            "the message must name the mount option that causes this: {problem}"
+        );
+        assert!(
+            !problem.contains("was not found") && !problem.contains("install it"),
+            "a program that is present must not be reported as absent: {problem}"
+        );
+    }
+
+    /// The other half of the same distinction: absence keeps its own remedy.
+    #[tokio::test]
+    async fn test_a_program_that_is_absent_is_still_reported_as_missing() {
+        let problems = check_commands_available(&["/nonexistent/qlean-probe"]).await;
+        assert_eq!(problems.len(), 1, "{problems:#?}");
+        let problem = &problems[0];
+        assert!(
+            problem.contains("was not found") && problem.contains("install it and try again"),
+            "absence is a missing package: {problem}"
+        );
+        assert!(
+            !problem.contains("cannot be executed"),
+            "absence is not a permissions problem: {problem}"
+        );
+    }
+
+    /// The classification is one decision, so it is testable without spawning anything.
+    #[test]
+    fn test_only_a_permission_refusal_counts_as_an_unrunnable_program() {
+        let denied = std::io::Error::from_raw_os_error(13);
+        let reason = not_executable_reason("qemu-img", &denied).expect("EACCES is a refusal");
+        assert!(
+            reason.contains("cannot be executed") && reason.contains("qemu-img"),
+            "the reason names the program and the cause: {reason}"
+        );
+        assert!(
+            !reason.contains("was not found") && !reason.contains("install it"),
+            "the reason may not borrow the missing program's advice: {reason}"
+        );
+        for other in [2, 20] {
+            let error = std::io::Error::from_raw_os_error(other);
+            assert!(
+                not_executable_reason("qemu-img", &error).is_none(),
+                "os error {other} is not a refusal to execute: {error}"
+            );
+        }
+        assert!(
+            not_executable_reason(
+                "qemu-img",
+                &std::io::Error::from(std::io::ErrorKind::NotFound)
+            )
+            .is_none()
+        );
+    }
+
+    /// `is_executable_file` is the crate's only definition of "this program can run".
+    #[test]
+    fn test_executable_file_wants_a_regular_file_with_an_execute_bit() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let plain = root.path().join("plain");
+        std::fs::write(&plain, b"").expect("write");
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod 0644");
+        assert!(!is_executable_file(&plain));
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod 0755");
+        assert!(is_executable_file(&plain));
+        assert!(
+            !is_executable_file(root.path()),
+            "a directory is not a program"
+        );
+        assert!(
+            !is_executable_file(&root.path().join("absent")),
+            "nothing there is not a program"
+        );
+    }
+
+    /// One program, one line, whichever cause it was: no cause may collect two.
+    #[test]
+    fn test_each_failing_program_produces_exactly_one_line() {
+        let probes = [
+            (
+                "/usr/bin/qemu-img",
+                ProgramProbe::NotExecutable("denied".into()),
+            ),
+            (
+                "/usr/bin/virsh",
+                ProgramProbe::Missing("no such file".into()),
+            ),
+        ];
+        let problems = program_problems(&probes);
+        assert_eq!(problems, vec!["denied".to_string(), "`/usr/bin/virsh` is required but was not found (no such file): install it and try again".to_string()]);
     }
 }

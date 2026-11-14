@@ -3590,6 +3590,100 @@ mod plan_doc_tests {
         );
     }
 
+    /// Both prerequisite gates ask the same question about a program.
+    ///
+    /// R215: "can this program run?" was answered in three places with two vocabularies. The
+    /// Windows gate learned to say "found but not executable" (R214), while the Linux gate and
+    /// the lease lookup still printed every start failure as absence - "`qemu-img` is required
+    /// but was not found (Permission denied (os error 13)): install it and try again" - so a
+    /// user whose program sat on a `noexec` mount was told, once per run, to install a package
+    /// that was already installed. The definition of "executable" and the sentence for that
+    /// cause now live once each, and this guard is what keeps them single.
+    #[test]
+    fn both_gates_ask_the_same_question_about_a_program() {
+        const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
+        const UTILS: &str = include_str!("../src/utils.rs");
+        const FIRMWARE: &str = include_str!("../src/firmware.rs");
+
+        // One definition of "executable": the Windows gate asks the Linux gate's question.
+        assert_eq!(
+            UTILS.matches("fn is_executable_file(").count(),
+            1,
+            "the crate must define `is_executable_file` exactly once"
+        );
+        assert!(
+            FIRMWARE.contains("crate::utils::is_executable_file"),
+            "the Windows gate stopped asking the shared `is_executable_file`"
+        );
+        assert!(
+            !FIRMWARE.contains("0o111"),
+            "the Windows gate tests execute bits itself again instead of delegating"
+        );
+
+        let body = |source: &'static str, signature: &str| -> &'static str {
+            let start = source
+                .find(signature)
+                .unwrap_or_else(|| panic!("`{signature}` is gone"));
+            let end = source[start..]
+                .find("\n}\n")
+                .map(|end| start + end)
+                .unwrap_or(source.len());
+            &source[start..end]
+        };
+
+        // The one sentence for "it is here and the host will not run it" names the repairs,
+        // and it may not borrow the missing program's repair.
+        let reason = body(UTILS, "fn not_executable_reason(");
+        for required in ["PermissionDenied", "cannot be executed", "noexec"] {
+            assert!(
+                reason.contains(required),
+                "`not_executable_reason` no longer states `{required}`: {reason}"
+            );
+        }
+        for borrowed in ["was not found", "install it"] {
+            assert!(
+                !reason.contains(borrowed),
+                "`not_executable_reason` tells the user `{borrowed}`, which is the other cause's                  advice: {reason}"
+            );
+        }
+
+        // Both call sites classify the failure by its kind instead of flattening it.
+        let probe = body(UTILS, "async fn check_commands_available(");
+        assert!(
+            probe.contains("not_executable_reason("),
+            "the dependency probe reports every start failure as a missing program again"
+        );
+        assert!(
+            body(UTILS, "fn program_problems(").contains("ProgramProbe::NotExecutable"),
+            "the dependency probe has no line of its own for an unrunnable program"
+        );
+        let lease = body(UTILS, "async fn find_lease_address_with(");
+        assert!(
+            lease.contains("not_executable_reason("),
+            "the lease lookup tells a user with an unrunnable `virsh` to install libvirt again"
+        );
+        // The other gate keeps its own sentence, and it says the same thing.
+        assert!(
+            FIRMWARE.contains("cannot be executed"),
+            "the Windows gate no longer separates \"not installed\" from \"cannot run\""
+        );
+
+        let row = PLAN
+            .lines()
+            .find(|line| line.starts_with("| 宿主前置的两道门 |"))
+            .expect("the plan lost the row that states the two gates' shared rule");
+        for fact in [
+            "is_executable_file",
+            "not_executable_reason",
+            "cannot be executed",
+        ] {
+            assert!(
+                row.contains(fact),
+                "the row that states the shared rule no longer names `{fact}`: {row}"
+            );
+        }
+    }
+
     /// The plan quotes the prerequisite error the Windows gate prints, word for word.
     ///
     /// The plan tells a reader what happens once the image variables are set: the gate hands

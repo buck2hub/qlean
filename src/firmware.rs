@@ -363,13 +363,12 @@ fn swtpm_program() -> PathBuf {
 /// mode, a mount with `noexec`) passed the check and then failed inside `launch` with a bare
 /// `Permission denied (os error 13)` naming no program. The gate exists to name every gap at
 /// the cheapest moment, so "there but unusable" is a gap of its own.
+///
+/// The definition itself lives in `crate::utils::is_executable_file`: the Linux dependency
+/// gate (`check_commands_available`) asks the same question, and two answers would let one
+/// gate accept exactly the file the other rejects.
 fn executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return false;
-    };
-    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+    crate::utils::is_executable_file(path)
 }
 
 /// Whether a host program can be run, and if not, why.
