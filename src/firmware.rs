@@ -3141,6 +3141,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Every program gap tells "installed but unrunnable" apart from "absent".
+    ///
+    /// R214/R215 established the distinction for `swtpm` and `qemu-img`; the other three were
+    /// only ever driven through `Presence::Missing`, and `virsh` builds its sentence by hand
+    /// instead of going through `program_problem`. Probed (R236): deleting the
+    /// `Presence::NotExecutable` arm of the `virsh` match left the whole suite green - 458
+    /// passed - so a `virsh` that exists but cannot run (`noexec` mount, a mode bit lost to a
+    /// tar unpack) was accepted as ready, and the start failed much later, at lease discovery,
+    /// with nothing pointing at the file. That is the repair this gate exists to make: the same
+    /// five programs are asked the same question here, so no single arm can drop back to
+    /// "absent" or to silence unobserved.
+    #[test]
+    fn test_every_program_gap_names_the_file_when_it_cannot_be_executed() {
+        let root = temp_dir("r236-nonexecutable-family");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let unrunnable = |name: &str| {
+            use std::os::unix::fs::PermissionsExt;
+            let path = root.join(name);
+            std::fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("write");
+            let mut permissions = std::fs::metadata(&path).expect("stat").permissions();
+            permissions.set_mode(0o644);
+            std::fs::set_permissions(&path, permissions).expect("chmod");
+            path
+        };
+        let check = |label: &str, path: &Path, problems: Vec<String>| {
+            assert_eq!(problems.len(), 1, "{label} reported {problems:?}");
+            let gap = &problems[0];
+            assert!(
+                gap.contains(label),
+                "the {label} gap has to keep the name it is filed under: {gap}"
+            );
+            assert!(
+                gap.contains(&path.display().to_string()),
+                "the {label} gap has to name the file whose permissions are wrong: {gap}"
+            );
+            assert!(
+                gap.contains("cannot be executed"),
+                "the {label} gap has to say the program is there but cannot run: {gap}"
+            );
+            assert!(
+                !gap.contains("was not found"),
+                "the {label} gap says the program is absent when it is installed: {gap}"
+            );
+        };
+
+        for label in [
+            "qemu-img",
+            "qemu-system-x86_64",
+            "swtpm",
+            "xorriso",
+            "virsh",
+        ] {
+            let path = unrunnable(label);
+            let presence = program_presence(&path);
+            assert_eq!(
+                presence,
+                Presence::NotExecutable(path.clone()),
+                "a file without the executable bit is not ready: {label}"
+            );
+            // `swtpm` is given by path, so the path is also the name its gap is filed under;
+            // every other program is filed under the fixed name the table lists.
+            let probes = match label {
+                "qemu-img" => HostProbes {
+                    qemu_img: presence,
+                    ..complete_host_fixture()
+                },
+                "qemu-system-x86_64" => HostProbes {
+                    qemu_system: presence,
+                    ..complete_host_fixture()
+                },
+                "swtpm" => HostProbes {
+                    swtpm_presence: presence,
+                    swtpm: &path,
+                    ..complete_host_fixture()
+                },
+                "xorriso" => HostProbes {
+                    seed_iso_builder: presence,
+                    ..complete_host_fixture()
+                },
+                _ => HostProbes {
+                    virsh: presence,
+                    ..complete_host_fixture()
+                },
+            };
+            check(label, &path, host_support_problems(probes));
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn test_program_presence_checks_absolute_paths() {
         assert_eq!(program_presence(Path::new("/bin/sh")), Presence::Ready);
