@@ -4538,6 +4538,84 @@ mod plan_doc_tests {
         );
     }
 
+    /// The staging rule a user can observe is written in the README, and the code still does it.
+    ///
+    /// R206, R208 and R210 each changed what a transfer leaves behind - the target keeps its old
+    /// content on failure, a directory download merges instead of replacing - and the support
+    /// matrix went on saying `unchanged` for `upload`, `download` and `write` on the Linux side.
+    /// A row that says "unchanged" is a claim about behaviour, so it is the last place a reader
+    /// looks for a change that is exactly there. Each row below is checked against the README and
+    /// against the code that has to keep it true, so neither side can be reworded alone.
+    #[test]
+    fn the_transfer_staging_rule_is_in_the_readme_and_in_the_code() {
+        const README_TEXT: &str = include_str!("../README.md");
+        const SSH: &str = include_str!("../src/ssh.rs");
+
+        let flat_readme = README_TEXT.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        // The rule itself, in the paragraph that speaks about transfers. The needles are the
+        // claims, not the sentences: a reworded paragraph that still makes all three claims has
+        // to pass, or this guard would only be checking one particular spelling of the README.
+        let about_transfers = flat_readme
+            .split("A transfer counts as a success only once it is closed")
+            .nth(1)
+            .expect("the README no longer has a paragraph about transfers");
+        for (claim, needle) in [
+            ("a transfer is staged", "hidden sibling"),
+            ("a failed transfer leaves the target alone", "as it was"),
+            (
+                "an existing directory is merged into, not replaced",
+                "merged into",
+            ),
+        ] {
+            assert!(
+                about_transfers.contains(needle),
+                "the README no longer states that {claim}"
+            );
+        }
+
+        // The rows: a staging transfer is not "unchanged" on either guest.
+        let transfer_row = README_TEXT
+            .lines()
+            .find(|line| line.starts_with("| `upload` / `download`"))
+            .expect("the support matrix lost its upload/download row");
+        assert!(
+            transfer_row.contains("staged in a hidden sibling"),
+            "the upload/download row does not say what a transfer does with the name: {transfer_row}"
+        );
+        assert!(
+            !transfer_row.trim_end().ends_with("| unchanged |"),
+            "the upload/download row claims the Linux behaviour is unchanged, but the staging is \
+             shared by both guests: {transfer_row}"
+        );
+        let write_row = README_TEXT
+            .lines()
+            .find(|line| line.starts_with("| `create_dir` / `create_dir_all`"))
+            .expect("the support matrix lost its create_dir/write row");
+        assert!(
+            !write_row.trim_end().ends_with("| unchanged |"),
+            "the write row claims the Linux behaviour is unchanged, but `write` stages too: {write_row}"
+        );
+
+        // And the code the README describes.
+        for producer in [
+            concat!("fn staged_upload", "_path("),
+            concat!("fn install_upload", "<"),
+            concat!("fn staged_download", "_path("),
+            concat!("fn install_downloaded", "_tree("),
+        ] {
+            assert!(
+                SSH.contains(producer),
+                "the README describes a staging rule the code no longer has: {producer}"
+            );
+        }
+        assert!(
+            SSH.contains(concat!("fn write_file", "("))
+                && SSH.contains(concat!("install_upload", "(&mut sink")),
+            "`write` no longer stages the bytes it is given"
+        );
+    }
+
     /// A path rule the user can observe is written in the README *and* in the changelog.
     ///
     /// R149 and R150 each changed what a user sees - a Linux guest keeps a backslash, and an

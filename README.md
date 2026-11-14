@@ -230,8 +230,8 @@ is `b` in `a`.
 
 | Operation | Windows guest | Linux guest |
 |---|---|---|
-| `upload` / `download` (file and directory) | supported; recursive trees keep spaces and non-ASCII names, and an entry whose name is not valid UTF-8 is refused by name instead of being uploaded under `U+FFFD` (a guest path is a UTF-8 string, so two such names would otherwise collide) | unchanged |
-| `create_dir` / `create_dir_all` / `exists` / `metadata` / `read` / `read_to_string` / `write` | supported | unchanged |
+| `upload` / `download` (file and directory) | supported; recursive trees keep spaces and non-ASCII names, and an entry whose name is not valid UTF-8 is refused by name instead of being uploaded under `U+FFFD` (a guest path is a UTF-8 string, so two such names would otherwise collide). A transfer is staged in a hidden sibling of its target and takes that name only once the last byte arrived, so a failed or cancelled one leaves the target as it was; a directory download merges into a directory that is already there instead of replacing it | same staging: the rule is Qlean's on both guests, so a failed transfer leaves the target as it was instead of half updated |
+| `create_dir` / `create_dir_all` / `exists` / `metadata` / `read` / `read_to_string` / `write` | supported; `write` is staged like an upload | `write` stages like an upload on both guests; the rest is unchanged |
 | `read_dir` / `remove_file` / `remove_dir_all` | supported (`remove_dir_all` deletes the tree) | unchanged |
 | `rename` | supported; an occupied destination is refused before the request is sent (a rename does not replace a file - remove it first), so the answer is Qlean's and not the guest's | same refusal: the decision is Qlean's on both guests, although the servers used to answer it differently |
 | `copy` | PowerShell `Copy-Item -LiteralPath ... -Destination ...`; never `cp` | `cp -p --` as before |
@@ -242,6 +242,14 @@ is `b` in `a`.
 A transfer counts as a success only once it is closed: both the flush and the close of the
 receiving file are part of the copy, so a full disk on the other side fails the upload with
 the file named instead of arriving as a truncated file behind a reported success.
+
+Every transfer - `upload`, `download` and `write` - is written to a hidden sibling of its
+target and renamed into place only after the last byte arrived, on both guests. A cancelled
+or failed transfer therefore leaves the target exactly as it was: the half it had sent is
+removed, or its location is named in the error if the guest refuses to remove it. A
+directory download is staged as a whole tree; when the target directory already exists the
+new tree is merged into it, because installing an answer does not delete files the caller
+put there.
 
 A download counts as one only once the file is complete: the bytes are staged in a hidden
 sibling of the target (a dot, the target's name, the process id, a counter, `.part`), flushed
