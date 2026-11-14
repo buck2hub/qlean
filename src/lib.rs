@@ -2322,6 +2322,40 @@ mod plan_doc_tests {
         );
     }
 
+    /// `exec` hands the command to the transport exactly as it was given.
+    ///
+    /// The README promises that `exec` runs the command verbatim and that the guest's own shell
+    /// decides what it means, and the doc comment on the method repeats it. A wrapper added in
+    /// this one function - an encoded PowerShell, a `cmd /c`, a quoting pass - would change what
+    /// every caller runs, and nothing else in the suite could see it: the body needs a session,
+    /// so the mutant that wrapped the command in `powershell_command` left every test green
+    /// (R251 census). The guard pins the one hand-over, and the absence of a second one.
+    #[test]
+    fn exec_hands_the_command_to_the_transport_unchanged() {
+        let source = include_str!("machine.rs");
+        let body = function_body(
+            source,
+            "    pub async fn exec<S: AsRef<str>>(&mut self, cmd: S) -> Result<Output> {",
+        );
+
+        assert_eq!(
+            body.matches("call_with_output(").count(),
+            1,
+            "the command must be handed over once"
+        );
+        assert!(
+            body.contains("ssh.call_with_output(cmd_ref, cancel_token).await?"),
+            "`exec` has to pass the caller's own string, not something derived from it:
+{body}"
+        );
+        for wrapper in ["powershell_command(", "escape(", "cmd /c", "powershell -"] {
+            assert!(
+                !body.contains(wrapper),
+                "`{wrapper}` in `exec` would change what every caller runs: {body}"
+            );
+        }
+    }
+
     /// The README states the symlink rules per guest, and the code keeps them.
     ///
     /// The bullet used to say that uploading a tree with a symlink and downloading one both

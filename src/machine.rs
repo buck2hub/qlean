@@ -277,6 +277,52 @@ impl Default for MachineConfig {
     }
 }
 
+/// Whether `Machine::confirm_deployment` has anything to wait for.
+///
+/// Only a Windows guest whose seed medium is still attached can be mid-deployment: the seed is
+/// staged by `init` and dropped once the guest reports the marker, so a `spawn`ed machine has
+/// nothing to confirm. Asked here rather than in the method because the answer is the whole
+/// reason the wait is skipped - a `spawn`ed Windows guest that got the wait anyway would sit out
+/// the full deployment budget and then fail a launch that had already succeeded, tearing a
+/// healthy VM down (R251: dropping the seed half left every test green).
+fn waits_for_deployment(guest_os: GuestOs, seed_staged: bool) -> bool {
+    guest_os == GuestOs::Windows && seed_staged
+}
+
+/// The refusal for a symbolic link handed to a Windows guest, if there is one.
+///
+/// Bots SFTP and PowerShell carry links differently: Windows needs a privilege Qlean's account
+/// does not have and the image contract does not grant. An attempt instead of a refusal becomes
+/// a half-uploaded tree whose link entries failed one by one, so the rule is a value that can be
+/// asked about, not a branch buried behind a live session.
+fn symbolic_link_refusal(guest_os: GuestOs, link: &GuestPath) -> Option<anyhow::Error> {
+    (guest_os == GuestOs::Windows).then(|| {
+        anyhow::anyhow!(
+            "symbolic links are not supported when uploading to a Windows guest: {}",
+            link.as_str()
+        )
+    })
+}
+
+/// The command `Machine::copy` runs on the guest.
+///
+/// Two shells, one relation: `cp -p --` with escaped paths on Linux, an encoded PowerShell
+/// `Copy-Item` on Windows. Both spellings take the source first and the destination second, and
+/// that order is the whole meaning of the operation - swapped, `Copy-Item -Force` writes the
+/// destination over the source and destroys the file the caller was copying *from*. It used to
+/// be built inline inside a method that needs a live guest, so neither the shell nor the order
+/// could be asked about (R251: both mutants left the suite green).
+fn copy_command(guest_os: GuestOs, from: &str, to: &str) -> String {
+    match guest_os {
+        GuestOs::Linux => format!(
+            "cp -p -- {} {}",
+            escape(Cow::Borrowed(from)),
+            escape(Cow::Borrowed(to))
+        ),
+        GuestOs::Windows => windows::copy_file_command(from, to),
+    }
+}
+
 /// Resolve a Windows guest's SSH endpoint from its DHCP lease.
 ///
 /// The address comes from the libvirt DHCP lease for this VM's MAC, so it never relies on
@@ -1142,12 +1188,18 @@ StandardError=journal
     /// Used by the teardown tests that hand it a real, live QEMU pid.
     #[cfg(test)]
     pub(crate) fn for_tests_with_pid(pid: Option<u32>) -> Self {
+        Self::for_tests_with_guest(GuestOs::Linux, pid)
+    }
+
+    /// The same fixture, for a machine that claims another guest OS.
+    #[cfg(test)]
+    pub(crate) fn for_tests_with_guest(guest_os: GuestOs, pid: Option<u32>) -> Self {
         Machine {
             id: "never-started".to_string(),
             image: MachineImage {
                 overlay: PathBuf::from("/nonexistent/overlay.qcow2"),
                 arch: GuestArch::Amd64,
-                guest_os: GuestOs::Linux,
+                guest_os,
                 seed: PathBuf::from("/nonexistent/seed.iso"),
             },
             config: MachineConfig::default(),
@@ -1579,7 +1631,7 @@ StandardError=journal
     /// yet. On success the seed ISO and its staged directory are deleted, so later
     /// boots can never re-read the client public key.
     pub(crate) async fn confirm_deployment(&mut self) -> Result<()> {
-        if self.image.guest_os != GuestOs::Windows || self.deploy_seed.is_none() {
+        if !waits_for_deployment(self.image.guest_os, self.deploy_seed.is_some()) {
             return Ok(());
         }
 
@@ -2050,14 +2102,7 @@ impl Machine {
             }
         }
 
-        let cmd = match os {
-            GuestOs::Linux => format!(
-                "cp -p -- {} {}",
-                escape(Cow::Borrowed(from.as_str())),
-                escape(Cow::Borrowed(to.as_str()))
-            ),
-            GuestOs::Windows => windows::copy_file_command(from.as_str(), to.as_str()),
-        };
+        let cmd = copy_command(os, from.as_str(), to.as_str());
         let (code, _stdout, stderr) = ssh.call_probe(&cmd, cancel_token).await?;
         if code != 0 {
             bail!(
@@ -2671,11 +2716,8 @@ async fn upload_symbolic_link(
     local_link: &Path,
     remote_link: &GuestPath,
 ) -> Result<()> {
-    if os == GuestOs::Windows {
-        bail!(
-            "symbolic links are not supported when uploading to a Windows guest: {}",
-            remote_link.as_str()
-        );
+    if let Some(refusal) = symbolic_link_refusal(os, remote_link) {
+        return Err(refusal);
     }
     let target = tokio::fs::read_link(local_link)
         .await
@@ -3134,6 +3176,175 @@ mod shutdown_tests {
             .await
             .expect_err("must refuse");
         assert!(error.to_string().contains("not running"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod guest_command_tests {
+    use super::*;
+
+    /// The copy command keeps the source first on both shells.
+    ///
+    /// `cp -p -- src dst` and `Copy-Item -LiteralPath src -Destination dst -Force` mean the same
+    /// thing, and both are data-destroying when the order is swapped: `-Force` writes over the
+    /// file the caller was copying *from*. The command is built by a method that needs a live
+    /// guest, so before this test the shell and the order were both unaskable (R251 census: the
+    /// Windows arm spelled as `cp` and a swapped argument pair each left 500 tests green).
+    #[test]
+    fn the_copy_command_copies_the_source_onto_the_destination_on_both_guests() {
+        // Linux: both operands are on the command line, source first. Swapped, `cp` writes the
+        // destination over the file the caller was copying *from*.
+        let linux = copy_command(GuestOs::Linux, "/etc/a b.conf", "/srv/c d.conf");
+        let source = linux.find("/etc/a").expect("the source is named");
+        let destination = linux.find("/srv/c").expect("the destination is named");
+        assert!(
+            source < destination,
+            "the source has to come before the destination: {linux}"
+        );
+
+        // Windows: the command is base64, so the order is pinned by the exact command and by
+        // the script it carries. `Copy-Item -Force` with the arguments swapped overwrites the
+        // source, which is the same data loss in the other shell.
+        let windows_cmd = copy_command(GuestOs::Windows, r"C:\a.conf", r"C:\b.conf");
+        assert_eq!(
+            windows_cmd,
+            windows::copy_file_command(r"C:\a.conf", r"C:\b.conf"),
+            "the Windows copy must hand the source and the destination over in that order"
+        );
+        let script = windows::copy_file_script(r"C:\a.conf", r"C:\b.conf");
+        assert!(
+            script.find(r"C:\a.conf").expect("the source is named")
+                < script.find(r"C:\b.conf").expect("the destination is named"),
+            "the script has to copy the source onto the destination: {script}"
+        );
+    }
+
+    /// Each guest gets the shell it actually has.
+    #[test]
+    fn the_copy_command_uses_the_shell_each_guest_has() {
+        let linux = copy_command(GuestOs::Linux, "/a", "/b");
+        assert!(
+            linux.starts_with("cp -p -- "),
+            "Linux guests keep their POSIX copy: {linux}"
+        );
+        assert!(
+            !linux.contains("powershell"),
+            "Linux guests have no PowerShell: {linux}"
+        );
+
+        let windows = copy_command(GuestOs::Windows, r"C:\a", r"C:\b");
+        assert_eq!(
+            windows,
+            windows::copy_file_command(r"C:\a", r"C:\b"),
+            "Windows guests copy with the documented PowerShell wrapper"
+        );
+        assert!(
+            windows.starts_with("powershell -NoProfile -NonInteractive -EncodedCommand "),
+            "the Windows copy must not depend on the image's default shell: {windows}"
+        );
+        assert!(
+            !windows.contains("cp -p --"),
+            "Windows guests have no `cp`: {windows}"
+        );
+    }
+
+    /// A Linux path with a space stays one argument.
+    ///
+    /// Both operands, not just the source: an unescaped destination splits the same way, and
+    /// `cp` would then write the remaining words as further arguments instead of one path.
+    #[test]
+    fn the_copy_command_escapes_a_linux_path_with_a_space() {
+        let cmd = copy_command(GuestOs::Linux, "/etc/a b.conf", "/srv/c d.conf");
+        for operand in ["/etc/a b.conf", "/srv/c d.conf"] {
+            let quoted = format!("'{operand}'");
+            let backslashed = operand.replace(' ', "\\ ");
+            assert!(
+                cmd.contains(&quoted) || cmd.contains(&backslashed),
+                "a path with a space has to reach `cp` as one operand: {cmd}"
+            );
+        }
+
+        // The control: a path with nothing to escape is passed through as it was given, so the
+        // assertions above are about escaping and not about rewriting every operand.
+        let plain = copy_command(GuestOs::Linux, "/etc/a.conf", "/srv/c.conf");
+        assert!(
+            plain.contains("/etc/a.conf") && plain.contains("/srv/c.conf"),
+            "{plain}"
+        );
+    }
+
+    /// Only a Windows guest that still has its seed is mid-deployment.
+    #[test]
+    fn only_a_windows_guest_with_its_seed_is_waited_for() {
+        assert!(waits_for_deployment(GuestOs::Windows, true));
+        assert!(
+            !waits_for_deployment(GuestOs::Windows, false),
+            "a spawned Windows guest has finished its deployment, or never started one"
+        );
+        assert!(
+            !waits_for_deployment(GuestOs::Linux, true),
+            "a Linux guest deploys through cloud-init, not through the marker"
+        );
+        assert!(!waits_for_deployment(GuestOs::Linux, false));
+    }
+
+    /// Uploading a link to a Windows guest is refused; to a Linux guest it is not.
+    #[test]
+    fn a_symbolic_link_is_refused_on_a_windows_guest_only() {
+        let link = GuestPath::new(GuestOs::Windows, r"C:\Users\qlean\link").expect("a path");
+        let refusal = symbolic_link_refusal(GuestOs::Windows, &link)
+            .expect("a Windows guest cannot store the link")
+            .to_string();
+        assert!(refusal.contains("symbolic links"), "{refusal}");
+        assert!(
+            refusal.contains("not supported"),
+            "the refusal must say the guest cannot do it, not that Qlean failed: {refusal}"
+        );
+        assert!(
+            refusal.contains(link.as_str()),
+            "the refusal must name the link: {refusal}"
+        );
+
+        assert!(
+            symbolic_link_refusal(GuestOs::Linux, &link).is_none(),
+            "Linux guests store links, so there is nothing to refuse"
+        );
+    }
+
+    /// The Windows refusal for an interactive shell is reachable without a guest.
+    ///
+    /// It used to be a `bail!` inside a method whose next step needs a session, so removing it
+    /// left the suite green: a Windows machine would then try to open a `vsock` session it does
+    /// not have and report a transport error instead of the un-supported feature.
+    #[tokio::test]
+    async fn a_windows_guest_refuses_an_interactive_shell_by_name() {
+        let windows = Machine::for_tests_with_guest(GuestOs::Windows, None);
+        // `InteractiveShell` has no `Debug`, so `expect_err` is not available here.
+        let Err(error) = windows.open_interactive_shell(80, 24).await else {
+            panic!("a Windows guest has no vsock to open a second session on")
+        };
+        let text = error.to_string();
+        assert!(
+            text.contains("not supported for Windows guests"),
+            "the refusal has to name the feature and the guest: {text}"
+        );
+        assert!(text.contains("exec"), "it has to name the way out: {text}");
+
+        // The control: a Linux machine that never started fails for the other reason.
+        let linux = Machine::for_tests_with_guest(GuestOs::Linux, None);
+        let Err(error) = linux.open_interactive_shell(80, 24).await else {
+            panic!("a machine that never started has no session")
+        };
+        assert!(
+            !error
+                .to_string()
+                .contains("not supported for Windows guests"),
+            "a Linux guest must not get the Windows refusal: {error}"
+        );
+        assert!(
+            error.to_string().contains("not running"),
+            "the control has to fail for being stopped: {error}"
+        );
     }
 }
 
