@@ -602,6 +602,480 @@ mod exit_signal_tests {
 }
 
 #[cfg(test)]
+mod upload_staging_tests {
+    use super::*;
+    use crate::GuestOs;
+    use std::{
+        collections::HashMap,
+        io,
+        pin::Pin,
+        sync::{Arc, Mutex},
+        task::{Context, Poll},
+    };
+    use tokio::io::AsyncWrite;
+
+    /// A guest's file table with a memory of what was done to it, and a way to refuse each step.
+    #[derive(Default)]
+    struct GuestState {
+        files: Mutex<HashMap<String, Vec<u8>>>,
+        /// Files that currently have an open handle - the guest refuses to rename or delete them.
+        open: Mutex<Vec<String>>,
+        ops: Mutex<Vec<String>>,
+        /// Fail the write once this many bytes have been accepted.
+        fail_write_after: Mutex<Option<usize>>,
+        fail_remove: Mutex<bool>,
+        fail_rename: Mutex<bool>,
+    }
+
+    impl GuestState {
+        fn files(&self) -> HashMap<String, Vec<u8>> {
+            self.files.lock().unwrap().clone()
+        }
+        fn ops(&self) -> Vec<String> {
+            self.ops.lock().unwrap().clone()
+        }
+        fn staged(&self) -> Vec<String> {
+            self.files
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|name| name.contains("qlean-upload"))
+                .cloned()
+                .collect()
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeGuest(Arc<GuestState>);
+
+    struct FakeWriter {
+        guest: Arc<GuestState>,
+        at: String,
+        buf: Vec<u8>,
+        limit: Option<usize>,
+    }
+
+    impl Drop for FakeWriter {
+        fn drop(&mut self) {
+            // What the guest is left with is whatever reached it, and the handle is gone by the
+            // time the caller can ask for a rename.
+            self.guest
+                .files
+                .lock()
+                .unwrap()
+                .insert(self.at.clone(), std::mem::take(&mut self.buf));
+            self.guest
+                .open
+                .lock()
+                .unwrap()
+                .retain(|open| *open != self.at);
+        }
+    }
+
+    impl AsyncWrite for FakeWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if let Some(limit) = self.limit
+                && self.buf.len() + data.len() > limit
+            {
+                let take = limit.saturating_sub(self.buf.len());
+                self.buf.extend_from_slice(&data[..take]);
+                return Poll::Ready(Err(io::Error::other("no space left on device (faked)")));
+            }
+            self.buf.extend_from_slice(data);
+            Poll::Ready(Ok(data.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl StagedSink for FakeGuest {
+        type Writer = FakeWriter;
+
+        async fn open_for_upload(&mut self, at: &str) -> Result<FakeWriter> {
+            self.0.ops.lock().unwrap().push(format!("open {at}"));
+            self.0.open.lock().unwrap().push(at.to_string());
+            self.0
+                .files
+                .lock()
+                .unwrap()
+                .insert(at.to_string(), Vec::new());
+            let limit = *self.0.fail_write_after.lock().unwrap();
+            Ok(FakeWriter {
+                guest: Arc::clone(&self.0),
+                at: at.to_string(),
+                buf: Vec::new(),
+                limit,
+            })
+        }
+
+        async fn exists(&mut self, at: &str) -> Result<bool> {
+            self.0.ops.lock().unwrap().push(format!("exists {at}"));
+            Ok(self.0.files.lock().unwrap().contains_key(at))
+        }
+
+        async fn remove(&mut self, at: &str) -> Result<()> {
+            self.0.ops.lock().unwrap().push(format!("remove {at}"));
+            if *self.0.fail_remove.lock().unwrap() {
+                bail!("faked: cannot remove {at}");
+            }
+            if self.0.open.lock().unwrap().iter().any(|open| open == at) {
+                bail!("faked: {at} has an open handle");
+            }
+            self.0.files.lock().unwrap().remove(at);
+            Ok(())
+        }
+
+        async fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+            self.0
+                .ops
+                .lock()
+                .unwrap()
+                .push(format!("rename {from} {to}"));
+            if *self.0.fail_rename.lock().unwrap() {
+                bail!("faked: cannot rename {from} to {to}");
+            }
+            // A file with an open handle cannot be renamed - on Windows no handle at all, and
+            // `russh-sftp` only sends `CLOSE` when the object is dropped.
+            if self.0.open.lock().unwrap().iter().any(|open| open == from) {
+                bail!("faked: {from} still has an open handle");
+            }
+            let mut files = self.0.files.lock().unwrap();
+            if files.contains_key(to) {
+                // What OpenSSH's sftp-server answers for a standard rename onto an existing name.
+                bail!("faked: {to} already exists");
+            }
+            let bytes = files
+                .remove(from)
+                .ok_or_else(|| anyhow::anyhow!("faked: {from} does not exist"))?;
+            files.insert(to.to_string(), bytes);
+            Ok(())
+        }
+    }
+
+    const WINDOWS_TARGET: &str = r"C:\Users\deploy\out\deploy.json";
+
+    fn target(guest_os: GuestOs) -> GuestPath {
+        match guest_os {
+            GuestOs::Windows => GuestPath::new(GuestOs::Windows, WINDOWS_TARGET).unwrap(),
+            GuestOs::Linux => GuestPath::new(GuestOs::Linux, "/tmp/out/deploy.json").unwrap(),
+        }
+    }
+
+    async fn upload(
+        guest: &mut FakeGuest,
+        target: &GuestPath,
+        contents: &[u8],
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let staged = staged_upload_path(target)?;
+        let mut source = contents;
+        install_upload(guest, &staged, target, &mut source, cancel).await
+    }
+
+    /// The defect: a failed upload left its half under the caller's name.
+    #[tokio::test]
+    async fn a_failed_upload_leaves_the_target_as_it_was() {
+        let mut guest = FakeGuest::default();
+        let target = target(GuestOs::Linux);
+        guest
+            .0
+            .files
+            .lock()
+            .unwrap()
+            .insert(target.as_str().to_string(), b"the old deploy.json".to_vec());
+        *guest.0.fail_write_after.lock().unwrap() = Some(8);
+
+        let error = upload(
+            &mut guest,
+            &target,
+            b"a much longer new deployment manifest",
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("a write that ran out of space must not report success");
+
+        assert!(
+            format!("{error:#}").contains("failed to write"),
+            "{error:#}"
+        );
+        let files = guest.0.files();
+        assert_eq!(
+            files.get(target.as_str()).map(Vec::as_slice),
+            Some(&b"the old deploy.json"[..]),
+            "the target kept neither its old contents nor nothing: {:?}",
+            files.get(target.as_str())
+        );
+        assert!(
+            guest.0.staged().is_empty(),
+            "the half-written staged file was left behind: {:?}",
+            guest.0.staged()
+        );
+        assert!(
+            !guest.0.ops().iter().any(|op| op.starts_with("rename")),
+            "a failed upload tried to install: {:?}",
+            guest.0.ops()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_upload_leaves_the_target_as_it_was() {
+        let mut guest = FakeGuest::default();
+        let target = target(GuestOs::Windows);
+        guest
+            .0
+            .files
+            .lock()
+            .unwrap()
+            .insert(target.as_str().to_string(), b"old".to_vec());
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let error = upload(&mut guest, &target, b"new contents", &cancel)
+            .await
+            .expect_err("a cancelled upload must not report success");
+        assert!(
+            format!("{error:#}").contains("Upload cancelled"),
+            "{error:#}"
+        );
+        assert_eq!(
+            guest.0.files().get(target.as_str()).map(Vec::as_slice),
+            Some(&b"old"[..])
+        );
+        assert!(guest.0.staged().is_empty(), "{:?}", guest.0.staged());
+    }
+
+    /// A failed upload whose half cannot be removed has to say so: the leftover is the only copy.
+    #[tokio::test]
+    async fn a_half_that_cannot_be_removed_is_named_in_the_error() {
+        let mut guest = FakeGuest::default();
+        let target = target(GuestOs::Linux);
+        *guest.0.fail_write_after.lock().unwrap() = Some(3);
+        *guest.0.fail_remove.lock().unwrap() = true;
+
+        let error = upload(
+            &mut guest,
+            &target,
+            b"0123456789",
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("a failed write must not report success");
+        let message = format!("{error:#}");
+        assert!(message.contains("failed to write"), "{message}");
+        assert!(
+            message.contains("incomplete upload at") && message.contains(".qlean-upload-"),
+            "the leftover half has to be named: {message}"
+        );
+        assert_eq!(
+            guest.0.staged().len(),
+            1,
+            "the half is still there, which is exactly what the message says"
+        );
+        assert!(
+            !guest.0.files().contains_key(target.as_str()),
+            "nothing may take the target's name"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_complete_upload_replaces_the_target_and_leaves_no_staging_file() {
+        for guest_os in [GuestOs::Linux, GuestOs::Windows] {
+            let mut guest = FakeGuest::default();
+            let target = target(guest_os);
+            guest
+                .0
+                .files
+                .lock()
+                .unwrap()
+                .insert(target.as_str().to_string(), b"old".to_vec());
+
+            upload(&mut guest, &target, b"brand new", &CancellationToken::new())
+                .await
+                .expect("an upload that fits must install");
+
+            let files = guest.0.files();
+            assert_eq!(
+                files.get(target.as_str()).map(Vec::as_slice),
+                Some(&b"brand new"[..]),
+                "{guest_os:?}"
+            );
+            assert!(
+                guest.0.staged().is_empty(),
+                "{guest_os:?}: {:?}",
+                guest.0.staged()
+            );
+            assert_eq!(files.len(), 1, "{guest_os:?}: {:?}", files.keys());
+        }
+    }
+
+    /// An overwrite has to remove the old name first - a standard rename refuses an existing one -
+    /// and the remove must happen after the bytes are all there, not before.
+    #[tokio::test]
+    async fn an_overwrite_removes_the_old_name_only_after_the_bytes_arrived() {
+        let mut guest = FakeGuest::default();
+        let target = target(GuestOs::Linux);
+        guest
+            .0
+            .files
+            .lock()
+            .unwrap()
+            .insert(target.as_str().to_string(), b"old".to_vec());
+
+        upload(&mut guest, &target, b"new", &CancellationToken::new())
+            .await
+            .expect("an overwrite must install");
+
+        let ops = guest.0.ops();
+        let open = ops.iter().position(|op| op.starts_with("open ")).unwrap();
+        let remove = ops
+            .iter()
+            .position(|op| op.starts_with(&format!("remove {}", target.as_str())))
+            .expect("an overwrite must remove the old name");
+        let rename = ops
+            .iter()
+            .position(|op| op.starts_with("rename "))
+            .expect("the staged file must be installed");
+        assert!(open < remove, "{ops:?}");
+        assert!(remove < rename, "{ops:?}");
+    }
+
+    #[tokio::test]
+    async fn a_target_that_cannot_be_removed_keeps_the_complete_upload_and_says_where() {
+        let mut guest = FakeGuest::default();
+        let target = target(GuestOs::Windows);
+        guest
+            .0
+            .files
+            .lock()
+            .unwrap()
+            .insert(target.as_str().to_string(), b"old".to_vec());
+        *guest.0.fail_remove.lock().unwrap() = true;
+
+        let error = upload(&mut guest, &target, b"new", &CancellationToken::new())
+            .await
+            .expect_err("an upload that cannot be installed must not report success");
+        let message = format!("{error:#}");
+        assert!(message.contains(target.as_str()), "{message}");
+        assert!(
+            message.contains("qlean-upload") && message.contains(".part"),
+            "the message must say where the complete upload is: {message}"
+        );
+        assert_eq!(
+            guest.0.staged().len(),
+            1,
+            "the complete upload must still be there: {:?}",
+            guest.0.staged()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rename_that_fails_keeps_the_complete_upload_and_says_where() {
+        let mut guest = FakeGuest::default();
+        let target = target(GuestOs::Linux);
+        *guest.0.fail_rename.lock().unwrap() = true;
+
+        let error = upload(&mut guest, &target, b"new", &CancellationToken::new())
+            .await
+            .expect_err("an upload that cannot be installed must not report success");
+        let message = format!("{error:#}");
+        assert!(message.contains(".part"), "{message}");
+        assert_eq!(guest.0.staged().len(), 1, "{:?}", guest.0.staged());
+        assert!(
+            !guest.0.files().contains_key(target.as_str()),
+            "nothing may take the target's name"
+        );
+    }
+
+    /// The guest refuses to rename a file that still has an open handle (Windows: any handle).
+    #[tokio::test]
+    async fn the_staged_file_is_closed_before_it_is_installed() {
+        let mut guest = FakeGuest::default();
+        let target = target(GuestOs::Windows);
+        upload(&mut guest, &target, b"new", &CancellationToken::new())
+            .await
+            .expect("the writer must be dropped before the rename");
+        assert!(
+            guest.0.open.lock().unwrap().is_empty(),
+            "{:?}",
+            guest.0.open.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn the_staged_name_is_a_short_hidden_sibling_of_the_target() {
+        let linux = target(GuestOs::Linux);
+        let staged = staged_upload_path(&linux).unwrap();
+        assert_eq!(
+            staged.parent().map(|parent| parent.as_str().to_string()),
+            Some("/tmp/out".to_string())
+        );
+        assert!(
+            staged.as_str().starts_with("/tmp/out/.qlean-upload-"),
+            "{}",
+            staged.as_str()
+        );
+        assert!(staged.as_str().ends_with(".part"), "{}", staged.as_str());
+
+        let windows = target(GuestOs::Windows);
+        let staged = staged_upload_path(&windows).unwrap();
+        // `GuestPath` spells a Windows path with forward slashes, which is what every SFTP call
+        // in this crate sends; the staging name is a sibling in that same spelling.
+        assert!(
+            staged
+                .as_str()
+                .starts_with("C:/Users/deploy/out/.qlean-upload-"),
+            "{}",
+            staged.as_str()
+        );
+        assert_eq!(
+            staged.parent().map(|parent| parent.as_str().to_string()),
+            Some("C:/Users/deploy/out".to_string())
+        );
+
+        // Two uploads to one target never share a staging name.
+        let a = staged_upload_path(&linux).unwrap();
+        let b = staged_upload_path(&linux).unwrap();
+        assert_ne!(a.as_str(), b.as_str());
+
+        // A name at the guest's own limit still has room for the staging suffix.
+        let long = GuestPath::new(GuestOs::Linux, format!("/tmp/out/{}", "n".repeat(250))).unwrap();
+        let staged = staged_upload_path(&long).unwrap();
+        let name = staged.file_name().unwrap();
+        assert!(name.len() < 250, "{}", name);
+    }
+
+    #[test]
+    fn the_upload_path_never_truncates_what_it_opens() {
+        const SOURCE: &str = include_str!("ssh.rs");
+        const MACHINE: &str = include_str!("machine.rs");
+        let truncate = concat!("OpenFlags::", "TRUNCATE");
+        assert!(
+            !SOURCE.contains(truncate),
+            "an upload that opens its target with a truncate leaves a half file under that name"
+        );
+        assert!(
+            !MACHINE.contains(truncate),
+            "`Machine::write` must stage on the guest too"
+        );
+        let staged = concat!("install_", "upload(");
+        assert!(
+            SOURCE.matches(staged).count() >= 3,
+            "`upload_file` and `write_file` must both go through the staged protocol"
+        );
+    }
+}
+
+#[cfg(test)]
 mod download_staging_tests {
     use super::*;
     use std::{
@@ -1014,6 +1488,151 @@ fn install_download(staged: &Path, local: &Path) -> Result<()> {
             local.display()
         )
     })
+}
+
+/// Where an upload stages its bytes on the guest before they take the target's name.
+///
+/// A sibling, so the rename that installs it stays inside one directory; a name of its own per
+/// upload, so two concurrent uploads to the same target cannot install each other's half. The
+/// name does not spell the target: a 250-byte name has no room left for a suffix inside the
+/// guest's own limit, and the error messages name the staged path anyway.
+fn staged_upload_path(remote: &GuestPath) -> Result<GuestPath> {
+    static UPLOADS: AtomicU64 = AtomicU64::new(0);
+    let parent = remote.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot upload to {}: it has no directory to stage the bytes in",
+            remote.as_str()
+        )
+    })?;
+    parent.join(format!(
+        ".qlean-upload-{}-{}.part",
+        std::process::id(),
+        UPLOADS.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// The guest's side of an upload: the four operations the staging rule needs.
+///
+/// A trait, not an `SftpSession`, because the whole point of the rule is what happens when one of
+/// these steps fails - and a test can fail any of them without a guest. `Sftp` is the real one; the
+/// tests use a fake that can refuse a write halfway, refuse the remove and refuse the rename, and
+/// that also enforces the one rule the guest enforces for us: a file with an open handle cannot be
+/// renamed (on Windows it cannot even be deleted).
+pub(crate) trait StagedSink {
+    type Writer: tokio::io::AsyncWrite + Unpin;
+
+    /// Open `at` for writing. The staged name is ours, so this must not truncate anything.
+    fn open_for_upload(
+        &mut self,
+        at: &str,
+    ) -> impl std::future::Future<Output = Result<Self::Writer>> + Send;
+
+    fn exists(&mut self, at: &str) -> impl std::future::Future<Output = Result<bool>> + Send;
+
+    fn remove(&mut self, at: &str) -> impl std::future::Future<Output = Result<()>> + Send;
+
+    fn rename(
+        &mut self,
+        from: &str,
+        to: &str,
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
+}
+
+/// Send `src`'s bytes to a staged name on the guest, then install them under `target`.
+///
+/// `upload_file` used to open the target with `CREATE | TRUNCATE | WRITE`, which is a truncation:
+/// a cancelled or failed upload left the first half of a file under the name the caller asked for,
+/// and nothing on the guest distinguished it from a complete one - a half-written
+/// `deploy.json`, a truncated registry hive, a half image all still read as *some* file. The
+/// download side has staged for the same reason since R203; this is the same rule on the other
+/// side of the wire.
+///
+/// The close comes before the rename on purpose: `russh-sftp` has a `CLOSE` for every open, and
+/// an open handle denies rename (and delete) on Windows, so a handle that is merely shut down but
+/// not dropped would make every upload to a Windows guest fail at the last step.
+///
+/// Installing is not atomic: standard SFTP `rename` refuses an existing target (OpenSSH's server
+/// answers `SSH_FX_FAILURE`; there is no `posix-rename` extension in `russh-sftp` 3.0.0), so an
+/// overwrite has to remove the old name first. Between that remove and the rename the target is
+/// absent - an accepted window, because the alternative is a half file wearing the target's name
+/// for as long as nobody looks.
+pub(crate) async fn install_upload<S, R>(
+    sink: &mut S,
+    staged: &GuestPath,
+    target: &GuestPath,
+    src: &mut R,
+    cancel_token: &CancellationToken,
+) -> Result<()>
+where
+    S: StagedSink,
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut writer = sink.open_for_upload(staged.as_str()).await?;
+    let what = format!("the uploaded file {}", staged.as_str());
+    let copied =
+        Session::copy_stream(src, &mut writer, &what, cancel_token, "Upload cancelled").await;
+    drop(writer);
+
+    if let Err(error) = copied {
+        // The half is ours, and the target still holds what it held. Removing the half must not
+        // replace the failure that produced it, but a half that stays behind has to be named: it
+        // is the only copy of a file nobody asked for.
+        return match sink.remove(staged.as_str()).await {
+            Ok(()) => Err(error),
+            Err(remove) => Err(error.context(format!(
+                "also failed to remove the incomplete upload at {}: {remove:#}",
+                staged.as_str()
+            ))),
+        };
+    }
+
+    if sink.exists(target.as_str()).await? {
+        sink.remove(target.as_str()).await.with_context(|| {
+            format!(
+                "failed to replace {} with the uploaded file (the complete upload is left at {})",
+                target.as_str(),
+                staged.as_str()
+            )
+        })?;
+    }
+
+    sink.rename(staged.as_str(), target.as_str())
+        .await
+        .with_context(|| {
+            format!(
+                "failed to install {} (the complete upload is left at {})",
+                target.as_str(),
+                staged.as_str()
+            )
+        })
+}
+
+/// The real [`StagedSink`]: an SFTP session.
+pub(crate) struct SftpSink<'a>(pub(crate) &'a mut SftpSession);
+
+impl StagedSink for SftpSink<'_> {
+    type Writer = russh_sftp::client::fs::File;
+
+    async fn open_for_upload(&mut self, at: &str) -> Result<Self::Writer> {
+        // No `TRUNCATE`: the staged name is ours, and a truncate here would be the very bug this
+        // path exists to avoid if the two names ever met.
+        Ok(self
+            .0
+            .open_with_flags(at, OpenFlags::CREATE | OpenFlags::WRITE)
+            .await?)
+    }
+
+    async fn exists(&mut self, at: &str) -> Result<bool> {
+        Ok(self.0.try_exists(at).await?)
+    }
+
+    async fn remove(&mut self, at: &str) -> Result<()> {
+        Ok(self.0.remove_file(at).await?)
+    }
+
+    async fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+        Ok(self.0.rename(from, to).await?)
+    }
 }
 
 /// What one message from a command channel means to the loop waiting for a status.
@@ -2076,24 +2695,18 @@ impl Session {
         cancel_token: CancellationToken,
     ) -> anyhow::Result<()> {
         let mut src = tokio::fs::File::open(local).await?;
-        // Scope SFTP borrow
-        let mut dst = {
-            let sftp = self.get_sftp().await?;
-            sftp.open_with_flags(
-                remote.as_str(),
-                OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
-            )
-            .await?
-        };
+        let staged = staged_upload_path(remote)?;
+        let mut sink = SftpSink(self.get_sftp().await?);
+        install_upload(&mut sink, &staged, remote, &mut src, &cancel_token).await
+    }
 
-        Self::copy_stream(
-            &mut src,
-            &mut dst,
-            &format!("the uploaded file {}", remote.as_str()),
-            &cancel_token,
-            "Upload cancelled",
-        )
-        .await
+    /// Upload `contents` as the whole of `remote`, staging it on the guest first.
+    pub(crate) async fn write_file(&mut self, contents: &[u8], remote: &GuestPath) -> Result<()> {
+        let staged = staged_upload_path(remote)?;
+        let mut source = contents;
+        let cancel_token = CancellationToken::new();
+        let mut sink = SftpSink(self.get_sftp().await?);
+        install_upload(&mut sink, &staged, remote, &mut source, &cancel_token).await
     }
 
     /// Download a single file via SFTP.

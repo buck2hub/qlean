@@ -2366,17 +2366,45 @@ mod plan_doc_tests {
                 "`copy_stream` discards the result of `{step}` again: {call:.60}"
             );
         }
+        // `Machine::write` used to open, write, flush and close a handle of its own. It now stages
+        // on the guest through `Session::write_file` (R206), so the property to hold on to is not
+        // the old spelling: no path may discard the end of the copy, and the handle has to be gone
+        // before the staged name is installed.
         let write = function_body(
             MACHINE,
             "pub async fn write<P: AsRef<Path>, C: AsRef<[u8]>>",
         );
         assert!(
-            write.contains("shutdown(&mut file)"),
-            "`Machine::write` no longer closes the handle it opened"
+            write.contains("write_file("),
+            "`Machine::write` no longer goes through the staged upload"
+        );
+        assert!(
+            !write.contains("let _ ="),
+            "`Machine::write` discards a result again: a failed flush reads as a landed file"
         );
         assert!(
             !write.contains("sftp.write("),
             "`Machine::write` is back to the crate helper that opens a second handle"
+        );
+        let staged = function_body(SSH, "pub(crate) async fn write_file(");
+        assert!(
+            staged.contains("install_upload("),
+            "`Session::write_file` no longer stages on the guest"
+        );
+        let install = function_body(SSH, "pub(crate) async fn install_upload<S, R>(");
+        let closed = install
+            .find("drop(writer)")
+            .unwrap_or_else(|| panic!("the staged handle is never dropped before the rename"));
+        let renamed = install
+            .find("sink.rename(")
+            .unwrap_or_else(|| panic!("the staged upload is never installed"));
+        assert!(
+            closed < renamed,
+            "the staged handle has to be dropped before the rename: an open handle denies it"
+        );
+        assert!(
+            !install.contains("let _ = sink.remove"),
+            "a failed install must report where the complete upload is, not discard the remove"
         );
         // Nothing in the two transfers may swallow the end of the copy either.
         for signature in [

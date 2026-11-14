@@ -45,6 +45,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   messages rather than by reading the arm
 
 ### Fixed
+- An upload that failed or was cancelled left the half it had already sent under the target's own
+  name on the guest: `upload_file` and `Machine::write` opened the target with `TRUNCATE`, so a
+  half-written `deploy.json`, registry hive or disk image read as *some* file and nothing on the
+  guest told it from a complete one. The bytes now go to a short hidden sibling of the target and
+  are installed under the target's name only after the last of them arrived and the handle is
+  closed; a failed transfer removes the staged half and names it in the error if the guest refuses.
+  Installing over an existing name is a remove followed by a rename - standard SFTP `rename`
+  refuses an existing target and `russh-sftp` 3.0.0 has no `posix-rename` - so between those two
+  steps the target is briefly absent, which is stated in the code rather than papered over.
 - A download that failed or was cancelled left the half it had received under the target's own
   name: `download_file` created the local file first, which truncates it, so a broken transfer
   looked exactly like a complete one - a truncated registry hive or disk image reads as *some*
