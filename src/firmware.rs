@@ -1035,6 +1035,12 @@ pub(crate) fn swtpm_args(state_dir: &Path, socket: &Path, log: &Path) -> Result<
     // builder's (`utils::option_field_text`), so the two tools cannot answer it differently.
     let state = crate::utils::option_field_text("swtpm TPM state directory", state_dir)?;
     let control = crate::utils::option_field_text("swtpm control socket", socket)?;
+    // The length rule is not part of `option_field_text`: a long path is fine in every other
+    // option value (`--log`, the state directory, QEMU's disk arguments). It applies to the
+    // socket, and the same function answers it for QEMU's QMP chardev.
+    if let Some(problem) = crate::utils::socket_path_problem("swtpm control socket", socket) {
+        anyhow::bail!("{problem}");
+    }
     let log = crate::utils::option_field_text("swtpm log file", log)?;
     Ok(vec![
         "socket".to_string(),
@@ -1052,6 +1058,9 @@ pub(crate) fn swtpm_args(state_dir: &Path, socket: &Path, log: &Path) -> Result<
 
 /// How long `swtpm` gets to flush its state before it is killed.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+/// How much of a `swtpm` log line is quoted when it left nothing on stderr.
+const LOG_TAIL_LIMIT: usize = 200;
 
 /// What one bounded wait for a child told us.
 ///
@@ -1218,9 +1227,50 @@ pub(crate) struct Swtpm {
     socket: PathBuf,
 }
 
+/// Why a `swtpm` that exited during startup ended, given what it said on stderr.
+///
+/// `swtpm` does not put every startup failure on stderr: measured in the container against
+/// 0.10.2 (R243), a control socket at the `sun_path` limit and a control socket that cannot be
+/// bound both leave stderr **empty** and write the reason - `Path for UnioIO socket is too
+/// long` - only into the `--log file=` medium. Reporting `exited during startup (exit status:
+/// 1):` with nothing after the colon tells the user that something failed and nothing about
+/// what, which is the shape that turned every one of these rounds into a round. The last line
+/// of that log is quoted instead, and when even that is empty the log's path is named so the
+/// reader knows where the answer lives.
+fn swtpm_exit_reason(stderr: &str, log: &Path) -> String {
+    if !stderr.is_empty() {
+        return stderr.to_string();
+    }
+    let tail = std::fs::read(log).ok().and_then(|bytes| {
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        text.lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(|line| line.chars().take(LOG_TAIL_LIMIT).collect::<String>())
+    });
+    match tail {
+        Some(line) => format!(
+            "no message on stderr; its log {} ends with `{line}`",
+            log.display()
+        ),
+        None => format!(
+            "no message on stderr, and its log {} holds no line either",
+            log.display()
+        ),
+    }
+}
+
 impl Swtpm {
     /// Start `swtpm` for the VM in `run_dir` and wait until its control socket exists.
     pub(crate) async fn start(run_dir: &Path) -> Result<Self> {
+        let program = swtpm_program();
+        Self::start_program(run_dir, &program).await
+    }
+
+    /// [`Swtpm::start`] against a named program, so the startup-failure report can be checked
+    /// against a stand-in that fails the way `swtpm` fails.
+    async fn start_program(run_dir: &Path, program: &Path) -> Result<Self> {
         let state_dir = run_dir.join("tpm");
         // The TPM state is per-VM secret material and `swtpm` starts writing into it as soon
         // as it runs, so the directory has to be owner-only from creation: creating it with
@@ -1260,8 +1310,7 @@ impl Swtpm {
         }
         let log = run_dir.join("swtpm.log");
 
-        let program = swtpm_program();
-        let mut cmd = tokio::process::Command::new(&program);
+        let mut cmd = tokio::process::Command::new(program);
         cmd.args(
             swtpm_args(&state_dir, &socket, &log)
                 .context("the run directory cannot be handed to `swtpm` as an option list")?,
@@ -1301,7 +1350,7 @@ impl Swtpm {
                 bail!(
                     "`{}` exited during startup ({status}): {}",
                     program.display(),
-                    stderr.trim()
+                    swtpm_exit_reason(stderr.trim(), &log)
                 );
             }
             if started.elapsed() > Duration::from_secs(10) {
@@ -2995,6 +3044,113 @@ mod tests {
                 .any(|arg| arg == "type=unixio,path=/run/qlean dir/VM-1/swtpm.sock,mode=0600"),
             "{spaced:?}"
         );
+    }
+
+    /// A control socket at the `sun_path` limit, spelled out so the byte count is the point.
+    fn socket_path_of_length(bytes: usize) -> String {
+        let prefix = "/run/qlean/";
+        assert!(prefix.len() < bytes);
+        format!("{prefix}{}", "a".repeat(bytes - prefix.len()))
+    }
+
+    #[test]
+    fn test_swtpm_args_refuse_a_control_socket_at_the_socket_path_limit() {
+        // Measured in the container against `swtpm` 0.10.2 (R243): a 108-byte control socket
+        // makes it exit with status 1 and an empty stderr, with `Path for UnioIO socket is too
+        // long` written only into the `--log file=` medium. 107 bytes still starts.
+        let long = socket_path_of_length(108);
+        let error = swtpm_args(
+            Path::new("/run/qlean/tpm"),
+            Path::new(&long),
+            Path::new("/run/qlean/swtpm.log"),
+        )
+        .expect_err("a 108-byte control socket has to be refused here, not inside swtpm");
+        let message = format!("{error:#}");
+        assert!(message.contains(&long), "{message}");
+        assert!(message.contains("108"), "{message}");
+        assert!(message.contains("107"), "{message}");
+
+        let short = socket_path_of_length(107);
+        let args = swtpm_args(
+            Path::new("/run/qlean/tpm"),
+            Path::new(&short),
+            Path::new("/run/qlean/swtpm.log"),
+        )
+        .expect("107 bytes is the longest path both consumers accept");
+        assert!(
+            args.iter()
+                .any(|arg| arg == &format!("type=unixio,path={short},mode=0600")),
+            "{args:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_swtpm_that_exits_silently_is_reported_by_the_line_in_its_log() {
+        // The wiring, not the wording: a stand-in that writes nothing to stderr and one line
+        // into the `--log file=` medium it was handed has to reach the caller's message. This
+        // is the shape of `swtpm` 0.10.2's own refusal (R243), and a `bail!` that only quotes
+        // stderr reports it as a blank colon.
+        let root = temp_dir("silent-swtpm");
+        let fake = root.join("fake-swtpm.sh");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n\
+             log=\n\
+             prev=\n\
+             for a in \"$@\"; do\n\
+             \x20 case \"$prev\" in --log) log=\"${a#file=}\"; log=\"${log%%,*}\" ;; esac\n\
+             \x20 prev=\"$a\"\n\
+             done\n\
+             printf 'Path for UnioIO socket is too long\\n' > \"$log\"\n\
+             exit 1\n",
+        )
+        .expect("write the stand-in");
+        let mut perms = std::fs::metadata(&fake).expect("stat").permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake, perms).expect("make the stand-in executable");
+        let run_dir = root.join("run");
+        std::fs::create_dir_all(&run_dir).expect("create the run directory");
+
+        let error = match Swtpm::start_program(&run_dir, &fake).await {
+            Ok(_) => panic!("the stand-in exits without ever creating a control socket"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("Path for UnioIO socket is too long"),
+            "{message}"
+        );
+        assert!(message.contains("swtpm.log"), "{message}");
+    }
+
+    #[test]
+    fn test_a_swtpm_that_says_nothing_on_stderr_is_reported_by_its_log() {
+        // swtpm leaves stderr empty for exactly the failures that are hardest to guess, so
+        // the reason has to come from its own log file rather than from a blank colon.
+        let root = temp_dir("swtpm-log-reason");
+        let log = root.join("swtpm.log");
+        std::fs::write(
+            &log,
+            "swtpm: Starting up\nPath for UnioIO socket is too long\n",
+        )
+        .expect("write the log");
+        let reason = swtpm_exit_reason("", &log);
+        assert!(
+            reason.contains("Path for UnioIO socket is too long"),
+            "{reason}"
+        );
+        assert!(reason.contains("swtpm.log"), "{reason}");
+
+        // Stderr wins when there is any: it is the message swtpm chose to show.
+        let reason = swtpm_exit_reason("Error binding socket", &log);
+        assert!(reason.contains("Error binding socket"), "{reason}");
+        assert!(!reason.contains("ends with"), "{reason}");
+
+        // A log that does not exist is not a reason either: name the file instead.
+        let missing = root.join("absent.log");
+        let reason = swtpm_exit_reason("", &missing);
+        assert!(reason.contains("absent.log"), "{reason}");
     }
 
     #[test]

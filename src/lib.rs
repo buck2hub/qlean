@@ -2810,9 +2810,19 @@ mod plan_doc_tests {
                 "the shared TPM ladder no longer says `{fact}` about a failed wait"
             );
         }
-        let start = function_body(
+        // The body lives in `start_program` (R243: the program is a parameter so a stand-in
+        // can be checked), and `start` has to be nothing but the delegation to it.
+        let entry = function_body(
             FIRMWARE,
             "pub(crate) async fn start(run_dir: &Path) -> Result<Self>",
+        );
+        assert!(
+            entry.contains("Self::start_program(run_dir, &program).await"),
+            "`Swtpm::start` no longer starts the TPM through `start_program`"
+        );
+        let start = function_body(
+            FIRMWARE,
+            "async fn start_program(run_dir: &Path, program: &Path) -> Result<Self>",
         );
         assert!(
             !start.contains("start_kill"),

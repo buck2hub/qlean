@@ -522,6 +522,47 @@ pub(crate) fn option_field_text(kind: &str, path: &Path) -> Result<String> {
     Ok(text)
 }
 
+/// Length of Linux's `sun_path`, in bytes: the whole Unix socket path has to fit inside it.
+pub(crate) const UNIX_SOCKET_PATH_LIMIT: usize = 108;
+
+/// Longest Unix socket path both consumers of Qlean's sockets accept, in bytes.
+///
+/// A Unix socket address lives in `sun_path`, which Linux declares as
+/// [`UNIX_SOCKET_PATH_LIMIT`] bytes, so the whole path has to fit there. The two consumers do
+/// not agree on the boundary itself: measured in the container (R243) against `swtpm` 0.10.2
+/// and QEMU 11.1.3, a 107-byte path starts under both, `swtpm` **refuses** a 108-byte control
+/// socket while QEMU still starts on one, and QEMU refuses at 109 bytes with
+/// `UNIX socket path '...' is too long` / `Path must be less than 108 bytes` - the same
+/// sentence it prints for a TPM chardev. The only length both accept is 107 bytes or fewer,
+/// which is what the gate has to enforce: a run directory that passes here has to pass both.
+pub(crate) const UNIX_SOCKET_PATH_LIMIT_FOR_BOTH: usize = UNIX_SOCKET_PATH_LIMIT - 1;
+
+/// Why `path` cannot be used as a Unix socket path, if it cannot.
+///
+/// Both failures are expensive to read, which is why this is asked before anything is
+/// created. `swtpm` answers a too-long control socket by exiting with status 1 and an **empty
+/// stderr** - the reason (`Path for UnioIO socket is too long`, swtpm's own spelling) appears
+/// only in the `--log file=` medium, so a launch reports `exited during startup (exit status:
+/// 1):` with nothing after the colon. QEMU answers at the next byte with `UNIX socket path
+/// '...' is too long` / `Path must be less than 108 bytes`, after the machine has already
+/// been assembled. Neither names the run directory, which is the thing the user controls.
+pub(crate) fn socket_path_problem(kind: &str, path: &Path) -> Option<String> {
+    let bytes = path.as_os_str().as_encoded_bytes().len();
+    if bytes <= UNIX_SOCKET_PATH_LIMIT_FOR_BOTH {
+        return None;
+    }
+    Some(format!(
+        "{kind} path `{}` is {bytes} bytes, but a Unix socket path must be at most \
+         {UNIX_SOCKET_PATH_LIMIT_FOR_BOTH} bytes (Linux `sun_path` is \
+         {UNIX_SOCKET_PATH_LIMIT}): `swtpm` refuses a {UNIX_SOCKET_PATH_LIMIT}-byte control \
+         socket and says so only inside its own log file, and QEMU refuses \
+         {UNIX_SOCKET_PATH_LIMIT} bytes and more with `UNIX socket path ... is too long`. The \
+         run directory is named after the data directory (`qlean dir` names it) plus the \
+         machine id, so move the data directory somewhere shorter",
+        path.display()
+    ))
+}
+
 /// Build a `key=path` command-line argument without lossy path conversion.
 ///
 /// `format!("{key}={}", path.display())` (and `to_string_lossy`) replaces non-UTF-8 bytes
@@ -2194,6 +2235,63 @@ mod tests {
         let networks = listed_networks(&output, "net-list --all").expect("a successful listing");
         assert!(networks.contains("qlean"), "{networks:?}");
         assert!(!networks.contains(""), "blank lines are not networks");
+    }
+
+    fn socket_path_of_length(bytes: usize) -> String {
+        let prefix = "/run/qlean/";
+        assert!(prefix.len() < bytes);
+        format!("{prefix}{}", "a".repeat(bytes - prefix.len()))
+    }
+
+    #[test]
+    fn test_a_socket_path_is_reported_by_the_limit_both_consumers_accept() {
+        // 107 is the longest path `swtpm` 0.10.2 and QEMU 11.1.3 both start on (R243): swtpm
+        // already refuses 108, QEMU only refuses at 109.
+        assert!(
+            socket_path_problem("QMP socket", Path::new(&socket_path_of_length(107))).is_none()
+        );
+        for bytes in [108, 109, 200] {
+            let path = socket_path_of_length(bytes);
+            let problem = socket_path_problem("QMP socket", Path::new(&path))
+                .unwrap_or_else(|| panic!("{bytes} bytes has to be refused"));
+            assert!(problem.contains(&path), "{problem}");
+            assert!(problem.contains(&bytes.to_string()), "{problem}");
+            assert!(problem.contains("107"), "{problem}");
+            assert!(problem.contains("swtpm"), "{problem}");
+            assert!(problem.contains("qlean dir"), "{problem}");
+        }
+        // The kind is the caller's: the same path is reported as whichever socket it is.
+        let path = socket_path_of_length(108);
+        let problem =
+            socket_path_problem("swtpm control socket", Path::new(&path)).expect("refused");
+        assert!(
+            problem.starts_with("swtpm control socket path"),
+            "{problem}"
+        );
+    }
+
+    #[test]
+    fn test_both_socket_consumers_answer_one_too_long_path_the_same_way() {
+        // The run directory is one path handed to two programs; `swtpm` refuses it one byte
+        // earlier than QEMU, so a rule written in either builder alone would let a launch
+        // through that the other end aborts - after the TPM state directory exists.
+        let path = socket_path_of_length(108);
+        let swtpm_error = crate::firmware::swtpm_args(
+            Path::new("/run/qlean/tpm"),
+            Path::new(&path),
+            Path::new("/run/qlean/swtpm.log"),
+        )
+        .err()
+        .map(|error| format!("{error:#}"))
+        .expect("swtpm refuses a 108-byte control socket");
+        let qmp_error = crate::qemu::qmp_chardev_args(Path::new(&path))
+            .err()
+            .map(|error| format!("{error:#}"))
+            .expect("QEMU refuses the same path through the shared rule");
+        for message in [&swtpm_error, &qmp_error] {
+            assert!(message.contains(&path), "{message}");
+            assert!(message.contains("107"), "{message}");
+        }
     }
 
     /// A path the guard would have to rewrite is refused, not converted.

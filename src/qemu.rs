@@ -196,6 +196,11 @@ fn vsock_args(guest_os: GuestOs, cid: u32) -> Vec<String> {
 /// enough that an older host would refuse it, and `-qmp` accepts the same chardev reference
 /// the rest of the argument list already uses.
 pub(crate) fn qmp_chardev_args(socket: &Path) -> anyhow::Result<Vec<String>> {
+    // Asked through the same function `swtpm_args` uses: a run directory is too deep for one
+    // consumer or the other, never for one of them on its own.
+    if let Some(problem) = crate::utils::socket_path_problem("QMP socket", socket) {
+        anyhow::bail!("{problem}");
+    }
     Ok(vec![
         "-chardev".to_string(),
         format!(
@@ -662,6 +667,29 @@ mod tests {
     /// ```text
     /// cargo test --lib -- --ignored qmp_control_channel
     /// ```
+    #[test]
+    fn test_qmp_chardev_refuses_a_socket_at_the_same_limit_as_swtpm() {
+        // Measured in the container (R243): QEMU 11.1.3 refuses a 109-byte socket with
+        // `UNIX socket path ... is too long` / `Path must be less than 108 bytes`, while
+        // `swtpm` 0.10.2 already refuses at 108. One path, one answer, asked once.
+        let long = format!("/run/qlean/{}", "a".repeat(108 - "/run/qlean/".len()));
+        assert_eq!(long.len(), 108);
+        let error = qmp_chardev_args(Path::new(&long))
+            .expect_err("a 108-byte QMP socket is refused by swtpm's half of the pair");
+        let message = format!("{error:#}");
+        assert!(message.contains(&long), "{message}");
+        assert!(message.contains("108"), "{message}");
+
+        let short = format!("/run/qlean/{}", "a".repeat(107 - "/run/qlean/".len()));
+        assert_eq!(short.len(), 107);
+        let args = qmp_chardev_args(Path::new(&short)).expect("107 bytes is accepted by both");
+        assert!(
+            args.iter()
+                .any(|arg| arg == &format!("socket,path={short},server=on,wait=off,id=qmp0")),
+            "{args:?}"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "needs qemu-system-x86_64; run with --ignored on a real host"]
     async fn test_the_qmp_control_channel_answers_a_real_qemu() {
