@@ -384,6 +384,16 @@ enum Presence {
 
 /// Resolve `program` the way `Command::new` would: a bare name through `PATH`, a path as given.
 fn program_presence(program: &Path) -> Presence {
+    let paths = std::env::var_os("PATH");
+    program_presence_in(paths.as_deref(), program)
+}
+
+/// The same question, with the search path given instead of read from the environment.
+///
+/// The four programs the gate knows by name are asked through the `PATH` branch, so that branch
+/// is the one production takes; the host's own `PATH` makes it untestable, and R237 split it out
+/// so a directory can be searched without asking what the machine happens to have installed.
+fn program_presence_in(paths: Option<&std::ffi::OsStr>, program: &Path) -> Presence {
     if program.components().count() > 1 {
         return if executable_file(program) {
             Presence::Ready
@@ -393,11 +403,11 @@ fn program_presence(program: &Path) -> Presence {
             Presence::Missing
         };
     }
-    let Some(paths) = std::env::var_os("PATH") else {
+    let Some(paths) = paths else {
         return Presence::Missing;
     };
     let mut unusable = None;
-    for dir in std::env::split_paths(&paths) {
+    for dir in std::env::split_paths(paths) {
         let candidate = dir.join(program);
         if executable_file(&candidate) {
             return Presence::Ready;
@@ -3227,6 +3237,80 @@ mod tests {
             };
             check(label, &path, host_support_problems(probes));
         }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A name found on `PATH` that cannot run is a gap, and the file that has to be fixed is
+    /// named - the branch the gate actually takes.
+    ///
+    /// R215/R236 established the "installed but unrunnable" verdict, but both only ever drove an
+    /// absolute path. The four programs the gate knows by name (`qemu-img`,
+    /// `qemu-system-x86_64`, `xorriso`, `virsh`) go through the `PATH` search instead, so the
+    /// verdict production relies on was never exercised on the branch production takes. Probed
+    /// (R237): replacing that branch's `Presence::NotExecutable(path)` with `Presence::Ready`
+    /// left the whole suite green - 459 passed - so a `qemu-img` under a `noexec`
+    /// `/usr/local/bin` was reported as present, and the start failed later with nothing naming
+    /// the file. The search is given a directory here rather than the host's own `PATH`, so the
+    /// answer is about this tree and not about what the test image happens to have installed.
+    #[test]
+    fn test_program_presence_searches_a_given_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_dir("r237-path-search");
+        let program = root.join("bin").join("qemu-img");
+        std::fs::create_dir_all(program.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&program, b"#!/bin/sh\nexit 0\n").expect("write");
+        let mode = |path: &Path, mode: u32| {
+            let mut permissions = std::fs::metadata(path).expect("stat").permissions();
+            permissions.set_mode(mode);
+            std::fs::set_permissions(path, permissions).expect("chmod");
+        };
+        mode(&program, 0o644);
+
+        let joined = |dirs: &[&Path]| std::env::join_paths(dirs).expect("a legal search path");
+        let bin = root.join("bin");
+        let unrunnable_search = joined(&[&bin]);
+        assert_eq!(
+            program_presence_in(Some(&unrunnable_search), Path::new("qemu-img")),
+            Presence::NotExecutable(program.clone()),
+            "a `qemu-img` on the search path that cannot be executed is not ready"
+        );
+
+        // Nothing by that name anywhere in the search path is the other answer.
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).expect("mkdir");
+        let empty_search = joined(&[&empty]);
+        assert_eq!(
+            program_presence_in(Some(&empty_search), Path::new("qemu-img")),
+            Presence::Missing
+        );
+        assert_eq!(
+            program_presence_in(None, Path::new("qemu-img")),
+            Presence::Missing,
+            "a host without a search path cannot have the program"
+        );
+
+        // The first candidate that can run wins, even when an earlier directory holds a file
+        // that cannot: `Command::new` would run the usable one, so the gate must not refuse.
+        let later = root.join("later");
+        std::fs::create_dir_all(&later).expect("mkdir");
+        let usable = later.join("qemu-img");
+        std::fs::write(&usable, b"#!/bin/sh\nexit 0\n").expect("write");
+        mode(&usable, 0o755);
+        let both = joined(&[&bin, &later]);
+        assert_eq!(
+            program_presence_in(Some(&both), Path::new("qemu-img")),
+            Presence::Ready,
+            "an unrunnable copy earlier on the path does not make a runnable one unusable"
+        );
+        // Reversed, the unrunnable copy is still the one named: the repair has to point at a
+        // file, and only an unusable candidate has one.
+        let only_unrunnable = joined(&[&bin, &empty]);
+        assert_eq!(
+            program_presence_in(Some(&only_unrunnable), Path::new("qemu-img")),
+            Presence::NotExecutable(program.clone())
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
