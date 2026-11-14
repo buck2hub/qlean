@@ -547,6 +547,24 @@ pub(crate) fn ensure_host_support() -> Result<()> {
 ///
 /// An existing vars image is kept untouched: it carries the boot entries and the
 /// Secure Boot variable store that must survive shutdown/spawn cycles.
+/// What sits at the vars image path when it is not a regular file, for the message.
+///
+/// A link is named by its target, because "a symlink to /usr/share/OVMF/OVMF_VARS.fd" is what a
+/// reader needs to recognise the hand-edit; anything else is described by its kind.
+fn not_a_plain_file(path: &Path, meta: &std::fs::Metadata) -> String {
+    let kind = meta.file_type();
+    if kind.is_symlink() {
+        return match std::fs::read_link(path) {
+            Ok(target) => format!("a symlink to {}", target.display()),
+            Err(_) => "a symlink".to_string(),
+        };
+    }
+    if kind.is_dir() {
+        return "a directory".to_string();
+    }
+    "not a regular file".to_string()
+}
+
 pub(crate) fn prepare_vars(run_dir: &Path, firmware: &FirmwarePaths) -> Result<PathBuf> {
     let dest = run_dir.join("ovmf_vars.fd");
     let code_len = std::fs::metadata(&firmware.code)
@@ -581,19 +599,38 @@ pub(crate) fn prepare_vars(run_dir: &Path, firmware: &FirmwarePaths) -> Result<P
         );
     }
 
-    if dest.is_file() {
-        // The per-VM vars image survives restarts and holds the guest's NVRAM, so it is not
-        // overwritten. A size that no longer matches the template means it was written by a
-        // different OVMF build (the distribution upgraded the firmware) or left truncated:
-        // booting on it either corrupts NVRAM or fails inside the firmware.
-        let dest_len = std::fs::metadata(&dest)
-            .with_context(|| {
+    // The per-VM vars image is a plain file the run directory owns, and Qlean never creates a
+    // link there. `is_file()` follows links, and R220 showed both halves of the cost: a link to
+    // the shared template took the reuse branch, whose `chmod` landed on the *template* (0600,
+    // breaking every other VM on the host), and a dangling link took the copy branch, which
+    // created the file wherever the link pointed - outside the run directory. Stat the entry
+    // itself and refuse anything that is not a regular file, without reading or writing it.
+    let existing = match std::fs::symlink_metadata(&dest) {
+        Ok(meta) => Some(meta),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| {
                 format!(
                     "failed to stat the per-VM OVMF vars image {}",
                     dest.display()
                 )
-            })?
-            .len();
+            });
+        }
+    };
+    if let Some(meta) = existing {
+        anyhow::ensure!(
+            meta.file_type().is_file(),
+            "the per-VM OVMF vars image {} is {}: Qlean keeps the guest's NVRAM in a plain file \
+             inside the run directory and does not follow a link there, so nothing was read or \
+             written. Remove it and boot again",
+            dest.display(),
+            not_a_plain_file(&dest, &meta)
+        );
+        // The per-VM vars image survives restarts and holds the guest's NVRAM, so it is not
+        // overwritten. A size that no longer matches the template means it was written by a
+        // different OVMF build (the distribution upgraded the firmware) or left truncated:
+        // booting on it either corrupts NVRAM or fails inside the firmware.
+        let dest_len = meta.len();
         anyhow::ensure!(
             dest_len == vars_len,
             "the per-VM OVMF vars image {} is {} bytes but the vars template {} is {} bytes: \
@@ -1361,6 +1398,125 @@ mod tests {
         assert_eq!(mode, 0o600, "per-VM vars must be writable and owner-only");
         // The point of 0600 here: a writable pflash image holding NVRAM and keys.
         std::fs::write(&dest, vec![2u8; 64]).expect("vars image must be writable");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A link in place of the per-VM vars image is refused, not followed.
+    ///
+    /// R220: `dest.is_file()` follows links. A link to a shared copy of the template took the
+    /// reuse branch and the `chmod` landed on the *file the link named* - 0644 became 0600, so a
+    /// shared firmware image was hardened for every other VM on the host, and a path outside the
+    /// run directory was modified by a run that believes it owns only its own directory.
+    #[test]
+    #[cfg(unix)]
+    fn test_prepare_vars_refuses_a_linked_vars_image() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_dir("vars-link");
+        let run_dir = root.join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let code = root.join("code.fd");
+        let vars_template = root.join("vars.fd");
+        write_file(&code, 64);
+        write_file(&vars_template, 64);
+        let shared = root.join("shared-vars.fd");
+        write_file(&shared, 64);
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let dest = run_dir.join("ovmf_vars.fd");
+        std::os::unix::fs::symlink(&shared, &dest).unwrap();
+        let firmware = FirmwarePaths {
+            code,
+            vars_template,
+            secure_boot: false,
+        };
+
+        let err = prepare_vars(&run_dir, &firmware)
+            .expect_err("a link is not the per-VM vars image")
+            .to_string();
+        assert!(
+            err.contains("a symlink to"),
+            "must say what it found: {err}"
+        );
+        assert!(err.contains(&shared.display().to_string()), "{err}");
+        assert!(err.contains("Remove it"), "must say how to recover: {err}");
+        // Nothing behind the link may be touched.
+        let mode = std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "the linked file was chmodded to {mode:o}");
+        assert_eq!(std::fs::read(&shared).unwrap(), vec![0u8; 64]);
+        assert!(
+            std::fs::symlink_metadata(&dest)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link must be left for the reader to inspect"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A dangling link is not a missing file: the copy branch would create its target.
+    ///
+    /// `is_file()` answers false for a link whose target does not exist, so R220's second half
+    /// was `fs::copy` running with `dest` as the link path: `open(2)` on the destination follows
+    /// the link, so the template was written to whatever path the link named - the run created a
+    /// file outside its own directory and then chmodded it.
+    #[test]
+    #[cfg(unix)]
+    fn test_prepare_vars_does_not_create_the_target_of_a_dangling_link() {
+        let root = temp_dir("vars-dangling");
+        let run_dir = root.join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let code = root.join("code.fd");
+        let vars_template = root.join("vars.fd");
+        write_file(&code, 64);
+        write_file(&vars_template, 64);
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let created = outside.join("created.fd");
+        let dest = run_dir.join("ovmf_vars.fd");
+        std::os::unix::fs::symlink(&created, &dest).unwrap();
+        let firmware = FirmwarePaths {
+            code,
+            vars_template,
+            secure_boot: false,
+        };
+
+        let err = prepare_vars(&run_dir, &firmware)
+            .expect_err("a dangling link must not be filled in")
+            .to_string();
+        assert!(err.contains("a symlink to"), "{err}");
+        assert!(
+            !created.exists(),
+            "the copy branch created {} outside the run directory",
+            created.display()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_prepare_vars_refuses_a_directory_in_place_of_the_vars_image() {
+        let root = temp_dir("vars-dir");
+        let run_dir = root.join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let code = root.join("code.fd");
+        let vars_template = root.join("vars.fd");
+        write_file(&code, 64);
+        write_file(&vars_template, 64);
+        std::fs::create_dir_all(run_dir.join("ovmf_vars.fd")).unwrap();
+        let firmware = FirmwarePaths {
+            code,
+            vars_template,
+            secure_boot: false,
+        };
+
+        // A directory used to fall through to the copy branch, where the only report was an
+        // `Is a directory` from `copy`, one layer below the file Qlean was asked to prepare.
+        let err = prepare_vars(&run_dir, &firmware)
+            .expect_err("a directory is not the per-VM vars image")
+            .to_string();
+        assert!(err.contains("a directory"), "{err}");
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -1908,6 +1908,57 @@ mod plan_doc_tests {
         );
     }
 
+    /// The per-VM vars image is classified from its own attributes, never through a link.
+    ///
+    /// R220: `prepare_vars` decided with `dest.is_file()`, a following `stat`. A link to a
+    /// shared template took the reuse branch and its `chmod` hardened the template for every
+    /// other VM; a dangling link took the copy branch, whose `open(2)` created the file the
+    /// link named, outside the run directory. The image QEMU loads must be a file this run owns,
+    /// so the guard requires an own-attribute `stat` of the entry and forbids the following
+    /// question - `is_file()` on a path is exactly `metadata(path).is_file()`.
+    #[test]
+    fn the_per_vm_vars_image_is_classified_without_following_links() {
+        let source = include_str!("firmware.rs");
+        let body = function_body(source, "pub(crate) fn prepare_vars(");
+        // Comments in this function name the questions it must not ask (`is_file()` is the
+        // following `stat`), so the spelling checks read the code lines only.
+        let code = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            code.matches("symlink_metadata(&dest)").count() == 1,
+            "the vars image has to be classified from its own attributes"
+        );
+        assert_eq!(
+            code.matches("is_file()").count(),
+            1,
+            "the only `is_file()` allowed here is the one on `file_type()`; `Path::is_file` \
+             follows links, so a link would be treated as the file it names"
+        );
+        assert!(
+            code.contains("meta.file_type().is_file()"),
+            "the regular-file check must ask the entry's own `file_type`"
+        );
+        assert!(
+            !code.contains("std::fs::metadata(&dest)"),
+            "a following `stat` of the vars image is the same question the guard forbids"
+        );
+        // The link check must come before the reuse branch that chmods the file.
+        let check = body
+            .find("meta.file_type().is_file()")
+            .expect("the regular-file check is gone");
+        let restrict = body
+            .find("crate::utils::restrict_file(&dest)")
+            .expect("the reuse branch no longer restricts the vars image");
+        assert!(
+            check < restrict,
+            "the regular-file check must run before anything is chmodded"
+        );
+    }
+
     /// `upload` classifies the local path it was handed, not what that path points at.
     ///
     /// The tree branch learned to ask about each entry itself, but the first call still used
