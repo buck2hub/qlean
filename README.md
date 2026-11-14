@@ -446,6 +446,9 @@ This defines a **NAT** network named `qlean` in libvirt, backed by the Linux bri
     pub distro: Distro,
     /// Source of the image, it can be a URL or a local file path.
     ///
+    /// A `file://` URL is read as the path it names (`file:///abs/path`); only `http://` and
+    /// `https://` are downloaded.
+    ///
     /// `source` and `digest` must both be set or both omitted: an image is never fetched
     /// without a digest to verify it against.
     pub source: Option<String>,

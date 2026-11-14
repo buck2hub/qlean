@@ -2135,6 +2135,14 @@ mod plan_doc_tests {
                 );
                 // R217: the digest is a file name. A reader who types the hex in uppercase
                 // must learn here that it is normalized, not from a second download.
+                // R218: `source` documents the forms the classifier accepts, and the
+                // classifier is the only thing that decides whether a form is downloaded.
+                if field.contains("source") {
+                    assert!(
+                        doc.contains("file://"),
+                        "{name}: the doc above `{field}` must say how a file URL is read: {doc}"
+                    );
+                }
                 if field.contains("digest") {
                     assert!(
                         doc.contains("either case") && doc.contains("lowercase"),

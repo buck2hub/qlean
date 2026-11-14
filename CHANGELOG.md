@@ -320,6 +320,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `source` written as a `file://` URL was handed to the HTTP client, which can only answer
+  "URL scheme is not allowed", while the same file as a bare path worked. `file:///abs/path`
+  and `file://localhost/abs/path` are now read as the paths they name; a `file://` URL with a
+  host component or percent-escapes is refused with the fix in the message.
 - A digest written in uppercase named its own image cache entry: the body kept the caller's casing
   while every comparison of it was case-insensitive, so the same image was fetched and kept twice.
   The digest is now normalized to lowercase when it is parsed.

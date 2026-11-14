@@ -95,6 +95,9 @@ pub struct ImageConfig {
     pub distro: Distro,
     /// Source of the image, it can be a URL or a local file path.
     ///
+    /// A `file://` URL is read as the path it names (`file:///abs/path`); only `http://` and
+    /// `https://` are downloaded.
+    ///
     /// `source` and `digest` must both be set or both omitted: an image is never fetched
     /// without a digest to verify it against, and config validation refuses the half-set
     /// pair with that sentence. When set, the image is fetched from `source` and verified
@@ -445,15 +448,38 @@ fn parse_prefixed_digest(s: &str) -> Result<(ShaType, String)> {
     Ok((sha_type, body.to_string()))
 }
 
-fn resolve_image_source(source: &str) -> ImageSource {
+/// What `source` names: a URL the HTTP client can fetch, or a path on this host.
+///
+/// A `file://` URL is a *path*, not something to download. R218: the classifier used to list
+/// the scheme and hand it to `download_with_hash`, where reqwest can only answer "URL scheme
+/// is not allowed" - so the natural spelling of a local image failed with a message about a
+/// download that never happened, while the bare path worked. Both shorthands that mean "this
+/// host" are now read as paths: `file:///abs/path` and `file://localhost/abs/path`.
+///
+/// Everything else that starts with `file://` is refused with the fix in the message rather
+/// than guessed at: `file://server/share/x` is another host's address, which this crate cannot
+/// open, and `%20` needs percent-decoding that no other accepted form of `source` asks for.
+fn resolve_image_source(source: &str) -> Result<ImageSource> {
     let s = source.trim();
     let lower = s.to_ascii_lowercase();
-    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("file://")
-    {
-        ImageSource::Url(s.to_string())
-    } else {
-        ImageSource::LocalPath(PathBuf::from(s))
+    if let Some(rest) = lower.strip_prefix("file://").map(|_| &s["file://".len()..]) {
+        let path = rest.strip_prefix("localhost").unwrap_or(rest);
+        anyhow::ensure!(
+            path.starts_with('/'),
+            "`{s}` is a `file://` URL that does not name a file on this host: use \
+             `file:///absolute/path` or pass the path itself"
+        );
+        anyhow::ensure!(
+            !path.contains('%'),
+            "`{s}` needs percent-decoding to name a path; pass the plain path instead \
+             (`file:///a%20b` is the URL spelling of the path `/a b`)"
+        );
+        return Ok(ImageSource::LocalPath(PathBuf::from(path)));
     }
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return Ok(ImageSource::Url(s.to_string()));
+    }
+    Ok(ImageSource::LocalPath(PathBuf::from(s)))
 }
 
 fn cache_name_from_source(source: &ImageSource) -> String {
@@ -990,7 +1016,11 @@ impl Image {
         let config = config.as_ref();
         config.validate().context("invalid image config")?;
 
-        let override_source = config.source.as_deref().map(resolve_image_source);
+        let override_source = config
+            .source
+            .as_deref()
+            .map(resolve_image_source)
+            .transpose()?;
         let override_digest = config
             .digest
             .as_deref()
@@ -1518,6 +1548,94 @@ f0442f3cd0087a609ecd5241109ddef0cbf4a1e05372e13d82c97fc77b35b2d8ecff85aea6770915
 
         assert!(parse_prefixed_digest(&format!("sha256:{}", "c".repeat(64))).is_ok());
         assert!(parse_prefixed_digest(&format!("sha512:{}", "d".repeat(128))).is_ok());
+    }
+
+    /// A `file://` URL is a path on this host, not something to download.
+    ///
+    /// R218: the classifier listed the scheme and the download branch received it, where the
+    /// HTTP client can only answer "URL scheme is not allowed" - so the natural spelling of a
+    /// local Windows qcow2 failed with a message about a download, while the bare path worked.
+    #[test]
+    fn test_a_file_url_names_a_path_on_this_host() {
+        for (spelling, expected) in [
+            ("file:///tmp/win.qcow2", "/tmp/win.qcow2"),
+            ("file://localhost/tmp/win.qcow2", "/tmp/win.qcow2"),
+            ("FILE:///tmp/win.qcow2", "/tmp/win.qcow2"),
+            ("  file:///tmp/win.qcow2  ", "/tmp/win.qcow2"),
+        ] {
+            let resolved = resolve_image_source(spelling).expect("a local file URL must resolve");
+            assert_eq!(
+                resolved,
+                ImageSource::LocalPath(PathBuf::from(expected)),
+                "`{spelling}` must name the path, not a download"
+            );
+        }
+        // The bare path and the HTTP forms keep their meanings.
+        assert_eq!(
+            resolve_image_source("/tmp/win.qcow2").unwrap(),
+            ImageSource::LocalPath(PathBuf::from("/tmp/win.qcow2"))
+        );
+        assert_eq!(
+            resolve_image_source("https://example.com/win.qcow2?token=x").unwrap(),
+            ImageSource::Url("https://example.com/win.qcow2?token=x".to_string())
+        );
+    }
+
+    /// The `file://` spelling really installs through the local copy branch.
+    ///
+    /// The mapping test above says which branch a `file://` source picks; this one says the
+    /// branch works end to end - copy, `.part` staging, digest verification - which is what a
+    /// reader who writes `file:///data/win.qcow2` needs, and it runs without a network or a
+    /// Windows image.
+    #[tokio::test]
+    async fn test_a_file_url_is_installed_by_the_local_copy_branch() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source_path = dir.path().join("source.qcow2");
+        let contents = b"qlean file url round-trip\n";
+        tokio::fs::write(&source_path, contents).await?;
+        let digest = get_sha256(&source_path).await?;
+
+        let url = format!("file://{}", source_path.display());
+        let source = resolve_image_source(&url)?;
+        assert!(
+            matches!(source, ImageSource::LocalPath(_)),
+            "the file URL was handed to the download branch: {source:?}"
+        );
+
+        let dest = dir.path().join("cached.qcow2");
+        fetch_from_source(&source, &dest, &digest, ShaType::Sha256, GuestOs::Linux).await?;
+        assert_eq!(std::fs::read(&dest)?, contents);
+        assert!(
+            !dest.with_extension("part").exists(),
+            "the staging file must not survive a completed copy"
+        );
+        Ok(())
+    }
+
+    /// A `file://` URL naming another host is refused with the fix, not handed to the client.
+    #[test]
+    fn test_a_file_url_for_another_host_is_refused() {
+        for spelling in ["file://server/share/win.qcow2", "file://localhost"] {
+            let error = resolve_image_source(spelling)
+                .expect_err("a file URL with no local path must be refused")
+                .to_string();
+            assert!(error.contains("file:///absolute/path"), "{error}");
+            assert!(error.contains(spelling.trim()), "{error}");
+            assert!(
+                !error.contains("download"),
+                "the fix must not send the reader to the network: {error}"
+            );
+        }
+    }
+
+    /// A percent-escaped `file://` URL is refused rather than opened under a literal `%20`.
+    #[test]
+    fn test_a_file_url_with_percent_escapes_is_refused() {
+        let error = resolve_image_source("file:///data/win%2024.qcow2")
+            .expect_err("a percent-escaped file URL must be refused")
+            .to_string();
+        assert!(error.contains("percent-decoding"), "{error}");
+        assert!(error.contains("/data/win%2024.qcow2"), "{error}");
     }
 
     #[test]
