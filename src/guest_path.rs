@@ -76,10 +76,18 @@ const WINDOWS_INVALID_CHARS: [char; 7] = ['<', '>', ':', '"', '|', '?', '*'];
 /// console's input and output devices, so a file of either name is not a file at all - SFTP
 /// opens the device instead, or fails with a message about a device it was never asked for.
 /// `CLOCK$` is the legacy clock device, reserved for the same reason.
-const WINDOWS_RESERVED_NAMES: [&str; 25] = [
+///
+/// The superscript forms are part of the same documented list, not a nicety: Windows names the
+/// first three serial and parallel devices with `COM¹`/`COM²`/`COM³` and `LPT¹`/`LPT²`/`LPT³`
+/// as well, because the legacy device names use superscript digits. They cannot be folded into
+/// the ASCII entries - `¹` is not `1` - so they are separate entries, and leaving them out left
+/// `C:/Users/COM¹.txt` accepted by a validator whose whole job is to refuse reserved device
+/// names (R207). [`GuestPath::new`] compares with `eq_ignore_ascii_case`, which folds the ASCII
+/// letters and leaves the digit alone, so `com¹` is refused as well as `COM¹`.
+const WINDOWS_RESERVED_NAMES: [&str; 31] = [
     "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "CLOCK$", "COM1", "COM2", "COM3", "COM4",
-    "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7",
-    "LPT8", "LPT9",
+    "COM5", "COM6", "COM7", "COM8", "COM9", "COM¹", "COM²", "COM³", "LPT1", "LPT2", "LPT3", "LPT4",
+    "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "LPT¹", "LPT²", "LPT³",
 ];
 
 impl GuestPath {
@@ -512,6 +520,48 @@ mod tests {
         }
     }
 
+    /// Every name on the list is refused, in every spelling a caller can write.
+    ///
+    /// The list is hand-written, and the tests used to sample it: `CON`, `NUL`, `COM1`, `LPT9`
+    /// and the console names were checked by name, so an entry that is *on* the list but never
+    /// *enforced* - a typo, a character that does not compare equal, a form the stem split
+    /// misses - passed every test. This one walks the list itself, so the list and the check
+    /// cannot drift apart: dropping `COM¹` from it fails here even though nothing else changes.
+    #[test]
+    fn every_reserved_device_name_on_the_list_is_refused() {
+        for reserved in WINDOWS_RESERVED_NAMES {
+            for spelling in [
+                reserved.to_string(),
+                reserved.to_lowercase(),
+                format!("{reserved}.txt"),
+            ] {
+                let raw = format!("C:/Users/out/{spelling}");
+                let error = GuestPath::new(GuestOs::Windows, &raw)
+                    .err()
+                    .unwrap_or_else(|| {
+                        panic!("`{raw}` should be refused: `{reserved}` is reserved")
+                    })
+                    .to_string();
+                assert!(
+                    error.contains("reserved Windows device name"),
+                    "`{raw}` was refused for another reason: {error}"
+                );
+            }
+        }
+        // The list itself must not repeat an entry: a duplicate hides a missing name behind a
+        // number that still looks right.
+        let mut seen = std::collections::BTreeSet::new();
+        for reserved in WINDOWS_RESERVED_NAMES {
+            assert!(seen.insert(reserved), "`{reserved}` is listed twice");
+        }
+        assert_eq!(
+            WINDOWS_RESERVED_NAMES.len(),
+            31,
+            "the documented list is 29 ASCII names plus the six superscript forms: {:?}",
+            WINDOWS_RESERVED_NAMES
+        );
+    }
+
     #[test]
     fn windows_path_rejects_traversal() {
         let err = GuestPath::new(GuestOs::Windows, r"C:\Users\..\Windows")
@@ -721,6 +771,10 @@ mod tests {
             ("C:/conin$", "reserved Windows device name"),
             ("C:/Users/CONOUT$.txt", "reserved Windows device name"),
             ("C:/Windows/clock$", "reserved Windows device name"),
+            ("C:/Users/COM¹.txt", "reserved Windows device name"),
+            ("C:/Users/com².log", "reserved Windows device name"),
+            ("C:/Users/LPT³", "reserved Windows device name"),
+            ("C:/Users/lpt¹.dat", "reserved Windows device name"),
         ];
         for (raw, expected) in rejected {
             let message = GuestPath::new(GuestOs::Windows, raw)

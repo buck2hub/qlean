@@ -256,7 +256,9 @@ Path rules for Windows guests:
 - `..` components are rejected, and every joined child is validated again, so a relative
   walk cannot escape the directory being uploaded or downloaded.
 - Names Windows cannot store are rejected: `<>:"|?*`, control characters, trailing space
-  or dot, and reserved device names (`CON`, `CONIN$`, `CLOCK$`, `COM1`, `LPT1`, ...).
+  or dot, and reserved device names (`CON`, `CONIN$`, `CLOCK$`, `COM1`, `LPT1`, `COM¹`, `LPT¹`,
+  ...) - the superscript forms are on Windows' own list too, and they are separate entries
+  because `¹` is not `1`.
 - UNC (`\\server\share`) and device (`\\?\`, `\\.\`) paths are rejected rather
   than guessed at.
 - Nothing is silently skipped: any entry the walk cannot read (a directory it is not allowed

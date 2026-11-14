@@ -45,6 +45,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   messages rather than by reading the arm
 
 ### Fixed
+- A Windows guest path named after one of the reserved device names with a superscript digit -
+  `COM¹`, `COM²`, `COM³`, `LPT¹`, `LPT²`, `LPT³` - was accepted, although Windows reserves those
+  spellings exactly as it reserves `COM1` and `LPT1`: the list the validator keeps had the 25
+  ASCII names and none of the six superscript ones, so a name whose whole point is to be refused
+  went through. All 31 documented names are now refused, in any ASCII case and with any
+  extension, and a test walks the list itself instead of sampling it, so a name that is on the
+  list but never enforced can no longer pass.
 - An upload that failed or was cancelled left the half it had already sent under the target's own
   name on the guest: `upload_file` and `Machine::write` opened the target with `TRUNCATE`, so a
   half-written `deploy.json`, registry hive or disk image read as *some* file and nothing on the
