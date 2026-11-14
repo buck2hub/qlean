@@ -55,6 +55,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not treated as free: the rename is not sent.
 
 ### Fixed
+- A host where the process table cannot be read (`hidepid=2`, a chroot, a sandbox) was told that
+  every QEMU had exited. The liveness readers answered `None`/`false` both for "there is no such
+  process" and for "I could not read it", so `Machine::shutdown` reported a clean stop and cleared
+  the pid while a live QEMU kept the overlay open - and the next start rebuilt the overlay of a
+  live guest - and `Machine::is_running` answered "not running" for a live domain, which is the
+  answer that lets a launch (or `MachinePool`) start a second QEMU on the same disk. "No such
+  process" and "could not look" are now different answers: teardown refuses with the reason
+  instead of reporting a shutdown, `is_running` returns that error instead of `Ok(false)`, and a
+  pid that cannot be identified is reported (`KillOutcome::Unconfirmed`) instead of being counted
+  as a pid that left.
 - A Windows boot could delete a live `swtpm`'s control socket. `Swtpm::start` removes the socket
   file at the control path because the process table says no daemon serves that TPM state
   directory - but the scan answered "no daemon" for *every* way of failing to look (a host

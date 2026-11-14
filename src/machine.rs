@@ -1181,7 +1181,10 @@ StandardError=journal
             let mut kill_sent = false;
 
             loop {
-                let alive = !process_is_gone(pid);
+                // Leave `self.pid` set on error: a check that could not look says nothing
+                // about the process, and reporting a clean shutdown here would let the next
+                // start rebuild the overlay of a live guest.
+                let alive = teardown_liveness(process_is_gone(pid), pid)?;
                 match teardown_step(alive, start.elapsed(), max_wait_time, kill_sent) {
                     TeardownStep::StillGone => {
                         debug!("QEMU process {} has exited", pid);
@@ -1676,14 +1679,30 @@ StandardError=journal
     /// `false` to decide that a launch is safe, and starting a second QEMU on a live domain's
     /// disk would corrupt it. A missing socket is proof that the domain is gone only when the
     /// process is gone too; a live QEMU without its socket is a missing socket, not a dead
-    /// domain, and is reported as such.
+    /// domain, and is reported as such. A process table that cannot be read is reported for
+    /// the same reason: a host with `hidepid=2` answers "no such process" for every pid, and
+    /// that answer is what tells a launch the overlay is free.
     pub async fn is_running(&self) -> Result<bool> {
         let socket_path = qmp::qmp_socket_path(&self.id)?;
-        let qemu_alive = self.pid.is_some_and(|pid| {
+        let qemu_alive = match self.pid {
+            None => false,
             // A pid that answers with somebody else's QMP socket is somebody else's QEMU: the
-            // domain this machine recorded is gone, whatever the pid is running now.
-            !process_is_gone(pid) && process_is_this_machines_qemu(pid, Some(socket_path.as_path()))
-        });
+            // domain this machine recorded is gone, whatever the pid is running now. A pid
+            // whose state or command line cannot be read answers neither question, so it is
+            // reported instead of being counted as a dead domain: `false` here is what lets a
+            // launch start a second QEMU on the live one's overlay.
+            Some(pid) => process_is_gone(pid)
+                .and_then(|gone| {
+                    if gone {
+                        Ok(false)
+                    } else {
+                        process_is_this_machines_qemu(pid, Some(socket_path.as_path()))
+                    }
+                })
+                .map_err(|error| {
+                    anyhow::anyhow!("{}", unconfirmed_liveness_message(pid, &error))
+                })?,
+        };
         match running_check(self.pid.is_some(), socket_path.exists(), qemu_alive) {
             RunningCheck::NotRunning => Ok(false),
             RunningCheck::NoControlSocket => Ok(false),
@@ -2274,9 +2293,20 @@ pub(crate) fn cmdline_is_this_machines_qemu(cmdline: &[u8], socket_path: Option<
 /// evidence that anything is still running. A killed QEMU that nobody reaped (its launch
 /// task was aborted, or teardown ran from a different code path) therefore looked alive for
 /// the whole 30s teardown budget and produced a misleading "force killing" message.
-fn process_state(pid: u32) -> Option<char> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    process_state_of(&stat)
+/// State letter from an injected process table, so both answers are testable.
+///
+/// `Ok(None)` means "this process table has no entry for that pid"; a process table that
+/// cannot be read is an `Err`. Folding the second into the first is how a hidden `/proc`
+/// (`hidepid=2`, a chroot, a sandbox) answered every question about every process with "that
+/// one is gone": teardown reported a clean shutdown of a live guest and cleared the pid, and
+/// `is_running` answered "not running" for a domain whose overlay a second launch then reused.
+fn state_in(proc_root: &Path, pid: u32) -> std::io::Result<Option<char>> {
+    let stat = match std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(process_state_of(&stat))
 }
 
 /// State letter of a `/proc/<pid>/stat` line (split out so it is testable without a pid).
@@ -2292,18 +2322,34 @@ fn process_state_of(stat: &str) -> Option<char> {
 /// Exited-but-unreaped (`Z`, and the transient `X`) counts as gone: such a process cannot be
 /// signalled back to life, and waiting for its `/proc` entry to disappear waits for a reaper
 /// that may never come.
-fn process_is_gone(pid: u32) -> bool {
-    match process_state(pid) {
+fn process_is_gone(pid: u32) -> std::io::Result<bool> {
+    process_is_gone_in(Path::new("/proc"), pid)
+}
+
+/// `process_is_gone` against an injected process table (see [`state_in`] for why `Err`).
+fn process_is_gone_in(proc_root: &Path, pid: u32) -> std::io::Result<bool> {
+    Ok(match state_in(proc_root, pid)? {
         None => true,
         Some(state) => matches!(state, 'Z' | 'X' | 'x'),
-    }
+    })
 }
 
 /// Whether `pid` still looks like the QEMU process Qlean started for this machine.
-fn process_is_this_machines_qemu(pid: u32, socket_path: Option<&Path>) -> bool {
-    match std::fs::read(format!("/proc/{pid}/cmdline")) {
-        Ok(cmdline) => cmdline_is_this_machines_qemu(&cmdline, socket_path),
-        Err(_) => false,
+fn process_is_this_machines_qemu(pid: u32, socket_path: Option<&Path>) -> std::io::Result<bool> {
+    identity_in(Path::new("/proc"), pid, socket_path)
+}
+
+/// `process_is_this_machines_qemu` against an injected process table.
+///
+/// A pid that left the table between two reads is "not ours" (`Ok(false)`, the pid is free);
+/// a command line that exists but cannot be read (`EACCES` under `hidepid`, a sandbox) is an
+/// `Err`, because "not ours" is the answer that licenses a launch to reuse the overlay and
+/// teardown to stop waiting.
+fn identity_in(proc_root: &Path, pid: u32, socket_path: Option<&Path>) -> std::io::Result<bool> {
+    match std::fs::read(proc_root.join(pid.to_string()).join("cmdline")) {
+        Ok(cmdline) => Ok(cmdline_is_this_machines_qemu(&cmdline, socket_path)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -2321,6 +2367,10 @@ enum KillOutcome {
     Killed,
     /// The pid is still our QEMU and the signal was refused, so it is alive and ours.
     Refused(String),
+    /// The pid could not be identified as our QEMU, so it was not signalled and its absence
+    /// cannot be claimed either. Treating this like `Gone` would report a clean shutdown of a
+    /// machine whose QEMU still holds the overlay.
+    Unconfirmed(String),
 }
 
 /// What teardown should do after one SIGKILL attempt.
@@ -2330,7 +2380,8 @@ enum KillStep {
     KeepPolling,
     /// Nothing left that belongs to us.
     NothingLeft,
-    /// The signal was refused: the machine was not shut down.
+    /// The signal was refused or the pid could not be identified: the machine was not shut
+    /// down.
     NotShutDown(String),
 }
 
@@ -2340,7 +2391,34 @@ fn kill_step(outcome: &KillOutcome) -> KillStep {
         KillOutcome::Killed => KillStep::KeepPolling,
         KillOutcome::Gone => KillStep::NothingLeft,
         KillOutcome::Refused(reason) => KillStep::NotShutDown(reason.clone()),
+        KillOutcome::Unconfirmed(reason) => KillStep::NotShutDown(reason.clone()),
     }
+}
+
+/// Whether teardown keeps waiting, from one liveness scan of the QEMU pid.
+///
+/// Split from the loop so the scan's third answer is testable: `Ok(gone)` says whether the
+/// process left, and `Err` says the scan could not look. Reading `Err` as "gone" is what
+/// turned a hidden `/proc` into a clean shutdown of a live guest.
+fn teardown_liveness(scan: std::io::Result<bool>, pid: u32) -> Result<bool> {
+    match scan {
+        Ok(gone) => Ok(!gone),
+        Err(error) => bail!("{}", unconfirmed_liveness_message(pid, &error)),
+    }
+}
+
+/// Message for a liveness check that could not look, which must never read like a shutdown.
+///
+/// This is the sibling of [`unkillable_message`] and [`kill_not_shut_down_message`]: all three
+/// exist because the caller was about to claim that a machine stopped when nothing proved it.
+fn unconfirmed_liveness_message(pid: u32, error: &std::io::Error) -> String {
+    format!(
+        "could not read the state of QEMU process {pid}: {error}\n\
+         Qlean reports a machine shut down - and clears its pid - only after it saw the process \
+         go, so this machine is still claimed and nothing was released. A host where /proc is \
+         hidden (hidepid=2, a chroot, a sandbox) answers every process as gone, which would let \
+         the next start rebuild the overlay of a live guest. Make /proc readable and try again"
+    )
 }
 
 /// Message for a refused kill, which must never read like a completed shutdown.
@@ -2364,13 +2442,38 @@ fn force_kill(pid: u32, socket_path: Option<&Path>) -> KillOutcome {
 fn force_kill_with(
     pid: u32,
     socket_path: Option<&Path>,
-    signal: impl Fn(u32) -> std::io::Result<()>,
+    signal: impl FnMut(u32) -> std::io::Result<()>,
 ) -> KillOutcome {
-    if !process_is_this_machines_qemu(pid, socket_path) {
-        warn!(
-            "not sending SIGKILL to pid {pid}: it no longer looks like the QEMU process Qlean started (the pid was probably reused)"
-        );
-        return KillOutcome::Gone;
+    force_kill_using(
+        pid,
+        |pid| process_is_this_machines_qemu(pid, socket_path),
+        signal,
+    )
+}
+
+/// `force_kill_with` with the identity check injectable too: "this pid is not our QEMU" and
+/// "this pid could not be identified" must not lead to the same place.
+fn force_kill_using(
+    pid: u32,
+    identity: impl Fn(u32) -> std::io::Result<bool>,
+    mut signal: impl FnMut(u32) -> std::io::Result<()>,
+) -> KillOutcome {
+    match identity(pid) {
+        Ok(true) => {}
+        Ok(false) => {
+            warn!(
+                "not sending SIGKILL to pid {pid}: it no longer looks like the QEMU process Qlean started (the pid was probably reused)"
+            );
+            return KillOutcome::Gone;
+        }
+        Err(error) => {
+            warn!(
+                "not sending SIGKILL to pid {pid}: could not identify it as this machine's QEMU: {error}"
+            );
+            return KillOutcome::Unconfirmed(format!(
+                "could not identify pid {pid} as this machine's QEMU: {error}"
+            ));
+        }
     }
     match signal(pid) {
         Ok(()) => KillOutcome::Killed,
@@ -2399,9 +2502,20 @@ fn signal_term(pid: u32) -> std::io::Result<()> {
 /// runs on paths that are already returning an error, and a teardown that cannot finish must
 /// not hide that error.
 async fn terminate_qemu(pid: u32, socket_path: Option<&Path>) {
-    if !process_is_this_machines_qemu(pid, socket_path) {
-        warn!("QEMU pid {pid} is gone; nothing to terminate");
-        return;
+    match process_is_this_machines_qemu(pid, socket_path) {
+        Ok(true) => {}
+        Ok(false) => {
+            warn!("QEMU pid {pid} is gone; nothing to terminate");
+            return;
+        }
+        Err(error) => {
+            // Signalling a pid that could not be identified would be a guess about whose
+            // process it is; this path is already returning an error, so say so and leave it.
+            warn!(
+                "not terminating pid {pid}: could not identify it as this machine's QEMU: {error}"
+            );
+            return;
+        }
     }
     if let Err(error) = signal_term(pid) {
         warn!("failed to send SIGTERM to QEMU pid {pid}: {error}");
@@ -2410,8 +2524,14 @@ async fn terminate_qemu(pid: u32, socket_path: Option<&Path>) {
     // Give it a moment to exit; then SIGKILL.
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(5) {
-        if process_is_gone(pid) {
-            return;
+        match process_is_gone(pid) {
+            Ok(true) => return,
+            // Leave it alone rather than SIGKILL a pid whose state cannot be read.
+            Err(error) => {
+                warn!("stopped waiting for QEMU pid {pid} to exit: {error}");
+                return;
+            }
+            Ok(false) => {}
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -3108,7 +3228,7 @@ mod liveness_tests {
     /// this test failed about one run in five.
     fn wait_until_the_child_is_qemu(pid: u32, socket: &std::path::Path) {
         for _ in 0..200 {
-            if process_is_this_machines_qemu(pid, Some(socket)) {
+            if process_is_this_machines_qemu(pid, Some(socket)).expect("this host can read /proc") {
                 return;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -3161,7 +3281,7 @@ mod liveness_tests {
         // proof, and the answer must be `false` rather than an error.
         let machine = machine_with_pid(Some(std::process::id()));
         assert!(
-            !process_is_this_machines_qemu(std::process::id(), None),
+            !process_is_this_machines_qemu(std::process::id(), None).expect("proc"),
             "the test binary is not QEMU; the case is only meaningful if it says so"
         );
         assert!(
@@ -3192,7 +3312,7 @@ mod liveness_tests {
             "a QEMU that serves another machine is not this machine's QEMU"
         );
         assert!(
-            !process_is_gone(pid),
+            !process_is_gone(pid).expect("this host can read /proc"),
             "the lookalike must still be running: nothing may be signalled"
         );
 
@@ -3201,7 +3321,10 @@ mod liveness_tests {
         // answers `false`, which would leave every real QEMU running at teardown.
         assert_eq!(force_kill(pid, Some(&theirs)), KillOutcome::Killed);
         let _ = child.wait();
-        assert!(process_is_gone(pid), "the lookalike was killed");
+        assert!(
+            process_is_gone(pid).expect("this host can read /proc"),
+            "the lookalike was killed"
+        );
     }
 
     #[tokio::test]
@@ -3929,7 +4052,7 @@ mod timeout_tests {
             .ok()?;
         // Wait until the exec has replaced bash, so `/proc/<pid>/cmdline` is the QEMU name.
         for _ in 0..100 {
-            if process_is_this_machines_qemu(child.id(), None) {
+            if process_is_this_machines_qemu(child.id(), None).expect("this host can read /proc") {
                 return Some(child);
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -3957,7 +4080,7 @@ mod timeout_tests {
             other => panic!("a refused signal must not be reported as {other:?}"),
         }
         assert!(
-            !process_is_gone(pid),
+            !process_is_gone(pid).expect("this host can read /proc"),
             "the fake QEMU was never signalled, so it must still be alive"
         );
 
@@ -3966,7 +4089,7 @@ mod timeout_tests {
         assert_eq!(force_kill(pid, None), KillOutcome::Killed);
         let _ = child.wait();
         for _ in 0..200 {
-            if process_is_gone(pid) {
+            if process_is_gone(pid).expect("this host can read /proc") {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -3992,10 +4115,13 @@ mod timeout_tests {
             return;
         };
         assert!(
-            process_is_this_machines_qemu(pid, None),
+            process_is_this_machines_qemu(pid, None).expect("this host can read /proc"),
             "pid {pid} does not look like QEMU"
         );
-        assert!(!process_is_gone(pid), "pid {pid} is already gone");
+        assert!(
+            !process_is_gone(pid).expect("this host can read /proc"),
+            "pid {pid} is already gone"
+        );
         // Signal 0 asks the kernel about permission without delivering anything, so this
         // precondition check cannot hide the very refusal the test is about.
         // SAFETY: signal 0 only tests whether the process exists and is signalable.
@@ -4014,7 +4140,7 @@ mod timeout_tests {
         assert!(message.contains("was not shut down"), "{message}");
         assert!(message.contains(&pid.to_string()), "{message}");
         assert!(
-            !process_is_gone(pid),
+            !process_is_gone(pid).expect("this host can read /proc"),
             "the fake QEMU must still be running after the refusal"
         );
         assert_eq!(
@@ -4205,6 +4331,153 @@ mod timeout_tests {
         assert_eq!(process_state_of("garbage"), None);
     }
 
+    /// A private process table for the tests that must not depend on the host's `/proc`.
+    fn fake_proc_root(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("qlean-proc-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create the fake process table");
+        root
+    }
+
+    fn write_pid_file(root: &std::path::Path, pid: u32, name: &str, body: &str) {
+        let dir = root.join(pid.to_string());
+        std::fs::create_dir_all(&dir).expect("create the pid entry");
+        std::fs::write(dir.join(name), body).expect("write the pid entry");
+    }
+
+    #[test]
+    fn a_process_table_that_cannot_be_read_is_not_a_gone_process() {
+        // The whole round: a hidden `/proc` (`hidepid=2`, a chroot, a sandbox) must answer
+        // "could not look", never "that process is gone". The second answer is what teardown
+        // reports as a clean shutdown and what lets a launch reuse a live guest's overlay.
+        let root = fake_proc_root("states");
+        assert!(
+            process_is_gone_in(&root, 4242).expect("an empty table is readable"),
+            "an entry that is not there is a process that is gone"
+        );
+        write_pid_file(
+            &root,
+            4242,
+            "stat",
+            "4242 (qemu-system-x86_64) S 1 4242 4242 0 -1 0",
+        );
+        assert!(
+            !process_is_gone_in(&root, 4242).expect("the table is readable"),
+            "a running process is not gone"
+        );
+        write_pid_file(
+            &root,
+            4243,
+            "stat",
+            "4243 (qemu-system-x86_64) Z 1 4243 4243 0 -1 0",
+        );
+        assert!(
+            process_is_gone_in(&root, 4243).expect("the table is readable"),
+            "a zombie cannot be signalled back to life"
+        );
+        // `X`/`x` are the transient dead states some kernels report instead of `Z`.
+        for dead in ['X', 'x'] {
+            let stat = format!("4245 (qemu-system-x86_64) {dead} 1 4245 4245 0 -1 0");
+            write_pid_file(&root, 4245, "stat", &stat);
+            assert!(
+                process_is_gone_in(&root, 4245).expect("the table is readable"),
+                "{dead} is a dead state"
+            );
+        }
+        // The `hidepid` case: the entry is there, reading it is refused.
+        let unreadable = root.join("4244");
+        std::fs::create_dir_all(unreadable.join("stat")).expect("make a directory where stat goes");
+        let error = process_is_gone_in(&root, 4244)
+            .expect_err("an entry that cannot be read is not evidence of anything");
+        assert_eq!(error.kind(), std::io::ErrorKind::IsADirectory, "{error}");
+    }
+
+    #[test]
+    fn a_command_line_that_cannot_be_read_is_not_somebody_elses_process() {
+        // "Not our QEMU" licenses a launch to reuse the disk. A command line that exists but
+        // cannot be read says nothing about the process, so it must not answer "not ours".
+        let root = fake_proc_root("cmdline");
+        assert!(
+            !identity_in(&root, 4242, None).expect("an empty table is readable"),
+            "a pid that left between two reads is not our QEMU"
+        );
+        write_pid_file(&root, 4242, "cmdline", "qemu-system-x86_64\0");
+        assert!(
+            identity_in(&root, 4242, None).expect("the table is readable"),
+            "argv[0] names QEMU"
+        );
+        let unreadable = root.join("4243");
+        std::fs::create_dir_all(unreadable.join("cmdline")).expect("make a directory for cmdline");
+        let error = identity_in(&root, 4243, None)
+            .expect_err("an unreadable command line must be reported, not answered");
+        assert_eq!(error.kind(), std::io::ErrorKind::IsADirectory, "{error}");
+    }
+
+    #[test]
+    fn a_liveness_check_that_could_not_look_never_reads_as_a_shutdown() {
+        let error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let message = unconfirmed_liveness_message(4242, &error);
+        assert!(message.contains("4242"), "{message}");
+        assert!(message.contains("permission denied"), "{message}");
+        assert!(message.contains("still claimed"), "{message}");
+        assert!(message.contains("nothing was released"), "{message}");
+        assert!(
+            message.contains("/proc"),
+            "the fix must be named: {message}"
+        );
+    }
+
+    #[test]
+    fn a_liveness_scan_that_could_not_look_does_not_end_teardown() {
+        // The three answers of the scan, and the one that used to be mistaken for the first.
+        assert!(teardown_liveness(Ok(false), 4242).expect("alive"));
+        assert!(!teardown_liveness(Ok(true), 4242).expect("gone"));
+        let error = teardown_liveness(
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            4242,
+        )
+        .expect_err("a scan that could not look must not end teardown");
+        assert!(error.to_string().contains("still claimed"), "{error}");
+        assert!(error.to_string().contains("4242"), "{error}");
+    }
+
+    #[test]
+    fn a_pid_that_could_not_be_identified_is_not_a_pid_that_left() {
+        // The identity check is the guard that licenses SIGKILL. Its two "no" answers are
+        // different: "somebody else's pid" needs no signal and no wait, "cannot tell" needs
+        // both to stay unclaimed.
+        let mut signalled = false;
+        let outcome = force_kill_using(
+            4242,
+            |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            |_| {
+                signalled = true;
+                Ok(())
+            },
+        );
+        assert!(!signalled, "an unidentified pid must not be signalled");
+        assert!(
+            matches!(&outcome, KillOutcome::Unconfirmed(reason) if reason.contains("4242")),
+            "{outcome:?}"
+        );
+        assert!(
+            matches!(kill_step(&outcome), KillStep::NotShutDown(_)),
+            "an unidentified pid is not a machine that shut down"
+        );
+
+        let outcome = force_kill_using(
+            4242,
+            |_| Ok(false),
+            |_| {
+                signalled = true;
+                Ok(())
+            },
+        );
+        assert!(!signalled, "somebody else's pid must not be signalled");
+        assert_eq!(outcome, KillOutcome::Gone);
+        assert_eq!(kill_step(&outcome), KillStep::NothingLeft);
+    }
+
     #[test]
     fn a_killed_unreaped_child_counts_as_gone() {
         // A zombie keeps its `/proc/<pid>` entry: teardown must not wait out its budget for a
@@ -4214,14 +4487,17 @@ mod timeout_tests {
             .spawn()
             .expect("spawn a child to kill");
         let pid = child.id();
-        assert!(!process_is_gone(pid), "a running child is not gone");
+        assert!(
+            !process_is_gone(pid).expect("this host can read /proc"),
+            "a running child is not gone"
+        );
         assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
         // SAFETY: the pid belongs to the child we just spawned.
         unsafe { libc::kill(pid as i32, libc::SIGKILL) };
         // Do not reap yet: this is exactly the zombie state teardown must recognise.
         let mut gone = false;
         for _ in 0..200 {
-            if process_is_gone(pid) {
+            if process_is_gone(pid).expect("this host can read /proc") {
                 gone = true;
                 break;
             }
@@ -4229,15 +4505,21 @@ mod timeout_tests {
         }
         let _ = child.wait();
         assert!(gone, "a killed but unreaped child must count as gone");
-        assert!(process_is_gone(u32::MAX), "a missing pid is gone");
+        assert!(
+            process_is_gone(u32::MAX).expect("this host can read /proc"),
+            "a missing pid is gone"
+        );
     }
 
     #[test]
     fn process_is_this_machines_qemu_rejects_the_current_test_process() {
         // Guards the guard: the test binary is not QEMU, and the helper must say so, so a
         // recycled pid never gets SIGKILLed.
-        assert!(!process_is_this_machines_qemu(std::process::id(), None));
-        assert!(!process_is_this_machines_qemu(u32::MAX, None));
+        assert!(
+            !process_is_this_machines_qemu(std::process::id(), None)
+                .expect("this host can read /proc")
+        );
+        assert!(!process_is_this_machines_qemu(u32::MAX, None).expect("this host can read /proc"));
     }
 
     #[test]
