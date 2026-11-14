@@ -948,9 +948,20 @@ StandardError=journal
         Ok(())
     }
 
+    /// What this machine's two pool entry points should do.
+    ///
+    /// The table itself is [`start_actions`]; this method is the only place that hands it this
+    /// machine's two inputs. Asking it twice (once per pool question) would let the two
+    /// questions be answered from different inputs - a Windows guest whose seed has just been
+    /// consumed would answer "spawn" to one and "init" to the other - and swapping the
+    /// columns is a one-token edit nothing would notice.
+    fn routing(&self) -> StartActions {
+        start_actions(self.image.guest_os, self.deploy_seed.is_some())
+    }
+
     /// Whether starting this machine should run `init` rather than `spawn`.
     pub(crate) fn wants_init(&self) -> bool {
-        start_actions(self.image.guest_os, self.deploy_seed.is_some()).init_all == Start::Init
+        self.routing().init_all == Start::Init
     }
 
     /// Whether this machine has a Windows deployment that has not run yet.
@@ -958,7 +969,7 @@ StandardError=journal
     /// Starting such a machine with `spawn` would boot a guest whose `sshd` has no
     /// installed key, so the deployment has to run first.
     pub(crate) fn needs_first_boot(&self) -> bool {
-        start_actions(self.image.guest_os, self.deploy_seed.is_some()).spawn_all == Start::Init
+        self.routing().spawn_all == Start::Init
     }
 
     /// Spawn the machine (normal boot).
@@ -2942,6 +2953,96 @@ fn session_or_operation_error<'a>(
     match ssh.as_mut() {
         Some(session) => Ok((session, cancel_token)),
         None => Err(not_running_error(operation, machine_id)),
+    }
+}
+
+#[cfg(test)]
+/// The two questions the pool asks a machine are the two columns of one table.
+///
+/// The table ([`start_actions`]) has its own four-row test, and the pool's call sites are
+/// pinned separately - so the only thing left between them is these two one-line projections,
+/// and *which column* each one reads had no test at all: swapping them (init asks `spawn_all`,
+/// spawn asks `init_all`) left the whole suite green. The cost is not symmetric: a pending
+/// Windows deployment that the pool sends to `spawn` boots a guest with no installed SSH key
+/// and times out in the deployment wait, and a deployed one that the pool sends to `init` is
+/// refused, because its seed medium is gone by design.
+mod routing_tests {
+    use super::*;
+
+    /// A machine fixture with the given guest OS and deployment state.
+    ///
+    /// The seed is really staged (three small files, no `xorriso`), because the question under
+    /// test is answered from `deploy_seed.is_some()` and not from a flag standing in for it.
+    async fn machine(guest_os: GuestOs, deployment_pending: bool) -> Machine {
+        let mut machine = Machine::for_tests_with_pid(None);
+        machine.image.guest_os = guest_os;
+        if deployment_pending {
+            let run_dir = std::env::temp_dir().join(format!(
+                "qlean-routing-tests-{}-{guest_os:?}",
+                std::process::id()
+            ));
+            let host_key = PersistedSshKeypair {
+                pubkey_str: String::new(),
+                _pubkey_path: run_dir.join("id_ed25519.pub"),
+                privkey_str: "host-key-material".to_string(),
+                privkey_path: run_dir.join("id_ed25519"),
+            };
+            machine.deploy_seed = Some(
+                windows::DeploySeed::stage(&run_dir, "ssh-ed25519 AAAA qlean", &host_key)
+                    .await
+                    .expect("stage a seed medium for the routing fixture"),
+            );
+        }
+        machine
+    }
+
+    #[tokio::test]
+    async fn each_pool_question_reads_its_own_column_of_the_start_table() {
+        let rows = [
+            (GuestOs::Linux, false),
+            (GuestOs::Linux, true),
+            (GuestOs::Windows, true),
+            (GuestOs::Windows, false),
+        ];
+        for (guest_os, pending) in rows {
+            let actions = start_actions(guest_os, pending);
+            let machine = machine(guest_os, pending).await;
+            assert_eq!(
+                machine.wants_init(),
+                actions.init_all == Start::Init,
+                "`init_all` for a {guest_os:?} guest with a pending deployment = {pending}"
+            );
+            assert_eq!(
+                machine.needs_first_boot(),
+                actions.spawn_all == Start::Init,
+                "`spawn_all` for a {guest_os:?} guest with a pending deployment = {pending}"
+            );
+        }
+    }
+
+    /// The two questions are not the same question worded twice.
+    ///
+    /// A test that only compared each accessor with its own column would still pass if both
+    /// columns were equal on every row it looked at; this pins the one row where they differ.
+    #[tokio::test]
+    async fn a_linux_machine_wants_init_and_does_not_need_a_first_boot() {
+        let linux = machine(GuestOs::Linux, false).await;
+        assert!(
+            linux.wants_init() && !linux.needs_first_boot(),
+            "a Linux guest has a fresh cloud-init seed on every `init` and nothing pending on \
+             `spawn`, so its two pool questions have different answers"
+        );
+        let windows = machine(GuestOs::Windows, true).await;
+        assert!(
+            windows.wants_init() && windows.needs_first_boot(),
+            "a pending Windows deployment has to run before either entry point can boot"
+        );
+        let deployed = machine(GuestOs::Windows, false).await;
+        assert!(
+            !deployed.wants_init() && !deployed.needs_first_boot(),
+            "a deployed Windows guest cannot run `init` again and needs no deployment, so both \
+             questions are answered `spawn`"
+        );
     }
 }
 

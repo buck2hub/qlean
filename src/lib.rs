@@ -1755,6 +1755,48 @@ mod plan_doc_tests {
         );
     }
 
+    /// `spawn` has to ask the machine whether it still needs its first boot.
+    ///
+    /// The predicate (`needs_first_boot`) has its own table test and the guard
+    /// (`spawn_guard`) has its own unit test, so the only thing left is the one boolean between
+    /// them: passing `false` there instead of the predicate left the whole suite green, and the
+    /// consequence is a Windows guest that boots with no deployment medium - no installed SSH
+    /// key, so the deployment wait times out fifteen minutes later instead of failing at once
+    /// with the reason.
+    #[test]
+    fn the_spawn_entry_point_asks_the_machine_whether_it_still_needs_its_first_boot() {
+        let machine = CRATE_SOURCES
+            .iter()
+            .find(|(path, _)| *path == "src/machine.rs")
+            .map(|(_, source)| *source)
+            .expect("src/machine.rs is not in CRATE_SOURCES");
+        let spawn = body_of(machine, "pub async fn spawn(&mut self) -> Result<()>");
+        let spawn = spawn.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            spawn.contains("spawn_guard(self.needs_first_boot(), &self.id)?"),
+            "`spawn` no longer hands `needs_first_boot()` to `spawn_guard`, so it will boot a \
+             Windows guest before its one-time deployment has run: {spawn}"
+        );
+        let init = body_of(machine, "pub async fn init(&mut self) -> Result<()>");
+        let init = init.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            init.contains(
+                "init_guard( start_actions(self.image.guest_os, self.deploy_seed.is_some()), \
+                 &self.id, )?"
+            ),
+            "`init` no longer hands the start table to `init_guard`, so a deployed Windows \
+             guest would be initialised again: {init}"
+        );
+        let shutdown = body_of(machine, "pub async fn shutdown(&mut self) -> Result<()>");
+        let shutdown = shutdown.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            shutdown.contains("self.qemu_should_exit.store(true, Ordering::SeqCst);"),
+            "`shutdown` no longer records that the QEMU exit it is about to cause is expected, \
+             so every clean stop is reported as `QEMU exited unexpectedly` and returned as an \
+             error: {shutdown}"
+        );
+    }
+
     /// The seven ignored Windows smoke tests all stop at the precondition the plan describes.
     ///
     /// Every Windows smoke test reaches the host gate, because it builds its machine through it.
