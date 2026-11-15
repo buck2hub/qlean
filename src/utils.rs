@@ -222,19 +222,24 @@ fn parse_lease_expiry(line: &str) -> String {
             && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit()))
     }
 
+    /// `HH:MM:SS`, checked by shape and not by counting characters.
+    ///
+    /// The column has to be *this* format, because the string is compared as a whole when
+    /// rows of one MAC are ranked: an eight-character token that is not a clock time (a
+    /// serial number, a state column) sorts among the timestamps whatever its bytes are, so
+    /// a row that carries no usable expiry can outrank a real one and the lookup hands back
+    /// the address the guest has already abandoned.
+    fn looks_like_time(token: &str) -> bool {
+        let parts = token.split(':').collect::<Vec<_>>();
+        parts.len() == 3
+            && parts
+                .iter()
+                .all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_digit()))
+    }
+
     let tokens = line.split_whitespace().collect::<Vec<_>>();
     let parsed = match tokens.as_slice() {
-        [date, time, ..]
-            if looks_like_date(date)
-                && time.len() == 8
-                && time.chars().enumerate().all(|(index, c)| {
-                    if index % 3 == 2 {
-                        c == ':'
-                    } else {
-                        c.is_ascii_digit()
-                    }
-                }) =>
-        {
+        [date, time, ..] if looks_like_date(date) && looks_like_time(time) => {
             Some(format!("{date} {time}"))
         }
         _ => None,
@@ -872,8 +877,13 @@ impl CommandExt for tokio::process::Command {
             .get_args()
             .map(|x| x.to_string_lossy())
             .map(|x| {
-                // Make sure that commands that contain spaces will be properly quoted.
-                if x.contains(' ') {
+                // The string is only ever logged (`debug!`), and it is logged so an operator can
+                // paste the command into a shell and re-run it. An argument that holds a space,
+                // a tab or nothing at all has to be visible as one argument in that paste:
+                // Qlean's own data directory is `~/Library/Application Support/qlean` on macOS,
+                // so an unquoted `-b /Users/me/Library/Application Support/...` reads as two
+                // arguments, and an empty one disappears from the line altogether.
+                if x.is_empty() || x.chars().any(char::is_whitespace) {
                     format!("\"{x}\"")
                 } else {
                     format!("{x}")
@@ -1494,6 +1504,41 @@ mod tests {
         );
     }
 
+    /// The walk starts at the *runs* directory, not at the run directory asking for a CID.
+    ///
+    /// Walking only the caller's own run directory finds its own previous `cid` file and
+    /// nothing else, so a second machine is handed the same CID the first one already uses:
+    /// two guests then answer on one vsock channel. Every `cid` file lives in a sibling of the
+    /// directory being allocated for, so a test that only nests a claim under *its own* run
+    /// directory cannot tell the two walks apart.
+    #[test]
+    fn test_a_cid_claimed_by_another_run_directory_is_not_handed_out_again() {
+        let runs = tempfile::tempdir().expect("temp dir");
+        let first = runs.path().join("run-1");
+        std::fs::create_dir_all(&first).expect("run dir");
+        let claimed = FIRST_GUEST_CID + 2;
+        std::fs::write(first.join("cid"), claimed.to_string()).expect("cid file");
+
+        let second = runs.path().join("run-2");
+        std::fs::create_dir_all(&second).expect("run dir");
+        let cid = get_free_cid(runs.path(), &second).expect("the allocation");
+
+        assert_eq!(
+            cid,
+            claimed + 1,
+            "a CID another run directory already uses must not be handed out twice"
+        );
+        assert_eq!(
+            std::fs::read_to_string(first.join("cid")).expect("the first cid file"),
+            claimed.to_string(),
+            "allocating a CID must not rewrite another run directory's claim"
+        );
+        assert_eq!(
+            std::fs::read_to_string(second.join("cid")).expect("the second cid file"),
+            cid.to_string()
+        );
+    }
+
     /// A `cid` file nobody can parse is reported with the file it came from.
     #[test]
     fn test_an_unparsable_cid_names_the_file_it_came_from() {
@@ -1925,6 +1970,33 @@ mod tests {
         assert_eq!(parse_lease_expiry(""), "");
     }
 
+    /// A column that is merely eight characters long is not a clock time.
+    ///
+    /// `parse_lease_expiry` returns a string that is later *compared* to rank two leases of the
+    /// same MAC, so a token that is not `HH:MM:SS` cannot be admitted: it sorts among the real
+    /// timestamps, and a row carrying no usable expiry then beats the row that has one.
+    #[test]
+    fn test_parse_lease_expiry_refuses_a_column_that_only_looks_like_a_time() {
+        for line in [
+            "2026-11-12 0935aabb   52:54:00:aa:bb:cc   ipv4   192.168.221.42/24",
+            "2026-11-12 09:35   52:54:00:aa:bb:cc   ipv4   192.168.221.42/24",
+            "2026-11-12 09:35:0a   52:54:00:aa:bb:cc   ipv4   192.168.221.42/24",
+            "2026-11-12 9:35:00   52:54:00:aa:bb:cc   ipv4   192.168.221.42/24",
+            "2026-11-12 09:35000   52:54:00:aa:bb:cc   ipv4   192.168.221.42/24",
+        ] {
+            assert_eq!(
+                parse_lease_expiry(line),
+                "",
+                "a column that is not `HH:MM:SS` is not an expiry: {line}"
+            );
+        }
+        assert_eq!(
+            parse_lease_expiry("2026-11-12 09:35:00   52:54:00:aa:bb:cc"),
+            "2026-11-12 09:35:00",
+            "the real format still parses"
+        );
+    }
+
     #[test]
     fn test_parse_lease_expiry_recognizes_a_lease_that_never_expires() {
         // `virsh` prints `infinite` for a static host entry. It is still a lease row, so it
@@ -1934,6 +2006,44 @@ mod tests {
             "infinite"
         );
         assert_eq!(parse_lease_expiry("Infinite"), "infinite");
+    }
+
+    /// The logged command line has to keep an argument an argument.
+    ///
+    /// `CommandExt::to_string` exists so the `debug!` lines that announce `qemu-img` and
+    /// `xorriso` show something an operator can paste back into a shell. Qlean's own data
+    /// directory is `~/Library/Application Support/qlean` on macOS, so every overlay and seed
+    /// path under it holds a space: printed inside one `"` pair they are one argument, and
+    /// printed bare they read as two. An empty argument is the same defect in the other
+    /// direction - it vanishes from the line, so the paste drops an argument that mattered.
+    #[test]
+    fn test_a_logged_command_keeps_each_argument_separate() {
+        let mut command = tokio::process::Command::new("qemu-img");
+        command
+            .arg("create")
+            .arg("-b")
+            .arg("/Users/me/Library/Application Support/qlean/base.qcow2")
+            .arg("")
+            .arg("a\tb")
+            .arg("plain");
+
+        let line = command.to_string();
+        assert!(
+            line.contains("\"/Users/me/Library/Application Support/qlean/base.qcow2\""),
+            "an argument with a space is quoted: {line}"
+        );
+        assert!(
+            line.contains("\"\""),
+            "an empty argument stays visible: {line}"
+        );
+        assert!(
+            line.contains("\"a\tb\""),
+            "an argument with a tab is quoted too: {line}"
+        );
+        assert!(
+            line.ends_with(" plain"),
+            "an argument with no whitespace is printed as it is: {line}"
+        );
     }
 
     #[test]
