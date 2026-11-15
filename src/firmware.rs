@@ -3682,6 +3682,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The override branch refuses two things that are not a firmware pair.
+    ///
+    /// Both refusals are the *only* thing standing between a mistyped variable and a QEMU
+    /// launch that fails far from its cause, and neither was pinned (R263): dropping either
+    /// `is_file` left the suite green. The vars one is the dangerous half - a directory there
+    /// passes `pflash_image_problem`, because a directory's length is a multiple of 0x1000,
+    /// so with a code image that carries no `secboot` marker the directory became the guest's
+    /// vars pflash and QEMU reported a firmware error that never named the variable.
+    #[test]
+    fn test_ovmf_override_refuses_what_is_not_a_pair() {
+        let root = temp_dir("r263-ovmf-override-shape");
+        let dir = root.join("firmware.d");
+        std::fs::create_dir(&dir).expect("create the directory both halves point at");
+        let code = root.join("OVMF_CODE.fd");
+        std::fs::write(&code, vec![0u8; 0x40_0000]).expect("write the code image");
+        let pair = |code: Option<&Path>, vars: Option<&Path>| {
+            resolve_ovmf_pair(
+                code.map(|path| path.display().to_string()),
+                vars.map(|path| path.display().to_string()),
+            )
+        };
+
+        // A directory where the code image belongs.
+        let error = pair(Some(&dir), Some(&code)).expect_err("a directory is not a code image");
+        let message = error.to_string();
+        assert!(message.contains(ENV_OVMF_CODE), "{message}");
+        assert!(message.contains(&dir.display().to_string()), "{message}");
+
+        // A directory where the vars template belongs. The code image has no `secboot`
+        // marker, so nothing downstream would have refused it either.
+        let error = pair(Some(&code), Some(&dir)).expect_err("a directory is not a vars template");
+        let message = error.to_string();
+        assert!(message.contains(ENV_OVMF_VARS), "{message}");
+        assert!(message.contains(&dir.display().to_string()), "{message}");
+
+        // One half alone: the reader is told both variables are set together, not left with
+        // a resolver that quietly looked at the host layout instead. Checked in both
+        // directions, because `(Some, None)` and `(None, Some)` are separate match arms.
+        for error in [
+            pair(Some(&code), None).expect_err("half a pair is not a pair"),
+            pair(None, Some(&code)).expect_err("half a pair is not a pair"),
+        ] {
+            let message = error.to_string();
+            assert!(message.contains(ENV_OVMF_CODE), "{message}");
+            assert!(message.contains(ENV_OVMF_VARS), "{message}");
+            assert!(message.contains("set together"), "{message}");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A broken image earlier in the layout list does not hide a usable pair after it.
     #[test]
     fn test_resolve_ovmf_skips_an_image_qemu_cannot_use() {
