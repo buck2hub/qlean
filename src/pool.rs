@@ -104,12 +104,27 @@ impl MachinePool {
         config: &MachineConfig,
     ) -> Result<()> {
         let name = name.as_ref();
-        if self.pool.contains_key(name) {
-            bail!("Machine with name '{}' already exists in the pool", name);
-        }
         let machine = Machine::new(image, config).await?;
-        self.pool.insert(name.to_owned(), Mutex::new(machine));
-        Ok(())
+        self.insert_machine(name, machine)
+    }
+
+    /// Give `machine` the name `name`, refusing a name another machine already holds.
+    ///
+    /// The claim goes through `Entry` instead of `if contains_key { bail }` followed by
+    /// `insert`: that pair left a second `insert` able to replace a machine that was already
+    /// in the pool, and dropping a `Machine` tears its QEMU down - so a duplicate `add` would
+    /// have killed the guest of the machine under that name and reported success.
+    fn insert_machine(&mut self, name: &str, machine: Machine) -> Result<()> {
+        match self.pool.entry(name.to_owned()) {
+            std::collections::hash_map::Entry::Occupied(occupied) => bail!(
+                "Machine with name '{}' already exists in the pool",
+                occupied.key()
+            ),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(Mutex::new(machine));
+                Ok(())
+            }
+        }
     }
 
     /// Get a mutable reference to a machine by name.
@@ -216,6 +231,22 @@ impl MachinePool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The source of `MachinePool::name`, up to the closing brace of its body.
+    ///
+    /// The pool loop bodies are the thing under guard here: each one is a wiring choice that a
+    /// copy-paste or a deleted `if` can invert without changing any signature.
+    fn pool_fn_source(name: &str) -> &'static str {
+        let source = include_str!("pool.rs");
+        let start = source
+            .find(&format!("pub async fn {name}"))
+            .unwrap_or_else(|| panic!("`{name}` is gone from the pool"));
+        let rest = &source[start..];
+        let end = rest
+            .find("\n    }\n")
+            .unwrap_or_else(|| panic!("`{name}` has no closing brace"));
+        &rest[..end]
+    }
 
     fn ok_task(name: &str) -> (String, PoolTask<'static>) {
         (name.to_string(), Box::pin(async { Ok(()) }))
@@ -401,20 +432,8 @@ mod tests {
     /// read as correct while sending one of the two cases down the wrong path.
     #[test]
     fn each_pool_entry_point_asks_its_own_question() {
-        let source = include_str!("pool.rs");
-        let body_of = |name: &str| -> &str {
-            let start = source
-                .find(&format!("pub async fn {name}"))
-                .unwrap_or_else(|| panic!("`{name}` is gone from the pool"));
-            let rest = &source[start..];
-            let end = rest
-                .find("\n    }\n")
-                .unwrap_or_else(|| panic!("`{name}` has no closing brace"));
-            &rest[..end]
-        };
-
-        let init_all = body_of("init_all");
-        let spawn_all = body_of("spawn_all");
+        let init_all = pool_fn_source("init_all");
+        let spawn_all = pool_fn_source("spawn_all");
         assert!(
             init_all.contains(".wants_init()") && !init_all.contains(".needs_first_boot()"),
             "`init_all` must route through `wants_init`"
@@ -423,6 +442,80 @@ mod tests {
             spawn_all.contains(".needs_first_boot()") && !spawn_all.contains(".wants_init()"),
             "`spawn_all` must route through `needs_first_boot`"
         );
+        // Both entry points ask the question *only* about a machine that is not already up.
+        // Without that gate `init_all` re-initialises a running guest, which `init` refuses
+        // with "already running", so a pool that is already up answers its own `init_all`
+        // with a failure for every machine.
+        for (name, body) in [("init_all", init_all), ("spawn_all", spawn_all)] {
+            assert!(
+                body.contains("if !m.is_running().await? {"),
+                "`{name}` must leave an already-running machine alone"
+            );
+            let gate = body
+                .find("if !m.is_running().await? {")
+                .expect("the gate was just asserted to be there");
+            let question = body
+                .find(if name == "init_all" {
+                    ".wants_init()"
+                } else {
+                    ".needs_first_boot()"
+                })
+                .expect("the question was just asserted to be there");
+            assert!(
+                gate < question,
+                "`{name}` must probe liveness before it decides which start to run"
+            );
+        }
+    }
+
+    /// A machine whose liveness cannot be read is the one that most needs shutting down.
+    ///
+    /// `shutdown_step` already answers `ShutDownWithoutLiveness` for a failed probe; the
+    /// remaining way to get this wrong is in the pool loop, where that arm can quietly become
+    /// `Ok(())` - leaving a hung QEMU for `Drop`, which SIGKILLs it.
+    #[test]
+    fn the_pool_shuts_down_a_machine_whose_liveness_is_unknown() {
+        let shutdown_all = pool_fn_source("shutdown_all");
+        assert!(
+            shutdown_all.contains("ShutdownStep::ShutDownWithoutLiveness { reason } =>"),
+            "`shutdown_all` must still carry the reason a probe failed into its error"
+        );
+        assert!(
+            shutdown_all.contains("m.shutdown_if_started().await.map_err("),
+            "a machine whose liveness is unknown must still be shut down"
+        );
+        assert!(
+            !shutdown_all.contains("=> Ok(())") || shutdown_all.matches("=> Ok(())").count() == 1,
+            "only the already-down arm may skip the shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_can_only_belong_to_one_machine() {
+        // `add` used to check `contains_key` and then `insert`, so a duplicate name replaced
+        // the machine already there. Dropping that machine tears its QEMU down: the second
+        // `add` killed the guest under that name and reported success.
+        let mut pool = MachinePool::new();
+        pool.insert_machine("vm", Machine::never_started_for_tests())
+            .expect("the first machine may claim the name");
+
+        let error = pool
+            .insert_machine("vm", Machine::never_started_for_tests())
+            .expect_err("the second machine may not take a name that is taken");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("vm") && message.contains("already exists"),
+            "the refusal must name the machine that holds the name: {message}"
+        );
+        assert_eq!(
+            pool.pool.len(),
+            1,
+            "the refused machine must not have replaced the one that holds the name"
+        );
+
+        pool.insert_machine("vm2", Machine::never_started_for_tests())
+            .expect("another name is still claimable");
+        assert_eq!(pool.pool.len(), 2, "a free name must still be claimable");
     }
 
     #[tokio::test]
