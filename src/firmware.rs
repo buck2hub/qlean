@@ -2441,14 +2441,13 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(gone, "the fake has to leave the process table");
-        let error = match Swtpm::start(&run_dir).await {
-            Ok(_) => panic!("`swtpm` is not installed on this host"),
-            Err(error) => error.to_string(),
-        };
-        assert!(
-            !error.contains(&format!("pid {pid}")),
-            "a gone process is not an owner: {error}"
-        );
+        match Swtpm::start(&run_dir).await {
+            Ok(mut tpm) => assert!(tpm.stop().await, "stop the replacement TPM"),
+            Err(error) => assert!(
+                !error.to_string().contains(&format!("pid {pid}")),
+                "a gone process is not an owner: {error}"
+            ),
+        }
 
         drop(listener);
         let _ = std::fs::remove_dir_all(&root);

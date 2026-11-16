@@ -718,6 +718,12 @@ impl Machine {
         // Before anything is written: a config QEMU cannot interpret must not leave a run
         // directory (or a half-created overlay) behind.
         config.validate()?;
+        // `Machine::new` is a public entry point, not only `with_machine`. A Windows guest is
+        // reached through the `qlean` libvirt network, so the bridge has to exist before QEMU
+        // is launched; otherwise QEMU exits with `bridge helper failed` and the guest never
+        // gets an address. `with_machine` asks the same question first, and the check is
+        // idempotent.
+        crate::utils::ensure_prerequisites(image.guest_os()).await?;
         // A host that cannot run the guest must say so before it writes anything. This used to
         // run after the overlay was created, so a bare host failed on `qemu-img` (a program
         // that was not even part of the prerequisite list) and learned about OVMF, the TPM and
@@ -1253,9 +1259,9 @@ StandardError=journal
 
     /// Execute a command on the machine and return the output.
     ///
-    /// The command string is passed through verbatim: Linux guests run it in their
-    /// configured shell, Windows guests in PowerShell (see `README`), and no argument
-    /// escaping is applied on either path.
+    /// The user's script text is preserved without argument escaping. Linux guests run it
+    /// in their configured shell; Windows guests run it in PowerShell with an appended
+    /// exit-status epilogue that preserves native failures (see `README`).
     pub async fn exec<S: AsRef<str>>(&mut self, cmd: S) -> Result<Output> {
         let cmd_ref = cmd.as_ref();
         if cmd_ref.trim().is_empty() {
@@ -1264,8 +1270,11 @@ StandardError=journal
             );
         }
         info!("🧬 Executing command `{}` on VM-{}", cmd_ref, self.id);
+        // Windows uses PowerShell as the SSH shell, which collapses a native nonzero status to 1
+        // unless the command preserves `$LASTEXITCODE`. Linux commands pass through unchanged.
+        let command = crate::exec::command_for_guest(self.image.guest_os, cmd_ref);
         let (ssh, cancel_token) = self.get_ssh("run a command")?;
-        let (exit_code, stdout, stderr) = ssh.call_with_output(cmd_ref, cancel_token).await?;
+        let (exit_code, stdout, stderr) = ssh.call_with_output(&command, cancel_token).await?;
 
         Ok(Output {
             status: crate::exec::exit_status_from_code(cmd_ref, exit_code)?,

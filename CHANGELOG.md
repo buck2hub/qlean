@@ -5,7 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - 2026-11-16
+
+### Migration
+
+- `ImageConfig` gained the `guest_os` field, so a struct literal written without
+  `..ImageConfig::default()` no longer compiles. Migrate to
+  `ImageConfig { guest_os, ..ImageConfig::default() }` or the builder chain
+  (`ImageConfig::default().with_guest_os(...)`); the default keeps `GuestOs::Linux` and
+  existing builder behavior is unchanged.
+- Linux runtime behavior changed in two places and needs caller adaptation: `exec` now
+  reports the real exit status (non-zero is a failure, and codes outside `0..=255` are an
+  error rather than being truncated), and empty or whitespace-only commands are rejected
+  before any SSH request is sent.
+- Windows guests are supported on amd64 only and require an explicit `source` and
+  `digest` — there is no built-in Windows image catalog. A Windows image must already be
+  generalized and ship a first-boot task that consumes Qlean's seed medium; see the
+  "Windows image contract" in the README.
+
 
 ### Added
 
@@ -55,6 +72,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not treated as free: the rename is not sent.
 
 ### Fixed
+- `Machine::new` on a Windows guest no longer launches QEMU onto a bridge that was never
+  created. The libvirt network that supplies the guest's DHCP lease was only ensured by
+  `with_machine`/`with_pool`, so calling `Machine::new` directly (as the Windows smoke tests
+  do) reached `qemu-system-x86_64 -netdev bridge,br=qlbr0` with no `qlbr0` and failed with
+  `bridge helper failed`. The constructor now runs the same idempotent prerequisite check
+  (including `ensure_network`) before writing any run directory, so the bridge and the
+  lease table exist before the guest boots.
+- Windows `exec` no longer reports a native command's exit code as 1. PowerShell's implicit
+  `-Command` completion collapses every nonzero native status to 1, so `cmd /c exit 3` came
+  back as 1 and `cmd /c exit 300` could not be told apart from an ordinary failure. `exec`
+  now appends an exit-status epilogue in the same PowerShell process, so the retained native
+  code reaches the caller unchanged for `0..=255`, and larger codes are rejected with an
+  actionable error instead of being truncated. The user's script text is preserved without
+  re-quoting or starting a second shell; Linux commands still pass through unchanged.
 - A host where the process table cannot be read (`hidepid=2`, a chroot, a sandbox) was told that
   every QEMU had exited. The liveness readers answered `None`/`false` both for "there is no such
   process" and for "I could not read it", so `Machine::shutdown` reported a clean stop and cleared

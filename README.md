@@ -205,9 +205,14 @@ Windows guests have no vsock, so Qlean reaches them over the libvirt NAT network
 
 #### Windows command execution
 
-`Machine::exec` sends the command string to the guest's shell **verbatim**: no argument
-escaping, no re-quoting and no POSIX translation is applied on any guest OS. Windows
-guests run it in PowerShell (see the image contract above), so write PowerShell syntax:
+`Machine::exec` preserves your script text **verbatim**: no argument escaping,
+re-quoting or POSIX translation is applied. Linux sends it unchanged; Windows appends
+an exit-status epilogue in the same PowerShell process. When execution reaches that
+epilogue, a successful last command returns 0; otherwise a retained nonzero
+`$LASTEXITCODE` is returned, or 1 if none exists. This also applies when a native
+failure is followed by a nonterminating PowerShell error. Explicit `exit` and
+terminating errors keep PowerShell's own behavior. Windows guests use PowerShell
+(see the image contract above), so write PowerShell syntax:
 
 ```rust
 let out = machine.exec(r#"Write-Output "hello from $env:COMPUTERNAME""#).await?;
@@ -518,19 +523,21 @@ records `guest_os`: metadata written before this field existed defaults to `Linu
 and a cache entry whose recorded OS does not match the request is rejected instead
 of being handed to the wrong guest.
 
-> **Status:** Windows guest support is implemented on `main` but not released or
-> supported yet. The `GuestOs` dimension, OVMF/TPM lifecycle, first-boot deployment,
-> transport, `exec`, `get_ip` and file semantics are all in the tree, but the plan's
-> core acceptance needs real Windows KVM smoke evidence that has not been recorded
-> yet, so the support matrix below still claims Linux only and 0.4.0 is unpublished.
+> **Status:** Windows guest support is implemented and verified on a real KVM host.
+> The seven `windows_*` smoke tests all passed against a generalized
+> **Windows 11 Enterprise Evaluation 10.0.26300.9457** qcow2 (UEFI + a per-VM TPM 2.0,
+> Secure Boot **disabled** because the host ships no Microsoft-enrolled OVMF vars
+> template). Only that exact build and configuration is covered by this evidence; other
+> Windows versions are not claimed until they are measured the same way.
 
 Support matrix — a guest OS is claimed only when its core smoke tests have been recorded
 on a real KVM host:
 
-| Guest OS | Crate state | Claimed support | Missing evidence |
+| Guest OS | Crate state | Claimed support | Verified configuration |
 |---|---|---|---|
-| Linux (built-in catalog) | released (`0.3.1`) | yes | — |
-| Windows 10 / 11 (`GuestOs::Windows`) | on `main`, unreleased | **no** | the seven `windows_*` smoke tests, which need a licensed qcow2 and a KVM host |
+| Linux (built-in catalog) | released (`0.4.0`) | yes | — |
+| Windows 11 Enterprise Evaluation 10.0.26300.9457 (`GuestOs::Windows`) | released (`0.4.0`) | yes (this build only) | amd64, UEFI + per-VM TPM 2.0, Secure Boot disabled; all seven `windows_*` smokes green on KVM |
+| Windows 10 and other Windows 11 builds | not verified | **no** | a licensed qcow2 and a recorded KVM run for each build |
 
 ### Image Interface
 

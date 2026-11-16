@@ -1494,10 +1494,10 @@ mod upload_staging_tests {
         const SSH: &str = include_str!("../src/ssh.rs");
 
         let unreleased = CHANGELOG
-            .split("## [Unreleased]")
+            .split("## [0.4.0]")
             .nth(1)
             .and_then(|rest| rest.split("\n## [").next())
-            .expect("the changelog must still have an [Unreleased] section");
+            .expect("the changelog must still have a [0.4.0] section");
         let flat = unreleased.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
             flat.contains("An upload to a file directly under a Windows drive root"),
@@ -2092,10 +2092,10 @@ mod download_tree_tests {
         );
 
         let unreleased = CHANGELOG
-            .split("## [Unreleased]")
+            .split("## [0.4.0]")
             .nth(1)
             .and_then(|rest| rest.split("\n## [").next())
-            .expect("the changelog must still have an [Unreleased] section");
+            .expect("the changelog must still have a [0.4.0] section");
         let flat = unreleased.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
             flat.contains("A directory download that failed"),

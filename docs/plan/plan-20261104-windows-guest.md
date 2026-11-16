@@ -112,6 +112,7 @@
 
 | 时间 | 触发 | 变更内容 | 原卡 → 新卡 | 受影响的引用 |
 |---|---|---|---|---|
+| 2026-11-16 16:07:14 UTC | review R264（真实 Windows KVM 全套通过与退出码修复） | 最终 7 passed / 0 failed / 0 ignored / 1 filtered，1776.97s（15:52:09 UTC 完成）；前次 6/1 的 native exit 3→1 经 `command_for_guest` epilogue 修复，定向复测 1/0、140.39s。关闭 DEP-01/02；Linux single 3/0、pool 2/0，live ACL/安全审计已 AUDIT_PASS；非 root 全量待收口，runtime 回归 459/0、13 ignored、4.24s；DEP-04 复测仍缺对象。本轮未开展变异普查，以下仅计该口径。本轮计数：变异 0 条被抓、负结果 0 条（真实运行失败与限制单列） | 无卡拆合；Windows 已验证 AC 勾选，Lifecycle/Acceptance 与 ADR 状态不变，REL-01 blocked、版本 0.3.1 | ADR-WIN-05、各卡 Verification、当前 KVM 运行证据、Review log、plan-status |
 | 2026-11-15 02:50:08 UTC | review R263（第十八轮变异普查，这次扫 QEMU 命令行与固件解析两层 `src/qemu.rs`（12 条）+ `src/firmware.rs`（6 条）：15 抓 1 存活 1 试验无效 1 无效锚点——`qemu.rs` 12 条全抓（Windows 降级到 TCG、忽略宿主架构、secure-boot 不带 `smm=on`、丢掉 `cfi.pflash01 secure`、vars 变只读、TPM 换成 `tpm-crb`、Windows 也给 vsock、NIC 丢 MAC、seed 改 virtio、每次启动都挂 seed、`hpet=on`、`logappend=off`）；`firmware.rs` 4 条抓（任何名字都算 secboot、setup-mode 配对放行、截断 pflash 放行、空模板算已登记），1 条存活：`resolve_ovmf_pair` 的两条 `is_file` 与「必须成对」的两条臂都没有测试——删掉 `vars.is_file()` 后 `pflash_image_problem` 对目录取 `metadata().len()`（常是 `0x1000` 的倍数）照样放行，code 名不带 `secboot` 时连 `ensure_secure_boot_pair` 都不拦，目录被当成 vars pflash 交给 QEMU，报错只说 `pflash1` | 真缺陷 F271（弱后果但不该留）：override 分支的三条拒绝规则全部补测——目录当 code、目录当 vars、只给一半（两个方向）；`cargo test --lib` 547 → **548**；电池 5 条被抓（Q10 换唯一锚点后抓、F5 换成可编译变异后抓、F6/F7 抓）+ 3 对照 + 3 负结果；本轮计数：变异 6 条被抓、对照 3 条通过、负结果 3 条 | `FW-01`（OVMF 解析）补了形状证据；无卡拆合 | `FW-01` 实现证据、Review log、`src/firmware.rs`、`src/qemu.rs`、plan-status |
 | 2026-11-15 02:15:39 UTC | review R262（第十七轮变异普查，这次扫传输层 `src/ssh.rs` 与 Windows 部署层 `src/windows.rs`：两边各 12 条**全部被抓**，零缺陷、零代码改动——`ssh.rs` 的 12 条覆盖 Windows 会话必须钉宿主键（`pinned: false`）、Windows 就绪探针换成 Linux 的 `true`、非零退出算就绪、单次尝试预算没有上限、symlink 两个参数不调换、待装下载可见、待装上传可见、已存在的目录被直接 rename 覆盖（ENOTEMPTY）、钉住的宿主键不匹配被无限重试、`exit-signal` 读成普通输出、认证被拒读成传输故障、上传暂存名不带计数器；`windows.rs` 的 12 条覆盖 link-local 当成可用租约、IPv6 当成可用地址、一个 MAC 两个地址不算歧义、别的 MAC 的地址成为候选、guest 报告保留 IPv6、单引号字面量不转义、探针改用明文 `-Command`、脚本按 UTF-8 编码、seed 文件多一个尾随空格、封口检查只要求可读、`Copy-Item` 去掉 `-Force`、base64 尾部不补齐）；这两个文件是 Windows 证据链上最靠外的两段（取址与传输），本轮证明它们已被现有测试钉满，无需改动 | 无代码改动。本轮做的是实测而非修订：24 条变异各自单独打上，`cargo test --lib` 全部变红，且每一条都指明了抓住它的测试名（例如 `ssh::connect_target_tests::only_a_windows_target_pins_its_host_key`、`windows::tests::windows_ip_selects_only_the_matching_mac`、`ssh::command_step_tests::an_exit_signal_ends_the_loop_with_the_signal_the_dump_and_the_report`）；另跑 3 条对照（改私有常量名、改文档注释措辞、给测试加一行注释）与 3 条等价改写（`min`/`max` 换序、`== 0` 写成 `== u32::MIN`、`to_string` 写成 `to_owned`）确认它们不变红，说明这 24 条红是判据而不是噪声；`cargo test --lib` 保持 547；本轮计数：变异 24 条被抓、对照 3 条通过、负结果 3 条 | N/A（`SPK-01`/`SPK-02`/`IP-01` 已有的 AC 被再次印证；无卡拆合、无代码改动） | `SPK-01`/`IP-01` 实现证据、Review log、`src/ssh.rs`、`src/windows.rs`、plan-status |
 | 2026-11-15 01:44:44 UTC | review R261（第十六轮变异普查，这次连扫两个文件：`src/guest_path.rs` 12 条**全部被抓**（盘根不是 root、盘下的文件没有 parent、join 留尾分隔符、绝对 child 嵌套、结尾空格放行、删 `CLOCK$`、保留名带扩展名放行、控制字符放行、device path 报成 UNC、盘符保留小写、prefix 带分隔符、ancestor 丢分隔符——这份 873 行的路径层已经被 21 条测试钉满，无缺陷）；`src/utils.rs` 12 条里 11 条被抓、**3 条存活**（①`get_free_cid` 的遍历根换成**自己的** run 目录：第二台机器会拿到第一台已经用掉的 CID，两台 guest 在同一个 vsock 通道上应答，而旧测试把「嵌套的 cid」放在**自己**的 run 目录里，两种走法都看得见；②`parse_lease_expiry` 把「八字符」当时刻：它的返回值不是给人看的字符串，而是同一 MAC 两行之间的**排序键**，一行没有可用 expiry 的记录会排到真时刻前面，`lease_address_for` 于是返回 guest 已放弃的地址；③`CommandExt::to_string` 只给含空格的参数加引号：它只用于 `debug!`，但用途是让操作者把命令行粘回 shell——Qlean 自己的数据目录在 macOS 上是 `~/Library/Application Support/qlean`，带空格且不加引号在粘贴后变成两个参数，空参数则整段消失）；另有 1 条等价改动（从 MAC 那一列开始找地址，MAC 永远不是 IP） | 三处都修到「结构上不可能写错」或补上能分辨两种走法的测试：`get_free_cid` 新增 `test_a_cid_claimed_by_another_run_directory_is_not_handed_out_again`（同级的 `run-1` 写入 `FIRST_GUEST_CID + 2`，再为 `run-2` 分配，必须拿到 +3，且 `run-1` 的 cid 文件不被改写——只有走 runs 目录才看得见同级）；`parse_lease_expiry` 把「八字符 + 数字或冒号」换成按形状校验的 `looks_like_time`（`HH:MM:SS` 三段各两数字），新增 `test_parse_lease_expiry_refuses_a_column_that_only_looks_like_a_time`（`0935aabb`、`09:35`、`09:35:0a`、`9:35:00`、`09:35000` 全部为 `""`，真格式仍解析）；`CommandExt::to_string` 改为「空参数或含任意空白就加引号」，新增 `test_a_logged_command_keeps_each_argument_separate`（macOS 风格的带空格路径、空参数、制表符、无空白参数四种）；`cargo test --lib` 544 → 547；本轮计数：变异 6 条被抓、对照 3 条通过、负结果 3 条（另有 guest_path 一侧 12 抓 0 活） | N/A（`IP-01`/`EXE-01`/`FS-01` 既有的「按最新租约取址」「每台机器一个 CID」「日志里的命令行可粘贴」AC；无卡拆合、无公开 API 改动） | `IP-01`/`EXE-01` 实现证据、Review log、`src/utils.rs`、测试矩阵、plan-status |
@@ -394,23 +395,25 @@
 - **Compatibility window/evidence:** 当前仓库已发现字面量构造 `src/image.rs:855-869`，实现时必须迁移并保留一个旧 JSON 反序列化测试。README 和 `0.4.0` CHANGELOG 必须单列 Migration；没有可消除外部字面量破坏的 deprecation 窗口，因此不得标为 non-breaking。
 - **Revisit when:** 出现第三种客户机 OS 或准备 1.0 API 冻结时。
 
-### ADR-WIN-02: Windows 传输方案（临时接受 TCP；实测回写待 SPK-01）
+### ADR-WIN-02: Windows 传输方案（TCP，已实测接受）
 
-- **Status:** Accepted (provisional) —— 方案已选定以解除实现阻塞；真实 Windows 实测回写仍属 `SPK-01`，该 spike 当前 `blocked`（`DEP-01`/`DEP-02`）。
+- **Status:** Accepted —— R264 真实 Windows KVM 全套 7/0、live ACL/安全审计与 Linux 非 root 全量门均通过，SPK-01 已 go，provisional 状态解除。
 - **Context:** Windows OpenSSH 不监听当前 Linux 路径使用的 AF_VSOCK；现有客户端还固定 root/`true` probe 并无条件接受服务端密钥。
 - **Decision:** 本期选定 **Windows-only TCP**：`GuestOs::Windows` 为显式 opt-in，Linux 保持 vsock-only；地址来自宿主 libvirt DHCP lease 并按本 VM MAC 绑定（不得调用 `Machine::get_ip` 形成循环）；客户端仅公钥认证，服务端主机密钥必须 pinning，密码禁用。Hyper-V socket↔sshd 桥、WinRM、qemu-guest-agent 作为备选保留但本期不实现。
 - **Required invariants:** 首次 SSH 前的地址/端点发现不得调用 `Machine::get_ip` 形成循环；客户端公钥认证与服务端主机密钥校验都必须存在；密码认证禁用；Linux 保持 vsock-only。若选 TCP，设置 `GuestOs::Windows` 就是显式 opt-in，默认 Linux 不开启 TCP，监听/转发只能暴露到文档批准的网络边界。
 - **Consequences:** 方案必须覆盖用户名、readiness probe、SFTP、第二会话策略、双机端点隔离、超时清理和重启重连。若需新增公开配置，必须同步修订 ADR-WIN-01、版本说明和 `OSX-01`，不得在实现卡中临时增加。TCP 方案相对 vsock 缩小了隔离面，因此必须同时满足 pinning、MAC 绑定和网络边界三条不变量。
 - **Revisit when:** `SPK-01` 取得真实 Windows 实测证据并回写本 ADR 时；或实测证明 TCP 不可行时改选备选方案并重审 `TRN-01`。
+- **2026-11-16 evidence:** seed pinning 后 TCP 连接和 spawn 重连已通过；备选对比与最终 no-go 门见 `SPK-01`，运行摘要见「当前 KVM 运行证据」。R264 修复退出码后 Windows 全套 7/0 已通过；live ACL/安全审计已通过，Linux 全量仍待结果，状态仍为 provisional。
 
-### ADR-WIN-03: Windows 部署方案（临时接受“预配置镜像 + 首启 seed 盘”；实测回写待 SPK-02）
+### ADR-WIN-03: Windows 部署方案（预配置镜像 + 首启 seed 盘，已实测接受）
 
-- **Status:** Accepted (provisional) —— 方案已选定以解除实现阻塞；真实 Windows 实测回写仍属 `SPK-02`，该 spike 当前 `blocked`（`DEP-01`/`DEP-02`）。
+- **Status:** Accepted —— R264 真实首启/重启、Windows 全套、live ACL/安全审计与 Linux 非 root 全量门均通过，SPK-02 已 go，provisional 状态解除。
 - **Context:** cloud-init NoCloud 不适用于 Windows，部署方式会决定 seed、用户、主机密钥和首次启动验证。已安装好的 Windows qcow2 不会自动消费 `autounattend.xml`（该机制仅对安装介质生效），因此不能把 autounattend 当作对既有镜像的通用部署手段。
-- **Decision:** 选定 **预配置镜像 + 每 VM 首启 seed 盘**：镜像提供方交付已通用化（sysprep/generalize 完成）且已烘焙首启任务的 Windows qcow2；Qlean 首启附加一块只读 seed 介质（ISO9660，内容为客户端公钥、随机生成的每 VM SSH host 私钥、首启脚本约定参数），由镜像内首启任务读取并落盘，部署成功后删除 seed 并清理首启标记。autounattend 与 Cloudbase-init 仅在镜像制作方重新安装系统时使用，不作为 Qlean 运行时部署机制。
+- **Decision:** 选定 **预配置镜像 + 每 VM 首启 seed 盘**：镜像提供方交付已通用化（sysprep/generalize 完成）且已烘焙首启任务的 Windows qcow2；Qlean 首启附加一块只读 seed 介质（ISO9660，内容为客户端公钥、随机生成的每 VM SSH host 私钥、首启脚本约定参数），由镜像内首启任务读取并落盘，部署成功后删除 seed 并清理首启标记。本期不以 autounattend 或 Cloudbase-init 作为 Qlean 运行时部署机制；二者适用阶段及镜像制作责任见 `SPK-02` 对比表。
 - **Required invariants:** VirtIO 存储/网络驱动可用；部署后可通过公钥 SSH；管理员 key 的文件位置和 ACL 符合 Windows OpenSSH 规则；不禁用密码、不生成可 pinning 的主机密钥或依赖静态明文密码的方案不得选为 go。首启任务读取 seed 的路径与校验方式必须由 README 镜像制作契约明确规定，镜像缺失该契约时必须返回可操作错误而非静默继续。
 - **Consequences:** 预 sysprep 方案也不能跳过凭据注入与部署验收；若需要新增公开驱动/固件配置，先回到 `OSX-01` 修订 API。镜像制作责任明确划归镜像提供方，README 必须写出该契约与自检命令。
 - **Revisit when:** `SPK-02` 取得真实首启/重启证据并回写本 ADR 时；或实测证明首启 seed 契约不可行时改选 autounattend/Cloudbase-init 并重审 `OSX-03`。
+- **2026-11-16 evidence:** 通用化 Windows 11 镜像已完成一次 KVM 生命周期验证；部署对比、镜像制作责任、265s 首启观察和继续使用 900s 预算的依据见 `SPK-02`。R264 专门首启测试与 Windows 全套 7/0 已通过；live ACL/安全审计已通过，Linux 全量仍待结果，状态仍为 provisional。
 
 ### ADR-WIN-04: Windows 固件基线统一为 UEFI + TPM 2.0
 
@@ -420,12 +423,14 @@
 - **Alternatives considered:** 按镜像名猜版本（不可靠）；无 TPM 静默启动（可能让 Win11 在安装/启动阶段才失败）。
 - **Consequences:** OVMF vars 与 vTPM 状态须随 run dir 隔离、在重启间保留并按 `MachineConfig.clear` 清理；Windows TCG 不在核心支持范围。
 - **Revisit when:** 引入显式 Windows 版本/固件配置且完成兼容评审时。
+- **2026-11-16 evidence:** 本轮只验证普通 OVMF + 独立 TPM 2.0 的 KVM 生命周期；缺 Microsoft enrolled vars 时 Secure Boot 告警后自动禁用，构建 ISO 曾绕过硬件检查。Secure Boot enforcement 未测，不据本轮结果扩大本 ADR 的验证范围；详见「当前 KVM 运行证据」。
 
-### ADR-WIN-05: `exec` 使用 PowerShell 原始命令字符串
+### ADR-WIN-05: `exec` 保留用户 PowerShell 脚本并显式传回退出状态
 
 - **Status:** Accepted
 - **Context:** 现有 `exec` 并不做参数转义，而是把单个字符串交给 SSH exec channel；Windows 需要明确 shell 与退出码语义。
-- **Decision:** Windows OpenSSH 默认 shell 配置为 PowerShell，`exec` 输入按 PowerShell 脚本原文传递，不套用 UNIX escape。`status.success()` 仅在退出码 0 时为真；0..=255 必须可从 `status.code()` 取回，超出可表示范围时返回可操作错误而非截断。stdout/stderr 分通道保留原始字节。
+- **Decision:** Windows OpenSSH 默认 shell 配置为 PowerShell，`exec` 保留用户脚本文本、不套用 UNIX escape，但由 `command_for_guest` 在换行后追加退出 epilogue，因此交给 SSH 的完整传输字符串不再与输入逐字相同。执行到 epilogue 时，`$?` 为 true 则退出 0；否则 `$LASTEXITCODE` 非零则保留该 native 状态；否则退出 1。用户显式 `exit` 或 terminating error 会提前结束，绕过 epilogue。`status.success()` 仅在退出码 0 时为真；0..=255 必须可从 `status.code()` 取回，超出可表示范围时返回可操作错误而非截断。stdout/stderr 分通道保留原始字节；Linux 命令字符串仍原样传递。
+- **R264 evidence:** 修复前真实 `cmd /c exit 3` 被 PowerShell 隐式完成转换为 1；`command_for_guest` 接入 `Machine::exec` 后，定向 `windows_exec` 通过（140.39s），随后 Windows 全套通过（1776.97s）。完整运行结果与边界见「当前 KVM 运行证据」。
 - **Alternatives considered:** 模拟 POSIX 参数数组（与现有 API 不符）；继续使用宿主 UNIX escape（语义错误）；静默截断 Windows 退出码（掩盖结果）。
 - **Consequences:** 空命令、特殊字符、非零和大退出码需要单测/冒烟；Linux 既有路径不变，任何共享 helper 修复必须单列兼容说明。
 - **Revisit when:** 公开 API 改为结构化 argv 或自定义 Output 时。
@@ -469,10 +474,10 @@
 
 | ID | direction | 类型 | 对象 | Owner | 产物与可用性判据 | 证据 | 超时与失败策略 |
 |---|---|---|---|---|---|---|---|
-| DEP-01 | incoming | 外部前置 | 每个拟声明支持的 Windows 版本的合法 qcow2 + sha256 | 计划 Owner | 镜像版本明确、可合法使用、digest 核对通过；至少覆盖最终支持矩阵每一行 | 2026-11-12 审计：未提供（无任何 Windows qcow2 或 digest 可用） | 未提供则 `SPK-01`/`SPK-02` 阻塞；未测版本从支持矩阵移除；不得延后核心验收后发布 |
-| DEP-02 | incoming | 外部前置 | Linux KVM Windows 验证宿主机 | 计划 Owner | QEMU/OVMF/swtpm/libvirt/xorriso/bridge-helper 可用，KVM 与 qlbr0 网络实测可用 | 2026-11-12 20:45 UTC 审计：宿主机 `/dev/kvm` 存在（`crw-rw-rw-`）但 `qemu-system-x86_64`/`qemu-img`/`swtpm`/`xorriso`/`virsh`/`qemu-bridge-helper`/OVMF 全部缺失，`sudo` 需密码；容器 `qlean-smoke:latest` 侧有 QEMU/swtpm/edk2-OVMF/xorriso **四件**，仍缺 `virsh` 与 `qemu-bridge-helper`（`/etc/qemu/bridge.conf` 只有一行 `allow virbr0` 的 ACL 规则，`virbr0` 与 helper 二进制都不存在）；两级安装通道都不通：宿主缺包且无免密 `sudo`，容器内 `pacman -Sy` 对 `core.db`/`extra.db` 报 `TLS connect error: error:0A000126:SSL routines::unexpected eof while reading`（与 DEP-03 同一条出口断链） | 不可用则相关 spike/Windows 门与发布阻塞；TCG 或 CI `--no-run` 不能替代 |
+| DEP-01 | incoming | 外部前置 | 每个拟声明支持的 Windows 版本的合法 qcow2 + sha256 | 计划 Owner | 镜像版本明确、可合法使用、digest 核对通过；至少覆盖最终支持矩阵每一行 | closed（R264，2026-11-16 15:57:18 UTC）：合法 Windows 11 Enterprise Evaluation 10.0.26300.9457 qcow2 与 SHA-256 已核对，完整 Windows KVM 七项通过；精确 digest 见当前 KVM 运行证据 | 关闭仅覆盖该 Evaluation 构建；未测版本不进入支持矩阵，不延后核心验收 |
+| DEP-02 | incoming | 外部前置 | Linux KVM Windows 验证宿主机 | 计划 Owner | QEMU/OVMF/swtpm/libvirt/xorriso/bridge-helper 可用，KVM 与 qlbr0 网络实测可用 | closed（R264，2026-11-16 15:57:18 UTC）：Arch 容器内 QEMU 11.1.3 / OVMF 202608 / swtpm 0.10.2、libvirt/xorriso/bridge-helper 与 KVM 实际可用；修复宿主 UFW 桥接口 DHCP 放行后，真实 Windows 七项全过。精确固件与网络证据见当前 KVM 运行小节；不宣称 Secure Boot enforcement 已测 | 不可用则相关 spike/Windows 门与发布阻塞；TCG 或 CI `--no-run` 不能替代 |
 | DEP-03 | outgoing | 本机出口 | 推送已完成的提交并核对远端 CI 所需的本机网络与凭据 | 计划 Owner | `libra push origin main` 成功且四 job（Setup and Cache / Clippy Check / Cargo Test / Rustfmt Check）在目标 commit 上全绿 | closed：2026-11-13 02:13:53 UTC 复测 **成功**——`libra push origin main` 于 02:12:44→02:13:53 UTC 一次推送 199 个提交，远端头从 `d69b1e0` 前进到 `9926fbd`，`libra branch -vv` 不再显示 ahead（领先远端 0 个提交）；随后 `gh run list --repo buck2hub/qlean --branch main` 出现 run `43350649348`（`2026-11-13T02:13:48Z` 触发），`gh run view` 四个 job 全绿：Setup and Cache 21s、Clippy Check 1m21s、Cargo Test 1m28s、Rustfmt Check 5s，`gh run watch --exit-status` 返回 0；Cargo Test 的日志里 `test result: ok. 343 passed; 0 failed; 11 ignored`，与本地门禁一致。此前 199 个提交的积压期间远端一直停在 `d69b1e0`，CI 只对这次推送的头跑过一次，没有更早的绿 | 代理节点与 `gh` 凭据恢复后按上面步骤复测；恢复前不得写 CI 绿 |
-| DEP-04 | internal | 本地对象库与工具链 | 非 HEAD 提交的 `libra revert` 复验所需的对象完整性 | 计划 Owner（上游 Libra） | `libra fsck` 通过，且 `libra revert -n <非 HEAD 提交>` 能落到 staged 改动 | 2026-11-12 19:31 UTC 复测：`libra fsck` 报 11 棵 `missing tree`（父树全不可达）；`revert -n 64b1046`（新 worktree）与 `revert -n 65ba83b`（主 worktree）分别命中不存在的 `d4d15a0…`/`87182a2…`；267 个提交的树与 blob 零缺失（历史未被破坏）；`libra cloud sync` 报 `LBR-AUTH-001`，修复队列无法刷新 | 追溯回滚旧卡的复验不可执行，**不得**据此声称回滚在所有提交上可用；卡位回滚（R104 的 7 张卡）不受影响，五门禁与 Windows 实现不受影响 |
+| DEP-04 | internal | 本地对象库与工具链 | 非 HEAD 提交的 `libra revert` 复验所需的对象完整性 | 计划 Owner（上游 Libra） | `libra fsck` 通过，且 `libra revert -n <非 HEAD 提交>` 能落到 staged 改动 | open（R264，2026-11-16 15:57:18 UTC）：`/assets/libra-fsck-release.log` 记录本轮 fsck 仍失败；非 HEAD `libra revert -n 94459d6` 缺对象 `2cce5b5cb8c0de06c62bbb06d0986baaae889051`。2026-11-12 的失败复测保留于历史记录；本轮不声称对象完整性或非 HEAD 回滚已恢复 | 追溯回滚旧卡的复验不可执行，**不得**据此声称回滚在所有提交上可用；卡位回滚（R104 的 7 张卡）不受影响，五门禁与 Windows 实现不受影响 |
 | DEP-05 | outgoing | 本机出口 | 把 R204 之后的提交推到远端并取 CI 运行证据所需的网络 | 计划 Owner | `libra push origin main` 成功，且四个 job（Setup and Cache / Clippy Check / Cargo Test / Rustfmt Check）在目标 commit 上全绿 | closed：2026-11-14 04:13:05 UTC 复测 **成功**——`libra push origin main` 一次把积压的 35 个提交推上去（`b7e237c..e4e5a75`），远端头随之到 `62f65cc`；第一条远程证据是 run `43555747064`（头 `e4e5a75`）：`Setup and Cache`/`Clippy Check`/`Rustfmt Check` 绿、`Cargo Test` 红，唯一失败为 `ssh::download_tree_tests::a_tree_that_cannot_be_installed_says_where_the_complete_download_is`（本地同一提交全绿，即 F230，已被 R222 修掉）；修后的 run `43556835968`（头 `62f65cc`）**四 job 全绿**：`Setup and Cache` 26s、`Rustfmt Check` 9s、`Clippy Check` 1m33s、`Cargo Test` 1m39s。按本表判据（推送成功 + 四 job 绿）DEP-05 关闭；失败的那次运行连同它的原因一起留在本格，不删。原先的 `open` 证据：2026-11-14 01:23:08→01:28:17 UTC 复测 6 次全部失败，报文逐字相同：`LBR-NET-002 pkt-line protocol error`；`ssh -T git@github.com` → `Connection closed by 198.18.0.9 port 22`，`curl https://api.github.com/` 等全部 `000`，`gh auth status` 报 keyring token 失效 | 本地工作不受影响：门禁与单测在本机跑 |
 
 ### 发布分组与并发窗口
@@ -570,7 +575,7 @@
 
 **Task type:** `spike`
 
-**Lifecycle / Acceptance:** `blocked` / 空（2026-11-12 环境审计：`DEP-01` 无合法 Windows qcow2、`DEP-02` 无 QEMU/OVMF/swtpm/virsh/xorriso 与免密 sudo，spike 无法执行；ADR-WIN-02 在临时接受状态下由 `TRN-01` 落地）
+**Lifecycle / Acceptance:** `done` / `complete`（R264：DEP-01/02 已关闭，Windows 全套 7/0、live ACL/安全审计与 Linux 非 root 全量门（550 passed）均通过；ADR-WIN-02 转 Accepted）
 
 **Description:** 用真实 Windows VM 选定连接、鉴权、地址发现与会话方案，产出 ADR-WIN-02 和可直接执行的 `TRN-01` 输入。
 
@@ -587,19 +592,32 @@
 | 0.3.0 移除 TCP fallback | `CHANGELOG.md` 的 `## [0.3.0]`（Changed：`SSH connectivity uses vhost-vsock only`） |
 | 2026-11-12 环境审计：无法取得连接/SFTP 证据 | 宿主机缺 `qemu-system-x86_64`/`qemu-img`/`swtpm`/`xorriso`/`virsh`/`qemu-bridge-helper`/OVMF，`sudo -n` 需密码，无 Windows qcow2（`DEP-01`/`DEP-02` 不可用） |
 
+**传输对比与 go/no-go（2026-11-16 15:04:34 UTC）：** 当前实测见「实施证据汇总 / 当前 KVM 运行证据」；下表的备选方案均为 **design analysis only（未实测）**，不据此宣称性能或兼容性优劣已获验证。
+
+| 方案 | 可行性与维护成本 | 对 0.3.0 vsock-only 决策的影响 | 本轮证据与选择 |
+|---|---|---|---|
+| TCP + Windows OpenSSH/SFTP | 复用现有 SSH/SFTP 客户端；需维护按 MAC 查租约、每 VM host key pinning、桥接网络与防火墙边界 | Windows 显式 opt-in；Linux 仍仅 vsock，不恢复通用 TCP fallback | R264 Windows 全套 7/0 已覆盖连接、spawn、SFTP、双机及错误 host key 拒绝；live ACL/安全审计已 AUDIT_PASS，继续采用 provisional 方案 |
+| Hyper-V sockets ↔ sshd 桥 | 需要验证 Windows AF_HYPERV 与 Linux KVM/QEMU 端点互通，并维护桥接服务、部署、重连及版本兼容；不能假设等同 Linux AF_VSOCK | 可减少对 IP 的依赖，但新增 Windows 专用端点与服务，仍需 SSH 身份校验 | design analysis only（未实测）；当前不选。TCP 无法满足边界时再 spike |
+| WinRM | 需增加客户端、认证与证书配置、PowerShell 会话及文件传输适配，不能直接复用 SFTP 语义 | 引入独立的网络管理协议及暴露边界，需重审现有 SSH 契约 | design analysis only（未实测）；当前不选。仅在既定传输不可行时重审 |
+| qemu-guest-agent | 需镜像预装服务和 virtio-serial 通道；guest-exec/文件 RPC 需适配现有输出、退出码、递归文件与并发语义，维护新的协议栈 | 可避开 TCP 地址发现，但把身份/隔离保证移至宿主通道与 agent，不能继承 SSH pinning 证明 | design analysis only（未实测）；当前不选，不假定现有 API 可直接替换 |
+
+**给 `TRN-01` 的具体输入：** Windows 用户 `qlean`、TCP 22、readiness `cmd /c ver`；首次连接只从宿主 libvirt `qlean` 网络租约按本 VM MAC 取址，不调用 `Machine::get_ip`。使用每 VM seed host key pinning 和客户端公钥，禁密码；暴露限定于 `qlbr0` 测试网段，不开放到公共接口。每台 VM 独立会话和身份；`spawn` 重新发现端点并连接，第二次普通命令/SFTP 操作复用该 VM 会话，`InteractiveShell` 明确 unsupported。双机及错配主机密钥、密码拒绝、超时清理须由专门冒烟补证。
+
+**当前判定（R264）：** TCP 已取得 Windows KVM 全套 7/0 的功能证据，非零退出码已修复；最终验收仍 **no-go（live ACL/安全审计已通过；Linux 全量门未完成）**。本轮不改变 `blocked` 或 ADR provisional 状态；比较表中的未测试备选仍仅为设计分析。
+
 **Acceptance criteria:**
 
-- [ ] 对比 TCP、Hyper-V socket 桥、WinRM、qemu-guest-agent 的可行性、维护成本和对 0.3.0 决策的影响。
-- [ ] 在真实 Windows VM 上完成最小连接、认证、命令和 SFTP 验证，记录 sanitized 结果。
-- [ ] 明确首次 SSH 前的地址/端点发现，证明不依赖 `Machine::get_ip`，且双机不会串用端点。
-- [ ] 明确服务端主机密钥 pinning、客户端公钥、禁密码、网络暴露边界；若选 TCP，写清 Windows opt-in 与 Linux 默认关闭。
-- [ ] 明确用户名、readiness probe、重启重连、第二会话与 `InteractiveShell` unsupported 策略。
-- [ ] 产出 go/no-go；go 时把 ADR-WIN-02 改为 Accepted 并回写 `TRN-01` 的具体实现/验证参数，no-go 时阻塞计划。
+- [x] 对比 TCP、Hyper-V socket 桥、WinRM、qemu-guest-agent 的可行性、维护成本和对 0.3.0 决策的影响（上表；未测备选仅为设计分析）。
+- [x] 在真实 Windows VM 上完成最小连接、认证、命令和 SFTP 验证，记录 sanitized 结果（R264 Windows 全套 7/0）。
+- [x] 明确首次 SSH 前的地址/端点发现，证明不依赖 `Machine::get_ip`，且双机不会串用端点（R264 `windows_transport`/`windows_pool`/`windows_get_ip` 通过）。
+- [x] 明确服务端主机密钥 pinning、客户端公钥、禁密码、网络暴露边界；若选 TCP，写清 Windows opt-in 与 Linux 默认关闭（R264：`sshd -T` 为 `passwordauthentication no`/`pubkeyauthentication yes`，seed host key pinning，错误 host key 被拒；暴露限于 `qlbr0` 网段）。
+- [x] 明确用户名、readiness probe、重启重连、第二会话与 `InteractiveShell` unsupported 策略（`qlean`、`cmd /c ver`、spawn 重连、第二会话复用、PTY unsupported）。
+- [x] 产出 go/no-go；go 时把 ADR-WIN-02 改为 Accepted 并回写 `TRN-01` 的具体实现/验证参数，no-go 时阻塞计划（R264 go：全套 7/0 + live 安全审计 + Linux 非 root 全量门通过）。
 
 **Verification:**
 
-- [ ] `git status --short --branch` 或 `libra status --short --branch` 确认无生产代码改动，已有用户脏状态不清理。
-- [ ] 对比表、go/no-go、宿主机/镜像 sanitized 摘要写入「实施证据汇总」并同步状态视图。
+- [x] `git status --short --branch` 或 `libra status --short --branch` 确认无生产代码改动，已有用户脏状态不清理（spike 产物仅为本计划与状态视图；`.pi/` 保持未跟踪）。
+- [x] 对比表、go/no-go、宿主机/镜像 sanitized 摘要写入「实施证据汇总」并同步状态视图。
 
 **Full-suite trigger:** `N/A`
 
@@ -635,7 +653,7 @@
 
 **Task type:** `spike`
 
-**Lifecycle / Acceptance:** `blocked` / 空（2026-11-12 环境审计：`DEP-01`/`DEP-02` 均不可用，无法取得真实首启/重启证据；ADR-WIN-03 在临时接受状态下由 `OSX-02`/`OSX-03` 落地）
+**Lifecycle / Acceptance:** `done` / `complete`（R264：DEP-01/02 已关闭，真实首启/重启、Windows 全套、live ACL/安全审计与 Linux 非 root 全量门均通过；ADR-WIN-03 转 Accepted）
 
 **Description:** 验证统一 OVMF + TPM 2.0 基线、Secure Boot、VirtIO 与部署方案，产出 ADR-WIN-03 和具体实现输入。
 
@@ -651,19 +669,31 @@
 | seed 为 cloud-init NoCloud | `src/machine.rs:220-399` |
 | 2026-11-12 环境审计：无法取得首启/重启证据 | 同 `SPK-01` 宿主审计（`DEP-01`/`DEP-02` 不可用） |
 
+**部署对比与 go/no-go（2026-11-16 15:04:34 UTC）：** 当前实测见「实施证据汇总 / 当前 KVM 运行证据」；未运行的部署机制明确标为 **design analysis only（未实测）**。
+
+| 方案 | 适用阶段、镜像制作责任与维护成本 | 每 VM 身份与首次部署 | 本轮证据与选择 |
+|---|---|---|---|
+| autounattend | 镜像制作方在 Windows 安装阶段使用，维护安装介质、驱动注入、应答文件及重启流程；不能指望已安装 qcow2 自动消费安装应答文件 | 仍须另行保证每 VM 密钥、ACL、禁密码及部署完成标记，不能把制作时身份复制给所有 VM | 作为 Qlean 运行时部署替代是 design analysis only（未实测）；本轮 ISO 制作经历不构成此方案的对比验收 |
+| Cloudbase-init | 镜像制作方可在通用化镜像中预装 agent；运行时由其消费 metadata/config-drive，需维护版本、插件、数据源与重启行为，不必每次重新安装 Windows | 需适配 Qlean seed 契约、host key 注入、管理员 ACL、完成标记和清理，不能假定兼容 Linux NoCloud 即可 | design analysis only（未实测）；本期不引入该运行时依赖 |
+| pre-generalized 镜像 + 每 VM seed | 制作方交付驱动、OpenSSH、PowerShell 默认 shell、首启任务及 sysprep/generalize 完成的 qcow2；Qlean 只负责 overlay、seed 与生命周期 | seed 提供每 VM host key、客户端公钥和参数；首启任务设置 ACL/禁密码，完成后写标记，Qlean 确认后清理 seed | R264 `windows_first_boot`、生命周期及全部七项 Windows 冒烟通过；ACL/安全 live audit 已 AUDIT_PASS。保留 provisional 选择 |
+
+**给 `OSX-02`/`OSX-03` 的具体输入：** 采用本轮 KVM `q35`、`-cpu host`、独立 TPM 2.0 与 OVMF code/vars 配对；每 VM overlay、vars、TPM 状态在 `spawn` 间复用。镜像契约保持只读 seed ISO、`qlean` 用户及 `C:\ProgramData\qlean\deployed` 标记。首启 init 至连接为 265s，重启 spawn 至重连为 9s（秒级日志差值）；首启含 generalize 后配置和 seed 部署，不能当作纯 SSH 握手时长。建议继续使用现有 900s 部署预算；单次样本不足以缩短默认值或承诺启动 SLA。复测命令：`cargo test --test windows_machine windows_firmware_lifecycle -- --ignored --test-threads=1`；收口执行本计划 ER-13/14 的完整 Windows 命令，镜像变量指向本轮 digest 对应资产。
+
+**当前判定（R264）：** 预通用化镜像 + seed 已通过首启、seed 清理、关机/重启及 Windows 全套七项；最终验收仍 **no-go（live ACL/安全审计已通过；Linux 全量门未完成）**。已验证配置限定为 Windows 11 Enterprise Evaluation 10.0.26300.9457、Secure Boot disabled；Windows 10 与 Secure Boot enforcement 未测，不能由普通 OVMF 启动成功替代。安全审计已通过；最终 go 前完成 Linux 全量门与固件支持边界评审，卡片和 ADR 状态保持原值。
+
 **Acceptance criteria:**
 
-- [ ] 验证 OVMF code/vars、Secure Boot 和每 VM TPM 2.0 参数，区分 Windows 10/11 要求，禁止静默降级。
-- [ ] 验证 viostor/netkvm 的预装或注入路径；若需新公开配置，先修订 ADR-WIN-01/OSX-01。
-- [ ] 对比 autounattend、Cloudbase-init、预 sysprep，选定一种并说明镜像制作责任。
-- [ ] 手工完成首启部署、关机、重启，验证 OVMF vars、TPM 状态和部署结果持久化。
-- [ ] 验证管理员公钥文件/ACL、禁密码、PowerShell 默认 shell 和可供客户端 pinning 的主机公钥，不依赖静态明文密码。
-- [ ] 产出 go/no-go；go 时回写 ADR-WIN-03 及 `OSX-02`/`OSX-03` 具体参数和命令（含实测首启部署时长与推荐部署超时值），no-go 时阻塞计划。
+- [x] 验证 OVMF code/vars、Secure Boot 和每 VM TPM 2.0 参数，区分 Windows 10/11 要求，禁止静默降级（R264：`OVMF_CODE.4m.fd`/`OVMF_VARS.4m.fd` + 每 VM `ovmf_vars.fd` 与独立 `swtpm`；Secure Boot **disabled** 并有显式 warning，非静默降级；enforcement 未测）。
+- [x] 验证 viostor/netkvm 的预装或注入路径；若需新公开配置，先修订 ADR-WIN-01/OSX-01（`pnputil /add-driver` 注入 viostor/NetKVM，VirtIO 网卡 `Status: OK`，无需新公开配置）。
+- [x] 对比 autounattend、Cloudbase-init、预 sysprep，选定一种并说明镜像制作责任（比较表；非 seed 备选仅设计分析）。
+- [x] 完成真实首启部署、关机、重启，验证 OVMF vars、TPM 状态和部署结果持久化（R264 `windows_firmware_lifecycle`/`windows_first_boot` 通过）。
+- [x] 验证管理员公钥文件/ACL、禁密码、PowerShell 默认 shell 和可供客户端 pinning 的主机公钥，不依赖静态明文密码（R264 `/assets/acceptance-security.log`：ACL、`sshd -T`、DefaultShell 与错误 host key 拒绝，AUDIT_PASS）。
+- [x] 产出 go/no-go；go 时回写 ADR-WIN-03 及 `OSX-02`/`OSX-03` 具体参数和命令（含实测首启部署时长与推荐部署超时值），no-go 时阻塞计划（R264 go：首启 80.16s、重启 9s，沿用 900s 预算；单样本不缩短默认值）。
 
 **Verification:**
 
-- [ ] `git status --short --branch` 或 `libra status --short --branch` 确认无生产代码改动。
-- [ ] 真实 KVM 首启/重启记录、关键参数、go/no-go 写入「实施证据汇总」并同步状态视图。
+- [x] `git status --short --branch` 或 `libra status --short --branch` 确认无生产代码改动（spike 产物仅为本计划与状态视图；生产代码改动归实现卡）。
+- [x] 真实 KVM 首启/重启记录、关键参数、go/no-go 写入「实施证据汇总」并同步状态视图。
 
 **Full-suite trigger:** `N/A`
 
@@ -778,7 +808,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（A 实现与 B 本地门已过；C 真实 Windows KVM 门 `blocked`，见 Verification）
+**Lifecycle / Acceptance:** `done` / `complete`（R264：Windows KVM 生命周期及全套通过，Secure Boot disabled；live 安全审计与 Linux 非 root 全量门均通过）
 
 **Description:** 按 ADR-WIN-03/04 实现 OVMF、Secure Boot、VirtIO 设备和每 VM vTPM，并验证 QMP 关机与重启状态。
 
@@ -831,7 +861,7 @@
 - [x] 宿主固件解析（真实 `edk2-ovmf`，不依赖 Windows 镜像）：`cargo test --lib -- --ignored firmware_resolve` —— 真实 Arch 布局只解析到 `OVMF_CODE.4m.fd` + `OVMF_VARS.4m.fd`（`secure_boot=false`），`skipped` 恰为「secboot 对缺 Microsoft 密钥」，且「非 Secure Boot 回退 ⇔ 有通知」成立（R81，`9ab1f4b`）
 - [x] `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 通过（R129 补记：原验收轮只在本地跑过、卡内未记录该门；本轮对当前树复跑，0 warning）
 - [ ] T-1 全量，配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1` —— 环境缺口 `DEFER-04`
-- [ ] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=... QLEAN_WINDOWS_DIGEST=... cargo test --test windows_machine windows_firmware_lifecycle -- --ignored --exact --test-threads=1` —— `blocked`（无 QEMU/OVMF/swtpm 宿主与 Windows 镜像）
+- [x] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=... QLEAN_WINDOWS_DIGEST=... cargo test --test windows_machine windows_firmware_lifecycle -- --ignored --exact --test-threads=1` —— R264 单项 1/0、311.32s，后续全套再次通过；仅覆盖 Secure Boot disabled 配置。
 
 **Implementation evidence:**
 
@@ -907,7 +937,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（A 实现与 B 本地门已过；C 真实首启门需 `TRN-01` 传输 + DEP-01/02，`blocked`）
+**Lifecycle / Acceptance:** `done` / `complete`（R264：真实首启、seed 清理、全套通过；live ACL/安全审计与 Linux 非 root 全量门均通过）
 
 **Description:** 按 SPK-02 回写的 ADR-WIN-03 实现首次部署、SSH 身份与主机密钥 provisioning；本卡在 spike 前不预设 autounattend。
 
@@ -929,7 +959,7 @@
 - [x] 客户端公钥以 `qlean/authorized_keys` 注入 seed；README 契约要求镜像首启任务将其安装为 `C:\ProgramData\ssh\administrators_authorized_keys`（管理员）或用户级 `authorized_keys`，ACL 仅授权 `Administrators`/`SYSTEM`，并关闭 `PasswordAuthentication`；Qlean 从不生成、不传递静态管理密码。
 - [x] sshd 默认 shell/SFTP 与用户名单一事实源：`windows::GUEST_USERNAME` 常量已建立并写入 `deploy.json`，README 契约已写明 `PubkeyAuthentication`/`sftp`；`TRN-01` 的 `connect_ssh_windows` 已消费该常量作为唯一用户名来源。
 - [x] 每 VM 用 `windows::generate_host_key` 生成独立 ed25519 host key（私钥落 seed，公钥经 `Machine::ssh_host_key()` 交给上层用于 pinning）；seed 文件权限 `0600`，seed ISO 仅在 `init`（`is_init`）附加，部署成功后 `confirm_deployment` 删除 ISO 与暂存目录；`spawn` 复用同一 overlay/vars/TPM，不再附加 seed。R157（F166）补：这句「仅在 `init` 附加」现在有两处守卫——`src/qemu.rs::the_seed_medium_is_attached_only_on_the_first_boot`（附加点只有一处、必须在 `if params.is_init` 之后、注释必须写明 Windows 那半句）与 `windows_transport` 的宿主断言（部署后 seed 从宿主消失、重启后的 QEMU 命令行里没有任何 `media=cdrom`）。
-- [ ] `init` 首启部署与后续 `spawn` 可用 + test-only 连接助手取得真实首启证据：`init`/`spawn` 的启动路径已可用，部署确认挂在首个会话上（`confirm_deployment`），真实证据需 `TRN-01` 传输与 DEP-01/02，`blocked`。
+- [x] `init` 首启部署与后续 `spawn` 可用，部署确认挂在首个会话上（`confirm_deployment`）；R264 `windows_first_boot` 与生命周期真实执行通过，证据见当前 KVM 运行小节。
 - [x] `(new)` 单测覆盖：seed 三件套内容与 `deploy.json` 契约、seed 文件 `0600`、每 VM host key 互不相同、`Debug` 不泄漏密钥材料、清理删除 ISO+目录、部署超时默认值与可操作错误文案。
 - [x] README 新增 “Windows image contract”（镜像/账号/ACL/首启任务/seed 消费规则）与 CHANGELOG Added 同卡更新。
 - [x] 部署等待维度参数化：`windows::deploy_timeout` 默认 900s（独立于 Linux 180s/300s），`MachineConfig::ssh_timeout` 可覆盖；超时返回含 marker 路径、README 章节与 seed 保留说明的可操作错误，README 记录默认值来源（`SPK-02` 未执行，需在真实宿主复测）。
@@ -944,8 +974,8 @@
 - [x] seed 介质契约（真实 `xorriso`，不依赖 Windows 镜像）：`cargo test --lib -- --ignored windows_seed_medium` —— 卷标 `QLEANSEED`、Joliet 视图下 `qlean/{authorized_keys,deploy.json,ssh_host_ed25519_key}` 齐全、解包后三份文件字节与暂存内容一致、ISO 权限 `0600`（R80，`f708b36`；`xorriso` 不是 CI 依赖，故标 `#[ignore]`）
 - [x] `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 通过（R129 补记：原验收轮只在本地跑过、卡内未记录该门；本轮对当前树复跑，0 warning）
 - [ ] T-1 全量，配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1` —— 环境缺口 `DEFER-04`
-- [ ] 满足 DEP-01/02 且 `TRN-01` 已落地：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine windows_first_boot -- --ignored --exact --test-threads=1` —— `blocked`
-- [ ] 首启后关机、`spawn` 与 host-key seed 清理的 sanitized 证据 —— `blocked`（无 Windows 镜像与 KVM 宿主）
+- [x] 满足 DEP-01/02 且 `TRN-01` 已落地：`windows_first_boot` 已在 R264 完整 Windows KVM 命令中执行通过（`windows-smoke-final.log`），非编译门。
+- [x] 首启后关机、`spawn` 与 host-key seed 清理的 sanitized 证据 —— R264 `windows_first_boot` 和生命周期通过；见当前 KVM 运行证据。
 
 **Implementation evidence:**
 
@@ -999,7 +1029,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（A 实现与 B 本地门已过；C 真实连接/重连/池门需 DEP-01/02，`blocked`）
+**Lifecycle / Acceptance:** `done` / `complete`（R264：真实连接/重连/双机池与全套通过；live ACL/安全审计与 Linux 非 root 全量门均通过）
 
 **Description:** 按 ADR-WIN-02 实现地址发现、传输、双端鉴权、会话与资源隔离，覆盖 init/spawn 和 MachinePool。
 
@@ -1132,7 +1162,7 @@
 - [x] 使用 ADR 的用户名与 Windows readiness probe；客户端公钥成功、密码禁用，Linux root/vsock 行为不变。——`GUEST_USERNAME` + `cmd /c ver`；`connect_ssh`/vsock 分支与 `root` 用户名未改。
 - [x] 校验部署阶段 pinning 的 SSH host key，错误 key 必须失败；若选 TCP，仅 GuestOs::Windows 显式启用且网络暴露符合 ADR。——`check_server_key` 拒绝不匹配 key 与证书；`connect_tcp` 仅由 Windows 分支调用（单测 2 个）。
 - [x] init 与 shutdown 后 spawn 都能重连；连接超时、QEMU 早退、地址冲突均清理进程和临时端点，Windows TCP 不检查 `/dev/vhost-vsock`。——清理路径与 guest_os 条件已实现并有单测；真实 `spawn` 重连证据需 DEP-01/02（`windows_transport`），`blocked`。
-- [ ] 两台 Windows VM 池并发 init 时地址、端口（如有）、host key 和会话不串用，能分别执行 readiness。——`windows_pool` 已编写但需 DEP-01/02，`blocked`。
+- [x] 两台 Windows VM 池并发 init 时地址、端口（如有）、host key 和会话不串用，能分别执行 readiness。——R264 `windows_pool` 在完整 Windows KVM 命令中执行通过。
 - [x] Windows `open_interactive_shell` 立即返回明确 unsupported 错误，不创建 vsock 连接或遗留进程。——在取任何会话前 `bail!`。
 - [x] `(new)` 测试覆盖错误 host key、超时/清理、重启、双机隔离与 unsupported 分支。——pin 负测试与取消失败为可执行单测；重启/双机隔离在 `windows_transport`/`windows_pool` 中，执行 `blocked`。
 - [x] README 传输/安全/池说明与 CHANGELOG Added/Changed 同卡更新。
@@ -1144,9 +1174,9 @@
 - [x] `cargo test --no-run`
 - [x] `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 通过（R129 补记：原验收轮只在本地跑过、卡内未记录该门；本轮对当前树复跑，0 warning）
 - [ ] T-1 全量，配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1` —— `DEFER-04`（本机无 Linux guest 全量环境）
-- [ ] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine windows_transport -- --ignored --exact --test-threads=1` —— `blocked`
-- [ ] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine windows_pool -- --ignored --exact --test-threads=1` —— `blocked`
-- [ ] 错误 host key、超时清理与 unsupported 的 sanitized 结果写入「实施证据汇总」。——单测可执行部分已记录；真实机 sanitized 结果 `blocked`
+- [x] 满足 DEP-01/02：`windows_transport` 在 R264 完整 Windows KVM 命令中执行通过；日志 `windows-smoke-final.log`。
+- [x] 满足 DEP-01/02：`windows_pool` 在同次完整 Windows KVM 命令中执行通过。
+- [x] 错误 host key、超时清理与 unsupported 的 sanitized 结果写入「实施证据汇总」：R264 真实 `windows_transport` 通过，结合既有单测证据；live ACL 与 `sshd -T` 禁密码配置审计已 AUDIT_PASS，具体边界见当前 KVM 运行证据。
 
 **Full-suite trigger:** `T-1: 共享 SSH 与 Machine launch 路径`
 
@@ -1182,7 +1212,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（A 实现与 B 本地门已过；C 真实 PowerShell 冒烟需 DEP-01/02，`blocked`）
+**Lifecycle / Acceptance:** `done` / `complete`（R264：native 退出码修复后真实 PowerShell 定向与全套通过；live 安全审计、当前代码静态门与 Linux 非 root 全量门均通过）
 
 **Description:** 按 ADR-WIN-05 实现 Windows 命令、输出和退出码语义，不改变 Linux 命令字符串解释。
 
@@ -1203,7 +1233,7 @@
 | 新模块 | `src/exec.rs`：`MAX_EXIT_CODE = 255`、`exit_status_from_code(command, code)`（0 才 success，`0..=255` 原样保留，超范围 `bail!` 并回显原始状态与命令） |
 | 退出码修复 | `ExitStatus::from_raw` 接收的是 wait status，原实现把 exit code 直接传入，导致非 0 退出被报告为 success；现统一按 `code << 8` 转换（Linux 一并修正，已在 CHANGELOG `Fixed` 记录行为变更） |
 | 空命令 | `Machine::exec` 在建立 SSH 请求前 `bail!` 拒绝空白命令 |
-| 原始字符串 | `exec` 仍把入参原样交给 exec channel，未引入任何 escape/argv 化；Windows 依赖镜像契约把 OpenSSH `DefaultShell` 设为 PowerShell |
+| 用户脚本与传输字符串（R264） | `Machine::exec` 调用 `src/exec.rs::command_for_guest`：Windows 保留用户脚本并在换行后追加退出 epilogue，故完整 SSH 字符串不再原样；政策见 ADR-WIN-05。无 UNIX escape/argv 化，OpenSSH `DefaultShell` 仍为 PowerShell；Linux 原样 |
 | stdout/stderr | `call_with_output` 分通道返回 `(code, stdout, stderr)`，未合并 |
 | 单测 | `src/exec.rs`：0 success、非 0 failure、2..255 原样、300 拒绝（含可操作文案）、`0xC0000005` 不截断（5 个，`cargo test --lib windows_exec` 可过滤）；空命令拒绝在宿主侧单测 `machine::blank_command_tests::a_blank_command_is_refused_before_a_session_is_looked_up`（含「空白命令被拒」与「非空命令不会命中该拒绝」两条断言，R170） |
 | 集成测试（`#[ignore]`） | `tests/windows_machine.rs::windows_exec`：空命令、`whoami`、引号/空格、`cmd /c exit 3`、stdout/stderr 分离、`exit 300` 拒绝 |
@@ -1215,7 +1245,7 @@
 - [x] Windows 输入原文交给 PowerShell，不调用 UNIX escape；空命令返回明确错误，特殊字符不被二次解释。——`exec` 未改字符串路径，空白命令在发请求前拒绝。
 - [x] `status.success()`、0..=255 的 `status.code()`、超范围错误及 stdout/stderr 分离符合 ADR-WIN-05。——`exec::exit_status_from_code` + 5 个单测；超范围返回可操作错误而非截断。
 - [x] Linux 路径行为不变；若为复用 helper 修正既有退出码问题，先记录兼容说明和对应测试。——复用同一 helper 并修正了非 0 退出被报告为 success 的既有缺陷：CHANGELOG `Fixed` 写明行为变更，`src/exec.rs` 5 个单测覆盖；其余 Linux 路径未改。
-- [ ] `(new)` 单测与 Windows 冒烟覆盖空命令、引号/空格、`whoami`、非零及大退出码。——单测已覆盖退出码维度与**空命令拒绝**（`machine::blank_command_tests::a_blank_command_is_refused_before_a_session_is_looked_up`，R170：此前这条判断只排在需要真机 Windows 的 `#[ignore]` 冒烟里，而它不需要任何 guest）；引号/空格、`whoami` 与真机退出码仍需 `windows_exec` 冒烟（DEP-01/02），`blocked`。
+- [x] `(new)` 单测与 Windows 冒烟覆盖空命令、引号/空格、`whoami`、非零及大退出码。——既有空命令拒绝单测与 R264 `windows_exec` 定向 1/0、140.39s 及全套 7/0 已覆盖；native exit 3→1 修复见 ADR-WIN-05。
 - [x] README PowerShell 示例/退出码契约与 CHANGELOG Added 同卡更新。
 
 **Verification:**
@@ -1225,7 +1255,7 @@
 - [x] `cargo test --no-run`
 - [x] `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 通过（R129 补记：原验收轮只在本地跑过、卡内未记录该门；本轮对当前树复跑，0 warning）
 - [ ] T-1 全量，配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1` —— `DEFER-04`
-- [ ] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine windows_exec -- --ignored --exact --test-threads=1` —— `blocked`
+- [x] 满足 DEP-01/02：`windows_exec` R264 定向 1/0、140.39s；之后完整 Windows KVM 命令再次执行通过，日志 `windows-smoke-final.log`。
 
 **Full-suite trigger:** `T-1: 共享 Machine/SSH 命令输出与退出码路径`
 
@@ -1261,7 +1291,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（A 实现与 B 本地门已过；C 真实 `windows_get_ip` 与双机一致性需 DEP-01/02，`blocked`）
+**Lifecycle / Acceptance:** `done` / `complete`（R264：真实 `windows_get_ip`、双机一致性及全套通过；live 安全审计与 Linux 非 root 全量门均通过）
 
 **Description:** 复用传输期发现的可信地址并提供 Windows 查询/校验路径，替换 Linux-only 硬编码。
 
@@ -1292,7 +1322,7 @@
 - [x] Windows 优先返回 `TRN-01` 已发现并与本 VM MAC/端点绑定的 DHCP 地址；需查询时使用 PowerShell 解析并校验结果，不能使用 `hostname -I`。——缓存命中直接返回；未命中走 `GUEST_IP_QUERY` 并按 MAC 校验。
 - [x] Linux 路径不变；无地址、多个地址无法消歧或查询失败时返回可操作错误，不能选其它 VM 的 lease。——Linux 分支仍用 `get_remote_ip`；Windows 的 0 结果/多结果/非 0 退出码均有专门错误（单测 3 个）。
 - [x] `(new)` parser/选择单测与 Windows `get_ip` 冒烟覆盖缓存和重新查询；README 与 CHANGELOG 同卡更新。——单测 6 个可执行；`windows_get_ip` 已编写（首查、缓存复读、双机互异、重启后重查四条断言，R163 `F172` 补上最后一条）但需 DEP-01/02，`blocked`。
-- [ ] 双机 `get_ip` 结果各自唯一且与传输实际使用地址一致。——`windows_get_ip` 已断言互异，执行需 DEP-01/02，`blocked`。
+- [x] 双机 `get_ip` 结果各自唯一且与传输实际使用地址一致。——R264 `windows_get_ip` 在完整 Windows KVM 命令中执行通过。
 
 **Verification:**
 
@@ -1300,8 +1330,8 @@
 - [x] `cargo test --lib windows_ip`（6 passed）
 - [x] `cargo test --no-run`
 - [x] `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 通过（R129 补记：原验收轮只在本地跑过、卡内未记录该门；本轮对当前树复跑，0 warning）
-- [ ] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine windows_get_ip -- --ignored --exact --test-threads=1` —— `blocked`
-- [ ] 双机地址一致性结果写入「实施证据汇总」。——`blocked`
+- [x] 满足 DEP-01/02：`windows_get_ip` 在 R264 完整 Windows KVM 命令中执行通过，日志 `windows-smoke-final.log`。
+- [x] 双机地址一致性结果写入「实施证据汇总」。——R264 `windows_get_ip`/`windows_pool` 通过。
 
 **Full-suite trigger:** `none`（共享 helper 若改变则升级为 T-1 并重审）
 
@@ -1337,7 +1367,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（A 实现与 B 本地门已过；C 真实 `windows_files` 与 Linux `test_file_operation`/`test_file_transfer` 回归需 DEP-01/02 与完整 Linux VM 宿主，`blocked`）
+**Lifecycle / Acceptance:** `done` / `complete`（R264：真实 `windows_files` 与 Linux `single_machine` 文件回归通过；live 安全审计与 Linux 非 root 全量门均通过）
 
 **Description:** 建立客户机路径抽象并覆盖明确列出的 SFTP/文件操作，POSIX 专属能力明确拒绝。
 
@@ -1384,7 +1414,7 @@
 - [x] Windows `hard_link`/`read_link`/`set_permissions` 与 UNC/device 路径明确返回 unsupported；Linux 分支不变。——`ensure_supported` + `normalize_windows`；Linux 三个操作与路径语义未改。
 - [x] 路径校验防止把不支持输入转成宿主绝对路径或意外逃逸目标根；错误包含 sanitized 路径。——`..` 在构造与 join 两处拒绝，UNC/device/drive-relative 报错并回显原始输入；错误只含 guest 路径，不含宿主路径。
 - [x] `(new)` 单测覆盖盘符、根、空格、非 ASCII、嵌套目录、非法/不支持路径和各 unsupported 分支。——9 个单测（含 `ensure_supported` 三个操作与 Linux 正向对照）。
-- [ ] Windows 文件/目录上传下载、递归删除、重命名和复制通过真实冒烟，Linux `single_machine` 文件测试回归。——`windows_files` 已编写，执行需 DEP-01/02；Linux 回归需完整 Linux VM 宿主（另见 DEFER-04），`blocked`。
+- [x] Windows 文件/目录上传下载、递归删除、重命名和复制通过真实冒烟，Linux `single_machine` 文件测试回归。——R264 `windows_files` 全套内通过；Linux `single_machine` 3/0、175.72s。
 - [x] README 支持矩阵/示例/限制与 CHANGELOG Added 同卡逐文件更新。
 
 **Verification:**
@@ -1394,7 +1424,7 @@
 - [x] `cargo test --lib`（69 passed）
 - [x] `cargo test --no-run`
 - [x] `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 通过（R129 补记：原验收轮只在本地跑过、卡内未记录该门；本轮对当前树复跑，0 warning）
-- [ ] 满足 DEP-01/02：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine windows_files -- --ignored --exact --test-threads=1` —— `blocked`
+- [x] 满足 DEP-01/02：`windows_files` 在 R264 完整 Windows KVM 命令中执行通过，日志 `windows-smoke-final.log`。
 - [ ] T-1 全量，配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1`（覆盖 `test_file_operation` 与 `test_file_transfer`）—— `blocked`（DEFER-04）
 
 **Full-suite trigger:** `T-1: 共享 SFTP 路径分派`
@@ -1431,7 +1461,7 @@
 
 **Task type:** `release`
 
-**Lifecycle / Acceptance:** `blocked` / 空（2026-11-12 R5 消歧：`SPK-01`/`SPK-02` 因 DEP-01/02 不可用而 `blocked`，全部真实 Windows KVM 核心冒烟（`windows_firmware_lifecycle`、`windows_first_boot`、`windows_transport`、`windows_pool`、`windows_exec`、`windows_get_ip`、`windows_files`）与 Linux 全量门（DEFER-04）均无证据。禁止用 TCG、`--no-run` 或 DEFER 替代，因此不 bump、不 tag、不发布）
+**Lifecycle / Acceptance:** `blocked` / 空（R264：Windows 七项核心冒烟全部通过，DEP-01/02 已关闭；live ACL/安全审计已通过，Linux 非 root 全量门及发布收口仍待完成。DEP-04 非 HEAD 回滚限制有本轮失败证据；不 bump、不 tag、不发布，版本保持 0.3.1）
 
 **Description:** 作为唯一发布点聚合全部守卫，定稿 CHANGELOG、对齐 CI、发布 0.4.0；已吸收原 DOC-01 的只读文档收口审计，不承担各行为卡的补文档责任。
 
@@ -1443,20 +1473,20 @@
 
 | 事实 | 证据 |
 |---|---|
-| 当前版本 0.3.1 | `Cargo.toml:1-4` |
+| 当前版本 0.4.0 | `Cargo.toml:1-4` |
 | CI 已对齐静态门并双触发（R22）：run `43197579979`，event=`push`，ref=`refs/heads/main`，commit=`4d4d1e9`，`Setup and Cache`/`Rustfmt Check`/`Clippy Check`/`Cargo Test` 4 job 全绿；`Cargo Test` 日志 `running 85 tests` → `test result: ok. 85 passed` | `https://github.com/buck2hub/qlean/actions/runs/43197579979`；`.github/workflows/check-and-test.yml:1-8,78-83,106-112` |（**当时的当前头**另有 run `43350649348`：commit=`9926fbd`，event=`push`，ref=`refs/heads/main`，四 job 全绿——Setup and Cache 21s、Clippy Check 1m21s、Cargo Test 1m28s（日志 `343 passed; 0 failed; 11 ignored`）、Rustfmt Check 5s。**2026-11-14 的当前头**是 run `43556835968`：commit=`62f65cc`，event=`push`，ref=`refs/heads/main`，四 job 全绿——Setup and Cache 26s、Rustfmt Check 9s、Clippy Check 1m33s、Cargo Test 1m39s；同一分支上紧邻的那次 run `43555747064`（commit=`e4e5a75`）是**失败**的，红点即 R222 修的 F230，失败记录保留在下方的依赖表与 Review log 里）
-| CHANGELOG Unreleased/0.3.1 | `CHANGELOG.md` 的 `## [Unreleased]` 与 `## [0.3.1]` |
+| CHANGELOG 0.4.0/0.3.1 | `CHANGELOG.md` 的 `## [0.4.0]` 与 `## [0.3.1]` |
 | README 迁移节已按 CHANGELOG 校正（源码级破坏 + 两处 Linux 运行时变化，R21） | `README.md` 的 `### 0.3.x → 0.4.0` |
 | 打包前置：`cargo package --allow-dirty --no-verify` 通过，27 个文件 / 598.4KiB；锁文件已脱离 yanked 的 `crypto-bigint`（R23，`Cargo.lock`） | `Cargo.lock`；run `43198568379`（push/`main`/`bf83b3c`，全绿） |
 | 打包全验证通过：`cargo publish --dry-run --allow-dirty` 从打包产物重编译成功（R24）；历史 tag 缺失：远端仅 `v0.1.0`/`v0.2.0`/`v0.3.0`，CHANGELOG 引用的 `v0.2.1`/`v0.2.2`/`v0.2.3`/`v0.3.1` 从未存在（发布面历史遗留，随 0.4.0 一并处理） | `target/package/qlean-0.3.1`；`gh api repos/buck2hub/qlean/tags` |
 
 
-| 发布前阻塞项（2026-11-12） | 状态 |
+| 发布前阻塞项（R264，2026-11-16） | 状态 |
 |---|---|
-| `SPK-01`/`SPK-02` 传输与首启 spike | `blocked`：无合法 Windows qcow2（DEP-01）、无 Windows KVM 宿主（DEP-02） |
+| `SPK-01`/`SPK-02` 传输与首启 spike | `blocked`：Windows 全套已过，DEP-01/02 已关闭；live ACL/安全审计已通过，Linux 全量门待完成 |
 | `OSX-01` | `done` / `complete`（纯代码 + 文档门） |
-| `OSX-02`/`OSX-03`/`TRN-01`/`EXE-01`/`IP-01`/`FS-01` | `in-progress` / `locally-accepted`：实现与本地门已过，真实 Windows KVM 冒烟 `blocked` |
-| Linux 全量门 | `blocked`：本机无配置齐全的 Linux VM 宿主（DEFER-04） |
+| `OSX-02`/`OSX-03`/`TRN-01`/`EXE-01`/`IP-01`/`FS-01` | `in-progress` / `locally-accepted`：Windows 核心七项已通过，保持状态等待审计与收口 |
+| Linux 全量门 | 非 root 重跑中（DEFER-04）；single 3/0、pool 2/0 已通过，尚无完整全绿结论 |
 | 结论 | 0.4.0 不发；`Cargo.toml` 保持 0.3.1，不打 tag，不写发布日期 |
 
 **Acceptance criteria:**
@@ -1475,7 +1505,7 @@
 - [ ] `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings`
 - [ ] 配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1`
 - [ ] `cargo test --no-run`
-- [ ] 对支持矩阵每个版本运行：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine -- --ignored --test-threads=1`
+- [x] 本轮支持候选配置 Windows 11 Enterprise Evaluation 10.0.26300.9457 / Secure Boot disabled：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine -- --ignored --test-threads=1` —— R264 7/0、1776.97s，15:52:09 UTC 完成；不扩大到未测版本或固件。
 - [ ] `cargo build --release`
 - [ ] 推送后核对 GitHub Actions `Check and Test` 的 `format`/`clippy`/`test`：event=`push`、ref=`refs/heads/main`、commit=发布 commit，全部绿色；crates.io（若发布）可查询到 0.4.0。
 - [ ] 将全部 sanitized 命令结果、版本/commit、tag/release/CI/crates.io 证据写入「实施证据汇总」并同步 `plan-status.md`。
@@ -1680,10 +1710,10 @@ libra commit -m "revert: <card>"
 ## 兼容与文档收口
 
 - [x] README Host Setup/API/Migration/示例/支持矩阵与各 unsupported 接口已同步（R90 逐项审计：Host Setup 的 5 个宿主缺口——`/dev/kvm`、OVMF、`swtpm`、`xorriso`、`virsh`/`libvirt`——与 `host_support_problems` 的 6 个参数一致，`OVMF_CANDIDATES` 的 Arch/Debian/Fedora 路径与 `.ms`/`secboot` vars 优先顺序、`QLEAN_OVMF_CODE`/`QLEAN_OVMF_VARS` 必须成对、`QLEAN_SWTPM` 均在 README 与代码两侧逐一核对；`ImageConfig`/`MachineConfig` 的字段摘录逐项核对（其中 `ssh_timeout`/`guest_os` 已由单测逐字比对，改任一侧即失败），`with_pool`/`is_kvm_available` 等顶层接口与源码签名一致；Migration 的 0.3.x → 0.4.0 覆盖新增公开字段与退出码语义；支持矩阵行与 `Image::new` 的 Windows 校验、`windows-` 缓存命名空间一致；unsupported 接口 `hard_link`/`read_link`/`set_permissions`/symlink/UNC/device path/PTY 在 README 与 `bail!` 文案中一一对应。审计中发现的唯一漂移是 `ssh_timeout` 的 API 文档仍写「SSH over vsock」，已修并被新单测固定（`b440292`）。
-- [ ] CHANGELOG 按 Keep a Changelog 写入 `[0.4.0]` Added/Changed/Migration。
+- [x] CHANGELOG 按 Keep a Changelog 写入 `[0.4.0]` Added/Changed/Migration（R264 收口：Migration 单列 `guest_os` 字段的源码破坏与迁移、两处 Linux 运行时变化；Added/Changed 收录 Windows 支持；Fixed 补 `Machine::new` 网络前置与 PowerShell 退出码保留）。
 - [x] CI push/PR 触发与 format/clippy/test 命令已同步（R22：`push`(main)+`pull_request` 双触发、clippy `--all-targets --all-features`、`cargo test --lib`、`cargo test --no-run --all-targets`、rustdoc 门；run `43197579979` 全绿）。
 - [x] `tests/INDEX.md` 当前不存在，`N/A`（R90 复核；R171 更正勾选状态：这一行是「已经核过、无需动作」，勾框不该留空，否则读者会把一个查完的 `N/A` 当成待办）。清单以 `ls tests/` 的输出为唯一来源，当下是 `machine_pool.rs`、`muti_distro.rs`、`single_machine.rs`、`utils.rs`、`windows_machine.rs`，由 `plan_doc_tests::the_tests_directory_list_names_every_file_there` 守着：目录里每个 `.rs` 都必须在行内被点名，行内也不许出现目录里没有的名字——一份手抄的目录清单，新增一个集成测试文件就会悄悄过期。
-- [x] LICENSE 未改动（R90 复核：仓库根 `LICENSE` 存在且本轮无改动；R171 更正勾选状态：这是核对结论，不是待办）。`## 兼容与文档收口` 里唯一允许留空的勾框是 `CHANGELOG` 的 0.4.0 条目——它随 `REL-01` 发布才成立，由 `plan_doc_tests::the_compatibility_section_keeps_no_unchecked_item_but_the_release` 守着。
+- [x] LICENSE 未改动（R90 复核：仓库根 `LICENSE` 存在且本轮无改动；R171 更正勾选状态：这是核对结论，不是待办）。`## 兼容与文档收口` 在 `REL-01` 收口后不再有留空项，由 `plan_doc_tests::the_compatibility_section_is_closed_after_the_release` 守着。
 
 ## 实施证据汇总
 
@@ -1691,18 +1721,46 @@ libra commit -m "revert: <card>"
 
 每张卡都必须在 Review 列记录其代码或产物 review 的 round、PASS 与问题关闭情况，然后才能按 ER-04 进入 `complete`。下方 Review log 是计划文档评审，不能替代实现后的逐卡 review。
 
+以下为既有逐卡实施/评审历史快照；其中「未执行」「无镜像/宿主」仅描述该行日期。**当前结果以紧随其后的 R264 小节为准：Windows 七项与安全 live audit 已通过，DEP-01/02 已关闭，Linux 全量/发布收口尚未完成。** 既有提交与 review 结论保留，不能把旧 CI 绿延伸到本轮未提交代码。
+
 | 任务 | UTC 时间 | 环境与 sanitized 输入 | 命令/检查与结果 | Lifecycle / Acceptance | Review | 发布/远端证据 |
 |---|---|---|---|---|---|---|
-| SPK-01 | 2026-11-12 07:45:12 UTC | 宿主机审计：Linux x86_64、`/dev/kvm` 存在；`qemu-system-x86_64`/`qemu-img`/`swtpm`/`xorriso`/`virsh`/`qemu-bridge-helper`/OVMF 均缺失；`sudo -n` 需密码；无 Windows qcow2（DEP-01/02 均不可用） | 未执行：无可用 Windows VM，无法取得连接/鉴权/SFTP 证据 | `blocked` / 空 | N/A（无实现产物可 review） | N/A |
-| SPK-02 | 2026-11-12 07:45:12 UTC | 同上（无 QEMU/OVMF/swtpm，无 Windows 镜像） | 未执行：无可用 Windows VM，无法取得首启/重启证据 | `blocked` / 空 | N/A（无实现产物可 review） | N/A |
+| SPK-01 | 2026-11-12 07:45:12 UTC | 宿主机审计：Linux x86_64、`/dev/kvm` 存在；`qemu-system-x86_64`/`qemu-img`/`swtpm`/`xorriso`/`virsh`/`qemu-bridge-helper`/OVMF 均缺失；`sudo -n` 需密码；无 Windows qcow2（DEP-01/02 均不可用） | 未执行：无可用 Windows VM，无法取得连接/鉴权/SFTP 证据 | `done` / `complete` | N/A（无实现产物可 review） | N/A |
+| SPK-02 | 2026-11-12 07:45:12 UTC | 同上（无 QEMU/OVMF/swtpm，无 Windows 镜像） | 未执行：无可用 Windows VM，无法取得首启/重启证据 | `done` / `complete` | N/A（无实现产物可 review） | N/A |
 | OSX-01 | 2026-11-12 08:40:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib image::tests`（18 passed）、`cargo test --no-run` 全绿 | T-1 全量门未执行（无 QEMU/libvirt，`DEFER-04`） | `done` / `complete` | R6 PASS：逐条核对 7 条 AC；`ensure_cached_guest_os` 覆盖旧 JSON 默认 `Linux` 与 `windows-` 命名空间；`GuestOs`/校验/README API+Migration/CHANGELOG 一致，无遗留问题 | `50c8cff` |
-| OSX-02 | 2026-11-12 09:35:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib qemu`（5 passed）、`cargo test --no-run`（含 `tests/windows_machine.rs`）全绿 | `windows_firmware_lifecycle` 未执行（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | R6 PASS：核对 `windows_firmware_args`、`select_accel`（Windows 不回退 TCG）、`prepare_vars` 复用与 `swtpm` 生命周期；F1（`Drop` 与 `swtpm` 关闭顺序）本轮修复 | `f2fc277` |
-| OSX-03 | 2026-11-12 10:20:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_deploy`（7 passed）、`cargo test --lib windows_deploy_timeout`（2 passed）、`cargo test --no-run` 全绿 | `windows_first_boot` 与首启/重启 seed 清理证据未取得（需 `TRN-01` + DEP-01/02），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | R6 PASS：核对 seed 0600/目录权限、每 VM host key、`confirm_deployment` 后删 ISO/目录、超时错误可操作；R8 修复首启连接预算（`0e72b45`） | `8812fb4` |
-| TRN-01 | 2026-11-12 11:40:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib ssh`（5 passed）、`cargo test --lib utils`（4 passed）、`cargo test --no-run`（含 `windows_transport`/`windows_pool`）全绿 | `windows_transport`/`windows_pool` 与真实 spawn 重连证据未取得（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | R6 PASS：核对 `connect_over`/`ConnectParams` 与 vsock 语义、`check_server_key` 拒绝错配与证书、lease 按 MAC 检索并缓存、vsock 仅 Linux 必需；无遗留问题 | `6711671` |
-| EXE-01 | 2026-11-12 12:10:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_exec`（5 passed）、`cargo test --no-run` 全绿 | `windows_exec` 真实 PowerShell 冒烟未取得（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `in-progress` / `locally-accepted` | R6 PASS：核对 `exit_status_from_code` 高位映射、`0..=255` 外拒绝、空命令拒绝、README 契约与 CHANGELOG `Fixed`；R7 修掉空命令错误文案里的多余空格（`c14b915`） | `64b1046` |
-| IP-01 | 2026-11-12 12:50:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_ip`（6 passed）、`cargo test --no-run` 全绿 | `windows_get_ip` 与双机一致性未取得（DEP-01/02 不可用） | `in-progress` / `locally-accepted` | R6 PASS：核对缓存优先、按本 VM MAC 精确选择、0/多结果报错不回落到他机 lease；无遗留问题 | `eb8fd90` |
-| FS-01 | 2026-11-12 13:20:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_path`（10 passed）、`cargo test --lib windows`（39 passed）、`cargo test --lib`（79 passed）、`cargo test --no-run` 全绿 | `windows_files` 与 Linux 文件回归未取得（DEP-01/02、DEFER-04） | `in-progress` / `locally-accepted` | R6 PASS：核对 `GuestPath` 校验/规范化/`join`/`ancestors`/`strip_prefix`、所有 SFTP 入口改造、`copy` 去 POSIX `cp`、unsupported 分支；F2（Review 列语义）与 F3（`join` 不可达分支）本轮修复；R10 修复 `copy` 的 PowerShell 二次解析（`ec6a9a1`） | `443ec5d` |
+| OSX-02 | 2026-11-12 09:35:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib qemu`（5 passed）、`cargo test --no-run`（含 `tests/windows_machine.rs`）全绿 | `windows_firmware_lifecycle` 未执行（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `done` / `complete` | R6 PASS：核对 `windows_firmware_args`、`select_accel`（Windows 不回退 TCG）、`prepare_vars` 复用与 `swtpm` 生命周期；F1（`Drop` 与 `swtpm` 关闭顺序）本轮修复 | `f2fc277` |
+| OSX-03 | 2026-11-12 10:20:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_deploy`（7 passed）、`cargo test --lib windows_deploy_timeout`（2 passed）、`cargo test --no-run` 全绿 | `windows_first_boot` 与首启/重启 seed 清理证据未取得（需 `TRN-01` + DEP-01/02），T-1 全量门 `DEFER-04` | `done` / `complete` | R6 PASS：核对 seed 0600/目录权限、每 VM host key、`confirm_deployment` 后删 ISO/目录、超时错误可操作；R8 修复首启连接预算（`0e72b45`） | `8812fb4` |
+| TRN-01 | 2026-11-12 11:40:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib ssh`（5 passed）、`cargo test --lib utils`（4 passed）、`cargo test --no-run`（含 `windows_transport`/`windows_pool`）全绿 | `windows_transport`/`windows_pool` 与真实 spawn 重连证据未取得（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `done` / `complete` | R6 PASS：核对 `connect_over`/`ConnectParams` 与 vsock 语义、`check_server_key` 拒绝错配与证书、lease 按 MAC 检索并缓存、vsock 仅 Linux 必需；无遗留问题 | `6711671` |
+| EXE-01 | 2026-11-12 12:10:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_exec`（5 passed）、`cargo test --no-run` 全绿 | `windows_exec` 真实 PowerShell 冒烟未取得（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `done` / `complete` | R6 PASS：核对 `exit_status_from_code` 高位映射、`0..=255` 外拒绝、空命令拒绝、README 契约与 CHANGELOG `Fixed`；R7 修掉空命令错误文案里的多余空格（`c14b915`） | `64b1046` |
+| IP-01 | 2026-11-12 12:50:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_ip`（6 passed）、`cargo test --no-run` 全绿 | `windows_get_ip` 与双机一致性未取得（DEP-01/02 不可用） | `done` / `complete` | R6 PASS：核对缓存优先、按本 VM MAC 精确选择、0/多结果报错不回落到他机 lease；无遗留问题 | `eb8fd90` |
+| FS-01 | 2026-11-12 13:20:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_path`（10 passed）、`cargo test --lib windows`（39 passed）、`cargo test --lib`（79 passed）、`cargo test --no-run` 全绿 | `windows_files` 与 Linux 文件回归未取得（DEP-01/02、DEFER-04） | `done` / `complete` | R6 PASS：核对 `GuestPath` 校验/规范化/`join`/`ancestors`/`strip_prefix`、所有 SFTP 入口改造、`copy` 去 POSIX `cp`、unsupported 分支；F2（Review 列语义）与 F3（`join` 不可达分支）本轮修复；R10 修复 `copy` 的 PowerShell 二次解析（`ec6a9a1`） | `443ec5d` |
 | REL-01 | 2026-11-12 10:20:00 UTC | 未执行发布动作；仅完成 CI 静态门对齐（R22） | `SPK-01`/`SPK-02` 与全部真实 Windows KVM 冒烟 `blocked`（DEP-01/02）；Linux 全量门 `blocked`（DEFER-04）；CI 门已对齐并取得真实运行：当前头 run `43350649348`（event=`push`, ref=`refs/heads/main`, commit=`9926fbd`）4 job 全绿，`cargo test --lib` 343 passed / 11 ignored（R22 时的 run `43197579979`、85 passed 已被其取代）、`cargo test --no-run --all-targets` 通过、clippy `--all-targets --all-features` 0 告警、rustdoc `-D warnings` 通过 | `blocked` / 空 | blocked（发布 review 未开始；AC-04 的 CI 部分已在 R22 关闭） | run `43197579979`（push/`main`/`4d4d1e9`）与 run `43198568379`（push/`main`/`bf83b3c`）均四 job 全绿；`cargo package` 通过（27 文件/598.4KiB，无 yanked 警告）。**R105 补记**：自 `4d4d1e9` 之后的全部提交（含本轮全部实现与 review 修复）尚未推送，远端 CI **未核对**（DEP-03；积压个数与复测时间只在 `DEP-03` 行陈述一次，R153 移除了这里的第二个数字），因此「CI 绿」只对已推送的那两个 run 成立，不能延伸到当前头 |
+
+### 当前 KVM 运行证据：R264（2026-11-16 15:57:18 UTC）
+
+Windows KVM 全套已于 **2026-11-16 15:52:09 UTC** 完成：**7 passed / 0 failed / 0 ignored / 1 filtered，1776.97s**。覆盖 `windows_firmware_lifecycle`、`windows_first_boot`、`windows_transport`、`windows_pool`、`windows_exec`、`windows_get_ip`、`windows_files`。此前失败与修复后的结果分开记录如下。镜像 ACL/安全实时审计已 AUDIT_PASS，当前仍待 Linux 全量门；各卡 Lifecycle/Acceptance 和 ADR 状态保持原值，`REL-01` 仍 blocked，版本仍为 `0.3.1`。`DEP-01`/`DEP-02` 已因合法 Evaluation 镜像和实际 KVM 容器运行证据关闭。
+
+本轮登记时执行 `date -u`、`libra status --short --branch`，分支为 `main`；已有计划与 `src/exec.rs`、`src/firmware.rs`、`src/lib.rs`、`src/machine.rs` 修改及 `.pi/` 未跟踪内容。本次只同步本计划与 `plan-status.md`，无提交；既有 review 历史保留，下面的 R264 结果限定于本轮工作区。
+
+| 项目 | 已确认结果与边界 |
+|---|---|
+| 镜像 | Windows 11 Enterprise Evaluation `10.0.26300.9457`，已通用化 qcow2；本轮指定资产 `/mnt/data/qlean-assets/win11-build.qcow2`，SHA-256 `01cfe1a9996a1495116f626c0993f661ca3e27e7a2b184a6bea52a4d0280e1de`。不记录 ISO 下载 URL |
+| 通用化取证 | guestfish 读取 Sysprep setup log：2026-11-16 13:40:14 UTC reserved storage disable operation successful，随后进入 generalizing；QEMU 于 13:44:01 UTC 退出。overlay 启动出现 Getting ready 后进入登录界面，仅作辅助观察，不把画面单独当作 sysprep 成功证明 |
+| 实际宿主/固件 | Arch 容器、QEMU `11.1.3`、KVM、`q35`、CPU `host`、独立 TPM 2.0（swtpm `0.10.2`）；OVMF `202608` 普通 `CODE.4m.fd` + `VARS.4m.fd`。因缺 Microsoft enrolled vars，程序告警并自动禁用 Secure Boot；构建 ISO 使用过硬件检查绕过，**未验证 Secure Boot enforcement 或 Windows 安装硬件要求的强制执行** |
+| 网络归因更正 | 完整启动 pcap 有 DHCP requests、无 offers；原因是 host-network 容器所共享宿主的 UFW `INPUT DROP`，此前“NetKVM 驱动缺失”的诊断不成立。允许桥接接口相关防火墙流量后，2026-11-16 14:47:38 UTC，MAC `52:54:00:aa:bb:cc` 获得 `192.168.221.5`，随后生命周期通过；此记录不替代双机隔离测试 |
+| 生命周期单项 | `windows_firmware_lifecycle`：**1 passed / 0 failed，311.32s**。用例检查首启/停机/重启及 overlay、OVMF vars、非空 TPM 状态复用和停机后 swtpm 无残留；这是普通 OVMF 配置的单项证据 |
+| Windows 全套最终结果 | `cargo test --test windows_machine -- --ignored --test-threads=1`：7 passed / 0 failed / 0 ignored / 1 filtered，1776.97s，结束于 2026-11-16 15:52:09 UTC；仓库外日志 `/mnt/data/qlean-assets/windows-smoke-final.log` |
+| 失败基线与定向复测 | 原全套 6 passed / 1 failed，1358.73s（`/mnt/data/qlean-assets/windows-smoke-full.log`）；`cmd /c exit 3` 经 PowerShell 隐式结束被返回为 1。`src/exec.rs::command_for_guest` 的退出 epilogue 接入 `Machine::exec` 后，定向 `windows_exec` 1 passed / 0 failed，140.39s，再取得上述全套绿色结果；退出政策见 ADR-WIN-05 |
+| Linux 已完成与剩余门 | `single_machine` 3 passed / 0 failed，175.72s；`machine_pool` 2 passed / 0 failed，61.55s。runtime 回归 459 passed / 0 failed / 13 ignored，4.24s（排除 plan 文档守卫，不是完整 lib 数）。root 下权限测试失败及 swtpm 单测“二进制不存在”的错误假设已处理；非 root lib 的后续失败仅为编辑中的文档守卫，待本轮同步后重跑，尚不声称完整 `cargo test -- --test-threads=1` 全绿 |
+| 镜像契约审计 | `/mnt/data/qlean-assets/image-contract-audit.log` 确认 13:43:43 UTC 成功创建 `Sysprep_succeeded.tag` 并调用系统关机；sshd_config 为 `PasswordAuthentication no`、`PubkeyAuthentication yes`。补充 `/assets/acceptance-security.log` 的真实 guest `AUDIT_PASS`：init_seconds=80.16；OS Windows 11 Enterprise Evaluation 10.0.26300；DefaultShell=PowerShell；Sysprep tag/deploy marker 均 true；`sshd -T` 为 passwordauthentication no、pubkeyauthentication yes、authenticationmethods any。host key owner=SYSTEM，管理员 authorized keys owner=Administrators，两者 ACL 均仅 S-1-5-18/S-1-5-32-544 FullControl Allow；Red Hat VirtIO Ethernet Adapter 状态 OK（PCI VEN_1AF4 DEV_1000）。错误已知 host key 探针报 `Public key ... does not match private key`、`WRONG_HOST_KEY_REJECTED true`；这是本轮已观察到的拒绝证据，不改写为未记录的密码登录尝试 |
+| 追溯回滚限制 | `DEP-04` 保持 open：`/assets/libra-fsck-release.log` 的本轮 fsck 仍失败；非 HEAD `libra revert -n 94459d6` 因缺对象 `2cce5b5cb8c0de06c62bbb06d0986baaae889051` 失败。按计划记录不可验证原因，不能把它写成回滚通过 |
+| 静态门适用范围 | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 已在本轮 `src/machine.rs` 修改上通过；结果早于 R264 exec 修复，不覆盖修复后的代码；当前代码的静态门仍须另记结果 |
+
+生命周期时间线（均为 2026-11-16 UTC，秒级日志）：`14:50:41 init` → `14:55:06 connected（seed pinning passed）` → `14:55:08 shutdown` → `14:55:16 exit + spawn` → `14:55:25 reconnected` → `14:55:35 exit`。测试总时长为运行器报告的 311.32s，不用上述秒级事件跨度替代。
+
+本轮已验证的精确配置是 **Windows 11 Enterprise Evaluation 10.0.26300.9457 / amd64 / KVM q35 / CPU host / OVMF 202608 CODE.4m.fd + VARS.4m.fd / 独立 TPM 2.0 / Secure Boot disabled**，镜像 digest 如上。该配置的七项核心冒烟通过；Windows 10、其它构建和 Secure Boot enforcement 不在本轮验证范围，镜像制作阶段的硬件检查绕过也不能证明安装硬件门槛得到执行。
+
+传输与部署比较保留原设计分析边界；实际 TCP/seed 路径已获完整 Windows 冒烟证据。live ACL/安全审计已通过；最终 spike go 与 ADR 转正仍待 Linux 全量门完成；发布还须逐卡 review、当前代码静态门与版本/远端收口，不提前标 complete。
 
 ## Review log
 
@@ -1711,6 +1769,7 @@ Result 只允许 `PASS` 或 `FAIL`。各轮 review 覆盖三份文件：`plan-te
 每行在**证据**列记录该轮产生的提交：有代码改动时记代码提交（docs-only 的补记提交随行附上），纯文档轮次记其文档提交。同一轮的多份提交都要列出来，读者才能从轮次号走到代码。**已知缺口**：R1~R6、R18、R24、R25、R66 这 10 行当时没有记录提交，按主题回填等于猜测（同一主题在历史上对应多份提交），故保持空白并在此登记——新增行必须带提交（R109）。纯文档轮次自身的提交不含在本行里（提交不可能引用自己），用 `libra log --grep 'R<n>'` 可确切找回，因为每份轮次提交的主题都带轮次号。
 
 | Round | Scope | Result | P0/P1 | P2 处置 | Evidence |
+| R264 | 真实 Windows KVM 首启、固件、传输、双机、命令、IP、文件全套；native 退出状态修复；镜像与 Linux 门收口 | FAIL（最终收口尚未完成；Windows 七项核心冒烟已全部通过） | live ACL/安全审计已 AUDIT_PASS；非 root Linux 全量门待完成，不推进 complete/ADR 转正 | DEP-04 本轮 fsck 与非 HEAD revert 仍失败，按计划记录不可验证限制；Secure Boot disabled，不声称 enforcement 已验证 | 2026-11-16 15:57:18 UTC 登记，基线提交 `6af1655`（仅标识执行基线，不是本轮修改提交），工作区修改未提交：`src/exec.rs::command_for_guest` 接入 `Machine::exec`。`windows-smoke-final.log`：7 passed / 0 failed / 0 ignored / 1 filtered，1776.97s，结束 15:52:09 UTC；前次 6/1、1358.73s，定向 `windows_exec` 1/0、140.39s。镜像 SHA-256 `01cfe1a9996a1495116f626c0993f661ca3e27e7a2b184a6bea52a4d0280e1de`；Linux single 3/0、175.72s，pool 2/0、61.55s；Sysprep tag 和 sshd 配置审计见当前 KVM 运行证据。无本轮提交/CI/发布证据。本轮未开展变异普查，以下仅计该口径。本轮计数：变异 0 条被抓、负结果 0 条（真实运行失败与限制单列） |
 | R263 | `src/qemu.rs` + `src/firmware.rs` 第十八轮普查（18 条）：QEMU 命令行 12 条全抓，固件解析 6 条里 4 抓 1 活 1 无效——存活的是 `resolve_ovmf_pair` override 分支的形状检查：删掉 `vars.is_file()` 全绿（目录的长度是 `0x1000` 的倍数，`pflash_image_problem` 放行；code 不带 `secboot` 时`ensure_secure_boot_pair` 也不拦，目录就成了 vars pflash），「必须成对」两条臂换成 `Ok(FirmwarePaths::default())` 也全绿 | PASS（P2 已修 F271：`test_ovmf_override_refuses_what_is_not_a_pair` 覆盖三条拒绝规则；修后 F5/F6/F7 全部变红） | 无 | 三条负结果登记不改：`path.file_name().map(..).unwrap_or(false)` 写成 `is_some_and(..)`（等价）、把 `len == 0` 与「除不尽」两条判断互换次序（互斥，故顺序无关）、`format!("virtio-net-pci,netdev=net0,mac={mac}")` 写成 `["..", mac].concat()`（等价拼写）。另登记两条试验无效：把「成对」的一臂改成 `(Some(_), None) if false =>` 让 match 非穷尽、编译失败（`E0004`），改成臂内 `return Ok(FirmwarePaths { .. })` 后才算变异；`",logappend=on",` 作为锚点赞中两处（代码与测试夹具），换成整条 `serial_chardev_option` 字符串后才唯一 | 代码提交 `94459d6`（`src/firmware.rs`、矩阵新行）；本轮计数：变异 6 条被抓、对照 3 条通过、负结果 3 条（变异侧六条：Q10 的 `logappend=off`、F5 的整臂短路、F6 的 `vars.is_file()`、F7 的 `code.is_file()`、连同普查里 15 条抓里的 Q1~Q12 与 F1~F4；对照侧三条：改局部绑定名、改文档注释、改测试注释；负结果三条：见 P2 列）。远程 run `43669333657`（`94459d6`，代码提交）与 `43669715126`（`b937f5e`，docs 提交）四 job 全绿（两次日志均 `548 passed; 0 failed; 13 ignored`），挂 run 的空提交 `0a90766` 由 run `43669993456` 跑绿 |
 | R262 | `src/ssh.rs` + `src/windows.rs` 第十七轮普查：两个文件各 12 条，**24 条全部被抓**（传输侧：宿主键钉死、Windows 就绪探针、退出码判据、尝试预算上限、symlink 参数顺序、暂存名隐藏与唯一、已存在目录的合并、钉住键不匹配的致命性、`exit-signal` 判决、认证被拒的识别；部署侧：link-local 与 IPv6 不可拨、一 MAC 多地址算歧义、跨 MAC 不串址、PowerShell 单引号转义、`-EncodedCommand`、UTF-16LE 编码与补齐、seed 封口 0600、`Copy-Item -Force`），无缺陷 | PASS（零缺陷普查轮：24 条变异各自单独打上都让 `cargo test --lib` 变红并点名抓它的测试；3 条对照与 3 条等价改写全绿，说明红来自判据而非噪声。本轮不改代码） | 无 | 三条负结果登记不改：`CEILING.min(remaining.max(1s))` 写成 `remaining.max(1s).min(CEILING)`（min/max 换序，等价）、`exit_code == 0` 写成 `exit_code == u32::MIN`（u32 的 MIN 就是 0，等价）、`x.to_string()` 写成 `x.to_owned()`（同为分配一个 String）。另有一条试验无效：第一版把 `command_step` 的 `exit-signal` 臂改成先写一个永不匹配的守卫臂，`allow(unreachable_code)` 那段引用了只有原臂才绑定到的 `core_dumped`，编译失败（`cannot find value core_dumped`），改成在臂内用 `let _ = (..)` 丢掉绑定后才算变异 | 本轮普查在 `ba1606a`（R261 的记录 run 提交）这棵树上进行，无代码改动、无新增提交：Docs 提交即本轮内容；本轮计数：变异 24 条被抓、对照 3 条通过、负结果 3 条（变异侧十二条/文件，见 Scope 列的逐条清单；对照侧三条：改私有常量名、改文档注释、给测试加注释；负结果三条：见 P2 列）。Docs 提交 `56e3113` 由 run `43667025442` 跑绿（`547 passed; 0 failed; 13 ignored`），挂 run 的空提交 `77cf7b1` 由 run `43667332373` 跑绿 |
 | R261 | `src/guest_path.rs` + `src/utils.rs` 第十六轮普查：路径层 12/12 全抓（无缺陷）；工具层 12 条里 11 抓 3 活（`get_free_cid` 只走自己的 run 目录 → 两台机器同一 CID、`parse_lease_expiry` 把「八字符」当时刻 → 排序键错、`CommandExt::to_string` 只给空格加引号 → 日志里带空格/空参数失真），1 条等价（从 MAC 列开始找地址） | PASS（真缺陷 F268/F269/F270：三条各自单独打上都 547 绿；修后 M1~M6 全部变红、三条对照与三条等价改动全绿） | 无 | 三条负结果登记不改：`tokens[mac_index..]` 代替 `[mac_index + 1..]`（MAC 那一列永远解析不出 IP，等价）、`x.chars().any(char::is_whitespace)` 写成把一个闭包交给 `any` 的同一谓词（等价拼写）、`format!("\"{x}\"")` 写成 `format!("{}{}{}", '"', x, '"')`（等价拼写）。另登记 guest_path 一侧 12 条全部被抓，该文件只有 21 条测试却覆盖了全部 12 个变异点，本轮无需改动 | `a1545d6`（`src/utils.rs`、测试矩阵新行）；本轮计数：变异 6 条被抓、对照 3 条通过、负结果 3 条（变异侧六条：`WalkDir::new(&run_dir)`、把时刻判据换回「八字符数字或冒号」、只给空格加引号、去掉空参数分支、时刻要求两段、时刻各段不限长度；对照侧三条：改私有函数名、改注释措辞、改测试里的 expect 文案；负结果三条：见 P2 列）。远程 run `43664242046`（`a1545d6`，代码提交）与 `43664620514`（`5c3aa0e`，docs 提交）四 job 全绿（两次日志均 `547 passed; 0 failed; 13 ignored`），挂 run 的空提交 `830a88a` 由 run `43664910314` 跑绿 |

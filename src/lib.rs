@@ -1624,7 +1624,7 @@ mod plan_doc_tests {
     fn every_environment_override_the_crate_reads_is_documented() {
         const README: &str = include_str!("../README.md");
         // Test hooks: they take effect only inside a test that asks for them.
-        const TEST_HOOKS: &[&str] = &["QLEAN_REFUSED_KILL_PID"];
+        const TEST_HOOKS: &[&str] = &["QLEAN_REFUSED_KILL_PID", "QLEAN_WINDOWS_EXEC_TEST_SHELL"];
 
         let mut read: Vec<&str> = Vec::new();
         for (path, source) in CRATE_SOURCES {
@@ -2413,14 +2413,11 @@ mod plan_doc_tests {
         );
     }
 
-    /// `exec` hands the command to the transport exactly as it was given.
+    /// Preserve the user's script text and use the guest-specific exit-status epilogue.
     ///
-    /// The README promises that `exec` runs the command verbatim and that the guest's own shell
-    /// decides what it means, and the doc comment on the method repeats it. A wrapper added in
-    /// this one function - an encoded PowerShell, a `cmd /c`, a quoting pass - would change what
-    /// every caller runs, and nothing else in the suite could see it: the body needs a session,
-    /// so the mutant that wrapped the command in `powershell_command` left every test green
-    /// (R251 census). The guard pins the one hand-over, and the absence of a second one.
+    /// Linux commands pass through unchanged. Windows commands append an explicit exit without
+    /// quoting or starting a second shell; the real Windows smoke verifies native status 3 and
+    /// rejection of status 300. Keep one transport call through that preparation step.
     #[test]
     fn exec_hands_the_command_to_the_transport_unchanged() {
         let source = include_str!("machine.rs");
@@ -2435,8 +2432,9 @@ mod plan_doc_tests {
             "the command must be handed over once"
         );
         assert!(
-            body.contains("ssh.call_with_output(cmd_ref, cancel_token).await?"),
-            "`exec` has to pass the caller's own string, not something derived from it:
+            body.contains("crate::exec::command_for_guest(self.image.guest_os, cmd_ref)")
+                && body.contains("ssh.call_with_output(&command, cancel_token).await?"),
+            "`exec` must preserve the user script through guest-specific status preparation:
 {body}"
         );
         for wrapper in ["powershell_command(", "escape(", "cmd /c", "powershell -"] {
@@ -2831,30 +2829,22 @@ mod plan_doc_tests {
         );
     }
 
-    /// `## 兼容与文档收口` mixes finished audits with one item that waits for the release.
+    /// `## 兼容与文档收口` closes once the 0.4.0 CHANGELOG entry is finalized.
     ///
-    /// Two of the finished audits sat in unchecked boxes, so a reader walking the section
-    /// could not tell "verified, nothing to do" from "not looked at yet" - and the plan's own
-    /// completion criterion is that this section is closed except for the release. The
-    /// directory list next to them was a hand-copied `ls tests/`, which goes stale the moment
-    /// an integration test file is added (R171).
+    /// Before the release the only open box was the CHANGELOG entry itself; the entry is now
+    /// written, so the whole section must be closed. The directory list next to it is read
+    /// from the tests directory rather than copied by hand (R171).
     #[test]
-    fn the_compatibility_section_keeps_no_unchecked_item_but_the_release() {
+    fn the_compatibility_section_is_closed_after_the_release() {
         const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
         let section = section(PLAN, "## 兼容与文档收口");
         let unchecked: Vec<&str> = section
             .lines()
             .filter(|line| line.starts_with("- [ ]"))
             .collect();
-        assert_eq!(
-            unchecked.len(),
-            1,
-            "only the 0.4.0 CHANGELOG entry may stay open in this section, and it must: {unchecked:#?}"
-        );
         assert!(
-            unchecked[0].contains("CHANGELOG 按 Keep a Changelog"),
-            "the one open box must be the release item, not an audit that is already done: {}",
-            unchecked[0]
+            unchecked.is_empty(),
+            "the 0.4.0 CHANGELOG entry is finalized, so no audit item may stay open: {unchecked:#?}"
         );
     }
 
@@ -4775,11 +4765,14 @@ mod plan_doc_tests {
         const PLAN: &str = include_str!("../docs/plan/plan-20261104-windows-guest.md");
         const GATE: &str = "RUSTDOCFLAGS=\"-D warnings\" cargo doc --no-deps";
 
-        // A card with an acceptance value is a card that has been through the local gate, whatever
-        // its lifecycle says about the Windows-hosted criteria still waiting on DEP-01/02.
+        // Only implementation cards carry the rustdoc gate. A spike's verification is a
+        // comparison table and a go/no-go, and the release card's is the publish pipeline, so
+        // completing them must not invent a rustdoc requirement they never had.
         let accepted: Vec<String> = card_states(PLAN)
             .into_iter()
-            .filter(|(_, _, acceptance)| acceptance != "空")
+            .filter(|(id, _, acceptance)| {
+                acceptance != "空" && !id.starts_with("SPK-") && !id.starts_with("REL-")
+            })
             .map(|(id, _, _)| id)
             .collect();
         assert_eq!(
@@ -5017,10 +5010,10 @@ mod plan_doc_tests {
         }
 
         let unreleased = CHANGELOG
-            .split("## [Unreleased]")
+            .split("## [0.4.0]")
             .nth(1)
             .and_then(|rest| rest.split("\n## [").next())
-            .expect("the changelog must still have an [Unreleased] section");
+            .expect("the changelog must still have a [0.4.0] section");
         let fixed = changelog_sections(unreleased)
             .into_iter()
             .find(|(title, _)| title == "Fixed")
@@ -5434,39 +5427,42 @@ mod plan_doc_tests {
     /// The README does not claim Windows support while the smoke tests that would earn it are
     /// deferred.
     ///
-    /// The plan forbids announcing Windows support without recorded evidence from a real KVM host.
-    /// The smoke tests are ignored for exactly that reason, so their `#[ignore]` attributes
-    /// and the README's "Claimed support" column are the same fact written twice. Flipping the
-    /// column to yes is the mistake a release would make; this catches it.
+    /// The README only claims the Windows build that has recorded KVM evidence, and the seven
+    /// hardware-gated smokes stay `#[ignore]`d so ordinary CI never needs a Windows guest.
+    ///
+    /// Claiming every Windows version after measuring one is the failure this guards: the
+    /// matrix must name the measured build and keep unmeasured versions at "no". The smoke
+    /// tests remain hardware-gated on purpose; acceptance is a local KVM run, not a CI job.
     #[test]
-    fn the_readme_claims_no_windows_support_while_the_smoke_tests_are_deferred() {
+    fn the_readme_only_claims_the_windows_build_that_was_measured() {
         const README: &str = include_str!("../README.md");
         const SMOKE_TESTS: &str = include_str!("../tests/windows_machine.rs");
 
-        // Count attributes, not mentions: the file also says `#[ignore]`d in its own prose.
         let deferred = SMOKE_TESTS
             .lines()
             .filter(|line| line.starts_with("#[ignore"))
             .count();
-        assert!(
-            deferred > 0,
-            "no Windows smoke test is deferred any more: the README's support claim has to be \
-             re-decided by hand before this guard is relaxed"
+        assert_eq!(
+            deferred, 7,
+            "the seven Windows smokes must stay hardware-gated with #[ignore]; acceptance is a \
+             local KVM run, not a GitHub Actions job"
         );
 
         let row = README
             .lines()
-            .find(|line| line.starts_with("| Windows 10 / 11"))
-            .expect("the README support matrix has no Windows row");
-        let cells: Vec<&str> = row.split('|').map(str::trim).collect();
+            .find(|line| line.starts_with("| Windows 11 Enterprise Evaluation"))
+            .expect("the support matrix has no measured Windows build");
         assert!(
-            cells.len() > 3,
-            "the Windows row of the support matrix lost its columns: {row}"
+            row.contains("10.0.26300.9457") && row.contains("yes (this build only)"),
+            "the support claim must name the measured build and stay scoped to it: {row}"
         );
-        assert_eq!(
-            cells[3], "**no**",
-            "the README claims Windows support while {deferred} smoke tests are still deferred: \
-             the claim needs recorded KVM evidence, not a table edit"
+        let unmeasured = README
+            .lines()
+            .find(|line| line.starts_with("| Windows 10 and other Windows 11 builds"))
+            .expect("the support matrix no longer refuses unmeasured Windows versions");
+        assert!(
+            unmeasured.contains("**no**"),
+            "unmeasured Windows versions must not be claimed as supported: {unmeasured}"
         );
     }
 
@@ -5641,10 +5637,10 @@ mod plan_doc_tests {
     fn the_unreleased_changelog_files_each_entry_under_the_change_it_describes() {
         const CHANGELOG_TEXT: &str = include_str!("../CHANGELOG.md");
         let unreleased = CHANGELOG_TEXT
-            .split("## [Unreleased]")
+            .split("## [0.4.0]")
             .nth(1)
             .and_then(|rest| rest.split("\n## [").next())
-            .expect("the changelog must still have an [Unreleased] section");
+            .expect("the changelog must still have a [0.4.0] section");
         let sections = changelog_sections(unreleased);
         let bullets_under = |wanted: &str| -> Vec<String> {
             sections
@@ -5818,10 +5814,10 @@ mod plan_doc_tests {
         const CHANGELOG_TEXT: &str = include_str!("../CHANGELOG.md");
 
         let unreleased = CHANGELOG_TEXT
-            .split("## [Unreleased]")
+            .split("## [0.4.0]")
             .nth(1)
             .and_then(|rest| rest.split("\n## [").next())
-            .expect("the changelog must still have an [Unreleased] section");
+            .expect("the changelog must still have a [0.4.0] section");
         let flat_changelog = unreleased.split_whitespace().collect::<Vec<_>>().join(" ");
         let flat_readme = README_TEXT.split_whitespace().collect::<Vec<_>>().join(" ");
 
@@ -5891,10 +5887,10 @@ mod plan_doc_tests {
         );
 
         let unreleased = CHANGELOG_TEXT
-            .split("## [Unreleased]")
+            .split("## [0.4.0]")
             .nth(1)
             .and_then(|rest| rest.split("\n## [").next())
-            .expect("the changelog must still have an [Unreleased] section");
+            .expect("the changelog must still have a [0.4.0] section");
         let flat_changelog = unreleased.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
             flat_changelog
