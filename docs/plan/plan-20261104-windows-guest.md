@@ -1461,7 +1461,7 @@
 
 **Task type:** `release`
 
-**Lifecycle / Acceptance:** `blocked` / 空（R264：Windows 七项核心冒烟全部通过，DEP-01/02 已关闭；live ACL/安全审计已通过，Linux 非 root 全量门及发布收口仍待完成。DEP-04 非 HEAD 回滚限制有本轮失败证据；不 bump、不 tag、不发布，版本保持 0.3.1）
+**Lifecycle / Acceptance:** `blocked` / 空（R264：Windows 七项、live 安全审计、Linux 非 root 全量门、静态门与 release build 全通过；已 bump 0.4.0、打 tag `v0.4.0`、建 GitHub Release，发布 commit `d107271` 的 CI run `43910813962` 四 job 全绿；crates.io 需独立 token，当前环境没有，待 Owner 决定。DEP-04 非 HEAD 回滚限制已记录）
 
 **Description:** 作为唯一发布点聚合全部守卫，定稿 CHANGELOG、对齐 CI、发布 0.4.0；已吸收原 DOC-01 的只读文档收口审计，不承担各行为卡的补文档责任。
 
@@ -1483,31 +1483,31 @@
 
 | 发布前阻塞项（R264，2026-11-16） | 状态 |
 |---|---|
-| `SPK-01`/`SPK-02` 传输与首启 spike | `blocked`：Windows 全套已过，DEP-01/02 已关闭；live ACL/安全审计已通过，Linux 全量门待完成 |
+| `SPK-01`/`SPK-02` 传输与首启 spike | `done` / `complete`（R264 go：对比表、真实证据、go/no-go 与实现输入齐全，ADR-WIN-02/03 转 Accepted） |
 | `OSX-01` | `done` / `complete`（纯代码 + 文档门） |
-| `OSX-02`/`OSX-03`/`TRN-01`/`EXE-01`/`IP-01`/`FS-01` | `in-progress` / `locally-accepted`：Windows 核心七项已通过，保持状态等待审计与收口 |
-| Linux 全量门 | 非 root 重跑中（DEFER-04）；single 3/0、pool 2/0 已通过，尚无完整全绿结论 |
-| 结论 | 0.4.0 不发；`Cargo.toml` 保持 0.3.1，不打 tag，不写发布日期 |
+| `OSX-02`/`OSX-03`/`TRN-01`/`EXE-01`/`IP-01`/`FS-01` | `done` / `complete`（R264：Windows 核心七项、live 安全审计与 Linux 非 root 全量门均通过） |
+| Linux 全量门 | 非 root 全绿（lib 550 passed/13 ignored、machine_pool 2、muti_distro 3、single_machine 3、windows_machine 1 passed + 7 ignored；DEFER-04 的环境缺口已补） |
+| 发布门（R264） | fmt/clippy `--all-targets --all-features -D warnings`/rustdoc/`cargo test --no-run --all-targets`/`cargo build --release`(39.41s)/`cargo publish --dry-run` 全通过；发布 commit `d107271` 的 CI run `43910813962` 四 job 全绿；tag `v0.4.0`、GitHub Release 已建；crates.io 需独立 token，当前环境没有 |
 
 **Acceptance criteria:**
 
 - [ ] 全部任务卡 `Lifecycle=done` 且 `Acceptance=complete`，最终 code review PASS，P0/P1 关闭。
-- [ ] `Cargo.toml` 从 0.3.1 bump 到 0.4.0，`Cargo.lock` 仅由 Cargo 工具链刷新，版本与迁移理由符合 ADR-WIN-01。
-- [ ] README 支持矩阵只包含实际通过核心冒烟的 Windows 版本；CHANGELOG `[0.4.0]` 含 Added/Changed/Migration 与发布日期，链接可解析。
+- [x] `Cargo.toml` 从 0.3.1 bump 到 0.4.0，`Cargo.lock` 仅由 Cargo 工具链刷新，版本与迁移理由符合 ADR-WIN-01。
+- [x] README 支持矩阵只包含实际通过核心冒烟的 Windows 版本；CHANGELOG `[0.4.0]` 含 Added/Changed/Migration 与发布日期，链接可解析。
 - [x] CI 对目标分支 push 和 PR 均触发 format/clippy/test job，clippy 使用 `--all-targets --all-features -- -D warnings`，Windows target 至少 `--no-run` 编译。（R22 完成并取得真实 push 运行证据：run `43197579979` 四 job 全绿，含 `cargo test --lib` 的 85 passed 与 `cargo test --no-run --all-targets`；PR 侧沿用既有触发配置）
-- [ ] Linux 全量、每个支持版本的 Windows KVM 核心冒烟与 release build 全绿；核心 Windows 证据无开放 DEFER。
-- [ ] 所有适用 Rollback mode 已验证或记录不可验证原因；发布前工作区只剩本计划声明的改动。
-- [ ] tag `v0.4.0`、GitHub Release、按需 crates.io publish 完成；不可撤回动作之后只前滚修复。
-- [ ] 目标分支 push 对应 CI 的 format/clippy/test job 与 crates.io 结果已记录 run ID/URL、event、ref 和结论。
+- [x] Linux 全量、每个支持版本的 Windows KVM 核心冒烟与 release build 全绿；核心 Windows 证据无开放 DEFER。
+- [x] 所有适用 Rollback mode 已验证或记录不可验证原因；发布前工作区只剩本计划声明的改动（DEP-04 的非 HEAD 回滚不可验证已记录；`.pi/` 保持未跟踪）。
+- [ ] tag `v0.4.0`、GitHub Release、按需 crates.io publish 完成；不可撤回动作之后只前滚修复（tag/Release 已完成；crates.io 需独立 token，待 Owner 决定）。
+- [x] 目标分支 push 对应 CI 的 format/clippy/test job 与 crates.io 结果已记录 run ID/URL、event、ref 和结论（CI run `43910813962`，event=`push`、ref=`refs/heads/main`、commit=`d107271`，四 job 全绿；crates.io 待 token）。
 
 **Verification:**
 
-- [ ] `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings`
-- [ ] 配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1`
-- [ ] `cargo test --no-run`
+- [x] `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings`
+- [x] 配置齐全的 Linux VM 宿主机：`cargo test -- --test-threads=1`（非 root：lib 550 passed/13 ignored、machine_pool 2、muti_distro 3、single_machine 3、windows_machine 1 passed + 7 ignored）
+- [x] `cargo test --no-run`（`--all-targets`）
 - [x] 本轮支持候选配置 Windows 11 Enterprise Evaluation 10.0.26300.9457 / Secure Boot disabled：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine -- --ignored --test-threads=1` —— R264 7/0、1776.97s，15:52:09 UTC 完成；不扩大到未测版本或固件。
-- [ ] `cargo build --release`
-- [ ] 推送后核对 GitHub Actions `Check and Test` 的 `format`/`clippy`/`test`：event=`push`、ref=`refs/heads/main`、commit=发布 commit，全部绿色；crates.io（若发布）可查询到 0.4.0。
+- [x] `cargo build --release`（39.41s）
+- [x] 推送后核对 GitHub Actions `Check and Test` 的 `format`/`clippy`/`test`：event=`push`、ref=`refs/heads/main`、commit=`d107271`、run `43910813962` 四 job 全绿；crates.io（若发布）可查询到 0.4.0（待 token）。
 - [ ] 将全部 sanitized 命令结果、版本/commit、tag/release/CI/crates.io 证据写入「实施证据汇总」并同步 `plan-status.md`。
 
 **Full-suite trigger:** `T-2: 发布点卡`
