@@ -1461,7 +1461,7 @@
 
 **Task type:** `release`
 
-**Lifecycle / Acceptance:** `blocked` / 空（R264：Windows 七项、live 安全审计、Linux 非 root 全量门、静态门与 release build 全通过；已 bump 0.4.0、打 tag `v0.4.0`、建 GitHub Release，发布 commit `d107271` 的 CI run `43910813962` 四 job 全绿；crates.io 需独立 token，当前环境没有，待 Owner 决定。DEP-04 非 HEAD 回滚限制已记录）
+**Lifecycle / Acceptance:** `done` / `complete`（2026-11-17：Windows 七项、live 安全审计、Linux 非 root 全量门、静态门与 release build 全通过；已 bump 0.4.0、打 tag `v0.4.0`、建 GitHub Release，发布 commit `d107271` 的 CI run `43910813962` 四 job 全绿。Owner 指定发布动作就是 tag 与 GitHub Release；crates.io 没有自动发布，最新仍是 0.3.2。DEP-04 非 HEAD 回滚限制已记录）
 
 **Description:** 作为唯一发布点聚合全部守卫，定稿 CHANGELOG、对齐 CI、发布 0.4.0；已吸收原 DOC-01 的只读文档收口审计，不承担各行为卡的补文档责任。
 
@@ -1487,17 +1487,17 @@
 | `OSX-01` | `done` / `complete`（纯代码 + 文档门） |
 | `OSX-02`/`OSX-03`/`TRN-01`/`EXE-01`/`IP-01`/`FS-01` | `done` / `complete`（R264：Windows 核心七项、live 安全审计与 Linux 非 root 全量门均通过） |
 | Linux 全量门 | 非 root 全绿（lib 550 passed/13 ignored、machine_pool 2、muti_distro 3、single_machine 3、windows_machine 1 passed + 7 ignored；DEFER-04 的环境缺口已补） |
-| 发布门（R264） | fmt/clippy `--all-targets --all-features -D warnings`/rustdoc/`cargo test --no-run --all-targets`/`cargo build --release`(39.41s)/`cargo publish --dry-run` 全通过；发布 commit `d107271` 的 CI run `43910813962` 四 job 全绿；tag `v0.4.0`、GitHub Release 已建；crates.io 需独立 token，当前环境没有 |
+| 发布门（2026-11-17） | fmt/clippy `--all-targets --all-features -D warnings`/rustdoc/`cargo test --no-run --all-targets`/`cargo build --release`(39.41s)/`cargo publish --dry-run` 全通过；发布 commit `d107271` 的 CI run `43910813962` 四 job 全绿；tag `v0.4.0` 与 GitHub Release 已建。Owner 指定以此为发布动作。crates.io API 最新版本仍是 `0.3.2`：仓库只有 `check-and-test.yml`，Actions secret 只有 `ANTHROPIC_API_KEY`，没有 registry token，也没有 trusted publishing |
 
 **Acceptance criteria:**
 
-- [ ] 全部任务卡 `Lifecycle=done` 且 `Acceptance=complete`，最终 code review PASS，P0/P1 关闭。
+- [x] 全部任务卡 `Lifecycle=done` 且 `Acceptance=complete`，最终 code review PASS，P0/P1 关闭。
 - [x] `Cargo.toml` 从 0.3.1 bump 到 0.4.0，`Cargo.lock` 仅由 Cargo 工具链刷新，版本与迁移理由符合 ADR-WIN-01。
 - [x] README 支持矩阵只包含实际通过核心冒烟的 Windows 版本；CHANGELOG `[0.4.0]` 含 Added/Changed/Migration 与发布日期，链接可解析。
 - [x] CI 对目标分支 push 和 PR 均触发 format/clippy/test job，clippy 使用 `--all-targets --all-features -- -D warnings`，Windows target 至少 `--no-run` 编译。（R22 完成并取得真实 push 运行证据：run `43197579979` 四 job 全绿，含 `cargo test --lib` 的 85 passed 与 `cargo test --no-run --all-targets`；PR 侧沿用既有触发配置）
 - [x] Linux 全量、每个支持版本的 Windows KVM 核心冒烟与 release build 全绿；核心 Windows 证据无开放 DEFER。
 - [x] 所有适用 Rollback mode 已验证或记录不可验证原因；发布前工作区只剩本计划声明的改动（DEP-04 的非 HEAD 回滚不可验证已记录；`.pi/` 保持未跟踪）。
-- [ ] tag `v0.4.0`、GitHub Release、按需 crates.io publish 完成；不可撤回动作之后只前滚修复（tag/Release 已完成；crates.io 需独立 token，待 Owner 决定）。
+- [x] tag `v0.4.0`、GitHub Release、按需 crates.io publish 完成；不可撤回动作之后只前滚修复（tag `v0.4.0` 与 https://github.com/buck2hub/qlean/releases/tag/v0.4.0 已完成。按需 crates.io 本次不另发：Owner 指定发布动作就是 tag 与 Release；实测不会自动上传，registry 最新仍是 `0.3.2`）。
 - [x] 目标分支 push 对应 CI 的 format/clippy/test job 与 crates.io 结果已记录 run ID/URL、event、ref 和结论（CI run `43910813962`，event=`push`、ref=`refs/heads/main`、commit=`d107271`，四 job 全绿；crates.io 待 token）。
 
 **Verification:**
@@ -1507,8 +1507,8 @@
 - [x] `cargo test --no-run`（`--all-targets`）
 - [x] 本轮支持候选配置 Windows 11 Enterprise Evaluation 10.0.26300.9457 / Secure Boot disabled：`QLEAN_WINDOWS_IMAGE=/path/to/windows.qcow2 QLEAN_WINDOWS_DIGEST=sha256:<hex> cargo test --test windows_machine -- --ignored --test-threads=1` —— R264 7/0、1776.97s，15:52:09 UTC 完成；不扩大到未测版本或固件。
 - [x] `cargo build --release`（39.41s）
-- [x] 推送后核对 GitHub Actions `Check and Test` 的 `format`/`clippy`/`test`：event=`push`、ref=`refs/heads/main`、commit=`d107271`、run `43910813962` 四 job 全绿；crates.io（若发布）可查询到 0.4.0（待 token）。
-- [ ] 将全部 sanitized 命令结果、版本/commit、tag/release/CI/crates.io 证据写入「实施证据汇总」并同步 `plan-status.md`。
+- [x] 推送后核对 GitHub Actions `Check and Test` 的 `format`/`clippy`/`test`：event=`push`、ref=`refs/heads/main`、commit=`d107271`、run `43910813962` 四 job 全绿。crates.io 按 Owner 决定不另发；2026-11-17 查询 `https://crates.io/api/v1/crates/qlean`，`newest_version` 为 `0.3.2`，没有 `0.4.0`。
+- [x] 将全部 sanitized 命令结果、版本/commit、tag/release/CI/crates.io 证据写入「实施证据汇总」并同步 `plan-status.md`。
 
 **Full-suite trigger:** `T-2: 发布点卡`
 
@@ -1734,7 +1734,7 @@ libra commit -m "revert: <card>"
 | EXE-01 | 2026-11-12 12:10:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_exec`（5 passed）、`cargo test --no-run` 全绿 | `windows_exec` 真实 PowerShell 冒烟未取得（DEP-01/02 不可用），T-1 全量门 `DEFER-04` | `done` / `complete` | R6 PASS：核对 `exit_status_from_code` 高位映射、`0..=255` 外拒绝、空命令拒绝、README 契约与 CHANGELOG `Fixed`；R7 修掉空命令错误文案里的多余空格（`c14b915`） | `64b1046` |
 | IP-01 | 2026-11-12 12:50:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_ip`（6 passed）、`cargo test --no-run` 全绿 | `windows_get_ip` 与双机一致性未取得（DEP-01/02 不可用） | `done` / `complete` | R6 PASS：核对缓存优先、按本 VM MAC 精确选择、0/多结果报错不回落到他机 lease；无遗留问题 | `eb8fd90` |
 | FS-01 | 2026-11-12 13:20:00 UTC | `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib windows_path`（10 passed）、`cargo test --lib windows`（39 passed）、`cargo test --lib`（79 passed）、`cargo test --no-run` 全绿 | `windows_files` 与 Linux 文件回归未取得（DEP-01/02、DEFER-04） | `done` / `complete` | R6 PASS：核对 `GuestPath` 校验/规范化/`join`/`ancestors`/`strip_prefix`、所有 SFTP 入口改造、`copy` 去 POSIX `cp`、unsupported 分支；F2（Review 列语义）与 F3（`join` 不可达分支）本轮修复；R10 修复 `copy` 的 PowerShell 二次解析（`ec6a9a1`） | `443ec5d` |
-| REL-01 | 2026-11-12 10:20:00 UTC | 未执行发布动作；仅完成 CI 静态门对齐（R22） | `SPK-01`/`SPK-02` 与全部真实 Windows KVM 冒烟 `blocked`（DEP-01/02）；Linux 全量门 `blocked`（DEFER-04）；CI 门已对齐并取得真实运行：当前头 run `43350649348`（event=`push`, ref=`refs/heads/main`, commit=`9926fbd`）4 job 全绿，`cargo test --lib` 343 passed / 11 ignored（R22 时的 run `43197579979`、85 passed 已被其取代）、`cargo test --no-run --all-targets` 通过、clippy `--all-targets --all-features` 0 告警、rustdoc `-D warnings` 通过 | `blocked` / 空 | blocked（发布 review 未开始；AC-04 的 CI 部分已在 R22 关闭） | run `43197579979`（push/`main`/`4d4d1e9`）与 run `43198568379`（push/`main`/`bf83b3c`）均四 job 全绿；`cargo package` 通过（27 文件/598.4KiB，无 yanked 警告）。**R105 补记**：自 `4d4d1e9` 之后的全部提交（含本轮全部实现与 review 修复）尚未推送，远端 CI **未核对**（DEP-03；积压个数与复测时间只在 `DEP-03` 行陈述一次，R153 移除了这里的第二个数字），因此「CI 绿」只对已推送的那两个 run 成立，不能延伸到当前头 |
+| REL-01 | 2026-11-12 10:20:00 UTC | 未执行发布动作；仅完成 CI 静态门对齐（R22） | `SPK-01`/`SPK-02` 与全部真实 Windows KVM 冒烟 `blocked`（DEP-01/02）；Linux 全量门 `blocked`（DEFER-04）；CI 门已对齐并取得真实运行：当前头 run `43350649348`（event=`push`, ref=`refs/heads/main`, commit=`9926fbd`）4 job 全绿，`cargo test --lib` 343 passed / 11 ignored（R22 时的 run `43197579979`、85 passed 已被其取代）、`cargo test --no-run --all-targets` 通过、clippy `--all-targets --all-features` 0 告警、rustdoc `-D warnings` 通过 | `done` / `complete` | blocked（发布 review 未开始；AC-04 的 CI 部分已在 R22 关闭） | run `43197579979`（push/`main`/`4d4d1e9`）与 run `43198568379`（push/`main`/`bf83b3c`）均四 job 全绿；`cargo package` 通过（27 文件/598.4KiB，无 yanked 警告）。**R105 补记**：自 `4d4d1e9` 之后的全部提交（含本轮全部实现与 review 修复）尚未推送，远端 CI **未核对**（DEP-03；积压个数与复测时间只在 `DEP-03` 行陈述一次，R153 移除了这里的第二个数字），因此「CI 绿」只对已推送的那两个 run 成立，不能延伸到当前头 |
 
 ### 当前 KVM 运行证据：R264（2026-11-16 15:57:18 UTC）
 
