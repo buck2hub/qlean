@@ -7,6 +7,10 @@ use utils::tracing_subscriber_init;
 
 #[tokio::test]
 #[serial]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "needs OrbStack: cargo test --test machine_pool test_ping -- --ignored --test-threads=1"
+)]
 async fn test_ping() -> Result<()> {
     tracing_subscriber_init();
 
@@ -39,6 +43,10 @@ async fn test_ping() -> Result<()> {
 
 #[tokio::test]
 #[serial]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "needs OrbStack: cargo test --test machine_pool test_concurrency -- --ignored --test-threads=1"
+)]
 async fn test_concurrency() -> Result<()> {
     tracing_subscriber_init();
 

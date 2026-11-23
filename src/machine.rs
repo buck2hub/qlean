@@ -20,6 +20,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
+#[cfg(target_os = "macos")]
+use crate::orbstack::OrbExec;
 use crate::{
     firmware::{self, Swtpm, VmFirmware},
     guest_path::{GuestPath, PosixOnlyOperation, ensure_supported},
@@ -71,6 +73,9 @@ pub struct Machine {
     /// phase a fresh budget would allow three times the documented wait, so the phases
     /// share one deadline. `None` means no first boot is in progress.
     first_boot_deadline: Option<std::time::Instant>,
+    /// macOS: Drop runs `orb stop` for a machine this process started.
+    /// Shutdown clears it. It never means delete.
+    orb_stop_on_drop: bool,
 }
 
 /// Removes a half-built run directory unless construction completed.
@@ -119,6 +124,7 @@ pub(crate) struct MachineImage {
     pub overlay: PathBuf,
     pub arch: GuestArch,
     pub guest_os: GuestOs,
+    pub distro: crate::Distro,
     pub seed: PathBuf,
 }
 
@@ -714,7 +720,12 @@ async fn remote_is_a_directory(ssh: &mut Session, path: &str) -> Result<bool> {
 
 impl Machine {
     /// Create a new Machine instance with specified image and configuration.
+    #[cfg_attr(target_os = "macos", allow(unreachable_code))]
     pub async fn new(image: &Image, config: &MachineConfig) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            return Self::new_on_orbstack(image, config).await;
+        }
         // Before anything is written: a config QEMU cannot interpret must not leave a run
         // directory (or a half-created overlay) behind.
         config.validate()?;
@@ -806,6 +817,7 @@ impl Machine {
                 overlay: overlay_image,
                 arch: image.guest_arch(),
                 guest_os: image.guest_os(),
+                distro: image.distro(),
                 seed: seed_iso_path,
             };
 
@@ -826,6 +838,7 @@ impl Machine {
                 deploy_seed: Some(seed),
                 ssh_host_key: Some(host_key.pubkey_str.trim().to_string()),
                 first_boot_deadline: None,
+                orb_stop_on_drop: false,
             });
         }
 
@@ -1015,6 +1028,7 @@ StandardError=journal
             overlay: overlay_image,
             arch: image.guest_arch(),
             guest_os: image.guest_os(),
+            distro: image.distro(),
             seed: seed_iso_path,
         };
 
@@ -1035,6 +1049,7 @@ StandardError=journal
             deploy_seed: None,
             ssh_host_key: None,
             first_boot_deadline: None,
+            orb_stop_on_drop: false,
         })
     }
 
@@ -1044,7 +1059,12 @@ StandardError=journal
     /// medium, which is deleted once the deployment marker appears. A second `init`
     /// would boot without a seed (and without the host key the guest installed), so it
     /// is rejected here instead of failing later inside QEMU or at the host-key check.
+    #[cfg_attr(target_os = "macos", allow(unreachable_code))]
     pub async fn init(&mut self) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            return self.init_orbstack().await;
+        }
         init_guard(
             start_actions(self.image.guest_os, self.deploy_seed.is_some()),
             &self.id,
@@ -1115,7 +1135,12 @@ StandardError=journal
     }
 
     /// Spawn the machine (normal boot).
+    #[cfg_attr(target_os = "macos", allow(unreachable_code))]
     pub async fn spawn(&mut self) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            return self.spawn_orbstack().await;
+        }
         info!("🔥 Spawning VM-{}", self.id);
 
         // Only a machine that is actually up counts as spawned: a failed launch leaves
@@ -1309,6 +1334,7 @@ StandardError=journal
                 overlay: PathBuf::from("/nonexistent/overlay.qcow2"),
                 arch: GuestArch::Amd64,
                 guest_os,
+                distro: crate::Distro::Debian,
                 seed: PathBuf::from("/nonexistent/seed.iso"),
             },
             config: MachineConfig::default(),
@@ -1329,6 +1355,7 @@ StandardError=journal
             deploy_seed: None,
             ssh_host_key: None,
             first_boot_deadline: None,
+            orb_stop_on_drop: false,
         }
     }
 
@@ -1347,7 +1374,12 @@ StandardError=journal
     }
 
     /// Shutdown the machine.
+    #[cfg_attr(target_os = "macos", allow(unreachable_code))]
     pub async fn shutdown(&mut self) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        if crate::orbstack::machine_name(&self.id).is_ok() {
+            return self.shutdown_orbstack().await;
+        }
         if !started(self.pid.is_some(), self.ssh.is_some()) {
             bail!("Machine is not running");
         }
@@ -1734,6 +1766,11 @@ StandardError=journal
     ///
     /// Windows guests get a fresh host keypair per VM; the public half is returned
     /// here so the transport can pin it instead of trusting an unseen key.
+    #[cfg(test)]
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
     pub fn ssh_host_key(&self) -> Option<&str> {
         self.ssh_host_key.as_deref()
     }
@@ -1877,7 +1914,12 @@ StandardError=journal
     /// domain, and is reported as such. A process table that cannot be read is reported for
     /// the same reason: a host with `hidepid=2` answers "no such process" for every pid, and
     /// that answer is what tells a launch the overlay is free.
+    #[cfg_attr(target_os = "macos", allow(unreachable_code))]
     pub async fn is_running(&self) -> Result<bool> {
+        #[cfg(target_os = "macos")]
+        if crate::orbstack::machine_name(&self.id).is_ok() {
+            return self.is_running_orbstack().await;
+        }
         let socket_path = qmp::qmp_socket_path(&self.id)?;
         let qemu_alive = match self.pid {
             None => false,
@@ -2879,8 +2921,245 @@ fn local_basename(path: &Path) -> Result<&str> {
         .ok_or_else(|| anyhow::anyhow!("local path {path:?} has no usable basename"))
 }
 
+impl Machine {
+    #[cfg(target_os = "macos")]
+    async fn new_on_orbstack(image: &Image, config: &MachineConfig) -> Result<Self> {
+        config.validate()?;
+        crate::orbstack::require_supported_guest(
+            image.guest_os(),
+            image.guest_arch(),
+            false,
+            cfg!(target_arch = "aarch64"),
+        )?;
+        let dirs = QleanDirs::new()?;
+        let machine_id = nanoid!(12, &HEX_ALPHABET);
+        let run_dir = Path::new(&dirs.runs).join(&machine_id);
+        crate::utils::create_owner_only_dir_all(&run_dir)?;
+        crate::utils::restrict_dir(&run_dir)?;
+        Ok(Self {
+            id: machine_id,
+            image: MachineImage {
+                overlay: run_dir.join("unused-overlay"),
+                arch: image.guest_arch(),
+                guest_os: image.guest_os(),
+                distro: image.distro(),
+                seed: run_dir.join("unused-seed"),
+            },
+            config: config.clone(),
+            keypair: PersistedSshKeypair {
+                pubkey_str: String::new(),
+                _pubkey_path: run_dir.join("unused-key.pub"),
+                privkey_str: String::new(),
+                privkey_path: run_dir.join("unused-key"),
+            },
+            ssh: None,
+            cid: 0,
+            pid: None,
+            qemu_should_exit: Arc::new(AtomicBool::new(false)),
+            ssh_cancel_token: None,
+            mac_address: String::new(),
+            ip: None,
+            swtpm: None,
+            deploy_seed: None,
+            ssh_host_key: None,
+            first_boot_deadline: None,
+            orb_stop_on_drop: false,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn init_orbstack(&mut self) -> Result<()> {
+        if self.already_started() {
+            bail!("Machine already initialized");
+        }
+        crate::orbstack::ensure_orbstack().await?;
+        self.sweep_orbstack().await?;
+        let name = crate::orbstack::machine_name(&self.id)?;
+        let create = crate::orbstack::create_args(
+            self.image.distro,
+            self.image.arch,
+            cfg!(target_arch = "aarch64"),
+            self.config.core,
+            self.config.mem,
+            self.config.disk,
+            &name,
+        )?;
+        let mut exec = crate::orbstack::LiveOrb;
+        let created = crate::orbstack::drive_init(&mut exec, &name, &create).await?;
+        self.ssh_cancel_token = Some(CancellationToken::new());
+        if let Err(error) = self.connect_orb_ssh(&name).await {
+            if let Err(cleanup) = crate::orbstack::drive_failure(&mut exec, &name, created).await {
+                self.abandon_launch();
+                return Err(error.context(format!("cleanup also failed: {cleanup:#}")));
+            }
+            self.abandon_launch();
+            return Err(error);
+        }
+        self.orb_stop_on_drop = true;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn spawn_orbstack(&mut self) -> Result<()> {
+        if self.already_started() {
+            bail!("Machine already spawned");
+        }
+        crate::orbstack::ensure_orbstack().await?;
+        let name = crate::orbstack::machine_name(&self.id)?;
+        let mut exec = crate::orbstack::LiveOrb;
+        let started = exec.execute(&crate::orbstack::start_args(&name)?).await?;
+        if !started.success {
+            let _ = crate::orbstack::drive_failure(&mut exec, &name, false).await;
+            bail!("orb start {name} failed: {}", started.stderr.trim());
+        }
+        self.ssh_cancel_token = Some(CancellationToken::new());
+        if let Err(error) = self.connect_orb_ssh(&name).await {
+            let _ = crate::orbstack::drive_failure(&mut exec, &name, false).await;
+            self.abandon_launch();
+            return Err(error);
+        }
+        self.orb_stop_on_drop = true;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn shutdown_orbstack(&mut self) -> Result<()> {
+        let name = crate::orbstack::machine_name(&self.id)?;
+        if !self.already_started() && !self.orb_stop_on_drop {
+            bail!("Machine is not running");
+        }
+        let mut exec = crate::orbstack::LiveOrb;
+        crate::orbstack::drive_shutdown(&mut exec, &name).await?;
+        if let Some(mut ssh) = self.ssh.take() {
+            let _ = ssh.close().await;
+        }
+        self.ip = None;
+        self.orb_stop_on_drop = false;
+        if let Some(token) = self.ssh_cancel_token.take() {
+            token.cancel();
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn is_running_orbstack(&self) -> Result<bool> {
+        let Ok(name) = crate::orbstack::machine_name(&self.id) else {
+            return Ok(false);
+        };
+        let mut exec = crate::orbstack::LiveOrb;
+        let result = exec.execute(&crate::orbstack::info_args(&name)?).await?;
+        let text = if result.success {
+            result.stdout
+        } else {
+            result.stderr
+        };
+        match crate::orbstack::parse_power(&name, &text, result.success)? {
+            crate::orbstack::OrbPower::Running => Ok(true),
+            crate::orbstack::OrbPower::Stopped | crate::orbstack::OrbPower::Absent => Ok(false),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn sweep_orbstack(&self) -> Result<()> {
+        let dirs = QleanDirs::new()?;
+        let mut exec = crate::orbstack::LiveOrb;
+        let listed = exec.execute(&crate::orbstack::list_args()).await?;
+        if !listed.success {
+            return Ok(());
+        }
+        let machines = crate::orbstack::parse_list(&listed.stdout)?;
+        let names: Vec<&str> = machines
+            .iter()
+            .map(|machine| machine.name.as_str())
+            .collect();
+        let doomed = crate::orbstack::sweep_names(names, |id| dirs.runs.join(id).is_dir());
+        for name in doomed {
+            let _ = exec.execute(&crate::orbstack::delete_args(&name)?).await;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn connect_orb_ssh(&mut self, name: &str) -> Result<()> {
+        use std::time::Instant;
+
+        use russh::keys::PrivateKey;
+
+        let home =
+            std::env::var("HOME").context("HOME is not set; OrbStack's SSH key lives under it")?;
+        let home = PathBuf::from(home);
+        let endpoint = crate::orbstack::ssh_endpoint(name, &home)?;
+        let key_text = crate::orbstack::read_private_key(&endpoint.key_path)?;
+        let privkey = PrivateKey::from_openssh(&key_text)?;
+        let known_path = crate::orbstack::known_hosts_path(&home);
+        let known = std::fs::read_to_string(&known_path).with_context(|| {
+            format!(
+                "OrbStack SSH known_hosts is missing at {}. Do not edit ~/.orbstack/ssh/authorized_keys.",
+                crate::orbstack::display_orb_path(&known_path)
+            )
+        })?;
+        let pinned = crate::orbstack::pinned_host_key(&known)?;
+        let timeout = Duration::from_secs(self.config.ssh_timeout.unwrap_or(180));
+        let cancel = self
+            .ssh_cancel_token
+            .clone()
+            .context("SSH was cancelled before it started")?;
+        let deadline = Instant::now() + timeout;
+        let mut last_error = None;
+        while Instant::now() < deadline {
+            if cancel.is_cancelled() {
+                bail!("SSH connection cancelled");
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let host: std::net::Ipv4Addr = endpoint
+                .host
+                .parse()
+                .expect("OrbStack SSH host is an IPv4 address");
+            match crate::ssh::Session::connect_orbstack(
+                privkey.clone(),
+                endpoint.user.clone(),
+                host,
+                endpoint.port,
+                remaining.max(Duration::from_secs(1)),
+                cancel.clone(),
+                pinned.clone(),
+            )
+            .await
+            {
+                Ok(mut session) => {
+                    session
+                        .call("true", cancel.clone())
+                        .await
+                        .context("OrbStack SSH accepted the key but `true` did not run")?;
+                    self.ssh = Some(session);
+                    return Ok(());
+                }
+                Err(error) => {
+                    if format!("{error:#}").contains("OrbStack's SSH service")
+                        || format!("{error:#}").contains("presented an SSH host key")
+                    {
+                        return Err(error);
+                    }
+                    last_error = Some(error);
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("timed out connecting to OrbStack SSH")))
+    }
+}
+
 impl Drop for Machine {
     fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        if self.orb_stop_on_drop {
+            // Stop only. Deleting would break a later spawn, and Drop must not block on a prompt.
+            if let Ok(name) = crate::orbstack::machine_name(&self.id) {
+                let _ = std::process::Command::new("orb")
+                    .args(["stop", &name])
+                    .status();
+            }
+        }
         // Ensure QEMU process is killed, but only if that pid is still QEMU: killing a
         // recycled pid would take down an unrelated process.
         if let Some(pid) = self.pid {

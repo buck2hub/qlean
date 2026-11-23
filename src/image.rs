@@ -1,3 +1,5 @@
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use std::{
     io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
@@ -1004,6 +1006,10 @@ impl Image {
         self.arch
     }
 
+    pub(crate) fn distro(&self) -> Distro {
+        self.distro
+    }
+
     /// Guest operating system family of this image.
     pub fn guest_os(&self) -> GuestOs {
         self.guest_os
@@ -1016,6 +1022,38 @@ impl Image {
         let config = config.as_ref();
         config.validate().context("invalid image config")?;
 
+        #[cfg(target_os = "macos")]
+        {
+            Self::new_on_orbstack(config)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Self::new_on_linux(config).await
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn new_on_orbstack(config: &ImageConfig) -> Result<Self> {
+        crate::orbstack::require_supported_guest(
+            config.guest_os,
+            config.arch,
+            config.source.is_some(),
+            cfg!(target_arch = "aarch64"),
+        )?;
+        // Built-in distros are OrbStack images. Do not download a qcow2.
+        Ok(Self {
+            name: format!("orbstack-{}", crate::orbstack::distro_arg(config.distro)),
+            path: PathBuf::from("orbstack"),
+            arch: config.arch,
+            distro: config.distro,
+            guest_os: config.guest_os,
+            digest: (ShaType::Sha256, "0".repeat(64)),
+            clear: false,
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    async fn new_on_linux(config: &ImageConfig) -> Result<Self> {
         let override_source = config
             .source
             .as_deref()

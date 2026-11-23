@@ -70,26 +70,21 @@ pub async fn with_machine<'a, F, R>(image: &'a Image, config: &'a MachineConfig,
 where
     F: for<'b> FnOnce(&'b mut Machine) -> Pin<Box<dyn Future<Output = Result<R>> + 'b>>,
 {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
-        let _ = (image, config, f);
         crate::orbstack::ensure_orbstack().await?;
-        anyhow::bail!(
-            "OrbStack is running, but Qlean cannot create a machine until the OrbStack driver is enabled."
-        );
     }
-
     #[cfg(target_os = "linux")]
     {
         ensure_prerequisites(image.guest_os()).await?;
-
-        let mut machine = Machine::new(image, config).await?;
-        machine.init().await?;
-        let outcome = f(&mut machine).await;
-        let shutdown = machine.shutdown().await;
-
-        combine_outcome(outcome, shutdown)
     }
+
+    let mut machine = Machine::new(image, config).await?;
+    machine.init().await?;
+    let outcome = f(&mut machine).await;
+    let shutdown = machine.shutdown().await;
+
+    combine_outcome(outcome, shutdown)
 }
 
 /// Execute a closure with a virtual machine pool.
@@ -97,27 +92,22 @@ pub async fn with_pool<F, R>(f: F) -> Result<R>
 where
     F: for<'a> FnOnce(&'a mut MachinePool) -> Pin<Box<dyn Future<Output = Result<R>> + 'a>>,
 {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
-        let _ = f;
         crate::orbstack::ensure_orbstack().await?;
-        anyhow::bail!(
-            "OrbStack is running, but Qlean cannot create a machine until the OrbStack driver is enabled."
-        );
     }
-
     #[cfg(target_os = "linux")]
     {
         // Pool members may be Windows guests, which do not need vsock; guest-specific
         // requirements are enforced when each machine starts.
         ensure_host_prerequisites().await?;
-
-        let mut pool = MachinePool::new();
-        let outcome = f(&mut pool).await;
-        let shutdown = pool.shutdown_all().await;
-
-        combine_outcome(outcome, shutdown)
     }
+
+    let mut pool = MachinePool::new();
+    let outcome = f(&mut pool).await;
+    let shutdown = pool.shutdown_all().await;
+
+    combine_outcome(outcome, shutdown)
 }
 
 #[cfg(test)]

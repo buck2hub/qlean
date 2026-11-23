@@ -110,6 +110,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 | 时间 | 触发 | 变更内容 | 原卡 → 新卡 | 受影响的引用 |
 |---|---|---|---|---|
+| 2026-11-23 16:34:00 UTC | `MAC-03` `MAC-04` `MAC-05` | macOS 用注入的执行器拼 `orb create`、走 localhost SSH、并完成 stop 不删除的生命周期。真机冒烟两次通过 | 三张卡 pending → done / locally-accepted | `src/orbstack.rs`、`src/machine.rs`、`src/ssh.rs`、`src/image.rs`、README、CHANGELOG |
 | 2026-11-23 16:18:04 UTC | `MAC-02` | 三条 OrbStack 前置错误可注入，检查不创建机器。README 与 CHANGELOG 写了安装、权限和未启动 | `MAC-02` pending → done / locally-accepted | `src/orbstack.rs`、`src/lib.rs`、README、CHANGELOG |
 | 2026-11-23 16:15:19 UTC | `MAC-01` | macOS 能编译。`kvm-ioctls` 与 `tokio-vsock` 收到 Linux target 依赖。宿主门说明 OrbStack，不把安装 QEMU 当成解法。7 个依赖 `/proc` 的既有单测改为 `cfg(target_os = "linux")` | `MAC-01` pending → done / locally-accepted | `Cargo.toml`、`src/lib.rs`、`src/ssh.rs`、README、CHANGELOG |
 | 2026-11-23 16:07:52 UTC | `MAC-00` 实测 | 写回「OrbStack 实测」。互 ping 成功。创建参数带 `--isolated`。地址字段是 `orb info -f json` 的 `ip4`。无参数 `orb stop` 禁止 | `MAC-00` pending → done / locally-accepted | ADR-MAC-04、实施证据汇总、`plan-status.md` |
@@ -461,7 +462,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Task type:** implementation
 
-**Lifecycle / Acceptance:** pending /
+**Lifecycle / Acceptance:** done / locally-accepted
 
 **Description:** 把发行版、架构和 `MachineConfig` 收成一条 `orb create` 参数列表。机器名只由 `qlean-` 加 id 生成。非法组合在拼参数之前拒绝。macOS 上四个内置发行版不下载 qcow2。
 
@@ -476,15 +477,15 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Acceptance criteria:**
 
-- [ ] Debian / Ubuntu / Fedora / Arch 映射到同名 distro。版本钉扎以 `MAC-00` 写回的结论为准；没有额外钉扎时用 OrbStack 的默认稳定版。
-- [ ] 架构 flag 符合 `MAC-00`。riscv64、Windows、带 `source` 的镜像各自一条错误，错误里不出现「安装 KVM」。
-- [ ] 停止和删除的参数构造拒绝缺少 `qlean-` 前缀或 id 不是 12 位十六进制的名字。
-- [ ] 内存换算与 `MAC-00` 的单位一致，换算结果进入启动日志。
-- [ ] 创建参数遵守 ADR-MAC-04：永不包含 `--isolate-network` 与 `--forward-ssh-agent`；`--isolated` 是否出现与 `MAC-00` 的互 ping 结论一致。单测覆盖这两种拼法中 `MAC-00` 选定的那一种，并断言另外两个 flag 不出现。
+- [x] Debian / Ubuntu / Fedora / Arch 映射到同名 distro。版本钉扎以 `MAC-00` 写回的结论为准；没有额外钉扎时用 OrbStack 的默认稳定版。
+- [x] 架构 flag 符合 `MAC-00`。riscv64、Windows、带 `source` 的镜像各自一条错误，错误里不出现「安装 KVM」。
+- [x] 停止和删除的参数构造拒绝缺少 `qlean-` 前缀或 id 不是 12 位十六进制的名字。
+- [x] 内存换算与 `MAC-00` 的单位一致，换算结果进入启动日志。
+- [x] 创建参数遵守 ADR-MAC-04：永不包含 `--isolate-network` 与 `--forward-ssh-agent`；`--isolated` 是否出现与 `MAC-00` 的互 ping 结论一致。单测覆盖这两种拼法中 `MAC-00` 选定的那一种，并断言另外两个 flag 不出现。
 
 **Verification:**
 
-- [ ] `cargo test --lib orb_create_args`
+- [x] `cargo test --lib orb_create_args`
 
 **Full-suite trigger:** T-1: `builtin_remote_image` 是镜像目录的单一事实源
 
@@ -520,7 +521,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Task type:** implementation
 
-**Lifecycle / Acceptance:** pending /
+**Lifecycle / Acceptance:** done / locally-accepted
 
 **Description:** macOS 上 `Machine` 的会话走 OrbStack SSH。用户名是运行时的 `root@qlean-<id>`，不是 `'static` 的 Windows 或 Linux 用户名。`ConnectTarget` 要能携带这个动态用户名；Linux 的 `linux_connect_target` / `vsock_connect_params` 与 Windows 的钉钥参数保持原样。Linux 目标不编译 OrbStack 路径，vsock 保持「没有 TCP 退路」。
 
@@ -535,15 +536,15 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Acceptance criteria:**
 
-- [ ] 连接参数是 `127.0.0.1`、`MAC-00` 确认的端口、用户名 `root@qlean-<id>`、私钥 `~/.orbstack/ssh/id_ed25519`。
-- [ ] 主机公钥与钉住的值不一致时失败，错误写明这是 OrbStack 的 SSH 服务。
-- [ ] 私钥文件缺失时的错误指出该路径，并说明不要改 `authorized_keys`。
-- [ ] Linux 目标上原有「vsock 没有 TCP 退路」的测试仍然通过。
+- [x] 连接参数是 `127.0.0.1`、`MAC-00` 确认的端口、用户名 `root@qlean-<id>`、私钥 `~/.orbstack/ssh/id_ed25519`。
+- [x] 主机公钥与钉住的值不一致时失败，错误写明这是 OrbStack 的 SSH 服务。
+- [x] 私钥文件缺失时的错误指出该路径，并说明不要改 `authorized_keys`。
+- [x] Linux 目标上原有「vsock 没有 TCP 退路」的测试仍然通过。
 
 **Verification:**
 
-- [ ] `cargo test --lib orb_ssh`。输出必须出现 `orb_ssh` 且不是 `0 tests`。覆盖用户名 `root@qlean-` + 12 位十六进制、主机 `127.0.0.1`、`MAC-00` 的端口、私钥路径，以及主机公钥不一致时的失败（错误写明这是 OrbStack 的 SSH 服务）。
-- [ ] `cargo test --lib connect_target_tests` 与新增的 `linux_guest_has_no_tcp_fallback`。后者断言 `connect_ssh` 在缺少 `/dev/vhost-vsock` 时的失败文本含 `no TCP fallback`，且该函数不调用 `connect_tcp`。证据必须显示这两个名字被执行。本机是 macOS，这条 Linux 断言用源码守卫实现，不要求本机有 vsock。
+- [x] `cargo test --lib orb_ssh`。输出必须出现 `orb_ssh` 且不是 `0 tests`。覆盖用户名 `root@qlean-` + 12 位十六进制、主机 `127.0.0.1`、`MAC-00` 的端口、私钥路径，以及主机公钥不一致时的失败（错误写明这是 OrbStack 的 SSH 服务）。
+- [x] `cargo test --lib connect_target_tests` 与新增的 `linux_guest_has_no_tcp_fallback`。后者断言 `connect_ssh` 在缺少 `/dev/vhost-vsock` 时的失败文本含 `no TCP fallback`，且该函数不调用 `connect_tcp`。证据必须显示这两个名字被执行。本机是 macOS，这条 Linux 断言用源码守卫实现，不要求本机有 vsock。
 
 **Full-suite trigger:** none
 
@@ -579,7 +580,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Task type:** implementation
 
-**Lifecycle / Acceptance:** pending /
+**Lifecycle / Acceptance:** done / locally-accepted
 
 **Description:** 把 `Machine` 的构造、启动、探活和停止接到 OrbStack。macOS 上 `Machine::new` 不调用 `qemu-img`、libvirt 或 KVM 门槛。`init` / `spawn` / `shutdown` / `Drop` 使用 `orb create` / `orb start` / `orb stop <name>`。`is_running` 区分在跑、已停止和探活失败。`upload` / `download` 走这条 SSH/SFTP 会话，不走 `/mnt/mac`。启动时清扫失去 run 目录的 `qlean-` 机器。
 
@@ -594,18 +595,18 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Acceptance criteria:**
 
-- [ ] macOS 上 `Machine::new` 不调用 `qemu-img`、libvirt 或 KVM 门槛。`init` 创建机器并等到 SSH 能执行一条命令。已存在的同名机器改为 `orb start`，不第二次 `create`。公开的 `Machine` / `MachineConfig` 签名与字段不改。
-- [ ] `shutdown` 只 `orb stop <name>`，不删除。随后 `spawn` 对同一名字执行 `orb start`。Drop 停止本进程创建的机器，同样不删除。
-- [ ] `is_running`：OrbStack 报告在跑则为 `Ok(true)`，报告已停止则为 `Ok(false)`，探活命令失败则是带机器名的 `Err`。池用这个结果决定启停，不把「已停止」当成错误，也不把「问失败」当成没在跑。
-- [ ] 清扫只会删除「`qlean-` 加 12 位十六进制，且 run 目录不存在」的名字。差一个字符的名字不会出现在删除参数里。
-- [ ] 只有这次尝试新创建的机器才会在失败时被 `orb delete`：`orb create` 失败后若名字已经出现，或新机器的 SSH 就绪超时。删除失败必须和原错误一起返回，不得吞掉。已经存在的机器若 `orb start` 或 SSH 就绪失败，只停止它，不删除。
-- [ ] `upload` 与 `download` 使用 OrbStack SSH/SFTP 会话。参数与实现都不把 `/mnt/mac` 当作文件 API。
+- [x] macOS 上 `Machine::new` 不调用 `qemu-img`、libvirt 或 KVM 门槛。`init` 创建机器并等到 SSH 能执行一条命令。已存在的同名机器改为 `orb start`，不第二次 `create`。公开的 `Machine` / `MachineConfig` 签名与字段不改。
+- [x] `shutdown` 只 `orb stop <name>`，不删除。随后 `spawn` 对同一名字执行 `orb start`。Drop 停止本进程创建的机器，同样不删除。
+- [x] `is_running`：OrbStack 报告在跑则为 `Ok(true)`，报告已停止则为 `Ok(false)`，探活命令失败则是带机器名的 `Err`。池用这个结果决定启停，不把「已停止」当成错误，也不把「问失败」当成没在跑。
+- [x] 清扫只会删除「`qlean-` 加 12 位十六进制，且 run 目录不存在」的名字。差一个字符的名字不会出现在删除参数里。
+- [x] 只有这次尝试新创建的机器才会在失败时被 `orb delete`：`orb create` 失败后若名字已经出现，或新机器的 SSH 就绪超时。删除失败必须和原错误一起返回，不得吞掉。已经存在的机器若 `orb start` 或 SSH 就绪失败，只停止它，不删除。
+- [x] `upload` 与 `download` 使用 OrbStack SSH/SFTP 会话。参数与实现都不把 `/mnt/mac` 当作文件 API。
 
 **Verification:**
 
-- [ ] `cargo test --lib orb_lifecycle`（注入的执行器，不调用真 `orb`）。必须覆盖：只 create 一次、shutdown 的参数是 stop 不是 delete、差一个字符的名字不删除、新机器失败会 delete、已存在机器失败不 delete、清理失败被返回、`is_running` 的三种答案。
-- [ ] 真机冒烟 `#[ignore]`，命令写在测试上：`cargo test --lib orb_lifecycle_live -- --ignored`。前提是 `DEP-MAC-01`。证据必须出现该测试名并且不是 0 tests。覆盖 create、root exec、upload/download 往返、shutdown 后再 spawn。
-- [ ] 池的停止再启动：`tests/machine_pool.rs` 的 `test_concurrency` 在 macOS 上改为 `#[ignore]`（Linux 上仍是普通测试，本卡拥有这个注解）。真机命令 `cargo test --test machine_pool test_concurrency -- --ignored --test-threads=1`，仅在 `DEP-MAC-01` 上执行。证据必须显示 `test_concurrency` 被执行。互 ping 失败不取消这条冒烟，也不许用文件共享代替它；互 ping 失败仍按成功定义挡住 `MAC-06` 与 0.5.0。
+- [x] `cargo test --lib orb_lifecycle`（注入的执行器，不调用真 `orb`）。必须覆盖：只 create 一次、shutdown 的参数是 stop 不是 delete、差一个字符的名字不删除、新机器失败会 delete、已存在机器失败不 delete、清理失败被返回、`is_running` 的三种答案。
+- [x] 真机冒烟 `#[ignore]`，命令写在测试上：`cargo test --lib orb_lifecycle_live -- --ignored`。前提是 `DEP-MAC-01`。证据必须出现该测试名并且不是 0 tests。覆盖 create、root exec、upload/download 往返、shutdown 后再 spawn。两次都是 1 passed / 0 failed（54.68s 与 54.12s）。
+- [x] 池的停止再启动：`tests/machine_pool.rs` 的 `test_concurrency` 在 macOS 上改为 `#[ignore]`（Linux 上仍是普通测试，本卡拥有这个注解）。真机命令 `cargo test --test machine_pool test_concurrency -- --ignored --test-threads=1`，仅在 `DEP-MAC-01` 上执行。证据必须显示 `test_concurrency` 被执行。互 ping 失败不取消这条冒烟，也不许用文件共享代替它；互 ping 失败仍按成功定义挡住 `MAC-06` 与 0.5.0。本机结果：1 passed / 0 failed，80.50s。测完删除了这四台 `qlean-` 机器。
 
 **Full-suite trigger:** T-1: `Machine::init` / `shutdown` 是生命周期的单一入口
 
@@ -907,6 +908,8 @@ OrbStack 文档核对日为 2026-11-23：
 **架构与发行版。** `--arch aarch64` 被拒：`Error: invalid architecture: aarch64`。help 只接受 `arm64` 与 `amd64`。不写 `--arch` 时 Apple Silicon 上得到 `arm64`。`--arch amd64` 的 `debian:bookworm` 创建成功，`image.arch=amd64`，`state=running`，有 `ip4`。`GuestArch::Aarch64` 映射为 `--arch arm64`，`GuestArch::Amd64` 映射为 `--arch amd64`。没有 Intel Mac，Intel 宿主上的 aarch64 写成「未测，实现按拒绝处理」。发行版参数用裸名字 `debian`、`ubuntu`、`fedora`、`arch`，不额外钉版本。2.2.5 的 help 默认是 debian bookworm/12、ubuntu resolute/26.04、fedora 44、arch current。本轮启动的是 `debian:bookworm`（等于 debian 默认）和它的 amd64 变体。
 
 **实现要写死的拼法。** `orb create --isolated --cpus <n> --memory <mem> --disk <disk>G --arch <arm64|amd64> <distro> <qlean-id>`。已存在则改为 `orb start <name>`，不第二次 create。停止是 `orb stop <name>`。失败清理新机器用 `orb delete -f <name>`。地址与探活解析 `orb info <name> -f json` 的 `ip4` 与 `record.state`。列名字用 `orb list -f json`。
+
+**MAC-03 至 MAC-05 证据（DEP-MAC-01，OrbStack 2.2.5）。** `cargo test --lib` 566 passed / 0 failed / 14 ignored。`cargo test --lib orb_lifecycle_live -- --ignored` 跑了两次，都是 1 passed / 0 failed（54.68s、54.12s）：root `id -u` 为 0，SFTP 往返读回 `orb-live`，`shutdown` 后名字仍在列表里，`spawn` 后再读到同一文件。`cargo test --test machine_pool test_concurrency -- --ignored --test-threads=1` 为 1 passed / 0 failed，80.50s。结束后 `orb list` 已清空这些 `qlean-` 机器。
 
 ## Review log
 

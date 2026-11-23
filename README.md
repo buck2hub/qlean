@@ -36,6 +36,10 @@ Qlean reports three different problems before it creates a machine:
 - `orb` is on `PATH` but cannot be executed. Fix the file mode, or remount that filesystem without `noexec`.
 - OrbStack is not running. Start OrbStack (`orb`, or `orb start` if the app is stopped). `orb status` should print `Running`.
 
+On macOS, `with_machine` creates an OrbStack Linux machine named `qlean-` plus 12 hexadecimal digits. Debian, Ubuntu, Fedora, and Arch use OrbStack's own images, so Qlean does not download a qcow2. The default amd64 guest on Apple Silicon runs under Rosetta; pass `GuestArch::Aarch64` for a native `arm64` machine. Windows, riscv64, and a caller-supplied qcow2 are refused. Machines are created with `--isolated` and without SSH agent forwarding. They are not QEMU-equivalent isolation: OrbStack machines share a kernel. `upload` and `download` still use SFTP, not `/mnt/mac`.
+
+SSH goes to `127.0.0.1:32222` as `root@qlean-<id>` with the key `~/.orbstack/ssh/id_ed25519`. The host key is OrbStack's, pinned from `~/.orbstack/ssh/known_hosts`. Do not edit `~/.orbstack/ssh/authorized_keys`. `shutdown` runs `orb stop` and leaves the machine in place so `spawn` can start it again. Qlean only deletes a `qlean-` machine when its run directory is already gone, or when the create that just made it fails. It does not delete your other OrbStack machines.
+
 #### Install CLI tools
 
 Install and configure QEMU, libvirt, and xorriso on your Linux host before using Qlean. On Debian or Ubuntu, see [the setup guide](https://buck2hub.com/docs/qlean/setup) for step-by-step instructions.

@@ -1,6 +1,7 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::{
+    borrow::Cow,
     io::ErrorKind,
     path::{Path, PathBuf},
     sync::{
@@ -245,6 +246,29 @@ mod connect_target_tests {
         assert!(
             !source.contains("cid,\n            22,"),
             "the vsock port must not be spelled as a literal argument"
+        );
+    }
+
+    /// The Linux guest path still has no TCP fallback. The check reads that function, not a copy.
+    #[test]
+    fn linux_guest_has_no_tcp_fallback() {
+        let source = include_str!("ssh.rs");
+        let marker = "#[cfg(target_os = \"linux\")]\npub(crate) async fn connect_ssh(";
+        let start = source
+            .find(marker)
+            .expect("the linux connect_ssh function is in this file");
+        let rest = &source[start..];
+        let end = rest
+            .find("\n#[cfg(not(target_os = \"linux\"))]")
+            .expect("the macos stub follows the linux function");
+        let body = &rest[..end];
+        assert!(
+            body.contains("no TCP fallback"),
+            "the linux function must keep the vsock refusal"
+        );
+        assert!(
+            !body.contains("connect_tcp"),
+            "connect_ssh must not call the TCP client"
         );
     }
 
@@ -2736,7 +2760,15 @@ pub(crate) async fn create_symlink(
         .map_err(Into::into)
 }
 
-fn host_key_rejection_message(transport_name: &str, pinned: bool) -> String {
+pub(crate) fn host_key_rejection_message(transport_name: &str, pinned: bool) -> String {
+    if transport_name == "orbstack" {
+        return format!(
+            "The host key presented on 127.0.0.1:32222 is not OrbStack's SSH service key. \
+             Qlean pins the ssh-ed25519 line in ~/.orbstack/ssh/known_hosts. \
+             Do not edit ~/.orbstack/ssh/authorized_keys. \
+             The endpoint {PINNED_KEY_REJECTED}."
+        );
+    }
     if pinned {
         format!(
             "The {transport_name} endpoint {PINNED_KEY_REJECTED} for this VM.\n\
@@ -2836,7 +2868,10 @@ pub(crate) struct ConnectTarget {
     /// Transport name used in error messages ("vsock", "tcp").
     pub(crate) transport_name: &'static str,
     /// User the guest image runs `sshd` for.
-    pub(crate) username: &'static str,
+    ///
+    /// Linux and Windows use a fixed name. OrbStack's localhost SSH user is
+    /// `root@<machine>`, which is only known once the machine id exists.
+    pub(crate) username: Cow<'static, str>,
     /// Message used when the budget elapses while the guest is still not listening.
     pub(crate) timeout_message: &'static str,
     /// Whether this transport pins the per-VM host key injected during deployment.
@@ -2853,7 +2888,7 @@ pub(crate) const VSOCK_SSH_PORT: u32 = 22;
 pub(crate) fn linux_connect_target() -> ConnectTarget {
     ConnectTarget {
         transport_name: "vsock",
-        username: "root",
+        username: Cow::Borrowed("root"),
         timeout_message: "Timeout while connecting to VM via vsock.",
         pinned: false,
     }
@@ -2867,7 +2902,7 @@ pub(crate) fn linux_connect_target() -> ConnectTarget {
 pub(crate) fn windows_connect_target() -> ConnectTarget {
     ConnectTarget {
         transport_name: "tcp",
-        username: crate::windows::GUEST_USERNAME,
+        username: Cow::Borrowed(crate::windows::GUEST_USERNAME),
         timeout_message: "Timeout while connecting to VM via tcp.",
         pinned: true,
     }
@@ -2932,6 +2967,26 @@ fn tcp_connect_params(
 ) -> ConnectParams {
     ConnectParams {
         target: windows_connect_target(),
+        timeout,
+        cancel_token,
+        expected_host_key: Some(expected_host_key),
+    }
+}
+
+/// OrbStack's localhost SSH user is per machine, and the host key belongs to OrbStack.
+fn orb_connect_params(
+    user: String,
+    timeout: Duration,
+    cancel_token: CancellationToken,
+    expected_host_key: PublicKey,
+) -> ConnectParams {
+    ConnectParams {
+        target: ConnectTarget {
+            transport_name: "orbstack",
+            username: Cow::Owned(user),
+            timeout_message: "Timeout while connecting to the OrbStack machine via SSH.",
+            pinned: true,
+        },
         timeout,
         cancel_token,
         expected_host_key: Some(expected_host_key),
@@ -3094,7 +3149,7 @@ impl Session {
         let auth_res = tokio::time::timeout(
             auth_budget,
             session.authenticate_publickey(
-                username,
+                username.as_ref(),
                 PrivateKeyWithHashAlg::new(Arc::new(privkey), None),
             ),
         )
@@ -3139,6 +3194,27 @@ impl Session {
     ) -> Result<Self> {
         Self::connect_over(
             tcp_connect_params(timeout, cancel_token, expected_host_key),
+            privkey,
+            || tokio::net::TcpStream::connect(addr),
+        )
+        .await
+    }
+
+    /// Connect to an OrbStack machine over its localhost SSH service.
+    ///
+    /// Linux guests do not use this. Their path stays on vsock and still refuses a TCP fallback.
+    pub(crate) async fn connect_orbstack(
+        privkey: PrivateKey,
+        user: String,
+        host: std::net::Ipv4Addr,
+        port: u16,
+        timeout: Duration,
+        cancel_token: CancellationToken,
+        expected_host_key: PublicKey,
+    ) -> Result<Self> {
+        let addr = std::net::SocketAddr::from((host, port));
+        Self::connect_over(
+            orb_connect_params(user, timeout, cancel_token, expected_host_key),
             privkey,
             || tokio::net::TcpStream::connect(addr),
         )

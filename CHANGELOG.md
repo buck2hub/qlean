@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - macOS hosts can compile Qlean. `with_machine` and `with_pool` on macOS ask for OrbStack (`brew install orbstack`) instead of reporting that only Linux is supported. Installing QEMU on the Mac is not the fix. Linux hosts keep the QEMU/KVM path.
 - macOS reports three OrbStack problems separately: `orb` is missing, `orb` is present but cannot be executed (`noexec` or a file mode), and OrbStack is not running (`orb status` must print `Running`).
+- macOS `with_machine` / `with_pool` drive OrbStack Linux machines (Debian, Ubuntu, Fedora, Arch) over localhost SSH. `shutdown` stops the machine and does not delete it. `get_ip` is still the Linux `hostname -I` path until the OrbStack address lookup lands.
 
 ## [0.4.0] - 2026-11-16
 

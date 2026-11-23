@@ -1238,6 +1238,7 @@ mod tests {
                 overlay: PathBuf::from("/run/qlean/vm1/overlay.img"),
                 arch: GuestArch::Amd64,
                 guest_os,
+                distro: crate::Distro::Debian,
                 seed: PathBuf::from("/run/qlean/vm1/seed.iso"),
             },
             config: MachineConfig {
