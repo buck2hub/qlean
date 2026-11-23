@@ -42,7 +42,7 @@
 | MAC-05 | implementation | done | complete | MAC-04 | 继承 REL-MAC-01 | 2026-11-23 17:10:19 UTC | 注入生命周期单测。真机 orb_lifecycle_live 两次 1/0。test_concurrency 1/0，80.50s |
 | MAC-06 | implementation | done | complete | MAC-05 | 继承 REL-MAC-01 | 2026-11-23 17:10:19 UTC | get_ip 读 ip4。test_ping 两次 1/0（61.83s、60.59s）。未 blocked |
 | MAC-07 | implementation | done | complete | MAC-06 | 继承 REL-MAC-01 | 2026-11-23 17:10:19 UTC | 工作流无 macos-latest，也无 macOS 测试步骤。未改 workflow 去加 runner |
-| MAC-08 | release | done | complete | MAC-07 | 0.5.0 / 本提交 | 2026-11-23 17:10:19 UTC | 本机 fmt、clippy、cargo test --lib 576/0 两次、cargo test --no-run 退出 0。不打 tag，不开 GitHub Release，不 cargo publish |
+| MAC-08 | release | done | complete | MAC-07 | 0.5.0 / `66ddb2c` | 2026-11-23 17:10:19 UTC | 本机 fmt、clippy、cargo test --lib 576/0 两次、cargo test --no-run 退出 0。不打 tag，不开 GitHub Release，不 cargo publish |
 
 ## 延后项与外部/跨计划依赖
 
