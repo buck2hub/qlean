@@ -110,6 +110,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 | 时间 | 触发 | 变更内容 | 原卡 → 新卡 | 受影响的引用 |
 |---|---|---|---|---|
+| 2026-11-23 16:38:23 UTC | `MAC-07` | 核对 CI 仍只有 ubuntu-latest，不新增 macOS 测试 | `MAC-07` pending → done / locally-accepted | `.github/workflows/check-and-test.yml`（未改）、实施证据汇总 |
 | 2026-11-23 16:37:42 UTC | `MAC-06` | macOS `get_ip` 使用 `orb info` 的 `ip4`。两机 `test_ping` 两次通过 | `MAC-06` pending → done / locally-accepted | `src/orbstack.rs`、`src/machine.rs`、`tests/machine_pool.rs`、README、CHANGELOG |
 | 2026-11-23 16:34:00 UTC | `MAC-03` `MAC-04` `MAC-05` | macOS 用注入的执行器拼 `orb create`、走 localhost SSH、并完成 stop 不删除的生命周期。真机冒烟两次通过 | 三张卡 pending → done / locally-accepted | `src/orbstack.rs`、`src/machine.rs`、`src/ssh.rs`、`src/image.rs`、README、CHANGELOG |
 | 2026-11-23 16:18:04 UTC | `MAC-02` | 三条 OrbStack 前置错误可注入，检查不创建机器。README 与 CHANGELOG 写了安装、权限和未启动 | `MAC-02` pending → done / locally-accepted | `src/orbstack.rs`、`src/lib.rs`、README、CHANGELOG |
@@ -702,7 +703,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Task type:** implementation
 
-**Lifecycle / Acceptance:** pending /
+**Lifecycle / Acceptance:** done / locally-accepted
 
 **Description:** 关闭 GAP-MAC-04 的方式是本机 Mac 上的 `cargo test --lib`，不是 GitHub Actions 的 macOS runner。本卡核对 `.github/workflows/check-and-test.yml` 仍然只有 `ubuntu-latest`，并且本计划的 diff 不添加 macOS 测试、macOS job 或 `macos-latest`。依赖 `/proc`、libvirt、KVM 的单测 cfg 归 `MAC-01`，本卡只核对它们没有被删掉。
 
@@ -717,13 +718,13 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Acceptance criteria:**
 
-- [ ] 工作流全文没有 `macos-latest`，没有 macOS 测试步骤或 job。本卡提交相对开工时的工作流不新增这些内容。
-- [ ] Ubuntu job 的命令保持：`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib`、`cargo test --test windows_machine`、`cargo test --no-run`。这些命令都不带 `--ignored`。
-- [ ] 提交和推送不等待 GitHub Actions。若推送后能看到 Ubuntu run，只把 run id 记为事后证据；看不到也不挡住本卡。本卡不要求 macOS run。
+- [x] 工作流全文没有 `macos-latest`，没有 macOS 测试步骤或 job。本卡提交相对开工时的工作流不新增这些内容。
+- [x] Ubuntu job 的命令保持：`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib`、`cargo test --test windows_machine`、`cargo test --no-run`。这些命令都不带 `--ignored`。
+- [x] 提交和推送不等待 GitHub Actions。若推送后能看到 Ubuntu run，只把 run id 记为事后证据；看不到也不挡住本卡。本卡不要求 macOS run。
 
 **Verification:**
 
-- [ ] 检索 `.github/workflows/check-and-test.yml` 的 `macos-latest` 与 macOS 测试步骤，无匹配。检索输出写入「实施证据汇总」。
+- [x] 检索 `.github/workflows/check-and-test.yml` 的 `macos-latest` 与 macOS 测试步骤，无匹配。检索输出写入「实施证据汇总」。
 
 **Full-suite trigger:** none（不改共享 CI 工作流）
 
@@ -909,6 +910,8 @@ OrbStack 文档核对日为 2026-11-23：
 **架构与发行版。** `--arch aarch64` 被拒：`Error: invalid architecture: aarch64`。help 只接受 `arm64` 与 `amd64`。不写 `--arch` 时 Apple Silicon 上得到 `arm64`。`--arch amd64` 的 `debian:bookworm` 创建成功，`image.arch=amd64`，`state=running`，有 `ip4`。`GuestArch::Aarch64` 映射为 `--arch arm64`，`GuestArch::Amd64` 映射为 `--arch amd64`。没有 Intel Mac，Intel 宿主上的 aarch64 写成「未测，实现按拒绝处理」。发行版参数用裸名字 `debian`、`ubuntu`、`fedora`、`arch`，不额外钉版本。2.2.5 的 help 默认是 debian bookworm/12、ubuntu resolute/26.04、fedora 44、arch current。本轮启动的是 `debian:bookworm`（等于 debian 默认）和它的 amd64 变体。
 
 **实现要写死的拼法。** `orb create --isolated --cpus <n> --memory <mem> --disk <disk>G --arch <arm64|amd64> <distro> <qlean-id>`。已存在则改为 `orb start <name>`，不第二次 create。停止是 `orb stop <name>`。失败清理新机器用 `orb delete -f <name>`。地址与探活解析 `orb info <name> -f json` 的 `ip4` 与 `record.state`。列名字用 `orb list -f json`。
+
+**MAC-07 证据。** 检索 `.github/workflows/check-and-test.yml` 的 `macos-latest` 与 `macos`：无匹配。工作流没有新增 macOS job。推送不等待 Actions。
 
 **MAC-06 证据（DEP-MAC-01，OrbStack 2.2.5）。** `get_ip` 读 `orb info -f json` 的 `ip4`。`cargo test --test machine_pool test_ping -- --ignored --test-threads=1` 两次都是 1 passed / 0 failed（61.83s、60.59s）。测完 `orb list` 为空。
 
