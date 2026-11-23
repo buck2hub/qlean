@@ -2849,7 +2849,7 @@ fn host_key_pending_message(addr: std::net::SocketAddr, budget: Duration) -> Str
     )
 }
 
-fn is_fatal_connect_error(error: &anyhow::Error) -> bool {
+pub(crate) fn is_fatal_connect_error(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.to_string().contains(PINNED_KEY_REJECTED))
@@ -2974,6 +2974,7 @@ fn tcp_connect_params(
 }
 
 /// OrbStack's localhost SSH user is per machine, and the host key belongs to OrbStack.
+#[cfg(target_os = "macos")]
 fn orb_connect_params(
     user: String,
     timeout: Duration,
@@ -3203,6 +3204,7 @@ impl Session {
     /// Connect to an OrbStack machine over its localhost SSH service.
     ///
     /// Linux guests do not use this. Their path stays on vsock and still refuses a TCP fallback.
+    #[cfg(target_os = "macos")]
     pub(crate) async fn connect_orbstack(
         privkey: PrivateKey,
         user: String,

@@ -12,6 +12,10 @@ mod utils;
 use utils::tracing_subscriber_init;
 
 #[tokio::test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "needs OrbStack: cargo test --test single_machine -- --ignored"
+)]
 #[serial]
 async fn hello() -> Result<()> {
     tracing_subscriber_init();
@@ -35,6 +39,10 @@ async fn hello() -> Result<()> {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "needs OrbStack: cargo test --test single_machine -- --ignored"
+)]
 #[serial]
 async fn test_file_transfer() -> Result<()> {
     tracing_subscriber_init();
@@ -130,6 +138,10 @@ async fn test_file_transfer() -> Result<()> {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "needs OrbStack: cargo test --test single_machine -- --ignored"
+)]
 #[serial]
 async fn test_file_operation() -> Result<()> {
     tracing_subscriber_init();

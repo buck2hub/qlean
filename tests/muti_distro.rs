@@ -8,6 +8,10 @@ mod utils;
 use utils::tracing_subscriber_init;
 
 #[tokio::test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "needs OrbStack: cargo test --test muti_distro -- --ignored"
+)]
 #[serial]
 async fn test_ubuntu_image() -> Result<()> {
     tracing_subscriber_init();
@@ -30,6 +34,10 @@ async fn test_ubuntu_image() -> Result<()> {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "needs OrbStack: cargo test --test muti_distro -- --ignored"
+)]
 #[serial]
 async fn test_fedora_image() -> Result<()> {
     tracing_subscriber_init();
@@ -52,6 +60,10 @@ async fn test_fedora_image() -> Result<()> {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "needs OrbStack: cargo test --test muti_distro -- --ignored"
+)]
 #[serial]
 async fn test_arch_image() -> Result<()> {
     tracing_subscriber_init();

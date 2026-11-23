@@ -74,7 +74,8 @@ pub struct Machine {
     /// share one deadline. `None` means no first boot is in progress.
     first_boot_deadline: Option<std::time::Instant>,
     /// macOS: Drop runs `orb stop` for a machine this process started.
-    /// Shutdown clears it. It never means delete.
+    /// Shutdown clears it. It never means delete. Linux never reads it.
+    #[cfg(target_os = "macos")]
     orb_stop_on_drop: bool,
 }
 
@@ -124,6 +125,8 @@ pub(crate) struct MachineImage {
     pub overlay: PathBuf,
     pub arch: GuestArch,
     pub guest_os: GuestOs,
+    /// OrbStack distro. Linux launches do not read it.
+    #[cfg(target_os = "macos")]
     pub distro: crate::Distro,
     pub seed: PathBuf,
 }
@@ -817,6 +820,7 @@ impl Machine {
                 overlay: overlay_image,
                 arch: image.guest_arch(),
                 guest_os: image.guest_os(),
+                #[cfg(target_os = "macos")]
                 distro: image.distro(),
                 seed: seed_iso_path,
             };
@@ -838,6 +842,7 @@ impl Machine {
                 deploy_seed: Some(seed),
                 ssh_host_key: Some(host_key.pubkey_str.trim().to_string()),
                 first_boot_deadline: None,
+                #[cfg(target_os = "macos")]
                 orb_stop_on_drop: false,
             });
         }
@@ -1028,6 +1033,7 @@ StandardError=journal
             overlay: overlay_image,
             arch: image.guest_arch(),
             guest_os: image.guest_os(),
+            #[cfg(target_os = "macos")]
             distro: image.distro(),
             seed: seed_iso_path,
         };
@@ -1049,6 +1055,7 @@ StandardError=journal
             deploy_seed: None,
             ssh_host_key: None,
             first_boot_deadline: None,
+            #[cfg(target_os = "macos")]
             orb_stop_on_drop: false,
         })
     }
@@ -1334,6 +1341,7 @@ StandardError=journal
                 overlay: PathBuf::from("/nonexistent/overlay.qcow2"),
                 arch: GuestArch::Amd64,
                 guest_os,
+                #[cfg(target_os = "macos")]
                 distro: crate::Distro::Debian,
                 seed: PathBuf::from("/nonexistent/seed.iso"),
             },
@@ -1355,6 +1363,7 @@ StandardError=journal
             deploy_seed: None,
             ssh_host_key: None,
             first_boot_deadline: None,
+            #[cfg(target_os = "macos")]
             orb_stop_on_drop: false,
         }
     }
@@ -1766,7 +1775,7 @@ StandardError=journal
     ///
     /// Windows guests get a fresh host keypair per VM; the public half is returned
     /// here so the transport can pin it instead of trusting an unseen key.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn id(&self) -> &str {
         &self.id
     }
@@ -2983,6 +2992,7 @@ impl Machine {
             deploy_seed: None,
             ssh_host_key: None,
             first_boot_deadline: None,
+            #[cfg(target_os = "macos")]
             orb_stop_on_drop: false,
         })
     }
@@ -2992,8 +3002,14 @@ impl Machine {
         if self.already_started() {
             bail!("Machine already initialized");
         }
-        crate::orbstack::ensure_orbstack().await?;
-        self.sweep_orbstack().await?;
+        crate::orbstack::require_memory_then(self.config.mem, || async {
+            crate::orbstack::ensure_orbstack().await?;
+            if crate::orbstack::claim_once(process_sweep_flag()) {
+                self.sweep_orbstack().await?;
+            }
+            Ok(())
+        })
+        .await?;
         let name = crate::orbstack::machine_name(&self.id)?;
         let create = crate::orbstack::create_args(
             self.image.distro,
@@ -3027,16 +3043,31 @@ impl Machine {
         crate::orbstack::ensure_orbstack().await?;
         let name = crate::orbstack::machine_name(&self.id)?;
         let mut exec = crate::orbstack::LiveOrb;
-        let started = exec.execute(&crate::orbstack::start_args(&name)?).await?;
-        if !started.success {
-            let _ = crate::orbstack::drive_failure(&mut exec, &name, false).await;
-            bail!("orb start {name} failed: {}", started.stderr.trim());
+        match exec.execute(&crate::orbstack::start_args(&name)?).await {
+            Ok(result) if result.success => {}
+            Ok(result) => {
+                let detail = format!("{} {}", result.stdout, result.stderr);
+                let error = anyhow::anyhow!(
+                    "orb start {name} failed: {}",
+                    detail.split_whitespace().collect::<Vec<_>>().join(" ")
+                );
+                return Err(attach_cleanup(
+                    error,
+                    crate::orbstack::drive_failure(&mut exec, &name, false).await,
+                ));
+            }
+            Err(error) => {
+                return Err(attach_cleanup(
+                    error,
+                    crate::orbstack::drive_failure(&mut exec, &name, false).await,
+                ));
+            }
         }
         self.ssh_cancel_token = Some(CancellationToken::new());
         if let Err(error) = self.connect_orb_ssh(&name).await {
-            let _ = crate::orbstack::drive_failure(&mut exec, &name, false).await;
+            let cleanup = crate::orbstack::drive_failure(&mut exec, &name, false).await;
             self.abandon_launch();
-            return Err(error);
+            return Err(attach_cleanup(error, cleanup));
         }
         self.orb_stop_on_drop = true;
         Ok(())
@@ -3050,8 +3081,16 @@ impl Machine {
         }
         let mut exec = crate::orbstack::LiveOrb;
         crate::orbstack::drive_shutdown(&mut exec, &name).await?;
-        if let Some(mut ssh) = self.ssh.take() {
-            let _ = ssh.close().await;
+        if let Some(mut ssh) = self.ssh.take()
+            && bounded_teardown(SSH_CLOSE_BUDGET, ssh.close())
+                .await
+                .is_none()
+        {
+            warn!(
+                "closing the SSH session for VM-{} did not finish within {}s; teardown continues",
+                self.id,
+                SSH_CLOSE_BUDGET.as_secs()
+            );
         }
         self.ip = None;
         self.orb_stop_on_drop = false;
@@ -3131,35 +3170,56 @@ impl Machine {
                 bail!("SSH connection cancelled");
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let host: std::net::Ipv4Addr = endpoint
-                .host
-                .parse()
-                .expect("OrbStack SSH host is an IPv4 address");
+            if remaining.is_zero() {
+                break;
+            }
+            let host: std::net::Ipv4Addr = endpoint.host.parse().with_context(|| {
+                format!("OrbStack SSH host {} is not an IPv4 address", endpoint.host)
+            })?;
             match crate::ssh::Session::connect_orbstack(
                 privkey.clone(),
                 endpoint.user.clone(),
                 host,
                 endpoint.port,
-                remaining.max(Duration::from_secs(1)),
+                remaining,
                 cancel.clone(),
                 pinned.clone(),
             )
             .await
             {
                 Ok(mut session) => {
-                    session
-                        .call("true", cancel.clone())
-                        .await
-                        .context("OrbStack SSH accepted the key but `true` did not run")?;
-                    self.ssh = Some(session);
-                    return Ok(());
-                }
-                Err(error) => {
-                    if format!("{error:#}").contains("OrbStack's SSH service")
-                        || format!("{error:#}").contains("presented an SSH host key")
-                    {
-                        return Err(error);
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        last_error = Some(anyhow::anyhow!(
+                            "timed out before `true` could run on {name}"
+                        ));
+                        break;
                     }
+                    match tokio::time::timeout(remaining, session.call("true", cancel.clone()))
+                        .await
+                    {
+                        Ok(Ok(_)) => {
+                            self.ssh = Some(session);
+                            return Ok(());
+                        }
+                        Ok(Err(error)) if crate::ssh::is_fatal_connect_error(&error) => {
+                            return Err(error);
+                        }
+                        Ok(Err(error)) => {
+                            last_error =
+                                Some(error.context(
+                                    "OrbStack SSH accepted the key but `true` did not run",
+                                ));
+                        }
+                        Err(_) => {
+                            last_error =
+                                Some(anyhow::anyhow!("timed out running `true` on {name}"));
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Err(error) if crate::ssh::is_fatal_connect_error(&error) => return Err(error),
+                Err(error) => {
                     last_error = Some(error);
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }
@@ -3169,15 +3229,53 @@ impl Machine {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn process_sweep_flag() -> &'static AtomicBool {
+    static SWEPT: AtomicBool = AtomicBool::new(false);
+    &SWEPT
+}
+
+#[cfg(target_os = "macos")]
+fn attach_cleanup(error: anyhow::Error, cleanup: Result<()>) -> anyhow::Error {
+    match cleanup {
+        Ok(()) => error,
+        Err(cleanup) => error.context(format!("cleanup also failed: {cleanup:#}")),
+    }
+}
+
+/// `orb stop <name>`, then kill and reap it if it is still running at `budget`.
+#[cfg(target_os = "macos")]
+fn stop_orb_within(name: &str, budget: Duration) {
+    let mut child = match std::process::Command::new("orb")
+        .args(["stop", name])
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return,
+    };
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => return,
+        }
+    }
+}
+
 impl Drop for Machine {
     fn drop(&mut self) {
         #[cfg(target_os = "macos")]
         if self.orb_stop_on_drop {
             // Stop only. Deleting would break a later spawn, and Drop must not block on a prompt.
             if let Ok(name) = crate::orbstack::machine_name(&self.id) {
-                let _ = std::process::Command::new("orb")
-                    .args(["stop", &name])
-                    .status();
+                // Bound the wait and reap the child. A stalled `orb` must not hang Drop.
+                stop_orb_within(&name, Duration::from_secs(60));
             }
         }
         // Ensure QEMU process is killed, but only if that pid is still QEMU: killing a

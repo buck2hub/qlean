@@ -35,6 +35,7 @@ mod firmware;
 mod guest_path;
 mod image;
 mod machine;
+#[cfg(any(test, target_os = "macos"))]
 mod orbstack;
 mod pool;
 mod qemu;
@@ -72,7 +73,7 @@ where
 {
     #[cfg(target_os = "macos")]
     {
-        crate::orbstack::ensure_orbstack().await?;
+        crate::orbstack::require_memory_then(config.mem, crate::orbstack::ensure_orbstack).await?;
     }
     #[cfg(target_os = "linux")]
     {

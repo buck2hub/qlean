@@ -110,6 +110,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 | 时间 | 触发 | 变更内容 | 原卡 → 新卡 | 受影响的引用 |
 |---|---|---|---|---|
+| 2026-11-23 17:10:19 UTC | 实现 review IMP-R3 = PASS | 记录 Codex 实现 review。R1/R2 的 P1 已关闭。IMP-R2-P2-01 由计划 Owner 接受为残余：清扫的 list/delete 失败不另报，且每个进程只清扫一次。`MAC-00` 至 `MAC-08` 改为 done / complete。版本 0.5.0。不打 tag | `MAC-00`..`MAC-07` locally-accepted → complete；`MAC-08` pending → done / complete | Review log、`Cargo.toml`、CHANGELOG、`plan-status.md` |
 | 2026-11-23 16:38:23 UTC | `MAC-07` | 核对 CI 仍只有 ubuntu-latest，不新增 macOS 测试 | `MAC-07` pending → done / locally-accepted | `.github/workflows/check-and-test.yml`（未改）、实施证据汇总 |
 | 2026-11-23 16:37:42 UTC | `MAC-06` | macOS `get_ip` 使用 `orb info` 的 `ip4`。两机 `test_ping` 两次通过 | `MAC-06` pending → done / locally-accepted | `src/orbstack.rs`、`src/machine.rs`、`tests/machine_pool.rs`、README、CHANGELOG |
 | 2026-11-23 16:34:00 UTC | `MAC-03` `MAC-04` `MAC-05` | macOS 用注入的执行器拼 `orb create`、走 localhost SSH、并完成 stop 不删除的生命周期。真机冒烟两次通过 | 三张卡 pending → done / locally-accepted | `src/orbstack.rs`、`src/machine.rs`、`src/ssh.rs`、`src/image.rs`、README、CHANGELOG |
@@ -283,7 +284,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Task type:** spike
 
-**Lifecycle / Acceptance:** done / locally-accepted
+**Lifecycle / Acceptance:** done / complete
 
 **Description:** 不改生产代码。在 `DEP-MAC-01` 的 Mac 上把后续卡片要写死的命令测出来，写回本计划的「OrbStack 实测」小节。
 
@@ -348,7 +349,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Task type:** implementation
 
-**Lifecycle / Acceptance:** done / locally-accepted
+**Lifecycle / Acceptance:** done / complete
 
 **Description:** 把 Linux 专用依赖和引用收进 `cfg(target_os = "linux")`。macOS 上调用入口时返回「需要 OrbStack」，而不是编译失败，也不是笼统的「只支持 Linux」。
 
@@ -407,7 +408,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Task type:** implementation
 
-**Lifecycle / Acceptance:** done / locally-accepted
+**Lifecycle / Acceptance:** done / complete
 
 **Description:** 一个函数回答现在能不能用 `orb`。没找到二进制、找到了但不能执行、OrbStack 没启动，三条错误分开。
 
@@ -464,7 +465,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Task type:** implementation
 
-**Lifecycle / Acceptance:** done / locally-accepted
+**Lifecycle / Acceptance:** done / complete
 
 **Description:** 把发行版、架构和 `MachineConfig` 收成一条 `orb create` 参数列表。机器名只由 `qlean-` 加 id 生成。非法组合在拼参数之前拒绝。macOS 上四个内置发行版不下载 qcow2。
 
@@ -523,7 +524,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Task type:** implementation
 
-**Lifecycle / Acceptance:** done / locally-accepted
+**Lifecycle / Acceptance:** done / complete
 
 **Description:** macOS 上 `Machine` 的会话走 OrbStack SSH。用户名是运行时的 `root@qlean-<id>`，不是 `'static` 的 Windows 或 Linux 用户名。`ConnectTarget` 要能携带这个动态用户名；Linux 的 `linux_connect_target` / `vsock_connect_params` 与 Windows 的钉钥参数保持原样。Linux 目标不编译 OrbStack 路径，vsock 保持「没有 TCP 退路」。
 
@@ -582,7 +583,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Task type:** implementation
 
-**Lifecycle / Acceptance:** done / locally-accepted
+**Lifecycle / Acceptance:** done / complete
 
 **Description:** 把 `Machine` 的构造、启动、探活和停止接到 OrbStack。macOS 上 `Machine::new` 不调用 `qemu-img`、libvirt 或 KVM 门槛。`init` / `spawn` / `shutdown` / `Drop` 使用 `orb create` / `orb start` / `orb stop <name>`。`is_running` 区分在跑、已停止和探活失败。`upload` / `download` 走这条 SSH/SFTP 会话，不走 `/mnt/mac`。启动时清扫失去 run 目录的 `qlean-` 机器。
 
@@ -644,7 +645,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Task type:** implementation
 
-**Lifecycle / Acceptance:** done / locally-accepted
+**Lifecycle / Acceptance:** done / complete
 
 **Description:** macOS 上 `get_ip` 返回 `MAC-00` 确认的那类 OrbStack 地址。池的契约是用这个地址互相 ping。
 
@@ -703,7 +704,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Task type:** implementation
 
-**Lifecycle / Acceptance:** done / locally-accepted
+**Lifecycle / Acceptance:** done / complete
 
 **Description:** 关闭 GAP-MAC-04 的方式是本机 Mac 上的 `cargo test --lib`，不是 GitHub Actions 的 macOS runner。本卡核对 `.github/workflows/check-and-test.yml` 仍然只有 `ubuntu-latest`，并且本计划的 diff 不添加 macOS 测试、macOS job 或 `macos-latest`。依赖 `/proc`、libvirt、KVM 的单测 cfg 归 `MAC-01`，本卡只核对它们没有被删掉。
 
@@ -760,7 +761,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Task type:** release
 
-**Lifecycle / Acceptance:** pending /
+**Lifecycle / Acceptance:** done / complete
 
 **Description:** 家族唯一发布点。版本从 0.4.0 升到 0.5.0。不在本卡新增行为。
 
@@ -770,21 +771,21 @@ OrbStack 文档核对日为 2026-11-23：
 
 | 事实 | 证据 |
 |---|---|
-| 当前版本 0.4.0 | `Cargo.toml:3` |
+| 版本 0.5.0，CHANGELOG `[0.5.0] - 2026-11-23` | `Cargo.toml`、`CHANGELOG.md`。`Cargo.lock` 的 qlean 包由 `cargo check` 写成 0.5.0 |
 
 **Acceptance criteria:**
 
-- [ ] `Cargo.toml` 为 `0.5.0`，CHANGELOG 有 `[0.5.0]` 段，Unreleased 中属于本计划的条目已移入该段。`Cargo.lock` 只由 `cargo check` 或 `cargo build` 刷新。
-- [ ] 本机 macOS：`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib`、`cargo test --no-run` 都退出 0。这是 ER-14 在非 Linux VM 宿主机上的回退。Linux 全量 `cargo test`（含 KVM 集成）登记为 `DEFER-MAC-05`，本卡不声称它已通过。
-- [ ] 真机冒烟已记入本计划：create、root exec、upload/download 往返、shutdown 后再 spawn、清扫不删非 `qlean-` 名字、两机 `get_ip` 后互 ping。证据来自 `MAC-05` 与 `MAC-06`，本卡只核对它们在。
-- [ ] 相对 0.4.0，Linux cfg 路径的行为没有为了 Mac 而改写。若发现有，先回到对应子卡。
-- [ ] `libra push origin main` 发生在本机门通过之后，不等待 GitHub Actions。不打 `v0.5.0` tag，不开 GitHub Release，不 `cargo publish`。Ubuntu CI 只是事后证据。工作流里没有 macOS job。
+- [x] `Cargo.toml` 为 `0.5.0`，CHANGELOG 有 `[0.5.0]` 段，Unreleased 中属于本计划的条目已移入该段。`Cargo.lock` 只由 `cargo check` 或 `cargo build` 刷新。
+- [x] 本机 macOS：`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib`、`cargo test --no-run` 都退出 0。这是 ER-14 在非 Linux VM 宿主机上的回退。Linux 全量 `cargo test`（含 KVM 集成）登记为 `DEFER-MAC-05`，本卡不声称它已通过。
+- [x] 真机冒烟已记入本计划：create、root exec、upload/download 往返、shutdown 后再 spawn、清扫不删非 `qlean-` 名字、两机 `get_ip` 后互 ping。证据来自 `MAC-05` 与 `MAC-06`，本卡只核对它们在。
+- [x] 相对 0.4.0，Linux cfg 路径的行为没有为了 Mac 而改写。若发现有，先回到对应子卡。
+- [x] `libra push origin main` 发生在本机门通过之后，不等待 GitHub Actions。不打 `v0.5.0` tag，不开 GitHub Release，不 `cargo publish`。Ubuntu CI 只是事后证据。工作流里没有 macOS job。
 
 **Verification:**
 
-- [ ] 上列本机四条命令，输出记入「实施证据汇总」，且都是退出 0。
-- [ ] `libra push origin main` 在本机门通过后执行。不把 Actions 的结论写成本卡的通过条件。
-- [ ] `libra status` 与 tag 列表证明没有 `v0.5.0`。用户另行要求时才打 tag 与 GitHub Release。
+- [x] 上列本机四条命令，输出记入「实施证据汇总」，且都是退出 0。
+- [x] `libra push origin main` 在本机门通过后执行。不把 Actions 的结论写成本卡的通过条件。
+- [x] `libra status` 与 tag 列表证明没有 `v0.5.0`。用户另行要求时才打 tag 与 GitHub Release。
 
 **Full-suite trigger:** T-2: 发布点
 
@@ -883,11 +884,11 @@ OrbStack 文档核对日为 2026-11-23：
 
 ## 兼容与文档收口
 
-- [ ] `README.md` 的 macOS Host Setup、支持矩阵、传输和 `get_ip` 由 `MAC-01`、`MAC-03`、`MAC-04`、`MAC-05`、`MAC-06` 分别写入。
-- [ ] `CHANGELOG.md` 的条目由上述行为卡写入 Unreleased，由 `MAC-08` 收成 `[0.5.0]`。
-- [ ] `.github/workflows/check-and-test.yml` 由 `MAC-07` 核对为仍然只有 `ubuntu-latest`。本计划不向它添加 macOS 测试。
-- [ ] `tests/INDEX.md`：`N/A`，仓库中不存在该文件。
-- [ ] `LICENSE` 不改。
+- [x] `README.md` 的 macOS Host Setup、支持矩阵、传输和 `get_ip` 由 `MAC-01`、`MAC-03`、`MAC-04`、`MAC-05`、`MAC-06` 分别写入。
+- [x] `CHANGELOG.md` 的条目由上述行为卡写入 Unreleased，由 `MAC-08` 收成 `[0.5.0]`。
+- [x] `.github/workflows/check-and-test.yml` 由 `MAC-07` 核对为仍然只有 `ubuntu-latest`。本计划不向它添加 macOS 测试。
+- [x] `tests/INDEX.md`：`N/A`，仓库中不存在该文件。
+- [x] `LICENSE` 不改。
 
 ## 实施证据汇总
 
@@ -913,6 +914,8 @@ OrbStack 文档核对日为 2026-11-23：
 
 **MAC-07 证据。** 检索 `.github/workflows/check-and-test.yml` 的 `macos-latest` 与 `macos`：无匹配。工作流没有新增 macOS job。推送不等待 Actions。
 
+**MAC-08 证据。** `Cargo.toml` 与 `Cargo.lock` 的 qlean 包是 `0.5.0`，锁文件由 `cargo check` 刷新。CHANGELOG 的 OrbStack 三条在 `[0.5.0] - 2026-11-23`。本机 `cargo fmt --check` 与 `cargo clippy --all-targets --all-features -- -D warnings` 退出 0。`cargo test --lib` 两次都是 576 passed / 0 failed / 14 ignored。`cargo test --no-run` 退出 0。没有 `v0.5.0` tag，没有 GitHub Release，没有 `cargo publish`。Linux 全量 `cargo test` 仍是 `DEFER-MAC-05`。
+
 **MAC-06 证据（DEP-MAC-01，OrbStack 2.2.5）。** `get_ip` 读 `orb info -f json` 的 `ip4`。`cargo test --test machine_pool test_ping -- --ignored --test-threads=1` 两次都是 1 passed / 0 failed（61.83s、60.59s）。测完 `orb list` 为空。
 
 **MAC-03 至 MAC-05 证据（DEP-MAC-01，OrbStack 2.2.5）。** `cargo test --lib` 566 passed / 0 failed / 14 ignored。`cargo test --lib orb_lifecycle_live -- --ignored` 跑了两次，都是 1 passed / 0 failed（54.68s、54.12s）：root `id -u` 为 0，SFTP 往返读回 `orb-live`，`shutdown` 后名字仍在列表里，`spawn` 后再读到同一文件。`cargo test --test machine_pool test_concurrency -- --ignored --test-threads=1` 为 1 passed / 0 failed，80.50s。结束后 `orb list` 已清空这些 `qlean-` 机器。
@@ -923,6 +926,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 | Round | Scope | Result | P0/P1 | P2 处置 | Evidence |
 |---|---|---|---|---|---|
+| IMP-R3 | 自计划 PASS 提交 `0a68938` 起的实现，含工作区。Codex 只读，非实现者自评。绑定约束：GitHub Actions 不得增加 macOS 测试或 `macos-latest` | PASS | 无未关闭 P0/P1。R2 残留的 IMP-P1-01（Linux dead_code）与 IMP-P1-04（`true` 使用连接前的剩余时间）已关闭。更早的 IMP-P1-02、03、05、06、07 已关闭 | IMP-R2-P2-01 由计划 Owner 接受：清扫时 list 失败或 delete 失败不另报，并且每个进程只清扫一次 | 2026-11-23 17:10:19 UTC，Codex CLI `codex exec -s read-only`，无 `--worktree`。判定行是 `PASS` |
 | R2 | 同上计划文本，复审 R1 的修订。Codex 只读 | PASS | 无未关闭 P0/P1。R1 的 P0-01..P0-04 与 P1-01..P1-08 已关闭 | P2-01 仍由计划 Owner 接受：崩溃后 run 目录还在则不扩大清扫。P2-R2-01 由计划 Owner 接受为残余：`MAC-01` 验证里的「Linux：`cargo check`」不是本机门，也不是完成条件；Linux 执行归 `DEFER-MAC-05`，Ubuntu CI 只作事后证据 | 2026-11-23，Codex CLI `codex exec -s read-only`，无 `--worktree`。判定行是 `PASS` |
 | R1 | `docs/plan/plan-20261123-macos-orbstack.md` 计划文本。Codex 只读，非实现者自评。绑定约束：GitHub Actions 不得增加 macOS 测试或 `macos-latest` | FAIL | P0-01 适用范围 / GAP-MAC-04 / 关系表 / ER-13/14 / Phase 3 仍要求 Mac CI。P0-02 `MAC-07` 要求 `macos-latest`。P0-03 `MAC-08` 要求 macOS Actions 全绿。P0-04 测试矩阵与 CI 风险行要求 Mac runner。P1-01 SSH 用户名超出当时写集。P1-02 `test_ping --ignored` 与 `connect_ssh` 过滤器会假绿。P1-03 `is_running` 与文件传输没有归属。P1-04 Linux 全量门与 ER-14 不一致。P1-05 失败清理不分新旧机器。P1-06 隔离边界没写。P1-07 `MAC-02` 缺同卡文档。P1-08 粒度计数与模板不符。本轮修订已改上述正文，待 R2 复审 | P2-01 崩溃后 run 目录仍在则不扩大清扫，手动恢复写入故障矩阵，责任人计划 Owner。P2-02 `MAC-01`..`MAC-05` 在互 ping 失败时可以继续，`MAC-06` 与 0.5.0 不行。P2-03 成稿「未评审」已移出 Result 列 | 2026-11-23 15:55 UTC 前后，Codex CLI `codex exec -s read-only`，无 `--worktree`。判定行是 `FAIL` |
 
@@ -938,13 +942,13 @@ OrbStack 文档核对日为 2026-11-23：
 
 ## 完成判据
 
-- [ ] 任务卡满足 `G-*`，粒度审计表已填，无未登记的 L 例外。
-- [ ] `MAC-00` 至 `MAC-08` 的 `Lifecycle=done` 且 `Acceptance=complete`。`MAC-06` 若 `blocked`，本计划不得完成。
-- [ ] 各卡 Verification 已跑并记入「实施证据汇总」。真机命令注明 `DEP-MAC-01`。
-- [ ] 收口门在本机 macOS 上：`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib`、`cargo test --no-run`，以及真机冒烟。Linux 全量集成是 `DEFER-MAC-05`，不作为本计划完成条件。GitHub Actions 不增加 macOS 测试或 `macos-latest`。提交和推送不等待 Actions。
-- [ ] README、CHANGELOG 已按追溯表更新。CI 工作流已核对为仍然只有 `ubuntu-latest`。
-- [ ] 计划 review 与实现 review 的最终轮次都是 PASS，P0/P1 关闭。实现者自己的笔记不算 PASS。
-- [ ] `MAC-08` 已把版本定为 0.5.0，锁文件只由工具链刷新。不打 tag，不开 GitHub Release，不 `cargo publish`，除非用户另行要求。
-- [ ] 「修订历史」记录成稿后的规范性变更。
-- [ ] `plan-status.md` 与任务卡一致。
-- [ ] 未新建证据目录。
+- [x] 任务卡满足 `G-*`，粒度审计表已填，无未登记的 L 例外。
+- [x] `MAC-00` 至 `MAC-08` 的 `Lifecycle=done` 且 `Acceptance=complete`。`MAC-06` 若 `blocked`，本计划不得完成。
+- [x] 各卡 Verification 已跑并记入「实施证据汇总」。真机命令注明 `DEP-MAC-01`。
+- [x] 收口门在本机 macOS 上：`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib`、`cargo test --no-run`，以及真机冒烟。Linux 全量集成是 `DEFER-MAC-05`，不作为本计划完成条件。GitHub Actions 不增加 macOS 测试或 `macos-latest`。提交和推送不等待 Actions。
+- [x] README、CHANGELOG 已按追溯表更新。CI 工作流已核对为仍然只有 `ubuntu-latest`。
+- [x] 计划 review 与实现 review 的最终轮次都是 PASS，P0/P1 关闭。实现者自己的笔记不算 PASS。
+- [x] `MAC-08` 已把版本定为 0.5.0，锁文件只由工具链刷新。不打 tag，不开 GitHub Release，不 `cargo publish`，除非用户另行要求。
+- [x] 「修订历史」记录成稿后的规范性变更。
+- [x] `plan-status.md` 与任务卡一致。
+- [x] 未新建证据目录。

@@ -4,13 +4,16 @@
 //! text, so they never spawn `orb`.
 
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::utils::{bounded_output, is_executable_file};
+#[cfg(target_os = "macos")]
+use crate::utils::{BoundedFailure, bounded_output, is_executable_file, run_bounded};
 
 /// How long `orb status` may take before the probe gives up.
+#[cfg(target_os = "macos")]
 const STATUS_BUDGET: Duration = Duration::from_secs(5);
 
 /// Text returned when the `orb` binary is not on `PATH`.
@@ -31,52 +34,102 @@ pub(crate) enum OrbLocation {
 
 /// Decide whether OrbStack can be used, from an injected lookup and status.
 ///
-/// `status` is the stdout of `orb status`, or the error string when that
-/// command could not be run. It is ignored unless `location` is [`OrbLocation::Found`].
-pub(crate) fn classify_orb(location: &OrbLocation, status: Result<&str, &str>) -> Result<()> {
+/// `status` is the stdout of `orb status`, or why that command could not be
+/// used. It is ignored unless `location` is [`OrbLocation::Found`].
+pub(crate) fn classify_orb(
+    location: &OrbLocation,
+    status: std::result::Result<String, StatusFailure>,
+) -> Result<()> {
     match location {
         OrbLocation::Missing => bail!("{}", missing_orbstack_message()),
-        OrbLocation::NotExecutable { path } => bail!(
-            "OrbStack's `orb` is at {} but cannot be executed. Fix the file mode or remount that filesystem without `noexec`, then retry.",
-            path.display()
-        ),
-        OrbLocation::Found { .. } => match status {
+        OrbLocation::NotExecutable { path } => cannot_execute(path, "the file mode denies it"),
+        OrbLocation::Found { path } => match status {
             Ok(text) if text.trim() == "Running" => Ok(()),
-            Ok(text) => {
-                let summary = one_line(text);
-                bail!(
-                    "OrbStack is installed but not running. Start OrbStack (`orb`, or `orb start` if the app is stopped). `orb status` should print `Running`. The probe returned: {summary}"
-                )
-            }
-            Err(error) => {
-                let summary = one_line(error);
-                bail!(
-                    "OrbStack is installed but not running. Start OrbStack (`orb`, or `orb start` if the app is stopped). `orb status` should print `Running`. The probe failed: {summary}"
-                )
-            }
+            Ok(text) => not_running(&one_line(&text), "returned"),
+            Err(StatusFailure::NotExecutable(detail)) => cannot_execute(path, &detail),
+            Err(StatusFailure::Unavailable(detail)) => not_running(&one_line(&detail), "failed"),
         },
     }
 }
 
-/// Look up `orb` on `PATH` and ask `orb status`, with a timeout.
-pub(crate) async fn ensure_orbstack() -> Result<()> {
-    let location = locate_orb();
+fn cannot_execute(path: &Path, detail: &str) -> Result<()> {
+    bail!(
+        "OrbStack's `orb` is at {} but cannot be executed ({detail}). Fix the file mode or remount that filesystem without `noexec`, then retry.",
+        path.display()
+    )
+}
+
+fn not_running(summary: &str, verb: &str) -> Result<()> {
+    bail!(
+        "OrbStack is installed but not running. Start OrbStack (`orb`, or `orb start` if the app is stopped). `orb status` should print `Running`. The probe {verb}: {summary}"
+    )
+}
+
+/// Refuse a memory value OrbStack will reject, before any `orb` command.
+pub(crate) fn reject_low_memory(mem_mib: u32) -> Result<()> {
+    if mem_mib < MIN_MEMORY_MIB {
+        bail!(
+            "OrbStack memory must be at least {MIN_MEMORY_MIB} MiB, got {mem_mib}. `--memory` is MiB and OrbStack rejects anything under 1 GiB."
+        );
+    }
+    Ok(())
+}
+
+/// Run `next` only after [`reject_low_memory`] accepts `mem_mib`.
+pub(crate) async fn require_memory_then<F, Fut>(mem_mib: u32, next: F) -> Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    reject_low_memory(mem_mib)?;
+    next().await
+}
+
+/// Why `orb status` did not report `Running`.
+#[derive(Debug)]
+pub(crate) enum StatusFailure {
+    /// The probe ran, timed out, or failed for a reason other than execution permission.
+    Unavailable(String),
+    /// The host refused to execute `orb` (`EACCES`, including a `noexec` mount).
+    NotExecutable(String),
+}
+
+/// Look up `orb` and read its status through injected steps.
+///
+/// `status` runs only after lookup finds an executable path, and only after the
+/// caller has already rejected a request that must not touch OrbStack.
+pub(crate) async fn ensure_with<L, S>(locate: L, status: S) -> Result<()>
+where
+    L: FnOnce() -> OrbLocation,
+    S: FnOnce(
+        PathBuf,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::result::Result<String, StatusFailure>> + Send>,
+    >,
+{
+    let location = locate();
     let status = match &location {
-        OrbLocation::Found { path } => run_status(path).await,
-        _ => Err(String::new()),
+        OrbLocation::Found { path } => status(path.clone()).await,
+        _ => Err(StatusFailure::Unavailable(String::new())),
     };
-    let status_ref = match &status {
-        Ok(text) => Ok(text.as_str()),
-        Err(error) => Err(error.as_str()),
-    };
-    classify_orb(&location, status_ref)
+    classify_orb(&location, status)
+}
+
+/// Look up `orb` on `PATH` and ask `orb status`, with a timeout.
+#[cfg(target_os = "macos")]
+pub(crate) async fn ensure_orbstack() -> Result<()> {
+    ensure_with(locate_orb, |path| Box::pin(run_status(path))).await
 }
 
 fn one_line(text: &str) -> String {
     let mut line = text.split_whitespace().collect::<Vec<_>>().join(" ");
     const LIMIT: usize = 120;
     if line.len() > LIMIT {
-        line.truncate(LIMIT);
+        let mut end = LIMIT;
+        while !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        line.truncate(end);
         line.push('…');
     }
     if line.is_empty() {
@@ -86,6 +139,7 @@ fn one_line(text: &str) -> String {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn locate_orb() -> OrbLocation {
     let Some(paths) = std::env::var_os("PATH") else {
         return OrbLocation::Missing;
@@ -106,19 +160,25 @@ fn locate_orb() -> OrbLocation {
     }
 }
 
-async fn run_status(program: &Path) -> Result<String, String> {
+#[cfg(target_os = "macos")]
+async fn run_status(program: PathBuf) -> std::result::Result<String, StatusFailure> {
     let mut command = tokio::process::Command::new(program);
     command.arg("status");
-    match bounded_output(command, STATUS_BUDGET, "ask OrbStack whether it is running").await {
+    match run_bounded(command, STATUS_BUDGET, "ask OrbStack whether it is running").await {
         Ok(output) if output.status.success() => {
             Ok(String::from_utf8_lossy(&output.stdout).into_owned())
         }
-        Ok(output) => Err(format!(
+        Ok(output) => Err(StatusFailure::Unavailable(format!(
             "exit {}: {}",
             output.status,
             one_line(&String::from_utf8_lossy(&output.stderr))
-        )),
-        Err(error) => Err(format!("{error:#}")),
+        ))),
+        Err(BoundedFailure::NotRun(error))
+            if error.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            Err(StatusFailure::NotExecutable(error.to_string()))
+        }
+        Err(failure) => Err(StatusFailure::Unavailable(failure.to_string())),
     }
 }
 
@@ -150,8 +210,10 @@ pub(crate) trait OrbExec {
 }
 
 /// Runs the real `orb` binary.
+#[cfg(target_os = "macos")]
 pub(crate) struct LiveOrb;
 
+#[cfg(target_os = "macos")]
 impl OrbExec for LiveOrb {
     async fn execute(&mut self, args: &[String]) -> Result<CommandResult> {
         let budget = if args.first().is_some_and(|arg| arg == "create") {
@@ -273,11 +335,7 @@ pub(crate) fn create_args(
     name: &str,
 ) -> Result<Vec<String>> {
     require_managed_name(name)?;
-    if mem_mib < MIN_MEMORY_MIB {
-        bail!(
-            "OrbStack memory must be at least {MIN_MEMORY_MIB} MiB, got {mem_mib}. `--memory` is MiB and OrbStack rejects anything under 1 GiB."
-        );
-    }
+    reject_low_memory(mem_mib)?;
     let arch_value = arch_flag(host_aarch64, arch)?;
     tracing::info!("{}", resource_log(mem_mib, disk_gb));
     let mut args = vec![
@@ -322,6 +380,7 @@ pub(crate) fn list_args() -> Vec<String> {
     vec!["list".to_string(), "-f".to_string(), "json".to_string()]
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn info_args(name: &str) -> Result<Vec<String>> {
     require_managed_name(name)?;
     Ok(vec![
@@ -454,59 +513,95 @@ pub(crate) async fn drive_init(
     let listed = run_ok(exec, &list_args(), "list OrbStack machines").await?;
     let machines = parse_list(&listed)?;
     if machines.iter().any(|machine| machine.name == name) {
-        let start = start_args(name)?;
-        let result = exec.execute(&start).await?;
-        if !result.success {
-            bail!(
-                "orb start {name} failed: {}",
+        return match exec.execute(&start_args(name)?).await {
+            Ok(result) if result.success => Ok(false),
+            Ok(result) => Err(stop_after(
+                exec,
+                name,
+                false,
+                format!(
+                    "orb start {name} failed: {}",
+                    one_line(&format!("{} {}", result.stdout, result.stderr))
+                ),
+            )
+            .await),
+            Err(error) => Err(stop_after(
+                exec,
+                name,
+                false,
+                format!("orb start {name} failed: {error:#}"),
+            )
+            .await),
+        };
+    }
+    match exec.execute(create).await {
+        Ok(result) if result.success => Ok(true),
+        Ok(result) => Err(stop_after(
+            exec,
+            name,
+            true,
+            format!(
+                "orb create {name} failed: {}",
                 one_line(&format!("{} {}", result.stdout, result.stderr))
-            );
-        }
-        return Ok(false);
-    }
-    let created = exec.execute(create).await?;
-    if created.success {
-        return Ok(true);
-    }
-    let cleanup_error = match delete_if_present(exec, name).await {
-        Ok(()) => None,
-        Err(error) => Some(format!("{error:#}")),
-    };
-    let create_error = one_line(&format!("{} {}", created.stdout, created.stderr));
-    match cleanup_error {
-        None => bail!("orb create {name} failed: {create_error}"),
-        Some(cleanup) => {
-            bail!("orb create {name} failed: {create_error}. Cleanup also failed: {cleanup}")
-        }
+            ),
+        )
+        .await),
+        Err(error) => Err(stop_after(
+            exec,
+            name,
+            true,
+            format!("orb create {name} failed: {error:#}"),
+        )
+        .await),
     }
 }
 
 /// Stop, and delete only when `created_this_attempt` is set.
+///
+/// A stop error does not skip deletion of a machine this attempt created.
 pub(crate) async fn drive_failure(
     exec: &mut impl OrbExec,
     name: &str,
     created_this_attempt: bool,
 ) -> Result<()> {
-    let stop = stop_args(name)?;
-    let stopped = exec.execute(&stop).await?;
+    let stop_error = match exec.execute(&stop_args(name)?).await {
+        Ok(result) if result.success => None,
+        Ok(result) => Some(one_line(&format!("{} {}", result.stdout, result.stderr))),
+        Err(error) => Some(format!("{error:#}")),
+    };
     if !created_this_attempt {
-        if stopped.success {
-            return Ok(());
+        return match stop_error {
+            None => Ok(()),
+            Some(error) => bail!("orb stop {name} failed: {error}"),
+        };
+    }
+    let delete_error = match delete_if_present(exec, name).await {
+        Ok(()) => None,
+        Err(error) => Some(format!("{error:#}")),
+    };
+    match (stop_error, delete_error) {
+        (None, None) => Ok(()),
+        (Some(stop), None) => {
+            bail!("orb stop {name} failed: {stop}. The new machine was deleted.")
         }
-        bail!(
-            "orb stop {name} failed: {}",
-            one_line(&format!("{} {}", stopped.stdout, stopped.stderr))
-        );
+        (stop, Some(delete)) => bail!(
+            "orb delete {name} after a failed start failed: {delete}. stop said: {}",
+            stop.unwrap_or_else(|| "stop succeeded".to_string())
+        ),
     }
-    let deleted = exec.execute(&delete_args(name)?).await?;
-    if deleted.success {
-        return Ok(());
+}
+
+/// Run [`drive_failure`] and attach its error to `why` when cleanup fails.
+async fn stop_after(
+    exec: &mut impl OrbExec,
+    name: &str,
+    created_this_attempt: bool,
+    why: String,
+) -> anyhow::Error {
+    match drive_failure(exec, name, created_this_attempt).await {
+        Ok(()) => anyhow::anyhow!(why),
+        Err(cleanup) => anyhow::anyhow!("{why}. Cleanup also failed: {cleanup:#}"),
     }
-    bail!(
-        "orb delete {name} after a failed start failed: {}. stop said: {}",
-        one_line(&format!("{} {}", deleted.stdout, deleted.stderr)),
-        one_line(&format!("{} {}", stopped.stdout, stopped.stderr))
-    )
 }
 
 /// `orb stop <name>` and nothing else.
@@ -523,25 +618,34 @@ pub(crate) async fn drive_shutdown(exec: &mut impl OrbExec, name: &str) -> Resul
 }
 
 async fn delete_if_present(exec: &mut impl OrbExec, name: &str) -> Result<()> {
-    let listed = run_ok(
-        exec,
-        &list_args(),
-        "list OrbStack machines after a failed create",
-    )
-    .await?;
-    let machines = parse_list(&listed)?;
-    if !machines.iter().any(|machine| machine.name == name) {
-        return Ok(());
+    match exec.execute(&list_args()).await {
+        Ok(result) if result.success => {
+            let machines = parse_list(&result.stdout)?;
+            if !machines.iter().any(|machine| machine.name == name) {
+                return Ok(());
+            }
+        }
+        Ok(_) | Err(_) => {
+            // The list itself failed. The name may still exist, so delete it.
+        }
     }
-    let result = exec.execute(&delete_args(name)?).await?;
-    if result.success {
-        Ok(())
-    } else {
-        bail!(
-            "{}",
-            one_line(&format!("{} {}", result.stdout, result.stderr))
-        )
+    match exec.execute(&delete_args(name)?).await {
+        Ok(result) if result.success => Ok(()),
+        Ok(result) => {
+            let text = one_line(&format!("{} {}", result.stdout, result.stderr));
+            if text.contains("machine not found") {
+                Ok(())
+            } else {
+                bail!("{text}")
+            }
+        }
+        Err(error) => bail!("{error:#}"),
     }
+}
+
+/// `true` the first time a process asks, then `false`.
+pub(crate) fn claim_once(flag: &std::sync::atomic::AtomicBool) -> bool {
+    !flag.swap(true, std::sync::atomic::Ordering::SeqCst)
 }
 
 async fn run_ok(exec: &mut impl OrbExec, args: &[String], what: &str) -> Result<String> {
@@ -574,6 +678,7 @@ pub(crate) fn ssh_endpoint(name: &str, home: &Path) -> Result<SshEndpoint> {
     })
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn known_hosts_path(home: &Path) -> PathBuf {
     home.join(".orbstack/ssh/known_hosts")
 }
@@ -617,7 +722,10 @@ pub(crate) fn pinned_host_key(known_hosts: &str) -> Result<russh::keys::PublicKe
 
 #[cfg(test)]
 mod orbstack_prerequisite {
-    use super::{OrbLocation, classify_orb, missing_orbstack_message};
+    use super::{
+        OrbLocation, StatusFailure, classify_orb, ensure_with, missing_orbstack_message,
+        require_memory_then,
+    };
 
     fn assert_no_qemu_install(message: &str) {
         let lower = message.to_ascii_lowercase();
@@ -629,7 +737,7 @@ mod orbstack_prerequisite {
 
     #[test]
     fn a_missing_binary_names_orbstack_and_brew() {
-        let error = classify_orb(&OrbLocation::Missing, Ok("Running")).unwrap_err();
+        let error = classify_orb(&OrbLocation::Missing, Ok("Running".to_string())).unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("OrbStack"), "{message}");
         assert!(message.contains("brew install orbstack"), "{message}");
@@ -643,7 +751,7 @@ mod orbstack_prerequisite {
             &OrbLocation::NotExecutable {
                 path: "/usr/local/bin/orb".into(),
             },
-            Ok("Running"),
+            Ok("Running".to_string()),
         )
         .unwrap_err();
         let message = format!("{error:#}");
@@ -659,7 +767,7 @@ mod orbstack_prerequisite {
             &OrbLocation::Found {
                 path: "/usr/local/bin/orb".into(),
             },
-            Ok("Stopped"),
+            Ok("Stopped".to_string()),
         )
         .unwrap_err();
         let message = format!("{error:#}");
@@ -675,7 +783,7 @@ mod orbstack_prerequisite {
             &OrbLocation::Found {
                 path: "/usr/local/bin/orb".into(),
             },
-            Err("timed out"),
+            Err(StatusFailure::Unavailable("timed out".to_string())),
         )
         .unwrap_err();
         let message = format!("{error:#}");
@@ -690,9 +798,56 @@ mod orbstack_prerequisite {
             &OrbLocation::Found {
                 path: "/usr/local/bin/orb".into(),
             },
-            Ok("Running\n"),
+            Ok("Running\n".to_string()),
         )
         .expect("Running is the ready status");
+    }
+
+    #[tokio::test]
+    async fn a_permission_denied_status_is_not_a_stopped_runtime() {
+        let error = ensure_with(
+            || OrbLocation::Found {
+                path: "/usr/local/bin/orb".into(),
+            },
+            |_| {
+                Box::pin(async {
+                    Err(StatusFailure::NotExecutable(
+                        "Permission denied (os error 13)".to_string(),
+                    ))
+                })
+            },
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("/usr/local/bin/orb"), "{message}");
+        assert!(message.contains("cannot be executed"), "{message}");
+        assert!(message.contains("noexec"), "{message}");
+        assert!(!message.contains("not running"), "{message}");
+        assert_no_qemu_install(&message);
+    }
+
+    #[tokio::test]
+    async fn low_memory_does_not_probe_orbstack() {
+        let mut probed = false;
+        let error = require_memory_then(512, || {
+            probed = true;
+            async { Ok(()) }
+        })
+        .await
+        .unwrap_err();
+        assert!(!probed);
+        let message = format!("{error:#}");
+        assert!(message.contains("1024"), "{message}");
+        assert!(message.contains("MiB"), "{message}");
+    }
+
+    #[test]
+    fn a_summary_does_not_split_a_utf8_character() {
+        let text = format!("{}界", "a".repeat(119));
+        let line = super::one_line(&text);
+        assert!(line.ends_with('…'), "{line}");
+        assert!(line.chars().count() <= 121, "{line}");
     }
 }
 
@@ -821,25 +976,37 @@ mod orb_lifecycle {
     use anyhow::Result;
 
     use super::{
-        CommandResult, OrbExec, OrbPower, create_args, drive_failure, drive_init, drive_shutdown,
-        list_args, parse_power, sweep_names,
+        CommandResult, OrbExec, OrbPower, create_args, drive_init, drive_shutdown, list_args,
+        parse_power, sweep_names,
     };
     use crate::{Distro, GuestArch};
 
     const NAME: &str = "qlean-00a11e000001";
 
     struct Script {
-        replies: Vec<CommandResult>,
+        replies: Vec<std::result::Result<CommandResult, String>>,
         calls: Vec<Vec<String>>,
     }
 
     impl Script {
-        fn ok(stdout: &str) -> CommandResult {
-            CommandResult {
+        fn ok(stdout: &str) -> std::result::Result<CommandResult, String> {
+            Ok(CommandResult {
                 success: true,
                 stdout: stdout.to_string(),
                 stderr: String::new(),
-            }
+            })
+        }
+
+        fn fail(stderr: &str) -> std::result::Result<CommandResult, String> {
+            Ok(CommandResult {
+                success: false,
+                stdout: String::new(),
+                stderr: stderr.to_string(),
+            })
+        }
+
+        fn err(message: &str) -> std::result::Result<CommandResult, String> {
+            Err(message.to_string())
         }
     }
 
@@ -849,7 +1016,7 @@ mod orb_lifecycle {
             if self.replies.is_empty() {
                 panic!("no scripted reply for {args:?}");
             }
-            Ok(self.replies.remove(0))
+            self.replies.remove(0).map_err(anyhow::Error::msg)
         }
     }
 
@@ -918,17 +1085,10 @@ mod orb_lifecycle {
         let mut script = Script {
             replies: vec![
                 Script::ok("[]"),
-                CommandResult {
-                    success: false,
-                    stdout: String::new(),
-                    stderr: "boom".to_string(),
-                },
+                Script::fail("boom"),
+                Script::ok(""),
                 Script::ok(&format!(r#"[{{"name":"{NAME}","state":"running"}}]"#)),
-                CommandResult {
-                    success: false,
-                    stdout: String::new(),
-                    stderr: "delete failed".to_string(),
-                },
+                Script::fail("delete failed"),
             ],
             calls: Vec::new(),
         };
@@ -950,18 +1110,13 @@ mod orb_lifecycle {
         let mut script = Script {
             replies: vec![
                 Script::ok(&listed),
-                CommandResult {
-                    success: false,
-                    stdout: String::new(),
-                    stderr: "start failed".to_string(),
-                },
+                Script::fail("start failed"),
+                Script::ok(""),
             ],
             calls: Vec::new(),
         };
         let error = drive_init(&mut script, NAME, &create()).await.unwrap_err();
         assert!(format!("{error:#}").contains("start failed"));
-        script.replies.push(Script::ok(""));
-        drive_failure(&mut script, NAME, false).await.unwrap();
         assert!(
             script
                 .calls
@@ -974,6 +1129,68 @@ mod orb_lifecycle {
                 .iter()
                 .all(|call| call.first().map(String::as_str) != Some("delete"))
         );
+    }
+
+    #[tokio::test]
+    async fn an_executor_error_while_starting_an_existing_machine_stops_it() {
+        let listed = format!(r#"[{{"name":"{NAME}","state":"stopped"}}]"#);
+        let mut script = Script {
+            replies: vec![
+                Script::ok(&listed),
+                Script::err("start timed out"),
+                Script::ok(""),
+            ],
+            calls: Vec::new(),
+        };
+        let error = drive_init(&mut script, NAME, &create()).await.unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("start timed out"), "{message}");
+        assert!(script.calls.iter().any(|call| call[0] == "stop"));
+        assert!(script.calls.iter().all(|call| call[0] != "delete"));
+    }
+
+    #[tokio::test]
+    async fn a_create_executor_error_still_deletes_a_name_that_appeared() {
+        let mut script = Script {
+            replies: vec![
+                Script::ok("[]"),
+                Script::err("create timed out"),
+                Script::ok(""),
+                Script::ok(&format!(r#"[{{"name":"{NAME}","state":"running"}}]"#)),
+                Script::ok(""),
+            ],
+            calls: Vec::new(),
+        };
+        let error = drive_init(&mut script, NAME, &create()).await.unwrap_err();
+        assert!(format!("{error:#}").contains("create timed out"));
+        assert!(script.calls.iter().any(|call| call[0] == "delete"));
+    }
+
+    #[tokio::test]
+    async fn a_stop_executor_error_still_deletes_a_new_machine() {
+        let mut script = Script {
+            replies: vec![
+                Script::ok("[]"),
+                Script::fail("boom"),
+                Script::err("stop down"),
+                Script::ok(&format!(r#"[{{"name":"{NAME}","state":"running"}}]"#)),
+                Script::fail("delete failed"),
+            ],
+            calls: Vec::new(),
+        };
+        let error = drive_init(&mut script, NAME, &create()).await.unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("boom"), "{message}");
+        assert!(message.contains("stop down"), "{message}");
+        assert!(message.contains("delete failed"), "{message}");
+        assert!(script.calls.iter().any(|call| call[0] == "delete"));
+    }
+
+    #[test]
+    fn a_process_claims_sweep_once() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(super::claim_once(&flag));
+        assert!(!super::claim_once(&flag));
     }
 
     #[test]
@@ -1074,6 +1291,19 @@ mod orb_ssh {
         assert!(message.contains("OrbStack's SSH service"), "{message}");
         assert!(message.contains("authorized_keys"), "{message}");
         assert!(message.contains("127.0.0.1:32222"), "{message}");
+        let error = anyhow::anyhow!("{message}");
+        assert!(crate::ssh::is_fatal_connect_error(&error));
+        let mut attempts = 0;
+        for _ in 0..3 {
+            attempts += 1;
+            if crate::ssh::is_fatal_connect_error(&error) {
+                break;
+            }
+        }
+        assert_eq!(
+            attempts, 1,
+            "a rejected OrbStack host key must not be retried"
+        );
     }
 
     #[test]
