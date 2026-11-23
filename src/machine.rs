@@ -1869,6 +1869,13 @@ StandardError=journal
             return Ok(ip.to_owned());
         }
 
+        #[cfg(target_os = "macos")]
+        if crate::orbstack::machine_name(&self.id).is_ok() {
+            let ip = self.query_orbstack_ip().await?;
+            self.ip = Some(ip.clone());
+            return Ok(ip);
+        }
+
         let ip = if self.image.guest_os == GuestOs::Windows {
             // Windows guests are reached over the NAT network: the address Qlean used for
             // the transport is the authoritative one, and a re-query must confirm the same
@@ -1880,6 +1887,19 @@ StandardError=journal
         };
         self.ip = Some(ip.to_owned());
         Ok(ip)
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn query_orbstack_ip(&self) -> Result<String> {
+        let name = crate::orbstack::machine_name(&self.id)?;
+        let mut exec = crate::orbstack::LiveOrb;
+        let result = exec.execute(&crate::orbstack::info_args(&name)?).await?;
+        let text = if result.success {
+            result.stdout
+        } else {
+            result.stderr
+        };
+        crate::orbstack::parse_ip4(&name, &text, result.success)
     }
 
     /// Ask a Windows guest for its own address and match it against this VM's MAC.

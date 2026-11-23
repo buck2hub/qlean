@@ -110,6 +110,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 | 时间 | 触发 | 变更内容 | 原卡 → 新卡 | 受影响的引用 |
 |---|---|---|---|---|
+| 2026-11-23 16:37:42 UTC | `MAC-06` | macOS `get_ip` 使用 `orb info` 的 `ip4`。两机 `test_ping` 两次通过 | `MAC-06` pending → done / locally-accepted | `src/orbstack.rs`、`src/machine.rs`、`tests/machine_pool.rs`、README、CHANGELOG |
 | 2026-11-23 16:34:00 UTC | `MAC-03` `MAC-04` `MAC-05` | macOS 用注入的执行器拼 `orb create`、走 localhost SSH、并完成 stop 不删除的生命周期。真机冒烟两次通过 | 三张卡 pending → done / locally-accepted | `src/orbstack.rs`、`src/machine.rs`、`src/ssh.rs`、`src/image.rs`、README、CHANGELOG |
 | 2026-11-23 16:18:04 UTC | `MAC-02` | 三条 OrbStack 前置错误可注入，检查不创建机器。README 与 CHANGELOG 写了安装、权限和未启动 | `MAC-02` pending → done / locally-accepted | `src/orbstack.rs`、`src/lib.rs`、README、CHANGELOG |
 | 2026-11-23 16:15:19 UTC | `MAC-01` | macOS 能编译。`kvm-ioctls` 与 `tokio-vsock` 收到 Linux target 依赖。宿主门说明 OrbStack，不把安装 QEMU 当成解法。7 个依赖 `/proc` 的既有单测改为 `cfg(target_os = "linux")` | `MAC-01` pending → done / locally-accepted | `Cargo.toml`、`src/lib.rs`、`src/ssh.rs`、README、CHANGELOG |
@@ -642,7 +643,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Task type:** implementation
 
-**Lifecycle / Acceptance:** pending /
+**Lifecycle / Acceptance:** done / locally-accepted
 
 **Description:** macOS 上 `get_ip` 返回 `MAC-00` 确认的那类 OrbStack 地址。池的契约是用这个地址互相 ping。
 
@@ -657,15 +658,15 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Acceptance criteria:**
 
-- [ ] 地址来自宿主侧对这台 `qlean-` 机器的查询（`MAC-00` 选定的 `orb info` 或 `orb list` 字段），不来自 `hostname -I`。
-- [ ] 查不到地址时，错误带上机器名和一行脱敏的原始输出摘要。
-- [ ] `MAC-00` 互 ping 失败时，本卡状态为 `blocked`，计划不标记完成，版本保持 `0.4.0`。
-- [ ] `tests/machine_pool.rs` 的 `test_ping` 由本卡加上 `#[cfg_attr(target_os = "macos", ignore)]`。Linux 上它仍是普通测试。macOS 上只有显式 `--ignored` 才会运行它。
+- [x] 地址来自宿主侧对这台 `qlean-` 机器的查询（`MAC-00` 选定的 `orb info` 或 `orb list` 字段），不来自 `hostname -I`。
+- [x] 查不到地址时，错误带上机器名和一行脱敏的原始输出摘要。
+- [x] `MAC-00` 互 ping 失败时，本卡状态为 `blocked`，计划不标记完成，版本保持 `0.4.0`。本机互 ping 成功，所以本卡没有 blocked。
+- [x] `tests/machine_pool.rs` 的 `test_ping` 由本卡加上 `#[cfg_attr(target_os = "macos", ignore)]`。Linux 上它仍是普通测试。macOS 上只有显式 `--ignored` 才会运行它。
 
 **Verification:**
 
-- [ ] `cargo test --lib orb_guest_ip`。输出必须出现该测试名。
-- [ ] 真机：`cargo test --test machine_pool test_ping -- --ignored --test-threads=1`，仅在 `DEP-MAC-01` 且 `MAC-00` 互 ping 结论为成功时执行。证据必须显示 `test_ping` 被执行，且两台 `get_ip` 地址互相 ping 成功。互 ping 结论为失败时不跑这条命令，也不改用其它传输。
+- [x] `cargo test --lib orb_guest_ip`。输出必须出现该测试名。
+- [x] 真机：`cargo test --test machine_pool test_ping -- --ignored --test-threads=1`，仅在 `DEP-MAC-01` 且 `MAC-00` 互 ping 结论为成功时执行。证据必须显示 `test_ping` 被执行，且两台 `get_ip` 地址互相 ping 成功。互 ping 结论为失败时不跑这条命令，也不改用其它传输。本机两次都是 1 passed / 0 failed（61.83s、60.59s）。
 
 **Full-suite trigger:** none
 
@@ -908,6 +909,8 @@ OrbStack 文档核对日为 2026-11-23：
 **架构与发行版。** `--arch aarch64` 被拒：`Error: invalid architecture: aarch64`。help 只接受 `arm64` 与 `amd64`。不写 `--arch` 时 Apple Silicon 上得到 `arm64`。`--arch amd64` 的 `debian:bookworm` 创建成功，`image.arch=amd64`，`state=running`，有 `ip4`。`GuestArch::Aarch64` 映射为 `--arch arm64`，`GuestArch::Amd64` 映射为 `--arch amd64`。没有 Intel Mac，Intel 宿主上的 aarch64 写成「未测，实现按拒绝处理」。发行版参数用裸名字 `debian`、`ubuntu`、`fedora`、`arch`，不额外钉版本。2.2.5 的 help 默认是 debian bookworm/12、ubuntu resolute/26.04、fedora 44、arch current。本轮启动的是 `debian:bookworm`（等于 debian 默认）和它的 amd64 变体。
 
 **实现要写死的拼法。** `orb create --isolated --cpus <n> --memory <mem> --disk <disk>G --arch <arm64|amd64> <distro> <qlean-id>`。已存在则改为 `orb start <name>`，不第二次 create。停止是 `orb stop <name>`。失败清理新机器用 `orb delete -f <name>`。地址与探活解析 `orb info <name> -f json` 的 `ip4` 与 `record.state`。列名字用 `orb list -f json`。
+
+**MAC-06 证据（DEP-MAC-01，OrbStack 2.2.5）。** `get_ip` 读 `orb info -f json` 的 `ip4`。`cargo test --test machine_pool test_ping -- --ignored --test-threads=1` 两次都是 1 passed / 0 failed（61.83s、60.59s）。测完 `orb list` 为空。
 
 **MAC-03 至 MAC-05 证据（DEP-MAC-01，OrbStack 2.2.5）。** `cargo test --lib` 566 passed / 0 failed / 14 ignored。`cargo test --lib orb_lifecycle_live -- --ignored` 跑了两次，都是 1 passed / 0 failed（54.68s、54.12s）：root `id -u` 为 0，SFTP 往返读回 `orb-live`，`shutdown` 后名字仍在列表里，`spawn` 后再读到同一文件。`cargo test --test machine_pool test_concurrency -- --ignored --test-threads=1` 为 1 passed / 0 failed，80.50s。结束后 `orb list` 已清空这些 `qlean-` 机器。
 

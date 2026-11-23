@@ -369,6 +369,26 @@ pub(crate) enum OrbPower {
     Absent,
 }
 
+/// IPv4 from `orb info -f json`. This is the host-side address, not `hostname -I`.
+pub(crate) fn parse_ip4(name: &str, stdout: &str, command_ok: bool) -> Result<String> {
+    let summary = one_line(stdout);
+    if !command_ok {
+        bail!("could not read the OrbStack address of {name}: {summary}");
+    }
+    let value: serde_json::Value = serde_json::from_str(stdout)
+        .map_err(|_| anyhow::anyhow!("could not read the OrbStack address of {name}: {summary}"))?;
+    match value.get("ip4").and_then(|ip| ip.as_str()) {
+        Some(ip) if ip.split('.').count() == 4 && ip.split('.').all(is_ipv4_octet) => {
+            Ok(ip.to_string())
+        }
+        _ => bail!("could not read the OrbStack address of {name}: {summary}"),
+    }
+}
+
+fn is_ipv4_octet(part: &str) -> bool {
+    part.parse::<u8>().is_ok() && !(part.len() > 1 && part.starts_with('0'))
+}
+
 /// `running` and `stopped` are answers. A probe failure is an error that names the machine.
 pub(crate) fn parse_power(name: &str, stdout: &str, command_ok: bool) -> Result<OrbPower> {
     if !command_ok {
@@ -975,6 +995,42 @@ mod orb_lifecycle {
         let message = format!("{error:#}");
         assert!(message.contains(NAME), "{message}");
         assert!(message.contains("not json"), "{message}");
+    }
+}
+
+#[cfg(test)]
+mod orb_guest_ip {
+    use super::parse_ip4;
+
+    const NAME: &str = "qlean-00a11e000001";
+
+    #[test]
+    fn the_address_comes_from_orb_info_ip4() {
+        let stdout =
+            r#"{"record":{"state":"running","name":"qlean-00a11e000001"},"ip4":"192.168.139.148"}"#;
+        assert_eq!(parse_ip4(NAME, stdout, true).unwrap(), "192.168.139.148");
+        let source = include_str!("orbstack.rs");
+        let start = source.find("pub(crate) fn parse_ip4").expect("parse_ip4");
+        let body = &source[start..start + 700];
+        assert!(!body.contains("hostname -I"), "{body}");
+    }
+
+    #[test]
+    fn a_missing_address_names_the_machine_and_the_output() {
+        let error = parse_ip4(NAME, r#"{"record":{"state":"stopped"}}"#, true).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains(NAME), "{message}");
+        assert!(message.contains("stopped"), "{message}");
+        assert!(!message.contains("hostname -I"), "{message}");
+    }
+
+    #[test]
+    fn a_failed_probe_keeps_a_one_line_summary() {
+        let error = parse_ip4(NAME, "not json\nsecond", false).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains(NAME), "{message}");
+        assert!(message.contains("not json second"), "{message}");
+        assert!(!message.contains('\n'), "{message}");
     }
 }
 
