@@ -110,6 +110,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 | 时间 | 触发 | 变更内容 | 原卡 → 新卡 | 受影响的引用 |
 |---|---|---|---|---|
+| 2026-11-23 16:07:52 UTC | `MAC-00` 实测 | 写回「OrbStack 实测」。互 ping 成功。创建参数带 `--isolated`。地址字段是 `orb info -f json` 的 `ip4`。无参数 `orb stop` 禁止 | `MAC-00` pending → done / locally-accepted | ADR-MAC-04、实施证据汇总、`plan-status.md` |
 | 2026-11-23 16:02:36 UTC | Codex 计划 review R2 = PASS | 记录 R2。P2-R2-01 接受为残余：`MAC-01` 的 Linux `cargo check` 不是本机门 | 无 | Review log |
 | 2026-11-23 15:55:15 UTC | Codex 计划 review R1 = FAIL（P0-01..P0-04，P1-01..P1-08） | 绑定约束：GitHub Actions 不得增加 macOS 测试或 `macos-latest`。`MAC-07` 改为核对 CI 仍只有 Ubuntu。补 ADR-MAC-04、动态 SSH 用户名、失败清理的新旧机器区分、`is_running` 与文件传输归属、`test_ping` 的 macOS ignore、ER-14 的本机回退与 `DEFER-MAC-05`、`MAC-02` 同卡文档、粒度计数。P2 三条已写入正文（崩溃后 run 目录还在则不扩大清扫；互 ping 失败不挡住 `MAC-01`..`MAC-05`；Review log 的 Result 只用 PASS/FAIL） | 无拆卡。`MAC-07` 改轴，编号保留 | 适用范围、GAP-MAC-04、关系表、ER-13/14、Phase 3、任务卡、测试矩阵、追溯表、风险表、完成判据、`plan-status.md` |
 | 2026-11-23 15:35:53 UTC | 成稿 | 建立本计划。宿主前提定为 OrbStack 机器，不移植 QEMU。用户批准写入，review 改到另一台执行机器 | 无 → `MAC-00`…`MAC-08` | 实施顺序、依赖表、追溯表、风险表 |
@@ -145,12 +146,12 @@ OrbStack 文档核对日为 2026-11-23：
 
 ### ADR-MAC-04: OrbStack 机器不是 QEMU 等价隔离
 
-- **Status:** Accepted。`--isolated` 是否进入创建参数，由 `MAC-00` 在 OrbStack 2.2.5 上的互 ping 实测二选一，不允许第三种传输。
+- **Status:** Accepted。`MAC-00` 在 OrbStack 2.2.5 上已选定：`orb create` 带 `--isolated`，不带 `--isolate-network`，不带 `--forward-ssh-agent`。该组合下两台机器用 `ip4` 互 ping 成功。
 - **Context:** 普通 OrbStack 机器共享内核，并默认带宿主文件共享与集成。文档 [Isolated machines](https://docs.orbstack.dev/machines/isolated) 给出 `--isolated`（关掉文件共享与集成）、`--isolate-network`（并切断到其它机器和宿主 IP 的网络）和 `--forward-ssh-agent`。不用 `/mnt/mac` 做 `upload` / `download` 并不会关掉这些集成。池契约要求两台机器能用 `get_ip` 互 ping，因此不能用切断机器间网络的开关换隔离。
 - **Decision:**
   - 创建参数永不包含 `--isolate-network`，也永不包含 `--forward-ssh-agent`。
-  - `MAC-00` 若证明「`--isolated` 且不带 `--isolate-network`」的两台机器仍能互 ping，则 `orb create` 带 `--isolated`。
-  - 若该组合不能互 ping，则不带 `--isolated`。文件 API 仍只走 SSH/SFTP，不读 `/mnt/mac`。README 写明 OrbStack 层的文件共享还在，qlean 不使用它，也不打开 agent 转发。
+  - `MAC-00` 已证明「`--isolated` 且不带 `--isolate-network`」的两台机器能互 ping。`orb create` 带 `--isolated`。
+  - 若以后的 OrbStack 让这个组合不能互 ping，再改计划。在那之前不退回非隔离机器。文件 API 仍只走 SSH/SFTP。实测里隔离机器没有 `/mnt/mac` 目录，SSH agent 也没有转发。
   - 两种结果都不声称与 QEMU/KVM 等价的隔离。README 写明这些机器共享 OrbStack 的内核。支持的工作负载就是现有公开 API：在机器里执行命令，并用 SFTP 传文件。这是 GC-07 下收窄后的边界，不是把宿主目录挂进客户机。
 - **Alternatives considered:** 总是 `--isolated --isolate-network`（池契约不成立，不能发 0.5.0）；把文件共享当成 `upload` / `download`（拆开 `guest_path`，本计划的非目标）。
 - **Consequences:** `MAC-03` 的参数测试必须断言没有 `--isolate-network` 和 `--forward-ssh-agent`，并断言 `--isolated` 与 `MAC-00` 的结论一致。
@@ -277,7 +278,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Task type:** spike
 
-**Lifecycle / Acceptance:** pending /
+**Lifecycle / Acceptance:** done / locally-accepted
 
 **Description:** 不改生产代码。在 `DEP-MAC-01` 的 Mac 上把后续卡片要写死的命令测出来，写回本计划的「OrbStack 实测」小节。
 
@@ -291,22 +292,22 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Acceptance criteria:**
 
-- [ ] `orb status` 的成功与失败形态已记录。
-- [ ] `orb create` 的成功与失败形态已记录，包括半创建时列表里是否出现该名字。
-- [ ] `orb start <name>` 的成功与失败形态已记录。
-- [ ] `orb stop <name>` 的成功与失败形态已记录，并且写明无参数的 `orb stop` 会停掉整个 OrbStack，实现不得使用无参数形式。
-- [ ] `orb delete <name>` 的成功与失败形态已记录。删除前若需要确认，记录非交互写法。
-- [ ] `orb list` 的机器可读形式已选定（`orb list -f json` 或 `orb info <name> -f json`），字段名写进本计划，作为探活与地址解析的唯一来源。
-- [ ] SSH 已记录：端口、用户名形态 `root@<machine>`、私钥路径、`known_hosts` 中 `[127.0.0.1]:<port>` 的键类型。不记录私钥、主机公钥全文或家目录用户名。
-- [ ] 两台机器的 IP 已记录，A ping B 的结果是明确的成功或失败。
-- [ ] `--cpus`、`--memory`、`--disk`、`--arch` 的单位，以及 Apple Silicon 上 `amd64` / `arm64` 的写法已记录。没有 Intel Mac，aarch64 客户机在 Intel 宿主上的结论写成「未测，实现按拒绝处理」。`GuestArch::Aarch64` 对应的 flag 值以实测为准，不把 `aarch64` 这个枚举名直接当成 `--arch` 的参数。
-- [ ] OrbStack 2.2.5 上 `--isolated`、`--isolate-network`、`--forward-ssh-agent` 是否存在已记录。`--isolated` 且不带 `--isolate-network` 时，两台机器能否互 ping 已有成功或失败。结论写回 ADR-MAC-04 的二选一。默认是否转发 SSH agent 已记录。
+- [x] `orb status` 的成功与失败形态已记录。
+- [x] `orb create` 的成功与失败形态已记录，包括半创建时列表里是否出现该名字。
+- [x] `orb start <name>` 的成功与失败形态已记录。
+- [x] `orb stop <name>` 的成功与失败形态已记录，并且写明无参数的 `orb stop` 会停掉整个 OrbStack，实现不得使用无参数形式。
+- [x] `orb delete <name>` 的成功与失败形态已记录。删除前若需要确认，记录非交互写法。
+- [x] `orb list` 的机器可读形式已选定（`orb list -f json` 或 `orb info <name> -f json`），字段名写进本计划，作为探活与地址解析的唯一来源。
+- [x] SSH 已记录：端口、用户名形态 `root@<machine>`、私钥路径、`known_hosts` 中 `[127.0.0.1]:<port>` 的键类型。不记录私钥、主机公钥全文或家目录用户名。
+- [x] 两台机器的 IP 已记录，A ping B 的结果是明确的成功或失败。
+- [x] `--cpus`、`--memory`、`--disk`、`--arch` 的单位，以及 Apple Silicon 上 `amd64` / `arm64` 的写法已记录。没有 Intel Mac，aarch64 客户机在 Intel 宿主上的结论写成「未测，实现按拒绝处理」。`GuestArch::Aarch64` 对应的 flag 值以实测为准，不把 `aarch64` 这个枚举名直接当成 `--arch` 的参数。
+- [x] OrbStack 2.2.5 上 `--isolated`、`--isolate-network`、`--forward-ssh-agent` 是否存在已记录。`--isolated` 且不带 `--isolate-network` 时，两台机器能否互 ping 已有成功或失败。结论写回 ADR-MAC-04 的二选一。默认是否转发 SSH agent 已记录。
 
 **Granularity 计数:** `AC=10/8@EX-MAC-01`。见规则 waiver。
 
 **Verification:**
 
-- [ ] 命令原文和脱敏输出写在本计划内，不新建证据目录。
+- [x] 命令原文和脱敏输出写在本计划内，不新建证据目录。
 
 **Full-suite trigger:** N/A（no-release）
 
@@ -889,7 +890,21 @@ OrbStack 文档核对日为 2026-11-23：
 
 ### OrbStack 实测
 
-待 `MAC-00` 填写。
+宿主：Apple Silicon（`uname -m` = `arm64`），OrbStack 2.2.5，`orb status` 成功输出为 `Running`（exit 0）。测量用的机器名是 `qlean-` 加 12 位十六进制，测完已 `orb delete -f`。最终 `orb list -f json` 为 `[]`。下面不记录私钥、主机公钥全文或家目录用户名。
+
+**探活与地址。** 唯一来源是 `orb info <name> -f json`。`record.state` 为 `running` 或 `stopped`。地址是顶层字符串 `ip4`（例：`192.168.139.148`、`192.168.139.146`），不是文档示例里的 `198.19.0.0/16`，也不是客户机里的 `hostname -I`。`stopped` 时没有 `ip4`。`orb list -f json` 有 `name` 与 `state`，没有 IP，清扫只拿它列名字。找不到机器时 stdout/stderr 为 `[-32098] machine not found: '<name>'`，exit 非 0。
+
+**create。** 成功：`orb create --isolated --cpus 2 --memory 2G --disk 8G debian:bookworm qlean-00a11e000001` exit 0，无 stdout。随后 `info` 里 `config.isolated=true`，`forward_ssh_agent=false`，`isolate_network=false`，`memory_limit_mib=2048`，`cpu_limit=2`，`disk_limit_bytes=8589934592`，`image.arch=arm64`，`image.distro=debian`，`image.version=bookworm`，`state=running`。第一次同样的 create 失败为 `[-32603] Post "http://sconrpc": EOF`（exit 1），列表里没有这个名字，没有半成品。同名再 create：`[-32098] create '<name>': machine already exists: '<name>'`（exit 1）。坏发行版：`Error: invalid distro: notadistro`。`--memory 512`：`memory limit must be at least 1 GiB`，不留下机器。因此裸 `--memory` 的单位是 MiB，且至少 1024。`--memory 2G` 存成 2048 MiB，所以 `G` 是 GiB。`--disk` 的 help 单位是 GiB；`--disk 8G` 存成 8589934592 字节。实现传 `--memory <mem>`（`MachineConfig.mem` 按 MiB，小于 1024 在调用 `orb` 前拒绝）和 `--disk <disk>G`。
+
+**start / stop / delete。** `orb stop <name>` 与 `orb start <name>` 成功都是 exit 0、无 stdout。停之后 `state=stopped` 且没有 `ip4`；再 start 后回到 `running`，这次 `ip4` 仍是 `192.168.139.148`。实现仍在每次启动后重新读 `ip4`，不把「IP 不变」写成契约。缺名字：`[-32098] machine not found: '<name>'`。无参数的 `orb stop` 按 help 会停掉整个 OrbStack，本轮没有执行，实现禁止。`orb delete <name>` 在非 TTY 下 exit 0 并删掉机器，没有确认提示。`orb delete -f <name>` 同样 exit 0。实现始终加 `-f`，避免终端卡住。删完 `orb list -f json` 为 `[]`。
+
+**SSH。** `ssh -p 32222 -i ~/.orbstack/ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.orbstack/ssh/known_hosts -l 'root@<machine>' 127.0.0.1 id -u` 输出 `0`，`hostname` 等于机器名。用户名是 `root@<machine>` 这一个 SSH 用户，主机是 `127.0.0.1`，端口 `32222`，私钥 `~/.orbstack/ssh/id_ed25519`。`known_hosts` 里 `[127.0.0.1]:32222` 有两行，类型是 `ssh-ed25519` 与 `ecdsa-sha2-nistp256`。实现钉住 `ssh-ed25519` 那一行，不把密钥写进日志。对已停止的机器发起这次 SSH 会把机器拉起来并让命令成功，所以 `is_running` 只读 `record.state`，不用 SSH 成败判断停机。`orb -m <name> -u root id -u` 也能得到 `0`，但传输仍走上面的 SSH，不把 `orb run` 当成文件 API。
+
+**互 ping。** 两台都是 `--isolated` 且没有 `--isolate-network`。`ip4` 分别是 `192.168.139.148` 与 `192.168.139.146`。A `ping -c 3 -W 2` B 与 B ping A 都是 3 包 0% 丢失（exit 0）。ADR-MAC-04 因此选定 `--isolated`。隔离机器上没有 `/mnt/mac` 目录，`SSH_AUTH_SOCK` 未设置。
+
+**架构与发行版。** `--arch aarch64` 被拒：`Error: invalid architecture: aarch64`。help 只接受 `arm64` 与 `amd64`。不写 `--arch` 时 Apple Silicon 上得到 `arm64`。`--arch amd64` 的 `debian:bookworm` 创建成功，`image.arch=amd64`，`state=running`，有 `ip4`。`GuestArch::Aarch64` 映射为 `--arch arm64`，`GuestArch::Amd64` 映射为 `--arch amd64`。没有 Intel Mac，Intel 宿主上的 aarch64 写成「未测，实现按拒绝处理」。发行版参数用裸名字 `debian`、`ubuntu`、`fedora`、`arch`，不额外钉版本。2.2.5 的 help 默认是 debian bookworm/12、ubuntu resolute/26.04、fedora 44、arch current。本轮启动的是 `debian:bookworm`（等于 debian 默认）和它的 amd64 变体。
+
+**实现要写死的拼法。** `orb create --isolated --cpus <n> --memory <mem> --disk <disk>G --arch <arm64|amd64> <distro> <qlean-id>`。已存在则改为 `orb start <name>`，不第二次 create。停止是 `orb stop <name>`。失败清理新机器用 `orb delete -f <name>`。地址与探活解析 `orb info <name> -f json` 的 `ip4` 与 `record.state`。列名字用 `orb list -f json`。
 
 ## Review log
 
