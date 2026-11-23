@@ -18,7 +18,7 @@
 - **macOS 宿主依赖：** OrbStack，以及 PATH 上的 `orb`。不新增 QEMU、libvirt、OVMF、swtpm 或 bridge helper 作为 Mac 前提。
 - **客户机：** OrbStack 提供的 Debian、Ubuntu、Fedora、Arch。架构是宿主原生架构，以及 Apple Silicon 上经 Rosetta 的 amd64。
 - **传输：** OrbStack 自带的 localhost SSH（`127.0.0.1:32222`），russh 复用现有 TCP 客户端。Linux 宿主的 vsock 路径不改。
-- **测试与发布：** macOS 上 `cargo test --lib` 进 CI；真机冒烟在装了 OrbStack 的 Mac 上跑。发布 0.5.0。
+- **测试与发布：** macOS 的编译与 `cargo test --lib` 在开发者的 Mac 上跑（本计划的执行机已安装 OrbStack 2.2.5）。GitHub Actions 保持只有 `ubuntu-latest`，不增加 macOS 测试、macOS job 或 `macos-latest`。真机冒烟在这台 Mac 上显式跑 `#[ignore]` 用例。发布 0.5.0。提交和推送不等待 Actions 变绿。
 
 ### 非目标
 
@@ -36,7 +36,7 @@
 - `with_pool` 的两台机器能用 `get_ip` 返回的地址互相访问，契约与 `tests/machine_pool.rs` 的 `test_ping` 相同。
 - 未安装 OrbStack、OrbStack 未启动、或请求了本计划不支持的客户机时，一条错误说明缺什么、如何安装，并且不把「在 Mac 上安装 QEMU」说成解法。
 - Linux 上的命令行、错误文本和测试保持 0.4.0 的行为。
-- README、CHANGELOG 与 CI 同步。`MAC-06` 若证明机器之间没有 IP 路由，则本计划不得标记完成，也不得把单机能力单独发成 0.5.0。
+- README 与 CHANGELOG 同步。CI 保持 Ubuntu-only，不新增 macOS job。`MAC-06` 若证明机器之间没有 IP 路由，则本计划不得标记完成，也不得把单机能力单独发成 0.5.0。`MAC-01` 至 `MAC-05` 在互 ping 失败时仍可做完；`MAC-06` 保持 `blocked`，版本留在 0.4.0。
 
 ## 事实基线
 
@@ -76,7 +76,7 @@ OrbStack 文档核对日为 2026-11-23：
 | GAP-MAC-01 | crate 在 macOS 上因 Linux 专用依赖无法编译 | Mac 上连错误提示都到不了 | `Cargo.toml:22`、`Cargo.toml:37`，`src/lib.rs:54` | `MAC-01` |
 | GAP-MAC-02 | 入口把所有非 Linux 宿主合成一句拒绝 | 用户不知道 Mac 的前提是 OrbStack | `src/lib.rs:70` | `MAC-01`、`MAC-02` |
 | GAP-MAC-03 | 启动、传输、探活、镜像下载都假设 QEMU/KVM/vsock/libvirt | 有 OrbStack 也跑不起来 | `src/qemu.rs:267`、`src/ssh.rs:3505`、`src/image.rs:323` | `MAC-03` 至 `MAC-06` |
-| GAP-MAC-04 | CI 不编译 Apple 目标 | macOS cfg 分叉可以在合入后才爆 | `.github/workflows/check-and-test.yml` | `MAC-07` |
+| GAP-MAC-04 | 没有 Mac 上的编译证据时，macOS cfg 分叉可以在合入后才爆 | 本地 Mac 门是 `cargo test --lib`；CI 不为此增加 runner | `.github/workflows/check-and-test.yml` 今天只有 `ubuntu-latest` | `MAC-01` 在本机编译；`MAC-07` 核对工作流仍无 `macos-latest` |
 
 ## 与其它计划的关系
 
@@ -87,7 +87,7 @@ OrbStack 文档核对日为 2026-11-23：
 | `plan-20261104-windows-guest.md` | 已完成的 Linux 宿主 Windows 客户机计划 | 不改其行为。macOS 上的 Windows 是本计划的非目标，不复用那套 OVMF/swtpm 任务 |
 | `plan-status.md` | 执行状况单一视图 | 本计划成稿时登记；每卡同步 |
 | `README.md` / `CHANGELOG.md` | 用户契约 | 行为卡同卡更新；`MAC-08` 只把 Unreleased 收成 `[0.5.0]` |
-| `.github/workflows/check-and-test.yml` | CI 契约 | `MAC-07` 增加 `macos-latest` 的 `cargo test --lib`，不在 CI 安装 OrbStack |
+| `.github/workflows/check-and-test.yml` | CI 契约 | `MAC-07` 核对它继续只有 `ubuntu-latest`。禁止添加 macOS 测试、macOS job 或 `macos-latest` |
 
 ## 评审结论与修订记录
 
@@ -110,6 +110,8 @@ OrbStack 文档核对日为 2026-11-23：
 
 | 时间 | 触发 | 变更内容 | 原卡 → 新卡 | 受影响的引用 |
 |---|---|---|---|---|
+| 2026-11-23 16:02:36 UTC | Codex 计划 review R2 = PASS | 记录 R2。P2-R2-01 接受为残余：`MAC-01` 的 Linux `cargo check` 不是本机门 | 无 | Review log |
+| 2026-11-23 15:55:15 UTC | Codex 计划 review R1 = FAIL（P0-01..P0-04，P1-01..P1-08） | 绑定约束：GitHub Actions 不得增加 macOS 测试或 `macos-latest`。`MAC-07` 改为核对 CI 仍只有 Ubuntu。补 ADR-MAC-04、动态 SSH 用户名、失败清理的新旧机器区分、`is_running` 与文件传输归属、`test_ping` 的 macOS ignore、ER-14 的本机回退与 `DEFER-MAC-05`、`MAC-02` 同卡文档、粒度计数。P2 三条已写入正文（崩溃后 run 目录还在则不扩大清扫；互 ping 失败不挡住 `MAC-01`..`MAC-05`；Review log 的 Result 只用 PASS/FAIL） | 无拆卡。`MAC-07` 改轴，编号保留 | 适用范围、GAP-MAC-04、关系表、ER-13/14、Phase 3、任务卡、测试矩阵、追溯表、风险表、完成判据、`plan-status.md` |
 | 2026-11-23 15:35:53 UTC | 成稿 | 建立本计划。宿主前提定为 OrbStack 机器，不移植 QEMU。用户批准写入，review 改到另一台执行机器 | 无 → `MAC-00`…`MAC-08` | 实施顺序、依赖表、追溯表、风险表 |
 
 ## 已决议设计决策
@@ -141,6 +143,19 @@ OrbStack 文档核对日为 2026-11-23：
 - **Consequences:** 用户自己的 OrbStack 机器不在清扫范围内。`shutdown` 只 `orb stop`，留下机器以便 `spawn`。本进程 Drop 时停止自己创建的机器。
 - **Revisit when:** 机器名规则与 nanoid 长度不再一致。
 
+### ADR-MAC-04: OrbStack 机器不是 QEMU 等价隔离
+
+- **Status:** Accepted。`--isolated` 是否进入创建参数，由 `MAC-00` 在 OrbStack 2.2.5 上的互 ping 实测二选一，不允许第三种传输。
+- **Context:** 普通 OrbStack 机器共享内核，并默认带宿主文件共享与集成。文档 [Isolated machines](https://docs.orbstack.dev/machines/isolated) 给出 `--isolated`（关掉文件共享与集成）、`--isolate-network`（并切断到其它机器和宿主 IP 的网络）和 `--forward-ssh-agent`。不用 `/mnt/mac` 做 `upload` / `download` 并不会关掉这些集成。池契约要求两台机器能用 `get_ip` 互 ping，因此不能用切断机器间网络的开关换隔离。
+- **Decision:**
+  - 创建参数永不包含 `--isolate-network`，也永不包含 `--forward-ssh-agent`。
+  - `MAC-00` 若证明「`--isolated` 且不带 `--isolate-network`」的两台机器仍能互 ping，则 `orb create` 带 `--isolated`。
+  - 若该组合不能互 ping，则不带 `--isolated`。文件 API 仍只走 SSH/SFTP，不读 `/mnt/mac`。README 写明 OrbStack 层的文件共享还在，qlean 不使用它，也不打开 agent 转发。
+  - 两种结果都不声称与 QEMU/KVM 等价的隔离。README 写明这些机器共享 OrbStack 的内核。支持的工作负载就是现有公开 API：在机器里执行命令，并用 SFTP 传文件。这是 GC-07 下收窄后的边界，不是把宿主目录挂进客户机。
+- **Alternatives considered:** 总是 `--isolated --isolate-network`（池契约不成立，不能发 0.5.0）；把文件共享当成 `upload` / `download`（拆开 `guest_path`，本计划的非目标）。
+- **Consequences:** `MAC-03` 的参数测试必须断言没有 `--isolate-network` 和 `--forward-ssh-agent`，并断言 `--isolated` 与 `MAC-00` 的结论一致。
+- **Revisit when:** OrbStack 提供与 QEMU 相当的虚拟化隔离，或池不再要求机器间 IP 互通。另立计划。
+
 ## 全局工程约束
 
 按 `plan-template.md` 的 GC-01~GC-11 生效。本计划额外强调：
@@ -154,7 +169,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 按 `plan-template.md` 的 ER-01~ER-14 生效。本计划补充：
 
-- **ER-13/14 macOS 门：** GitHub `macos-latest` 只跑 `cargo test --lib`，不安装 OrbStack，不传 `--ignored`。真机冒烟在 `DEP-MAC-01` 的 Mac 上执行测试注释里的命令。没有这台 Mac 时，`MAC-00` 与真机验收为 `blocked`，编译卡仍可做；`MAC-08` 在真机冒烟完成前不得发布。
+- **ER-13/14 本计划的门：** GitHub Actions 不增加 macOS 测试、macOS job 或 `macos-latest`。现有 Ubuntu job（format、clippy、`cargo test --lib`、`cargo test --test windows_machine`、`cargo test --no-run`）保持不变，只作为推送之后的事后证据。提交和推送不等待 Actions 变绿。macOS 编译与单测的门是这台 Mac 上的 `cargo test --lib`。真机冒烟在 `DEP-MAC-01` 上执行测试注释里的命令，命令必须带 `--ignored`，证据必须显示用例名被执行而不是 0 tests。本执行机不是配齐的 Linux VM 宿主机，因此 ER-14 的全量 `cargo test`（含 `tests/**` 的 KVM 集成）登记为 `DEFER-MAC-05`；收口至少跑 `cargo test --lib` 与 `cargo test --no-run`。没有这台 Mac 时，`MAC-00` 与真机验收为 `blocked`；`MAC-08` 在真机冒烟完成前不得发布。互 ping 失败时同样不得发布，见成功定义。
 - **VCS：** 本 checkout 使用 `libra status` / `libra add <路径>` / `libra commit` / `libra push origin main`。不得改用 git，也不得把无关文件暂存进去。
 
 ## 实施顺序
@@ -181,7 +196,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **发布者:** 计划 Owner。
 
-**发布窗口顺序:** `MAC-08` 独自 bump、提交、推送、等待 CI。tag 与 GitHub Release 在用户要求发布时做。本计划不默认 `cargo publish`。
+**发布窗口顺序:** `MAC-08` 独自 bump、提交、推送。推送前的门是本机 `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib`、`cargo test --no-run`。不等待 GitHub Actions。Ubuntu CI 若随后出现，只记为事后证据，不作为完成条件，也不因此添加 macOS job。tag 与 GitHub Release 在用户要求发布时做。本计划不默认 `cargo publish`。
 
 ### Phase 0: 命令契约
 
@@ -189,7 +204,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **进入条件:** `DEP-MAC-01` 可用。
 
-**退出条件:** `MAC-00` 的结论已写回本计划。互 ping 失败时，`MAC-06` 的进入条件不成立。
+**退出条件:** `MAC-00` 的结论已写回本计划。互 ping 失败时，`MAC-06` 的进入条件不成立。`MAC-01` 至 `MAC-05` 不因此停工。停的是 `MAC-06`、0.5.0 和本计划的完成标记。
 
 ### Phase 1: 能编译，并能说明前提
 
@@ -209,7 +224,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 ### Phase 3: 池、CI 与发布
 
-**目标:** 互访契约成立，CI 编译 Mac 目标，发布 0.5.0。
+**目标:** 互访契约成立，本机 Mac 门通过，CI 仍只有 Ubuntu，发布 0.5.0。
 
 **进入条件:** Phase 2 完成，且 `MAC-00` 的互 ping 为成功。
 
@@ -238,21 +253,25 @@ OrbStack 文档核对日为 2026-11-23：
 | `MAC-00` | Task type / Release boundary / Version increment | `spike` / `no-release` / `N/A` |
 | `MAC-08` | Task type / Release boundary / Version increment | `release` / `family release point of REL-MAC-01` / `minor` |
 
-**规则 waiver（`EX-*`）：** 无。
+**规则 waiver（`EX-*`）：**
+
+| ID | 任务 | 豁免项 | 理由与补偿 | 审批人 | 轮次 | 位置 | 范围 |
+|---|---|---|---|---|---|---|---|
+| EX-MAC-01 | `MAC-00` | G-03 条目上限 | 一次真机测量要分别记下六条命令的成败、SSH、互 ping、架构单位、隔离开关。拆成两张 spike 会把同一次机器会话拆开。补偿：每条 AC 仍是独立 pass/fail，全部写进「OrbStack 实测」 | 计划 Owner | R1 复审 | `MAC-00` Acceptance criteria | 本计划内 |
 
 #### 任务卡粒度审计表
 
 | 任务 | type | axis | recovery | complete | self-contained | AC | VER | landing / prod-files | scope | deps | writeset | release | split-from | exception |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| MAC-00 | spike | CLI 契约 | 删掉本计划里的实测小节 | yes | yes | 5/8 | 1/8 | 1/0 | S | DEP-MAC-01 | 序列化于后续全部卡 | no-release | N/A | N/A |
-| MAC-01 | implementation | macOS 可编译 | revert | yes | yes | 4/8 | 2/8 | 3/2 | M | 无 | 序列化于 MAC-02 | family child | N/A | N/A |
-| MAC-02 | implementation | 前置检查 | revert | yes | yes | 3/8 | 1/8 | 2/1 | S | MAC-01 | 序列化于 MAC-03 | family child | N/A | N/A |
-| MAC-03 | implementation | create 参数 | revert | yes | yes | 4/8 | 1/8 | 3/2 | M | MAC-00, MAC-02 | 序列化于 MAC-04 | family child | N/A | N/A |
+| MAC-00 | spike | CLI 契约 | 删掉本计划里的实测小节 | yes | yes | 10/8@EX-MAC-01 | 1/8 | 1/0 | S | DEP-MAC-01 | 序列化于后续全部卡 | no-release | N/A | EX-MAC-01 |
+| MAC-01 | implementation | macOS 可编译 | revert | yes | yes | 5/8 | 2/8 | 3/2 | M | 无 | 序列化于 MAC-02 | family child | N/A | N/A |
+| MAC-02 | implementation | 前置检查 | revert | yes | yes | 4/8 | 1/8 | 2/1 | S | MAC-01 | 序列化于 MAC-03 | family child | N/A | N/A |
+| MAC-03 | implementation | create 参数 | revert | yes | yes | 5/8 | 1/8 | 3/2 | M | MAC-00, MAC-02 | 序列化于 MAC-04 | family child | N/A | N/A |
 | MAC-04 | implementation | SSH 传输 | revert | yes | yes | 4/8 | 2/8 | 3/2 | M | MAC-03 | 序列化于 MAC-05 | family child | N/A | N/A |
-| MAC-05 | implementation | 生命周期 | revert | yes | yes | 5/8 | 2/8 | 3/2 | M | MAC-04 | 序列化于 MAC-06 | family child | N/A | N/A |
-| MAC-06 | implementation | 池地址 | revert | yes | yes | 3/8 | 2/8 | 3/2 | M | MAC-05 | 序列化于 MAC-07 | family child | N/A | N/A |
-| MAC-07 | implementation | CI | revert | yes | yes | 3/8 | 1/8 | 2/1 | S | MAC-06 | 序列化于 MAC-08 | family child | N/A | N/A |
-| MAC-08 | release | 0.5.0 | immutable-release | yes | yes | 4/12 | 3/12 | 3/2 | S | MAC-07 | 发布写集 | family release point | N/A | N/A |
+| MAC-05 | implementation | 生命周期 | revert | yes | yes | 6/8 | 3/8 | 4/3 | M | MAC-04 | 序列化于 MAC-06 | family child | N/A | N/A |
+| MAC-06 | implementation | 池地址 | revert | yes | yes | 4/8 | 2/8 | 3/3 | M | MAC-05 | 序列化于 MAC-07 | family child | N/A | N/A |
+| MAC-07 | implementation | CI 仍为 Ubuntu | revert | yes | yes | 3/8 | 1/8 | 1/0 | S | MAC-06 | 序列化于 MAC-08 | family child | N/A | N/A |
+| MAC-08 | release | 0.5.0 | immutable-release | yes | yes | 5/12 | 3/12 | 3/3 | M | MAC-07 | 发布写集 | family release point | N/A | N/A |
 
 ### Task MAC-00: 核对 OrbStack 命令契约
 
@@ -272,11 +291,18 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Acceptance criteria:**
 
-- [ ] `orb status`、`orb create`、`orb start`、`orb stop`、`orb delete`、`orb list` 的成功与失败形态已记录，并选定一种机器可读的探活方式。
-- [ ] 以 root 连上 `127.0.0.1:32222` 的用户名、私钥路径、主机公钥文件位置已记录。
+- [ ] `orb status` 的成功与失败形态已记录。
+- [ ] `orb create` 的成功与失败形态已记录，包括半创建时列表里是否出现该名字。
+- [ ] `orb start <name>` 的成功与失败形态已记录。
+- [ ] `orb stop <name>` 的成功与失败形态已记录，并且写明无参数的 `orb stop` 会停掉整个 OrbStack，实现不得使用无参数形式。
+- [ ] `orb delete <name>` 的成功与失败形态已记录。删除前若需要确认，记录非交互写法。
+- [ ] `orb list` 的机器可读形式已选定（`orb list -f json` 或 `orb info <name> -f json`），字段名写进本计划，作为探活与地址解析的唯一来源。
+- [ ] SSH 已记录：端口、用户名形态 `root@<machine>`、私钥路径、`known_hosts` 中 `[127.0.0.1]:<port>` 的键类型。不记录私钥、主机公钥全文或家目录用户名。
 - [ ] 两台机器的 IP 已记录，A ping B 的结果是明确的成功或失败。
-- [ ] `--cpus`、`--memory`、`--disk`、`--arch` 的单位，以及 Apple Silicon 上 amd64 / aarch64 的写法已记录。
-- [ ] Intel Mac 能否创建 aarch64 机器已有结论；没有 Intel 机器则写成「未测，实现按拒绝处理」。
+- [ ] `--cpus`、`--memory`、`--disk`、`--arch` 的单位，以及 Apple Silicon 上 `amd64` / `arm64` 的写法已记录。没有 Intel Mac，aarch64 客户机在 Intel 宿主上的结论写成「未测，实现按拒绝处理」。`GuestArch::Aarch64` 对应的 flag 值以实测为准，不把 `aarch64` 这个枚举名直接当成 `--arch` 的参数。
+- [ ] OrbStack 2.2.5 上 `--isolated`、`--isolate-network`、`--forward-ssh-agent` 是否存在已记录。`--isolated` 且不带 `--isolate-network` 时，两台机器能否互 ping 已有成功或失败。结论写回 ADR-MAC-04 的二选一。默认是否转发 SSH agent 已记录。
+
+**Granularity 计数:** `AC=10/8@EX-MAC-01`。见规则 waiver。
 
 **Verification:**
 
@@ -310,7 +336,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **C/D coverage from:** `MAC-08`
 
-**Granularity:** `type=spike; axis=CLI 契约; recovery=删掉实测小节; complete=yes; self-contained=yes; AC=5/8; VER=1/8; landing=1; prod-files=0; scope=S; deps=DEP-MAC-01; writeset=序列化于后续全部卡; release=no-release; split-from=N/A; exception=N/A`
+**Granularity:** `type=spike; axis=CLI 契约; recovery=删掉实测小节; complete=yes; self-contained=yes; AC=10/8@EX-MAC-01; VER=1/8; landing=1; prod-files=0; scope=S; deps=DEP-MAC-01; writeset=序列化于后续全部卡; release=no-release; split-from=N/A; exception=EX-MAC-01`
 
 ### Task MAC-01: 让 crate 在 macOS 上能编译
 
@@ -331,9 +357,10 @@ OrbStack 文档核对日为 2026-11-23：
 **Acceptance criteria:**
 
 - [ ] `kvm-ioctls` 与 `tokio-vsock` 只出现在 Linux 目标依赖里。
-- [ ] `cargo check` 在 macOS 与 Linux 上都通过。没有 Mac 时，至少 Linux 上 `cargo check` 通过，且 macOS cfg 分支能被阅读到「OrbStack」错误文本；Mac 编译证据补在 `MAC-07`。
-- [ ] macOS 上 `with_machine` / `with_pool` 的错误包含 `OrbStack` 和 `brew install orbstack`，且不说在 Mac 上安装 QEMU 即可使用。
+- [ ] 本机 macOS 上 `cargo check` 通过。Linux 交叉编译不是本机的门；Linux cfg 路径不改写原有前置失败文本，Ubuntu CI 事后仍编译它们。
+- [ ] macOS 上宿主门的错误包含 `OrbStack` 和 `brew install orbstack`，且不说在 Mac 上安装 QEMU 即可使用。`with_machine` / `with_pool` 在 OrbStack 不可用时走这句，而不是「只支持 Linux」。
 - [ ] Linux 上原有的前置失败文本不被这段 cfg 改写。
+- [ ] 依赖 `/proc`、libvirt 或 KVM 才能成立的既有 `cargo test --lib` 用例用 `cfg(target_os = "linux")` 留在 Linux 上执行。macOS 上 `cargo test --lib` 不因缺少这些设施而失败。这些用例的源码仍在，不删测试。
 
 **Verification:**
 
@@ -346,7 +373,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Deliverables:** N/A
 
-**Implementation write set:** `Cargo.toml`、`Cargo.lock`（仅工具链刷新）、`src/lib.rs`、被 `kvm_ioctls` / `tokio_vsock` 牵连而必须加 cfg 的模块、`README.md`（Host Setup 增加 macOS 节的首段）、`CHANGELOG.md`（Unreleased 一条）、本计划、`plan-status.md`
+**Implementation write set:** `Cargo.toml`、`Cargo.lock`（仅工具链刷新）、`src/lib.rs`、被 `kvm_ioctls` / `tokio_vsock` 牵连而必须加 cfg 的模块、依赖 `/proc` 或 KVM 或 libvirt 才能在 macOS 上通过的既有 `#[cfg(test)]` 模块（只加 `cfg(target_os = "linux")`，不删用例）、`README.md`（Host Setup 增加 macOS 节的首段）、`CHANGELOG.md`（Unreleased 一条）、本计划、`plan-status.md`
 
 **Release write set:** N/A（family child）
 
@@ -368,7 +395,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **C/D coverage from:** `MAC-08`
 
-**Granularity:** `type=implementation; axis=macOS 可编译; recovery=revert; complete=yes; self-contained=yes; AC=4/8; VER=2/8; landing=3; prod-files=2; scope=M; deps=none; writeset=序列化于 MAC-02; release=family child; split-from=N/A; exception=N/A`
+**Granularity:** `type=implementation; axis=macOS 可编译; recovery=revert; complete=yes; self-contained=yes; AC=5/8; VER=2/8; landing=3; prod-files=2; scope=M; deps=none; writeset=序列化于 MAC-02; release=family child; split-from=N/A; exception=N/A`
 
 ### Task MAC-02: OrbStack 前置检查
 
@@ -388,9 +415,10 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Acceptance criteria:**
 
-- [ ] 三条失败各有一句可操作说明：安装、修权限或 `noexec`、执行 `orb` / `orb start`。
+- [ ] 三条失败各有一句可操作说明：安装（含 `brew install orbstack`）、修权限或 `noexec`、执行 `orb` / 启动 OrbStack。三条都不把「在 Mac 上安装 QEMU」说成解法。
 - [ ] 检查本身不创建机器。
 - [ ] 命令查找和「是否在运行」可以注入，单测不执行真的 `orb`。
+- [ ] README 与 CHANGELOG 写明这三条失败和对应处置。安装句与 `MAC-01` 的 Host Setup 一致，不另起一套安装说明。
 
 **Verification:**
 
@@ -402,13 +430,13 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Deliverables:** N/A
 
-**Implementation write set:** `src/orbstack.rs`、`src/lib.rs`、本计划、`plan-status.md`
+**Implementation write set:** `src/orbstack.rs`、`src/lib.rs`、`README.md`、`CHANGELOG.md`、本计划、`plan-status.md`
 
 **Release write set:** N/A
 
 **Files likely touched:** 见实现写集
 
-**Docs and compatibility impact:** 错误文本即契约，不另加 README 节。`MAC-01` 已指向安装方式。
+**Docs and compatibility impact:** README Host Setup 的 macOS 节写明三条失败（没有二进制、有二进制但不能执行、OrbStack 没启动）。CHANGELOG Unreleased 各记一条。不把安装 QEMU 写成 Mac 的解法。
 
 **Rollback mode:** revert
 
@@ -424,7 +452,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **C/D coverage from:** `MAC-08`
 
-**Granularity:** `type=implementation; axis=前置检查; recovery=revert; complete=yes; self-contained=yes; AC=3/8; VER=1/8; landing=2; prod-files=1; scope=S; deps=MAC-01; writeset=序列化于 MAC-03; release=family child; split-from=N/A; exception=N/A`
+**Granularity:** `type=implementation; axis=前置检查; recovery=revert; complete=yes; self-contained=yes; AC=4/8; VER=1/8; landing=2; prod-files=1; scope=S; deps=MAC-01; writeset=序列化于 MAC-03; release=family child; split-from=N/A; exception=N/A`
 
 ### Task MAC-03: 创建参数、架构与机器名
 
@@ -449,6 +477,7 @@ OrbStack 文档核对日为 2026-11-23：
 - [ ] 架构 flag 符合 `MAC-00`。riscv64、Windows、带 `source` 的镜像各自一条错误，错误里不出现「安装 KVM」。
 - [ ] 停止和删除的参数构造拒绝缺少 `qlean-` 前缀或 id 不是 12 位十六进制的名字。
 - [ ] 内存换算与 `MAC-00` 的单位一致，换算结果进入启动日志。
+- [ ] 创建参数遵守 ADR-MAC-04：永不包含 `--isolate-network` 与 `--forward-ssh-agent`；`--isolated` 是否出现与 `MAC-00` 的互 ping 结论一致。单测覆盖这两种拼法中 `MAC-00` 选定的那一种，并断言另外两个 flag 不出现。
 
 **Verification:**
 
@@ -482,7 +511,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **C/D coverage from:** `MAC-08`
 
-**Granularity:** `type=implementation; axis=create 参数; recovery=revert; complete=yes; self-contained=yes; AC=4/8; VER=1/8; landing=3; prod-files=2; scope=M; deps=MAC-00,MAC-02; writeset=序列化于 MAC-04; release=family child; split-from=N/A; exception=N/A`
+**Granularity:** `type=implementation; axis=create 参数; recovery=revert; complete=yes; self-contained=yes; AC=5/8; VER=1/8; landing=3; prod-files=2; scope=M; deps=MAC-00,MAC-02; writeset=序列化于 MAC-04; release=family child; split-from=N/A; exception=N/A`
 
 ### Task MAC-04: 经 localhost SSH 建立 root 会话
 
@@ -490,9 +519,9 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Lifecycle / Acceptance:** pending /
 
-**Description:** macOS 上 `Machine` 的会话走 OrbStack SSH。Linux 目标不编译这条路径，vsock 保持「没有 TCP 退路」。
+**Description:** macOS 上 `Machine` 的会话走 OrbStack SSH。用户名是运行时的 `root@qlean-<id>`，不是 `'static` 的 Windows 或 Linux 用户名。`ConnectTarget` 要能携带这个动态用户名；Linux 的 `linux_connect_target` / `vsock_connect_params` 与 Windows 的钉钥参数保持原样。Linux 目标不编译 OrbStack 路径，vsock 保持「没有 TCP 退路」。
 
-**Out of scope:** 不改 Windows 的每机主机密钥。不把 qlean 私钥写入 OrbStack 的 `authorized_keys`。
+**Out of scope:** 不改 Windows 的每机主机密钥。不把 qlean 私钥写入 OrbStack 的 `authorized_keys`。不把 Linux 客户机改成 TCP。
 
 **Current evidence:**
 
@@ -510,8 +539,8 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Verification:**
 
-- [ ] `cargo test --lib orb_ssh`
-- [ ] Linux：`cargo test --lib connect_ssh`
+- [ ] `cargo test --lib orb_ssh`。输出必须出现 `orb_ssh` 且不是 `0 tests`。覆盖用户名 `root@qlean-` + 12 位十六进制、主机 `127.0.0.1`、`MAC-00` 的端口、私钥路径，以及主机公钥不一致时的失败（错误写明这是 OrbStack 的 SSH 服务）。
+- [ ] `cargo test --lib connect_target_tests` 与新增的 `linux_guest_has_no_tcp_fallback`。后者断言 `connect_ssh` 在缺少 `/dev/vhost-vsock` 时的失败文本含 `no TCP fallback`，且该函数不调用 `connect_tcp`。证据必须显示这两个名字被执行。本机是 macOS，这条 Linux 断言用源码守卫实现，不要求本机有 vsock。
 
 **Full-suite trigger:** none
 
@@ -519,7 +548,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Deliverables:** N/A
 
-**Implementation write set:** `src/orbstack.rs`、`src/ssh.rs`（只收窄 `connect_tcp` 的注释与可见性，不改变 Linux 调用）、`README.md`（传输一小节）、`CHANGELOG.md`、本计划、`plan-status.md`
+**Implementation write set:** `src/orbstack.rs`、`src/ssh.rs`（允许内部连接参数携带动态用户名 `root@qlean-<id>`，并让 OrbStack 会话复用现有 TCP 钉钥客户端；不改变 `linux_connect_target`、`vsock_connect_params` 与 Windows 钉钥）、`README.md`（传输一小节）、`CHANGELOG.md`、本计划、`plan-status.md`
 
 **Release write set:** N/A
 
@@ -549,9 +578,9 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Lifecycle / Acceptance:** pending /
 
-**Description:** 把 `Machine` 的启动和停止接到 `orb create` / `orb start` / `orb stop`。启动时清扫失去 run 目录的 `qlean-` 机器。
+**Description:** 把 `Machine` 的构造、启动、探活和停止接到 OrbStack。macOS 上 `Machine::new` 不调用 `qemu-img`、libvirt 或 KVM 门槛。`init` / `spawn` / `shutdown` / `Drop` 使用 `orb create` / `orb start` / `orb stop <name>`。`is_running` 区分在跑、已停止和探活失败。`upload` / `download` 走这条 SSH/SFTP 会话，不走 `/mnt/mac`。启动时清扫失去 run 目录的 `qlean-` 机器。
 
-**Out of scope:** 不实现 `get_ip`。不在 `shutdown` 时 `orb delete`。
+**Out of scope:** 不实现 `get_ip`。不在 `shutdown` 时 `orb delete`。不扩大清扫到「进程崩溃但 run 目录还在」的机器，见风险表。
 
 **Current evidence:**
 
@@ -562,16 +591,18 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Acceptance criteria:**
 
-- [ ] `init` 创建机器并等到 SSH 能执行一条命令。已存在的同名机器改为 `orb start`，不第二次 `create`。
-- [ ] `shutdown` 停止机器且不删除，随后 `spawn` 仍连得上同一名字。
-- [ ] Drop 停止本进程创建的机器。
+- [ ] macOS 上 `Machine::new` 不调用 `qemu-img`、libvirt 或 KVM 门槛。`init` 创建机器并等到 SSH 能执行一条命令。已存在的同名机器改为 `orb start`，不第二次 `create`。公开的 `Machine` / `MachineConfig` 签名与字段不改。
+- [ ] `shutdown` 只 `orb stop <name>`，不删除。随后 `spawn` 对同一名字执行 `orb start`。Drop 停止本进程创建的机器，同样不删除。
+- [ ] `is_running`：OrbStack 报告在跑则为 `Ok(true)`，报告已停止则为 `Ok(false)`，探活命令失败则是带机器名的 `Err`。池用这个结果决定启停，不把「已停止」当成错误，也不把「问失败」当成没在跑。
 - [ ] 清扫只会删除「`qlean-` 加 12 位十六进制，且 run 目录不存在」的名字。差一个字符的名字不会出现在删除参数里。
-- [ ] `orb create` 失败时，若机器已经出现，错误路径删除它。
+- [ ] 只有这次尝试新创建的机器才会在失败时被 `orb delete`：`orb create` 失败后若名字已经出现，或新机器的 SSH 就绪超时。删除失败必须和原错误一起返回，不得吞掉。已经存在的机器若 `orb start` 或 SSH 就绪失败，只停止它，不删除。
+- [ ] `upload` 与 `download` 使用 OrbStack SSH/SFTP 会话。参数与实现都不把 `/mnt/mac` 当作文件 API。
 
 **Verification:**
 
-- [ ] `cargo test --lib orb_lifecycle`（注入的执行器，不调用真 `orb`）
-- [ ] 真机冒烟 `#[ignore]`，命令写在测试上：`cargo test --lib orb_lifecycle_live -- --ignored`。前提是 `DEP-MAC-01`。
+- [ ] `cargo test --lib orb_lifecycle`（注入的执行器，不调用真 `orb`）。必须覆盖：只 create 一次、shutdown 的参数是 stop 不是 delete、差一个字符的名字不删除、新机器失败会 delete、已存在机器失败不 delete、清理失败被返回、`is_running` 的三种答案。
+- [ ] 真机冒烟 `#[ignore]`，命令写在测试上：`cargo test --lib orb_lifecycle_live -- --ignored`。前提是 `DEP-MAC-01`。证据必须出现该测试名并且不是 0 tests。覆盖 create、root exec、upload/download 往返、shutdown 后再 spawn。
+- [ ] 池的停止再启动：`tests/machine_pool.rs` 的 `test_concurrency` 在 macOS 上改为 `#[ignore]`（Linux 上仍是普通测试，本卡拥有这个注解）。真机命令 `cargo test --test machine_pool test_concurrency -- --ignored --test-threads=1`，仅在 `DEP-MAC-01` 上执行。证据必须显示 `test_concurrency` 被执行。互 ping 失败不取消这条冒烟，也不许用文件共享代替它；互 ping 失败仍按成功定义挡住 `MAC-06` 与 0.5.0。
 
 **Full-suite trigger:** T-1: `Machine::init` / `shutdown` 是生命周期的单一入口
 
@@ -579,7 +610,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Deliverables:** N/A
 
-**Implementation write set:** `src/orbstack.rs`、`src/machine.rs`、`README.md`（生命周期：stop 保留、清扫范围）、`CHANGELOG.md`、本计划、`plan-status.md`
+**Implementation write set:** `src/orbstack.rs`、`src/machine.rs`、`tests/machine_pool.rs`（仅为 `test_concurrency` 增加 macOS `ignore`）、`README.md`（生命周期：stop 保留、清扫范围、`is_running` 三分、文件 API 不走 `/mnt/mac`）、`CHANGELOG.md`、本计划、`plan-status.md`
 
 **Release write set:** N/A
 
@@ -601,7 +632,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **C/D coverage from:** `MAC-08`
 
-**Granularity:** `type=implementation; axis=生命周期; recovery=revert; complete=yes; self-contained=yes; AC=5/8; VER=2/8; landing=3; prod-files=2; scope=M; deps=MAC-04; writeset=序列化于 MAC-06; release=family child; split-from=N/A; exception=N/A`
+**Granularity:** `type=implementation; axis=生命周期; recovery=revert; complete=yes; self-contained=yes; AC=6/8; VER=3/8; landing=4; prod-files=3; scope=M; deps=MAC-04; writeset=序列化于 MAC-06; release=family child; split-from=N/A; exception=N/A`
 
 ### Task MAC-06: get_ip 与池互访
 
@@ -622,14 +653,15 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Acceptance criteria:**
 
-- [ ] 地址来自宿主侧对这台 `qlean-` 机器的查询，不来自 `hostname -I`。
+- [ ] 地址来自宿主侧对这台 `qlean-` 机器的查询（`MAC-00` 选定的 `orb info` 或 `orb list` 字段），不来自 `hostname -I`。
 - [ ] 查不到地址时，错误带上机器名和一行脱敏的原始输出摘要。
-- [ ] `MAC-00` 互 ping 失败时，本卡状态为 `blocked`，计划不标记完成。
+- [ ] `MAC-00` 互 ping 失败时，本卡状态为 `blocked`，计划不标记完成，版本保持 `0.4.0`。
+- [ ] `tests/machine_pool.rs` 的 `test_ping` 由本卡加上 `#[cfg_attr(target_os = "macos", ignore)]`。Linux 上它仍是普通测试。macOS 上只有显式 `--ignored` 才会运行它。
 
 **Verification:**
 
-- [ ] `cargo test --lib orb_guest_ip`
-- [ ] 真机：`cargo test --test machine_pool test_ping -- --ignored --test-threads=1`，仅在 `DEP-MAC-01` 且互 ping 结论为成功时执行。
+- [ ] `cargo test --lib orb_guest_ip`。输出必须出现该测试名。
+- [ ] 真机：`cargo test --test machine_pool test_ping -- --ignored --test-threads=1`，仅在 `DEP-MAC-01` 且 `MAC-00` 互 ping 结论为成功时执行。证据必须显示 `test_ping` 被执行，且两台 `get_ip` 地址互相 ping 成功。互 ping 结论为失败时不跑这条命令，也不改用其它传输。
 
 **Full-suite trigger:** none
 
@@ -637,7 +669,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Deliverables:** N/A
 
-**Implementation write set:** `src/orbstack.rs`、`src/machine.rs`、`README.md`（`get_ip` 在 Mac 上的地址含义）、`CHANGELOG.md`、本计划、`plan-status.md`
+**Implementation write set:** `src/orbstack.rs`、`src/machine.rs`、`tests/machine_pool.rs`（仅为 `test_ping` 增加 macOS `ignore`）、`README.md`（`get_ip` 在 Mac 上的地址含义）、`CHANGELOG.md`、本计划、`plan-status.md`
 
 **Release write set:** N/A
 
@@ -659,47 +691,48 @@ OrbStack 文档核对日为 2026-11-23：
 
 **C/D coverage from:** `MAC-08`
 
-**Granularity:** `type=implementation; axis=池地址; recovery=revert; complete=yes; self-contained=yes; AC=3/8; VER=2/8; landing=3; prod-files=2; scope=M; deps=MAC-05; writeset=序列化于 MAC-07; release=family child; split-from=N/A; exception=N/A`
+**Granularity:** `type=implementation; axis=池地址; recovery=revert; complete=yes; self-contained=yes; AC=4/8; VER=2/8; landing=3; prod-files=3; scope=M; deps=MAC-05; writeset=序列化于 MAC-07; release=family child; split-from=N/A; exception=N/A`
 
-### Task MAC-07: CI 编译 macOS 目标
+### Task MAC-07: 核对 CI 保持 Ubuntu-only
 
 **Task type:** implementation
 
 **Lifecycle / Acceptance:** pending /
 
-**Description:** `macos-latest` 上跑 `cargo test --lib`。CI 不安装 OrbStack。
+**Description:** 关闭 GAP-MAC-04 的方式是本机 Mac 上的 `cargo test --lib`，不是 GitHub Actions 的 macOS runner。本卡核对 `.github/workflows/check-and-test.yml` 仍然只有 `ubuntu-latest`，并且本计划的 diff 不添加 macOS 测试、macOS job 或 `macos-latest`。依赖 `/proc`、libvirt、KVM 的单测 cfg 归 `MAC-01`，本卡只核对它们没有被删掉。
 
-**Out of scope:** 不在 CI 里跑 `#[ignore]` 的真机测试。
+**Out of scope:** 不新增 macOS job。不在 CI 安装 OrbStack。不在 CI 传 `--ignored`。不把 Actions 变绿当作本卡或后续推送的前置条件。
 
 **Current evidence:**
 
 | 事实 | 证据 |
 |---|---|
 | 工作流只有 `ubuntu-latest` | `.github/workflows/check-and-test.yml` |
+| 本机 OrbStack | 2.2.5，`MAC-00` 写回实测 |
 
 **Acceptance criteria:**
 
-- [ ] 新 job 与 Ubuntu job 并列。一边失败不取消另一边已开始的结论（`fail-fast: false` 覆盖含 Mac 的矩阵，或 Mac job 独立）。
-- [ ] 依赖 `/proc`、libvirt、KVM 的单测在 macOS 上不编译进失败路径；Ubuntu 上仍执行。
-- [ ] 真机测试保持 `#[ignore]`，CI 命令不含 `--ignored`。
+- [ ] 工作流全文没有 `macos-latest`，没有 macOS 测试步骤或 job。本卡提交相对开工时的工作流不新增这些内容。
+- [ ] Ubuntu job 的命令保持：`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib`、`cargo test --test windows_machine`、`cargo test --no-run`。这些命令都不带 `--ignored`。
+- [ ] 提交和推送不等待 GitHub Actions。若推送后能看到 Ubuntu run，只把 run id 记为事后证据；看不到也不挡住本卡。本卡不要求 macOS run。
 
 **Verification:**
 
-- [ ] 工作流中能定位 `macos-latest` 与 `cargo test --lib`。推送后的 run 记入「实施证据汇总」。
+- [ ] 检索 `.github/workflows/check-and-test.yml` 的 `macos-latest` 与 macOS 测试步骤，无匹配。检索输出写入「实施证据汇总」。
 
-**Full-suite trigger:** T-4: 改共享 CI 工作流
+**Full-suite trigger:** none（不改共享 CI 工作流）
 
 **Dependencies:** MAC-06
 
 **Deliverables:** N/A
 
-**Implementation write set:** `.github/workflows/check-and-test.yml`、需要 cfg 的测试模块、本计划、`plan-status.md`
+**Implementation write set:** 本计划、`plan-status.md`。不修改 `.github/workflows/check-and-test.yml` 来添加 Mac。若发现工作流里已经有 `macos-latest`（成稿时没有），删除该 job，而不是保留它。
 
 **Release write set:** N/A
 
-**Files likely touched:** 见实现写集
+**Files likely touched:** 上述两个计划文件
 
-**Docs and compatibility impact:** N/A（CI 不改变用户可见契约；README 已在前序卡写明真机前提）
+**Docs and compatibility impact:** N/A（用户可见契约已由前序卡写入 README）
 
 **Rollback mode:** revert
 
@@ -715,7 +748,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **C/D coverage from:** `MAC-08`
 
-**Granularity:** `type=implementation; axis=CI; recovery=revert; complete=yes; self-contained=yes; AC=3/8; VER=1/8; landing=2; prod-files=1; scope=S; deps=MAC-06; writeset=序列化于 MAC-08; release=family child; split-from=N/A; exception=N/A`
+**Granularity:** `type=implementation; axis=CI 仍为 Ubuntu; recovery=revert; complete=yes; self-contained=yes; AC=3/8; VER=1/8; landing=1; prod-files=0; scope=S; deps=MAC-06; writeset=序列化于 MAC-08; release=family child; split-from=N/A; exception=N/A`
 
 ### Task MAC-08: 以 0.5.0 收口
 
@@ -735,16 +768,17 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Acceptance criteria:**
 
-- [ ] `Cargo.toml` 为 `0.5.0`，CHANGELOG 有 `[0.5.0]` 段，Unreleased 中属于本计划的条目已移入该段。
-- [ ] Linux：`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib` 通过。
-- [ ] macOS：`cargo test --lib` 通过。真机冒烟（create、exec、两机 ping、shutdown 后再 spawn、清扫不删非 `qlean-` 名字）在 `DEP-MAC-01` 上跑过并记入本计划。
-- [ ] 相对 0.4.0 没有 Linux 行为变化。若发现有，先回到对应子卡，不在本卡改语义。
+- [ ] `Cargo.toml` 为 `0.5.0`，CHANGELOG 有 `[0.5.0]` 段，Unreleased 中属于本计划的条目已移入该段。`Cargo.lock` 只由 `cargo check` 或 `cargo build` 刷新。
+- [ ] 本机 macOS：`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib`、`cargo test --no-run` 都退出 0。这是 ER-14 在非 Linux VM 宿主机上的回退。Linux 全量 `cargo test`（含 KVM 集成）登记为 `DEFER-MAC-05`，本卡不声称它已通过。
+- [ ] 真机冒烟已记入本计划：create、root exec、upload/download 往返、shutdown 后再 spawn、清扫不删非 `qlean-` 名字、两机 `get_ip` 后互 ping。证据来自 `MAC-05` 与 `MAC-06`，本卡只核对它们在。
+- [ ] 相对 0.4.0，Linux cfg 路径的行为没有为了 Mac 而改写。若发现有，先回到对应子卡。
+- [ ] `libra push origin main` 发生在本机门通过之后，不等待 GitHub Actions。不打 `v0.5.0` tag，不开 GitHub Release，不 `cargo publish`。Ubuntu CI 只是事后证据。工作流里没有 macOS job。
 
 **Verification:**
 
-- [ ] 上列三条命令。
-- [ ] `libra push origin main` 之后，Ubuntu 与 macOS job 在该提交上全绿，run id 写入「实施证据汇总」。
-- [ ] 用户要求发布时再打 `v0.5.0` 与 GitHub Release。未要求则本卡到 CI 全绿为止，tag 记为未做。
+- [ ] 上列本机四条命令，输出记入「实施证据汇总」，且都是退出 0。
+- [ ] `libra push origin main` 在本机门通过后执行。不把 Actions 的结论写成本卡的通过条件。
+- [ ] `libra status` 与 tag 列表证明没有 `v0.5.0`。用户另行要求时才打 tag 与 GitHub Release。
 
 **Full-suite trigger:** T-2: 发布点
 
@@ -766,7 +800,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Performance budget:** N/A
 
-**Estimated scope:** S
+**Estimated scope:** M
 
 **Version increment:** minor
 
@@ -774,17 +808,18 @@ OrbStack 文档核对日为 2026-11-23：
 
 **C/D coverage from:** self
 
-**Granularity:** `type=release; axis=0.5.0; recovery=immutable-release; complete=yes; self-contained=yes; AC=4/12; VER=3/12; landing=3; prod-files=2; scope=S; deps=MAC-07; writeset=发布写集; release=family release point; split-from=N/A; exception=N/A`
+**Granularity:** `type=release; axis=0.5.0; recovery=immutable-release; complete=yes; self-contained=yes; AC=5/12; VER=3/12; landing=3; prod-files=3; scope=M; deps=MAC-07; writeset=发布写集; release=family release point; split-from=N/A; exception=N/A`
 
 ## 测试矩阵
 
 | 类别 | 必须覆盖 | Target / command |
 |---|---|---|
-| 单元 | 门禁文本、前置三条错误、create 参数、SSH 参数、生命周期状态机、地址解析、前缀清扫 | `cargo test --lib` |
-| 真机单机 | create、root exec、shutdown 后再 spawn | `cargo test --lib orb_lifecycle_live -- --ignored`（仅 `DEP-MAC-01`） |
-| 真机池 | 两机 `get_ip` 后互 ping | `cargo test --test machine_pool test_ping -- --ignored --test-threads=1` |
-| Linux 回归 | 现有 lib 测试，含 vsock 无 TCP 退路 | `cargo test --lib`（Ubuntu） |
-| 编译门槛 | macOS 与 Linux 都能编过单测 | CI 的 Ubuntu job 与 `macos-latest` job |
+| 单元 | 门禁文本、前置三条错误、create 参数、SSH 参数、生命周期状态机、地址解析、前缀清扫 | 本机 `cargo test --lib`。证据必须出现 `macos_host_gate`、`orbstack_prerequisite`、`orb_create_args`、`orb_ssh`、`orb_lifecycle`、`orb_guest_ip`，且不是 0 tests |
+| 真机单机 | create、root exec、upload/download、shutdown 后再 spawn | `cargo test --lib orb_lifecycle_live -- --ignored`（仅 `DEP-MAC-01`，证据里出现该测试名） |
+| 真机池重启 | init、shutdown、再 spawn | `cargo test --test machine_pool test_concurrency -- --ignored --test-threads=1`（macOS 上该测试为 ignore；Linux 上仍直接跑） |
+| 真机池互访 | 两机 `get_ip` 后互 ping | `cargo test --test machine_pool test_ping -- --ignored --test-threads=1`（仅互 ping 结论为成功时；macOS 上 `#[cfg_attr(target_os = "macos", ignore)]`） |
+| Linux 回归 | 现有 lib 测试，含 vsock 无 TCP 退路 | 本机源码守卫 `linux_guest_has_no_tcp_fallback` 与 `connect_target_tests`。完整 Linux `cargo test` 见 `DEFER-MAC-05`。Ubuntu CI 的 `cargo test --lib` 是事后证据 |
+| 编译门槛 | 本机 Mac 能编过并跑过单测；CI 不增加 Mac runner | 本机 `cargo test --lib` 与 `cargo test --no-run`。工作流保持只有 `ubuntu-latest` |
 
 ## 追溯表
 
@@ -792,30 +827,31 @@ OrbStack 文档核对日为 2026-11-23：
 |---|---|---|---|---|
 | MAC-00 | OrbStack 文档与 GAP-MAC-03 | 无 | 本计划实测小节 | 无生产测试 |
 | MAC-01 | GAP-MAC-01、GAP-MAC-02 | `Cargo.toml`、`src/lib.rs` | README Host Setup 首段、CHANGELOG | `macos_host_gate` |
-| MAC-02 | GAP-MAC-02 | `src/orbstack.rs` | 错误文本 | `orbstack_prerequisite` |
-| MAC-03 | GAP-MAC-03、ADR-MAC-03 | `src/orbstack.rs`、`src/image.rs` | README 支持矩阵 | `orb_create_args` |
-| MAC-04 | ADR-MAC-02 | `src/orbstack.rs`、`src/ssh.rs` | README 传输 | `orb_ssh` |
-| MAC-05 | ADR-MAC-03 | `src/machine.rs`、`src/orbstack.rs` | README 生命周期 | `orb_lifecycle` |
-| MAC-06 | `tests/machine_pool.rs` | `src/machine.rs` | README `get_ip` | `orb_guest_ip`、`test_ping` |
-| MAC-07 | GAP-MAC-04 | `.github/workflows/check-and-test.yml` | N/A | CI job |
-| MAC-08 | 成功定义 | `Cargo.toml`、CHANGELOG | `[0.5.0]` | 全量门 |
+| MAC-02 | GAP-MAC-02 | `src/orbstack.rs` | README 三条失败、CHANGELOG | `orbstack_prerequisite` |
+| MAC-03 | GAP-MAC-03、ADR-MAC-03、ADR-MAC-04 | `src/orbstack.rs`、`src/image.rs` | README 支持矩阵与隔离边界 | `orb_create_args` |
+| MAC-04 | ADR-MAC-02 | `src/orbstack.rs`、`src/ssh.rs`（动态用户名，Linux vsock 不变） | README 传输 | `orb_ssh`、`connect_target_tests`、`linux_guest_has_no_tcp_fallback` |
+| MAC-05 | ADR-MAC-03 | `src/machine.rs`、`src/orbstack.rs`、`tests/machine_pool.rs` 的 `test_concurrency` | README 生命周期与 `is_running` | `orb_lifecycle`、`orb_lifecycle_live`、`test_concurrency` |
+| MAC-06 | `tests/machine_pool.rs` | `src/machine.rs`、`test_ping` 的 macOS ignore | README `get_ip` | `orb_guest_ip`、`test_ping` |
+| MAC-07 | GAP-MAC-04 | 不改工作流以添加 Mac。核对 `.github/workflows/check-and-test.yml` 仍无 `macos-latest` | N/A | 检索无匹配 |
+| MAC-08 | 成功定义 | `Cargo.toml`、`Cargo.lock`、CHANGELOG | `[0.5.0]` | 本机 fmt、clippy、`cargo test --lib`、`cargo test --no-run`；`DEFER-MAC-05` |
 
 ## 里程碑验收与回滚
 
 | 里程碑 | 完成条件 | 发布/证据 | 回滚或前滚 |
 |---|---|---|---|
-| M0 | `MAC-00` 结论写回，互 ping 有明确结果 | 本计划实测小节 | 互 ping 失败则停在 M0，不发布 |
+| M0 | `MAC-00` 结论写回，互 ping 有明确结果 | 本计划实测小节 | 互 ping 失败不撤销 M0。`MAC-01` 至 `MAC-05` 可以继续。不发布 0.5.0，计划不标记完成 |
 | M1 | Mac 上能编译，缺 OrbStack 有可操作错误 | `MAC-01`、`MAC-02` 的 lib 测试 | revert 这两张卡的提交 |
-| M2 | 单机能 init、exec、stop、再 spawn | `MAC-05` 真机冒烟 | revert；半成品机器按失败路径删除 |
-| M3 | 两机能互 ping，0.5.0 的 CI 全绿 | `MAC-08` | 已发布则前滚新版本，不改写已推送的 tag |
+| M2 | 单机能 init、exec、传文件、stop、再 spawn；`is_running` 三分 | `MAC-05` 真机冒烟 | revert；只删除这次新创建的半成品 |
+| M3 | 两机能互 ping，本机收口门通过，CI 仍只有 Ubuntu | `MAC-08`。不等待 Actions | 未打 tag。若用户日后发布，只能前滚新版本 |
 
 ### 故障恢复矩阵
 
 | 故障点 | 可接受残留 | 恢复动作 | 禁止结果 |
 |---|---|---|---|
-| `orb create` 失败 | 无 `qlean-` 机器 | 错误路径 `orb delete` 同名机器 | 留下半成品占用名字 |
-| SSH 就绪超时 | 已创建的机器 | 停止并删除该名字，返回超时错误 | 把超时当成「机器可用」 |
-| 进程被杀掉 | 运行中的 `qlean-<id>` | 下次启动按 run 目录缺失清扫；Drop 能走到则先 stop | 删除用户的非 `qlean-` 机器 |
+| `orb create` 失败且名字已经出现 | 无这台新机器 | 错误路径 `orb delete` 这个新名字。删除失败和原错误一起返回 | 留下半成品占用名字，或吞掉清理错误 |
+| 新机器 SSH 就绪超时 | 无这台新机器 | 停止并 `orb delete` 这个新名字，返回超时错误 | 把超时当成「机器可用」 |
+| 已存在机器的 `orb start` 或 SSH 失败 | 机器还在，处于停止 | 只 `orb stop <name>`，不 `orb delete` | 删掉用户上次留下的 `qlean-` 数据 |
+| 进程被杀掉 | 运行中的 `qlean-<id>`，run 目录通常还在 | Drop 能走到则先 stop。run 目录还在时清扫不删除它。手动恢复是操作者执行 `orb stop <name>` 与 `orb delete <name>`，或删掉 run 目录后再启动 qlean 让清扫命中 | 扩大清扫，或删除用户的非 `qlean-` 机器 |
 | `shutdown` 之后 | 已停止的机器还在 | `spawn` 使用 `orb start` | `shutdown` 时 `orb delete` 导致不能 spawn |
 
 ## 风险登记
@@ -828,7 +864,8 @@ OrbStack 文档核对日为 2026-11-23：
 | 端口、用户名或密钥路径变化 | Mac 上全部连接失败 | 三处常量；错误文本指向 OrbStack SSH 文档 | `MAC-04` |
 | 清扫误删用户机器 | 数据丢失 | 只删除精确的 `qlean-` + 12 位十六进制，且 run 目录已不在 | `MAC-05` |
 | 默认 amd64 在 Apple Silicon 上走 Rosetta | 首启看起来像挂死 | README 说明改用 aarch64；沿用现有 SSH 预算 | `MAC-03` |
-| CI 的 macOS runner 没有 OrbStack | 真机回归不在 CI | CI 只编译；真机是 `MAC-08` 的人工门 | `MAC-07` |
+| 有人把 macOS 测试加进 GitHub Actions | 违反本计划的绑定约束 | `MAC-07` 核对工作流没有 `macos-latest`。Mac 门是本机 `cargo test --lib` 与显式的 ignored 真机命令。OrbStack 2.2.5 在 `DEP-MAC-01` 上 | `MAC-07` |
+| 崩溃后 run 目录还在，清扫因此不删机器 | 停止的 `qlean-<id>` 留到操作者处理 | 不扩大删除条件。风险表上一行写了手动恢复。P2，责任人：计划 Owner | `MAC-05` |
 
 ## 性能与容量摘要
 
@@ -842,7 +879,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 - [ ] `README.md` 的 macOS Host Setup、支持矩阵、传输和 `get_ip` 由 `MAC-01`、`MAC-03`、`MAC-04`、`MAC-05`、`MAC-06` 分别写入。
 - [ ] `CHANGELOG.md` 的条目由上述行为卡写入 Unreleased，由 `MAC-08` 收成 `[0.5.0]`。
-- [ ] `.github/workflows/check-and-test.yml` 由 `MAC-07` 更新。
+- [ ] `.github/workflows/check-and-test.yml` 由 `MAC-07` 核对为仍然只有 `ubuntu-latest`。本计划不向它添加 macOS 测试。
 - [ ] `tests/INDEX.md`：`N/A`，仓库中不存在该文件。
 - [ ] `LICENSE` 不改。
 
@@ -856,11 +893,12 @@ OrbStack 文档核对日为 2026-11-23：
 
 ## Review log
 
-实现 review 按用户要求留到另一台执行机器。本机成稿不单开 review 轮次。
+成稿时 review 还没做。那一句不是评审结论，所以不放进 Result 列。Result 只允许 `PASS` 或 `FAIL`。
 
 | Round | Scope | Result | P0/P1 | P2 处置 | Evidence |
 |---|---|---|---|---|---|
-| — | 成稿写入，review 未在本机执行 | 未评审 | 未开始 | 由执行机器上的 review 填写 | 2026-11-23 用户批准写入并明确推迟 review |
+| R2 | 同上计划文本，复审 R1 的修订。Codex 只读 | PASS | 无未关闭 P0/P1。R1 的 P0-01..P0-04 与 P1-01..P1-08 已关闭 | P2-01 仍由计划 Owner 接受：崩溃后 run 目录还在则不扩大清扫。P2-R2-01 由计划 Owner 接受为残余：`MAC-01` 验证里的「Linux：`cargo check`」不是本机门，也不是完成条件；Linux 执行归 `DEFER-MAC-05`，Ubuntu CI 只作事后证据 | 2026-11-23，Codex CLI `codex exec -s read-only`，无 `--worktree`。判定行是 `PASS` |
+| R1 | `docs/plan/plan-20261123-macos-orbstack.md` 计划文本。Codex 只读，非实现者自评。绑定约束：GitHub Actions 不得增加 macOS 测试或 `macos-latest` | FAIL | P0-01 适用范围 / GAP-MAC-04 / 关系表 / ER-13/14 / Phase 3 仍要求 Mac CI。P0-02 `MAC-07` 要求 `macos-latest`。P0-03 `MAC-08` 要求 macOS Actions 全绿。P0-04 测试矩阵与 CI 风险行要求 Mac runner。P1-01 SSH 用户名超出当时写集。P1-02 `test_ping --ignored` 与 `connect_ssh` 过滤器会假绿。P1-03 `is_running` 与文件传输没有归属。P1-04 Linux 全量门与 ER-14 不一致。P1-05 失败清理不分新旧机器。P1-06 隔离边界没写。P1-07 `MAC-02` 缺同卡文档。P1-08 粒度计数与模板不符。本轮修订已改上述正文，待 R2 复审 | P2-01 崩溃后 run 目录仍在则不扩大清扫，手动恢复写入故障矩阵，责任人计划 Owner。P2-02 `MAC-01`..`MAC-05` 在互 ping 失败时可以继续，`MAC-06` 与 0.5.0 不行。P2-03 成稿「未评审」已移出 Result 列 | 2026-11-23 15:55 UTC 前后，Codex CLI `codex exec -s read-only`，无 `--worktree`。判定行是 `FAIL` |
 
 ## 非目标与延后项
 
@@ -870,16 +908,17 @@ OrbStack 文档核对日为 2026-11-23：
 | DEFER-MAC-02 | macOS 上的 Windows 客户机 | OrbStack 无 Windows 机器；现有 Windows 路径要 KVM | OrbStack 提供 Windows 机器，或另选已授权的 macOS 虚拟化 | 新计划 |
 | DEFER-MAC-03 | macOS 上的 riscv64 客户机 | OrbStack 机器架构只有 aarch64 与 amd64 | OrbStack 能创建 riscv64 机器 | 新计划 |
 | DEFER-MAC-04 | macOS 上使用调用方的 qcow2 | 自定义镜像是 orbstack#11，尚未提供 | 该 issue 关闭且 `orb create` 能吃 qcow2 | 新计划 |
+| DEFER-MAC-05 | 配齐的 Linux 宿主机上的全量 `cargo test`（含 `tests/**` 的 KVM 集成） | 本执行机是 macOS，不是 ER-14 要求的 Linux VM 宿主机。不把本机结果说成 Linux 集成已通过 | 在配齐 KVM、QEMU、libvirt、xorriso 与 bridge helper 的 Linux 宿主机上跑通 `cargo test` 并写回证据 | 该宿主机上的后续验证，不在本计划用 TCP 或 OrbStack 代替 |
 
 ## 完成判据
 
 - [ ] 任务卡满足 `G-*`，粒度审计表已填，无未登记的 L 例外。
 - [ ] `MAC-00` 至 `MAC-08` 的 `Lifecycle=done` 且 `Acceptance=complete`。`MAC-06` 若 `blocked`，本计划不得完成。
 - [ ] 各卡 Verification 已跑并记入「实施证据汇总」。真机命令注明 `DEP-MAC-01`。
-- [ ] 收口门：Linux 上 `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib`；macOS 上 `cargo test --lib`；真机冒烟通过。
-- [ ] README、CHANGELOG、CI 已按追溯表更新。
-- [ ] 实现 review 在执行机器上的最终轮次为 PASS，P0/P1 关闭。本机写入不代替那次 review。
-- [ ] `MAC-08` 已把版本定为 0.5.0，锁文件只由工具链刷新。tag 与 GitHub Release 仅在用户要求时执行。
+- [ ] 收口门在本机 macOS 上：`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --lib`、`cargo test --no-run`，以及真机冒烟。Linux 全量集成是 `DEFER-MAC-05`，不作为本计划完成条件。GitHub Actions 不增加 macOS 测试或 `macos-latest`。提交和推送不等待 Actions。
+- [ ] README、CHANGELOG 已按追溯表更新。CI 工作流已核对为仍然只有 `ubuntu-latest`。
+- [ ] 计划 review 与实现 review 的最终轮次都是 PASS，P0/P1 关闭。实现者自己的笔记不算 PASS。
+- [ ] `MAC-08` 已把版本定为 0.5.0，锁文件只由工具链刷新。不打 tag，不开 GitHub Release，不 `cargo publish`，除非用户另行要求。
 - [ ] 「修订历史」记录成稿后的规范性变更。
 - [ ] `plan-status.md` 与任务卡一致。
 - [ ] 未新建证据目录。
