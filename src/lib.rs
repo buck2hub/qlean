@@ -35,6 +35,7 @@ mod firmware;
 mod guest_path;
 mod image;
 mod machine;
+mod orbstack;
 mod pool;
 mod qemu;
 mod qmp;
@@ -72,7 +73,10 @@ where
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (image, config, f);
-        anyhow::bail!("{}", macos_host_gate_message());
+        crate::orbstack::ensure_orbstack().await?;
+        anyhow::bail!(
+            "OrbStack is running, but Qlean cannot create a machine until the OrbStack driver is enabled."
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -96,7 +100,10 @@ where
     #[cfg(not(target_os = "linux"))]
     {
         let _ = f;
-        anyhow::bail!("{}", macos_host_gate_message());
+        crate::orbstack::ensure_orbstack().await?;
+        anyhow::bail!(
+            "OrbStack is running, but Qlean cannot create a machine until the OrbStack driver is enabled."
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -113,21 +120,11 @@ where
     }
 }
 
-/// What a Mac sees until an OrbStack runtime check replaces this gate.
-///
-/// The sentence names OrbStack and the install command. It does not tell the
-/// reader to install QEMU on the Mac: that stack is the Linux host path.
-pub(crate) fn macos_host_gate_message() -> &'static str {
-    "Qlean on macOS needs OrbStack. Install it with `brew install orbstack`, start OrbStack, and retry. Installing QEMU on the Mac is not the fix."
-}
-
 #[cfg(test)]
 mod macos_host_gate {
-    use super::macos_host_gate_message;
-
     #[test]
     fn macos_host_gate_names_orbstack_and_not_qemu() {
-        let message = macos_host_gate_message();
+        let message = super::orbstack::missing_orbstack_message();
         assert!(message.contains("OrbStack"), "{message}");
         assert!(message.contains("brew install orbstack"), "{message}");
         assert!(
@@ -167,6 +164,7 @@ mod plan_doc_tests {
         ("src/image.rs", include_str!("../src/image.rs")),
         ("src/lib.rs", include_str!("../src/lib.rs")),
         ("src/machine.rs", include_str!("../src/machine.rs")),
+        ("src/orbstack.rs", include_str!("../src/orbstack.rs")),
         ("src/pool.rs", include_str!("../src/pool.rs")),
         ("src/qemu.rs", include_str!("../src/qemu.rs")),
         ("src/qmp.rs", include_str!("../src/qmp.rs")),
@@ -4853,7 +4851,7 @@ mod plan_doc_tests {
             .collect();
         assert_eq!(
             lengths.len(),
-            12,
+            13,
             "the crate has {} source files",
             lengths.len()
         );

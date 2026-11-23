@@ -110,6 +110,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 | 时间 | 触发 | 变更内容 | 原卡 → 新卡 | 受影响的引用 |
 |---|---|---|---|---|
+| 2026-11-23 16:18:04 UTC | `MAC-02` | 三条 OrbStack 前置错误可注入，检查不创建机器。README 与 CHANGELOG 写了安装、权限和未启动 | `MAC-02` pending → done / locally-accepted | `src/orbstack.rs`、`src/lib.rs`、README、CHANGELOG |
 | 2026-11-23 16:15:19 UTC | `MAC-01` | macOS 能编译。`kvm-ioctls` 与 `tokio-vsock` 收到 Linux target 依赖。宿主门说明 OrbStack，不把安装 QEMU 当成解法。7 个依赖 `/proc` 的既有单测改为 `cfg(target_os = "linux")` | `MAC-01` pending → done / locally-accepted | `Cargo.toml`、`src/lib.rs`、`src/ssh.rs`、README、CHANGELOG |
 | 2026-11-23 16:07:52 UTC | `MAC-00` 实测 | 写回「OrbStack 实测」。互 ping 成功。创建参数带 `--isolated`。地址字段是 `orb info -f json` 的 `ip4`。无参数 `orb stop` 禁止 | `MAC-00` pending → done / locally-accepted | ADR-MAC-04、实施证据汇总、`plan-status.md` |
 | 2026-11-23 16:02:36 UTC | Codex 计划 review R2 = PASS | 记录 R2。P2-R2-01 接受为残余：`MAC-01` 的 Linux `cargo check` 不是本机门 | 无 | Review log |
@@ -403,7 +404,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Task type:** implementation
 
-**Lifecycle / Acceptance:** pending /
+**Lifecycle / Acceptance:** done / locally-accepted
 
 **Description:** 一个函数回答现在能不能用 `orb`。没找到二进制、找到了但不能执行、OrbStack 没启动，三条错误分开。
 
@@ -417,14 +418,14 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Acceptance criteria:**
 
-- [ ] 三条失败各有一句可操作说明：安装（含 `brew install orbstack`）、修权限或 `noexec`、执行 `orb` / 启动 OrbStack。三条都不把「在 Mac 上安装 QEMU」说成解法。
-- [ ] 检查本身不创建机器。
-- [ ] 命令查找和「是否在运行」可以注入，单测不执行真的 `orb`。
-- [ ] README 与 CHANGELOG 写明这三条失败和对应处置。安装句与 `MAC-01` 的 Host Setup 一致，不另起一套安装说明。
+- [x] 三条失败各有一句可操作说明：安装（含 `brew install orbstack`）、修权限或 `noexec`、执行 `orb` / 启动 OrbStack。三条都不把「在 Mac 上安装 QEMU」说成解法。
+- [x] 检查本身不创建机器。
+- [x] 命令查找和「是否在运行」可以注入，单测不执行真的 `orb`。
+- [x] README 与 CHANGELOG 写明这三条失败和对应处置。安装句与 `MAC-01` 的 Host Setup 一致，不另起一套安装说明。
 
 **Verification:**
 
-- [ ] `cargo test --lib orbstack_prerequisite`
+- [x] `cargo test --lib orbstack_prerequisite`
 
 **Full-suite trigger:** none
 
