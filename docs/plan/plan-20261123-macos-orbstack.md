@@ -110,7 +110,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 | 时间 | 触发 | 变更内容 | 原卡 → 新卡 | 受影响的引用 |
 |---|---|---|---|---|
-| 2026-11-23 17:10:19 UTC | 实现 review IMP-R3 = PASS | 记录 Codex 实现 review。R1/R2 的 P1 已关闭。IMP-R2-P2-01 由计划 Owner 接受为残余：清扫的 list/delete 失败不另报，且每个进程只清扫一次。`MAC-00` 至 `MAC-08` 改为 done / complete。版本 0.5.0。不打 tag | `MAC-00`..`MAC-07` locally-accepted → complete；`MAC-08` pending → done / complete | Review log、`Cargo.toml`、CHANGELOG、`plan-status.md` |
+| 2026-11-23 17:10:19 UTC | 实现 review R3 = PASS | 记录 Codex 实现 review R3。R1/R2 的 P1 已关闭。IMP-R2-P2-01 由计划 Owner 接受为残余：清扫的 list/delete 失败不另报，且每个进程只清扫一次。`MAC-00` 至 `MAC-08` 改为 done / complete。版本 0.5.0。不打 tag | `MAC-00`..`MAC-07` locally-accepted → complete；`MAC-08` pending → done / complete | Review log、`Cargo.toml`、CHANGELOG、`plan-status.md` |
 | 2026-11-23 16:38:23 UTC | `MAC-07` | 核对 CI 仍只有 ubuntu-latest，不新增 macOS 测试 | `MAC-07` pending → done / locally-accepted | `.github/workflows/check-and-test.yml`（未改）、实施证据汇总 |
 | 2026-11-23 16:37:42 UTC | `MAC-06` | macOS `get_ip` 使用 `orb info` 的 `ip4`。两机 `test_ping` 两次通过 | `MAC-06` pending → done / locally-accepted | `src/orbstack.rs`、`src/machine.rs`、`tests/machine_pool.rs`、README、CHANGELOG |
 | 2026-11-23 16:34:00 UTC | `MAC-03` `MAC-04` `MAC-05` | macOS 用注入的执行器拼 `orb create`、走 localhost SSH、并完成 stop 不删除的生命周期。真机冒烟两次通过 | 三张卡 pending → done / locally-accepted | `src/orbstack.rs`、`src/machine.rs`、`src/ssh.rs`、`src/image.rs`、README、CHANGELOG |
@@ -926,7 +926,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 | Round | Scope | Result | P0/P1 | P2 处置 | Evidence |
 |---|---|---|---|---|---|
-| IMP-R3 | 自计划 PASS 提交 `0a68938` 起的实现，含工作区。Codex 只读，非实现者自评。绑定约束：GitHub Actions 不得增加 macOS 测试或 `macos-latest` | PASS | 无未关闭 P0/P1。R2 残留的 IMP-P1-01（Linux dead_code）与 IMP-P1-04（`true` 使用连接前的剩余时间）已关闭。更早的 IMP-P1-02、03、05、06、07 已关闭 | IMP-R2-P2-01 由计划 Owner 接受：清扫时 list 失败或 delete 失败不另报，并且每个进程只清扫一次 | 2026-11-23 17:10:19 UTC，Codex CLI `codex exec -s read-only`，无 `--worktree`。判定行是 `PASS` |
+| R3 | 自计划 PASS 提交 `0a68938` 起的实现，含工作区。Codex 只读，非实现者自评。绑定约束：GitHub Actions 不得增加 macOS 测试或 `macos-latest`。证据文件 `codex-impl-review-r3.txt`，判定行是 `PASS` | PASS | 无未关闭 P0/P1。R2 残留的 IMP-P1-01（Linux dead_code）与 IMP-P1-04（`true` 使用连接前的剩余时间）已关闭。更早的 IMP-P1-02、03、05、06、07 已关闭 | IMP-R2-P2-01 由计划 Owner 接受：清扫时 list 失败或 delete 失败不另报，并且每个进程只清扫一次 | 2026-11-23 17:10:19 UTC，Codex CLI `codex exec -s read-only`，无 `--worktree`。判定行是 `PASS` |
 | R2 | 同上计划文本，复审 R1 的修订。Codex 只读 | PASS | 无未关闭 P0/P1。R1 的 P0-01..P0-04 与 P1-01..P1-08 已关闭 | P2-01 仍由计划 Owner 接受：崩溃后 run 目录还在则不扩大清扫。P2-R2-01 由计划 Owner 接受为残余：`MAC-01` 验证里的「Linux：`cargo check`」不是本机门，也不是完成条件；Linux 执行归 `DEFER-MAC-05`，Ubuntu CI 只作事后证据 | 2026-11-23，Codex CLI `codex exec -s read-only`，无 `--worktree`。判定行是 `PASS` |
 | R1 | `docs/plan/plan-20261123-macos-orbstack.md` 计划文本。Codex 只读，非实现者自评。绑定约束：GitHub Actions 不得增加 macOS 测试或 `macos-latest` | FAIL | P0-01 适用范围 / GAP-MAC-04 / 关系表 / ER-13/14 / Phase 3 仍要求 Mac CI。P0-02 `MAC-07` 要求 `macos-latest`。P0-03 `MAC-08` 要求 macOS Actions 全绿。P0-04 测试矩阵与 CI 风险行要求 Mac runner。P1-01 SSH 用户名超出当时写集。P1-02 `test_ping --ignored` 与 `connect_ssh` 过滤器会假绿。P1-03 `is_running` 与文件传输没有归属。P1-04 Linux 全量门与 ER-14 不一致。P1-05 失败清理不分新旧机器。P1-06 隔离边界没写。P1-07 `MAC-02` 缺同卡文档。P1-08 粒度计数与模板不符。本轮修订已改上述正文，待 R2 复审 | P2-01 崩溃后 run 目录仍在则不扩大清扫，手动恢复写入故障矩阵，责任人计划 Owner。P2-02 `MAC-01`..`MAC-05` 在互 ping 失败时可以继续，`MAC-06` 与 0.5.0 不行。P2-03 成稿「未评审」已移出 Result 列 | 2026-11-23 15:55 UTC 前后，Codex CLI `codex exec -s read-only`，无 `--worktree`。判定行是 `FAIL` |
 

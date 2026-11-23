@@ -34,9 +34,9 @@
 
 | 任务 | type | Lifecycle | Acceptance | 依赖 | 发布版本 / commit | 最近更新时间 | 备注 |
 |---|---|---|---|---|---|---|---|
-| MAC-00 | spike | done | complete | DEP-MAC-01 | — | 2026-11-23 17:10:19 UTC | 实测写回计划。互 ping 成功。`--isolated` 保留。实现 review IMP-R3 PASS |
+| MAC-00 | spike | done | complete | DEP-MAC-01 | — | 2026-11-23 17:10:19 UTC | 实测写回计划。互 ping 成功。`--isolated` 保留。实现 review R3 PASS |
 | MAC-01 | implementation | done | complete | 无 | 继承 REL-MAC-01 | 2026-11-23 17:10:19 UTC | 本机 cargo test --lib 通过。宿主门文本含 OrbStack 与 brew install orbstack。Linux cargo check 未在本机跑，仍是 DEFER-MAC-05 |
-| MAC-02 | implementation | done | complete | MAC-01 | 继承 REL-MAC-01 | 2026-11-23 17:10:19 UTC | 注入的 classify_orb。真 orb 只在 ensure_orbstack 里。实现 review IMP-R3 PASS |
+| MAC-02 | implementation | done | complete | MAC-01 | 继承 REL-MAC-01 | 2026-11-23 17:10:19 UTC | 注入的 classify_orb。真 orb 只在 ensure_orbstack 里。实现 review R3 PASS |
 | MAC-03 | implementation | done | complete | MAC-00, MAC-02 | 继承 REL-MAC-01 | 2026-11-23 17:10:19 UTC | create 参数单测。`--isolated`，裸 distro 名，`--arch arm64`/`amd64` |
 | MAC-04 | implementation | done | complete | MAC-03 | 继承 REL-MAC-01 | 2026-11-23 17:10:19 UTC | SSH `127.0.0.1:32222`，用户 `root@qlean-<id>`，钉 `known_hosts` 的 ed25519 |
 | MAC-05 | implementation | done | complete | MAC-04 | 继承 REL-MAC-01 | 2026-11-23 17:10:19 UTC | 注入生命周期单测。真机 orb_lifecycle_live 两次 1/0。test_concurrency 1/0，80.50s |
