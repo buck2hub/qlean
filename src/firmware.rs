@@ -2072,6 +2072,7 @@ mod tests {
     /// `start` cannot be entered without spawning `swtpm`, but the refusal is decided before
     /// the spawn: a run directory whose socket path holds a directory fails here without any
     /// program installed, which is what makes this testable on a host without `swtpm`.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_a_foreign_entry_at_the_control_socket_path_is_refused_not_deleted() {
         for (entry, expected) in [("directory", "a directory"), ("file", "a regular file")] {
@@ -2364,7 +2365,7 @@ mod tests {
     /// running TPM and then starts a second daemon on the same state directory. The process
     /// whose `argv` names this VM's `--tpmstate` is the only witness, and it has to be
     /// consulted before the removal.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_a_live_swtpm_for_this_vm_is_refused_before_its_socket_is_touched() {
         let root = temp_dir("swtpm-live-owner");
@@ -3083,6 +3084,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_a_swtpm_that_exits_silently_is_reported_by_the_line_in_its_log() {
         // The wiring, not the wording: a stand-in that writes nothing to stderr and one line

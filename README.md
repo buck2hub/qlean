@@ -26,6 +26,10 @@ For distributed or multi-node scenarios, Qlean lets you create and coordinate se
 
 ### Host Setup
 
+#### macOS
+
+macOS uses OrbStack, not the Linux QEMU/KVM stack. Install and start it with `brew install orbstack`. Do not follow the Linux sections below: do not install libvirt, and do not configure `qemu-bridge-helper`. A missing OrbStack install is fixed by that brew command, not by installing QEMU on the Mac.
+
 #### Install CLI tools
 
 Install and configure QEMU, libvirt, and xorriso on your Linux host before using Qlean. On Debian or Ubuntu, see [the setup guide](https://buck2hub.com/docs/qlean/setup) for step-by-step instructions.

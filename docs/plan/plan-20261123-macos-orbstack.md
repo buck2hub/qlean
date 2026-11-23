@@ -110,6 +110,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 | 时间 | 触发 | 变更内容 | 原卡 → 新卡 | 受影响的引用 |
 |---|---|---|---|---|
+| 2026-11-23 16:15:19 UTC | `MAC-01` | macOS 能编译。`kvm-ioctls` 与 `tokio-vsock` 收到 Linux target 依赖。宿主门说明 OrbStack，不把安装 QEMU 当成解法。7 个依赖 `/proc` 的既有单测改为 `cfg(target_os = "linux")` | `MAC-01` pending → done / locally-accepted | `Cargo.toml`、`src/lib.rs`、`src/ssh.rs`、README、CHANGELOG |
 | 2026-11-23 16:07:52 UTC | `MAC-00` 实测 | 写回「OrbStack 实测」。互 ping 成功。创建参数带 `--isolated`。地址字段是 `orb info -f json` 的 `ip4`。无参数 `orb stop` 禁止 | `MAC-00` pending → done / locally-accepted | ADR-MAC-04、实施证据汇总、`plan-status.md` |
 | 2026-11-23 16:02:36 UTC | Codex 计划 review R2 = PASS | 记录 R2。P2-R2-01 接受为残余：`MAC-01` 的 Linux `cargo check` 不是本机门 | 无 | Review log |
 | 2026-11-23 15:55:15 UTC | Codex 计划 review R1 = FAIL（P0-01..P0-04，P1-01..P1-08） | 绑定约束：GitHub Actions 不得增加 macOS 测试或 `macos-latest`。`MAC-07` 改为核对 CI 仍只有 Ubuntu。补 ADR-MAC-04、动态 SSH 用户名、失败清理的新旧机器区分、`is_running` 与文件传输归属、`test_ping` 的 macOS ignore、ER-14 的本机回退与 `DEFER-MAC-05`、`MAC-02` 同卡文档、粒度计数。P2 三条已写入正文（崩溃后 run 目录还在则不扩大清扫；互 ping 失败不挡住 `MAC-01`..`MAC-05`；Review log 的 Result 只用 PASS/FAIL） | 无拆卡。`MAC-07` 改轴，编号保留 | 适用范围、GAP-MAC-04、关系表、ER-13/14、Phase 3、任务卡、测试矩阵、追溯表、风险表、完成判据、`plan-status.md` |
@@ -343,7 +344,7 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Task type:** implementation
 
-**Lifecycle / Acceptance:** pending /
+**Lifecycle / Acceptance:** done / locally-accepted
 
 **Description:** 把 Linux 专用依赖和引用收进 `cfg(target_os = "linux")`。macOS 上调用入口时返回「需要 OrbStack」，而不是编译失败，也不是笼统的「只支持 Linux」。
 
@@ -357,16 +358,16 @@ OrbStack 文档核对日为 2026-11-23：
 
 **Acceptance criteria:**
 
-- [ ] `kvm-ioctls` 与 `tokio-vsock` 只出现在 Linux 目标依赖里。
-- [ ] 本机 macOS 上 `cargo check` 通过。Linux 交叉编译不是本机的门；Linux cfg 路径不改写原有前置失败文本，Ubuntu CI 事后仍编译它们。
-- [ ] macOS 上宿主门的错误包含 `OrbStack` 和 `brew install orbstack`，且不说在 Mac 上安装 QEMU 即可使用。`with_machine` / `with_pool` 在 OrbStack 不可用时走这句，而不是「只支持 Linux」。
-- [ ] Linux 上原有的前置失败文本不被这段 cfg 改写。
-- [ ] 依赖 `/proc`、libvirt 或 KVM 才能成立的既有 `cargo test --lib` 用例用 `cfg(target_os = "linux")` 留在 Linux 上执行。macOS 上 `cargo test --lib` 不因缺少这些设施而失败。这些用例的源码仍在，不删测试。
+- [x] `kvm-ioctls` 与 `tokio-vsock` 只出现在 Linux 目标依赖里。
+- [x] 本机 macOS 上 `cargo check` 通过。Linux 交叉编译不是本机的门；Linux cfg 路径不改写原有前置失败文本，Ubuntu CI 事后仍编译它们。
+- [x] macOS 上宿主门的错误包含 `OrbStack` 和 `brew install orbstack`，且不说在 Mac 上安装 QEMU 即可使用。`with_machine` / `with_pool` 在 OrbStack 不可用时走这句，而不是「只支持 Linux」。
+- [x] Linux 上原有的前置失败文本不被这段 cfg 改写。
+- [x] 依赖 `/proc`、libvirt 或 KVM 才能成立的既有 `cargo test --lib` 用例用 `cfg(target_os = "linux")` 留在 Linux 上执行。macOS 上 `cargo test --lib` 不因缺少这些设施而失败。这些用例的源码仍在，不删测试。
 
 **Verification:**
 
-- [ ] `cargo test --lib macos_host_gate`
-- [ ] Linux：`cargo check`
+- [x] `cargo test --lib macos_host_gate`
+- [ ] Linux：`cargo check`（不是本机门。归 `DEFER-MAC-05` 与 Ubuntu CI 事后证据。计划 Owner 在 R2 接受了这条残余。）
 
 **Full-suite trigger:** T-1: 依赖表与 `src/lib.rs` 入口是所有宿主共享的编译入口
 

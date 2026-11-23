@@ -1,3 +1,5 @@
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use std::{
     io::ErrorKind,
     path::{Path, PathBuf},
@@ -22,6 +24,7 @@ use tokio::{
     time::{Instant, sleep},
 };
 use tokio_util::sync::CancellationToken;
+#[cfg(target_os = "linux")]
 use tokio_vsock::{VsockAddr, VsockStream};
 use tracing::{debug, info};
 
@@ -3107,6 +3110,7 @@ impl Session {
     }
 
     /// Connect to an SSH server via vsock (Linux guests).
+    #[cfg(target_os = "linux")]
     async fn connect(
         privkey: PrivateKey,
         cid: u32,
@@ -3502,6 +3506,7 @@ impl InteractiveShellWriter {
 }
 
 /// Connect SSH and run a command that checks whether the system is ready for operation.
+#[cfg(target_os = "linux")]
 pub(crate) async fn connect_ssh(
     cid: u32,
     timeout: Duration,
@@ -3564,6 +3569,19 @@ pub(crate) async fn connect_ssh(
     }
 
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Timeout establishing SSH over vsock.")))
+}
+
+/// macOS has no vhost-vsock. The Linux function above is the only vsock path.
+#[cfg(not(target_os = "linux"))]
+pub(crate) async fn connect_ssh(
+    cid: u32,
+    timeout: Duration,
+    keypair: PersistedSshKeypair,
+    cancel_token: CancellationToken,
+    _mac_address: String,
+) -> Result<Session> {
+    let _ = (cid, timeout, keypair, cancel_token);
+    bail!("/dev/vhost-vsock is missing. Qlean requires vhost-vsock for SSH (no TCP fallback).")
 }
 
 /// Connect to a Windows guest over TCP and confirm it is ready for commands.

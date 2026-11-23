@@ -3601,6 +3601,7 @@ mod liveness_tests {
     /// `argv[0]` is the QEMU name, and the argument list carries the machine's own QMP socket.
     /// `exec -a` sets an `argv[0]` that is not the program path, and the inner `bash` ignores the
     /// extra argument (it becomes `$0`), so the fixture stays alive for 30s.
+    #[cfg(target_os = "linux")]
     fn spawn_lookalike_qemu(socket: &std::path::Path) -> std::process::Child {
         let chardev = format!(
             "socket,path={},server=on,wait=off,id=qmp0",
@@ -3625,6 +3626,7 @@ mod liveness_tests {
     /// module that spawns a process, so the copy is not always executable the moment it lands -
     /// measured as one failed full-suite run in six, with `start the lookalike: Os { code: 26,
     /// kind: ExecutableFileBusy }`.
+    #[cfg(target_os = "linux")]
     fn spawn_beside_a_busy_copy(program: &std::path::Path) -> std::process::Child {
         let mut last = None;
         for _ in 0..200 {
@@ -3651,6 +3653,7 @@ mod liveness_tests {
     /// `spawn` therefore has to fail, and `spawn_beside_a_busy_copy` has to succeed once the
     /// descriptor is closed - which is the whole difference between the flaky test this replaced
     /// (one failed run in six) and a deterministic one.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_copy_open_for_writing_is_refused_until_it_is_closed() {
         let dir = std::env::temp_dir().join(format!("qlean-busy-{}", std::process::id()));
@@ -3694,6 +3697,7 @@ mod liveness_tests {
     /// `spawn` returns as soon as the child is forked; until it `exec`s, its command line is
     /// still this test binary's, so the `argv[0]` check answers `false` and the first draft of
     /// this test failed about one run in five.
+    #[cfg(target_os = "linux")]
     fn wait_until_the_child_is_qemu(pid: u32, socket: &std::path::Path) {
         for _ in 0..200 {
             if process_is_this_machines_qemu(pid, Some(socket)).expect("this host can read /proc") {
@@ -3704,6 +3708,7 @@ mod liveness_tests {
         panic!("the lookalike never appeared as QEMU in /proc/{pid}/cmdline");
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn is_running_refuses_a_live_qemu_that_lost_its_socket() {
         // The state a hung or half-torn-down launch leaves behind. `false` here would let a
@@ -3761,6 +3766,7 @@ mod liveness_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_qemu_serving_another_machine_is_not_signalled() {
         // The case the identity check exists for. A recorded pid is reused by a QEMU that is
@@ -5049,6 +5055,7 @@ mod timeout_tests {
         assert_eq!(kill_step(&outcome), KillStep::NothingLeft);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_killed_unreaped_child_counts_as_gone() {
         // A zombie keeps its `/proc/<pid>` entry: teardown must not wait out its budget for a

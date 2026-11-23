@@ -24,8 +24,10 @@ use std::future::Future;
 use std::pin::Pin;
 
 use anyhow::Result;
+#[cfg(target_os = "linux")]
 use kvm_ioctls::Kvm;
 
+#[cfg(target_os = "linux")]
 use crate::utils::{ensure_host_prerequisites, ensure_prerequisites};
 
 mod exec;
@@ -52,12 +54,14 @@ pub use ssh::{InteractiveShell, InteractiveShellReader, InteractiveShellWriter};
 
 /// Check if KVM is available on the host.
 pub fn is_kvm_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        Kvm::new().is_ok()
+    }
     #[cfg(not(target_os = "linux"))]
     {
-        return false;
+        false
     }
-
-    Kvm::new().is_ok()
 }
 
 /// Execute a closure with a virtual machine.
@@ -67,17 +71,21 @@ where
 {
     #[cfg(not(target_os = "linux"))]
     {
-        anyhow::bail!("Qlean currently only supports Linux hosts.");
+        let _ = (image, config, f);
+        anyhow::bail!("{}", macos_host_gate_message());
     }
 
-    ensure_prerequisites(image.guest_os()).await?;
+    #[cfg(target_os = "linux")]
+    {
+        ensure_prerequisites(image.guest_os()).await?;
 
-    let mut machine = Machine::new(image, config).await?;
-    machine.init().await?;
-    let outcome = f(&mut machine).await;
-    let shutdown = machine.shutdown().await;
+        let mut machine = Machine::new(image, config).await?;
+        machine.init().await?;
+        let outcome = f(&mut machine).await;
+        let shutdown = machine.shutdown().await;
 
-    combine_outcome(outcome, shutdown)
+        combine_outcome(outcome, shutdown)
+    }
 }
 
 /// Execute a closure with a virtual machine pool.
@@ -87,18 +95,47 @@ where
 {
     #[cfg(not(target_os = "linux"))]
     {
-        anyhow::bail!("Qlean currently only supports Linux hosts.");
+        let _ = f;
+        anyhow::bail!("{}", macos_host_gate_message());
     }
 
-    // Pool members may be Windows guests, which do not need vsock; guest-specific
-    // requirements are enforced when each machine starts.
-    ensure_host_prerequisites().await?;
+    #[cfg(target_os = "linux")]
+    {
+        // Pool members may be Windows guests, which do not need vsock; guest-specific
+        // requirements are enforced when each machine starts.
+        ensure_host_prerequisites().await?;
 
-    let mut pool = MachinePool::new();
-    let outcome = f(&mut pool).await;
-    let shutdown = pool.shutdown_all().await;
+        let mut pool = MachinePool::new();
+        let outcome = f(&mut pool).await;
+        let shutdown = pool.shutdown_all().await;
 
-    combine_outcome(outcome, shutdown)
+        combine_outcome(outcome, shutdown)
+    }
+}
+
+/// What a Mac sees until an OrbStack runtime check replaces this gate.
+///
+/// The sentence names OrbStack and the install command. It does not tell the
+/// reader to install QEMU on the Mac: that stack is the Linux host path.
+pub(crate) fn macos_host_gate_message() -> &'static str {
+    "Qlean on macOS needs OrbStack. Install it with `brew install orbstack`, start OrbStack, and retry. Installing QEMU on the Mac is not the fix."
+}
+
+#[cfg(test)]
+mod macos_host_gate {
+    use super::macos_host_gate_message;
+
+    #[test]
+    fn macos_host_gate_names_orbstack_and_not_qemu() {
+        let message = macos_host_gate_message();
+        assert!(message.contains("OrbStack"), "{message}");
+        assert!(message.contains("brew install orbstack"), "{message}");
+        assert!(
+            message.contains("Installing QEMU on the Mac is not the fix"),
+            "{message}"
+        );
+        assert!(!message.contains("only supports Linux"), "{message}");
+    }
 }
 
 /// Report the closure's outcome, keeping a teardown failure as context on it.
@@ -108,6 +145,7 @@ where
 /// the reader after the wrong problem. The closure's error stays the primary one and the
 /// teardown error is attached to it; a teardown failure on its own is still an error
 /// because a VM that could not be stopped leaks resources.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn combine_outcome<T>(outcome: Result<T>, shutdown: Result<()>) -> Result<T> {
     match (outcome, shutdown) {
         (Err(error), Err(teardown)) => {
